@@ -41,7 +41,7 @@ export function clamAvHealthCheck(options: ClamAvTcpOptions): Promise<boolean> {
     socket.setTimeout(options.timeoutMs ?? 3_000, () => finish(false));
     socket.on("error", () => finish(false));
     socket.on("data", (chunk: Buffer) => finish(/PONG/i.test(chunk.toString("utf8"))));
-    socket.on("connect", () => { socket.write(Buffer.from("PING\\0", "ascii")); });
+    socket.on("connect", () => { socket.write(Buffer.from("zPING\0", "ascii")); });
   });
 }
 

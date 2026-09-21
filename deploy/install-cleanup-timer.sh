@@ -3,7 +3,7 @@ set -euo pipefail
 
 action="${1:-install}"
 unit_dir="/etc/systemd/system"
-project_dir="${OCR_PROJECT_DIR:-/opt/innovera-ocr}"
+project_dir="${OCR_PROJECT_DIR:-/opt/innovera-ocr-app/ocr}"
 
 case "$action" in
   install)

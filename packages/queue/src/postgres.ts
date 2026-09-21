@@ -12,12 +12,25 @@ export class PostgresQueue {
   }
 
   async enqueue(input: { organizationId: string; runId: string; kind?: string; availableAt?: Date }): Promise<string> {
-    const result = await this.pool.query<{ id: string }>(
-      `INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, available_at)
-       VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3, 'PENDING', COALESCE($4, now())) RETURNING id`,
-      [input.organizationId, input.runId, input.kind ?? "OCR", input.availableAt ?? null]
-    );
-    return result.rows[0]!.id;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT set_config('app.current_org', $1, true)", [input.organizationId]);
+
+      const result = await client.query<{ id: string }>(
+        `INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, available_at)
+         VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3, 'PENDING', COALESCE($4, now())) RETURNING id`,
+        [input.organizationId, input.runId, input.kind ?? "OCR", input.availableAt ?? null]
+      );
+
+      await client.query("COMMIT");
+      return result.rows[0]!.id;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async claim(now = new Date()): Promise<ClaimedJob | null> {

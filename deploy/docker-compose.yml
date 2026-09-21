@@ -4,12 +4,12 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_DB: innovera_ocr
-      POSTGRES_USER: ocr_migrator
-      POSTGRES_PASSWORD: ${POSTGRES_MIGRATOR_PASSWORD:?set POSTGRES_MIGRATOR_PASSWORD}
+      POSTGRES_USER: ocr_bootstrap
+      POSTGRES_PASSWORD: ${POSTGRES_BOOTSTRAP_PASSWORD:?set POSTGRES_BOOTSTRAP_PASSWORD}
     ports: ["127.0.0.1:55432:5432"]
     volumes: ["ocr_pgdata:/var/lib/postgresql/data"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ocr_migrator -d innovera_ocr"]
+      test: ["CMD-SHELL", "pg_isready -U ocr_bootstrap -d innovera_ocr"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -28,6 +28,9 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.web
     environment:
+      VIRTUAL_HOST: ocr.innoveraappcenter.com
+      VIRTUAL_PORT: 3100
+      LETSENCRYPT_HOST: ocr.innoveraappcenter.com
       OCR_ENV: production
       OCR_PORT: 3100
       OCR_TRUSTED_PROXY_HOPS: 0
@@ -38,6 +41,9 @@ services:
       AUTH_JWT_SECRETS: ${AUTH_JWT_SECRETS:?set AUTH_JWT_SECRETS}
       AUTH_JWT_ISSUER: ${AUTH_JWT_ISSUER:?set AUTH_JWT_ISSUER}
       AUTH_JWT_AUDIENCE: ${AUTH_JWT_AUDIENCE:?set AUTH_JWT_AUDIENCE}
+      OCR_WEB_AUTO_AUTH: ${OCR_WEB_AUTO_AUTH:-0}
+      OCR_WEB_TENANT_ID: ${OCR_WEB_TENANT_ID:-}
+      OCR_WEB_SUBJECT_ID: ${OCR_WEB_SUBJECT_ID:-}
       DATABASE_URL: ${DATABASE_URL_APP:?set DATABASE_URL_APP}
       DATABASE_URL_MIGRATOR: ${DATABASE_URL_MIGRATOR:?set DATABASE_URL_MIGRATOR}
       DATABASE_URL_QUEUE: ${DATABASE_URL_QUEUE:?set DATABASE_URL_QUEUE}
@@ -48,6 +54,9 @@ services:
       postgres: { condition: service_healthy }
       clamav: { condition: service_healthy }
     volumes: ["ocr_appdata:/var/lib/ocr"]
+    networks:
+      - default
+      - innovera-ocr-net
   worker:
     restart: unless-stopped
     build:
@@ -60,6 +69,9 @@ services:
       OCR_REQUEST_TIMEOUT: ${OCR_REQUEST_TIMEOUT:-120}
       OCR_MAX_RETRIES: ${OCR_MAX_RETRIES:-3}
       OCR_WORKER_ID: ${OCR_WORKER_ID:-worker-1}
+      AUTH_JWT_SECRETS: ${AUTH_JWT_SECRETS:?set AUTH_JWT_SECRETS}
+      AUTH_JWT_ISSUER: ${AUTH_JWT_ISSUER:?set AUTH_JWT_ISSUER}
+      AUTH_JWT_AUDIENCE: ${AUTH_JWT_AUDIENCE:?set AUTH_JWT_AUDIENCE}
       DATABASE_URL_WORKER: ${DATABASE_URL_WORKER:?set DATABASE_URL_WORKER}
       DATABASE_URL_QUEUE: ${DATABASE_URL_QUEUE:?set DATABASE_URL_QUEUE}
       OCR_CLAMAV_HOST: clamav
@@ -69,7 +81,29 @@ services:
       clamav: { condition: service_healthy }
     volumes: ["ocr_appdata:/var/lib/ocr"]
 
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./prometheus-production.yml:/etc/prometheus/prometheus.yml:ro
+      - ocr_prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:59090:9090"
+    networks:
+      - default
+
 volumes:
   ocr_pgdata:
   ocr_clamdb:
   ocr_appdata:
+  ocr_prometheus_data:
+
+
+networks:
+  innovera-ocr-net:
+    external: true
