@@ -1,0 +1,9 @@
+{
+  "name": "@innovera/ocr-ingest",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts", "./http": "./src/http.ts", "./clamav": "./src/clamav.ts" },
+  "types": "./src/index.ts",
+  "scripts": { "typecheck": "tsc -p tsconfig.json" },
+  "dependencies": { "@innovera/ocr-config": "workspace:*", "@innovera/ocr-storage": "workspace:*" }
+}

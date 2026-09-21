@@ -1,0 +1,8 @@
+{
+  "name": "@innovera/ocr-observability",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "types": "./src/index.ts",
+  "scripts": { "typecheck": "tsc -p tsconfig.json" }
+}

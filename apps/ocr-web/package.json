@@ -1,0 +1,19 @@
+{
+  "name": "@innovera/ocr-web",
+  "private": true,
+  "type": "module",
+  "scripts": { "typecheck": "tsc -p tsconfig.json", "start": "tsx src/server.ts" },
+  "dependencies": {
+    "@innovera/ocr-config": "workspace:*",
+    "@innovera/ocr-ingest": "workspace:*",
+    "@innovera/ocr-client": "workspace:*",
+    "@innovera/ocr-persistence": "workspace:*"
+    ,"@innovera/ocr-db-runtime": "workspace:*",
+    "@innovera/ocr-storage": "workspace:*",
+    "@innovera/ocr-queue": "workspace:*"
+    ,"@innovera/ocr-auth": "workspace:*"
+    ,"@innovera/ocr-observability": "workspace:*"
+    ,"pg": "8.16.3"
+  },
+  "devDependencies": { "@types/pg": "8.15.5" }
+}

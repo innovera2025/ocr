@@ -1,0 +1,22 @@
+{
+  "name": "innovera-ocr",
+  "private": true,
+  "packageManager": "pnpm@12.3.4",
+  "engines": {
+    "node": ">=24.21.0 <25",
+    "pnpm": ">=12.3.4 <13"
+  },
+  "scripts": {
+    "typecheck": "tsc -b",
+    "test": "tsx --test 'test/**/*.test.ts' 'apps/**/*.test.ts' 'packages/**/*.test.ts' 'services/**/*.test.ts'",
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "@types/node": "24.0.10",
+    "@typescript-eslint/eslint-plugin": "8.40.0",
+    "@typescript-eslint/parser": "8.40.0",
+    "eslint": "9.39.5",
+    "tsx": "4.23.5",
+    "typescript": "6.0.3"
+  }
+}

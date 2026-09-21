@@ -1,0 +1,16 @@
+[Unit]
+Description=Innovera OCR retention cleanup
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ocr-retention
+Group=ocr-retention
+EnvironmentFile=/etc/innovera/ocr-cleanup.env
+ExecStart=/opt/innovera-ocr/deploy/cleanup-retention.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ocr /var/log/innovera-ocr /run
+

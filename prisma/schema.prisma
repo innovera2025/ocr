@@ -1,0 +1,120 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum DocumentStatus { VALIDATING SCANNING CLEAN PROCESSING SUCCEEDED NEEDS_REVIEW FAILED QUARANTINED DELETED }
+enum RunOutcome { RUNNING SUCCEEDED FAILED CANCELLED }
+enum JobStatus { PENDING RUNNING SUCCEEDED FAILED DEAD CANCELLED }
+
+model Organization {
+  id        String     @id @db.Uuid
+  name      String     @db.VarChar(200)
+  createdAt DateTime   @default(now()) @map("created_at")
+  documents Document[]
+  @@map("organizations")
+}
+
+model Document {
+  id             String         @id @db.Uuid
+  organizationId String         @db.Uuid @map("organization_id")
+  publicId       String         @db.VarChar(32) @map("public_id")
+  status         DocumentStatus
+  filename       String         @db.VarChar(120)
+  mimeType       String         @db.VarChar(127) @map("mime_type")
+  sizeBytes      BigInt         @map("size_bytes")
+  contentHash    String         @db.VarChar(64) @map("content_hash")
+  storageKey     String?        @db.VarChar(512) @map("storage_key")
+  ocrDocumentId  String?        @db.VarChar(255) @map("ocr_document_id")
+  ocrEngine      String?        @db.VarChar(80) @map("ocr_engine")
+  ocrVersion     String?        @db.VarChar(40) @map("ocr_version")
+  rawResponse    Json?          @map("raw_response")
+  structuredResult Json?        @map("structured_result")
+  needsReview    Boolean        @default(false) @map("needs_review")
+  errorMessage   String?        @db.Text @map("error_message")
+  processedAt    DateTime?      @map("processed_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+  confirmStatus  String?        @db.VarChar(32) @map("confirm_status")
+  confirmError   String?        @db.Text @map("confirm_error")
+  confirmedAt    DateTime?      @map("confirmed_at")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  deletedAt      DateTime?      @map("deleted_at")
+  organization   Organization   @relation(fields: [organizationId], references: [id])
+  runs           DocumentRun[]
+  pages          DocumentPage[]
+  @@unique([organizationId, publicId])
+  @@index([organizationId, createdAt])
+  @@map("documents")
+}
+
+model DocumentRun {
+  id             String       @id @db.Uuid
+  organizationId String       @db.Uuid @map("organization_id")
+  documentId     String       @db.Uuid @map("document_id")
+  outcome        RunOutcome
+  createdAt      DateTime     @default(now()) @map("created_at")
+  finishedAt     DateTime?    @map("finished_at")
+  document       Document     @relation(fields: [documentId, organizationId], references: [id, organizationId])
+  jobs           ExtractionJob[]
+  ocrResults     OcrResult[]
+  @@unique([id, organizationId])
+  @@unique([organizationId, documentId, createdAt])
+  @@index([organizationId, documentId])
+  @@map("document_runs")
+}
+
+model DocumentPage {
+  id             String       @id @db.Uuid
+  organizationId String       @db.Uuid @map("organization_id")
+  documentId     String       @db.Uuid @map("document_id")
+  pageNo         Int          @map("page_no")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  document       Document     @relation(fields: [documentId, organizationId], references: [id, organizationId])
+  ocrResults     OcrResult[]
+  @@unique([organizationId, documentId, pageNo])
+  @@unique([id, organizationId])
+  @@map("document_pages")
+}
+
+model ExtractionJob {
+  id             String    @id @db.Uuid
+  organizationId String    @db.Uuid @map("organization_id")
+  runId          String    @db.Uuid @map("run_id")
+  kind           String    @db.VarChar(32)
+  status         JobStatus
+  priority       Int       @default(100)
+  availableAt    DateTime  @default(now()) @map("available_at")
+  attempts       Int       @default(0)
+  maxAttempts    Int       @default(3) @map("max_attempts")
+  nextRetryAt    DateTime? @map("next_retry_at")
+  lastError      String?   @db.Text @map("last_error")
+  lockedAt       DateTime? @map("locked_at")
+  lockedBy       String?   @db.VarChar(255) @map("locked_by")
+  leaseTokenHash Bytes?    @map("lease_token_hash")
+  leaseExpiresAt DateTime? @map("lease_expires_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  run            DocumentRun @relation(fields: [runId, organizationId], references: [id, organizationId])
+  @@unique([organizationId, id])
+  @@index([priority, availableAt])
+  @@map("extraction_jobs")
+}
+
+model OcrResult {
+  id             String       @id @db.Uuid
+  organizationId String       @db.Uuid @map("organization_id")
+  runId          String       @db.Uuid @map("run_id")
+  documentPageId String       @db.Uuid @map("document_page_id")
+  engineId       String       @db.VarChar(80) @map("engine_id")
+  textNfc        String       @map("text_nfc")
+  confidence     Decimal?     @db.Decimal(6, 5)
+  geometryJson   Json         @map("geometry_json")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  run            DocumentRun  @relation(fields: [runId, organizationId], references: [id, organizationId])
+  page           DocumentPage @relation(fields: [documentPageId, organizationId], references: [id, organizationId])
+  @@unique([organizationId, runId, documentPageId, engineId])
+  @@map("ocr_results")
+}

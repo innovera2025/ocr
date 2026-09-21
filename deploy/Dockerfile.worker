@@ -1,0 +1,9 @@
+FROM node:24.21.0-bookworm-slim
+WORKDIR /app
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json tsconfig.json ./
+COPY apps ./apps
+COPY packages ./packages
+COPY services ./services
+COPY prisma ./prisma
+RUN corepack enable && pnpm install --frozen-lockfile
+CMD ["pnpm", "--filter", "@innovera/ocr-worker", "start"]

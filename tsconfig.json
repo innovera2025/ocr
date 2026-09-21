@@ -1,0 +1,17 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/config" },
+    { "path": "packages/ocr-client" },
+    { "path": "packages/ocr-persistence" },
+    { "path": "packages/db-runtime" },
+    { "path": "packages/auth" },
+    { "path": "packages/queue" },
+    { "path": "packages/storage" },
+    { "path": "packages/observability" },
+    { "path": "packages/ingest" },
+    { "path": "services/ocr-worker" },
+    { "path": "apps/ocr-web" }
+  ],
+  "compilerOptions": { "noEmit": true }
+}

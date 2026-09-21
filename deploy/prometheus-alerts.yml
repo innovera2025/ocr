@@ -1,0 +1,48 @@
+groups:
+  - name: innovera-ocr
+    rules:
+      - alert: OcrHttp5xxRateHigh
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "OCR web HTTP 5xx rate is high" }
+      - alert: OcrApiErrorsHigh
+        expr: rate(ocr_requests_total{status="error"}[5m]) > 0.02
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "OCR API errors are elevated" }
+      - alert: OcrLatencyHigh
+        expr: rate(ocr_latency_ms_sum[5m]) / rate(ocr_requests_total[5m]) > 30000
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "OCR latency exceeds 30 seconds" }
+      - alert: OcrQueueBacklog
+        expr: ocr_queue_depth > 100
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "OCR queue backlog is high" }
+      - alert: OcrOutboxBacklog
+        expr: ocr_outbox_pending > 100
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "OCR confirm outbox backlog is high" }
+      - alert: OcrWorkerHeartbeatStale
+        expr: time() - ocr_worker_heartbeat_timestamp_seconds > 120
+        for: 5m
+        labels: { severity: critical }
+        annotations: { summary: "OCR worker heartbeat is stale" }
+      - alert: OcrPostgresUnavailable
+        expr: up{job="ocr-postgres"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "OCR PostgreSQL exporter is unavailable" }
+      - alert: OcrClamAvUnavailable
+        expr: clamav_health == 0
+        for: 5m
+        labels: { severity: critical }
+        annotations: { summary: "ClamAV is unavailable" }
+      - alert: OcrDiskSpaceLow
+        expr: (node_filesystem_avail_bytes{mountpoint="/var/lib/ocr"} / node_filesystem_size_bytes{mountpoint="/var/lib/ocr"}) < 0.15
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "OCR storage free space is below 15 percent" }

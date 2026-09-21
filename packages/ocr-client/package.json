@@ -1,0 +1,9 @@
+{
+  "name": "@innovera/ocr-client",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "types": "./src/index.ts",
+  "scripts": { "typecheck": "tsc -p tsconfig.json" },
+  "dependencies": { "@innovera/ocr-config": "workspace:*" }
+}

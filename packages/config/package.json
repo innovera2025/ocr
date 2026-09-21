@@ -1,0 +1,9 @@
+{
+  "name": "@innovera/ocr-config",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "types": "./src/index.ts",
+  "dependencies": { "zod": "4.5.4" },
+  "scripts": { "typecheck": "tsc -p tsconfig.json" }
+}

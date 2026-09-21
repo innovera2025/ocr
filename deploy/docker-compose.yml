@@ -1,0 +1,75 @@
+services:
+  postgres:
+    image: postgres:17.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: innovera_ocr
+      POSTGRES_USER: ocr_migrator
+      POSTGRES_PASSWORD: ${POSTGRES_MIGRATOR_PASSWORD:?set POSTGRES_MIGRATOR_PASSWORD}
+    ports: ["127.0.0.1:55432:5432"]
+    volumes: ["ocr_pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ocr_migrator -d innovera_ocr"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+  clamav:
+    image: clamav/clamav:1.4
+    restart: unless-stopped
+    volumes: ["ocr_clamdb:/var/lib/clamav"]
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --ping 2 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+  web:
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+    environment:
+      OCR_ENV: production
+      OCR_PORT: 3100
+      OCR_TRUSTED_PROXY_HOPS: 0
+      OCR_STORAGE_ROOT: /var/lib/ocr
+      OCR_API_BASE_URL: ${OCR_API_BASE_URL:-https://ai.innoveraappcenter.com/ocr}
+      OCR_REQUEST_TIMEOUT: ${OCR_REQUEST_TIMEOUT:-120}
+      OCR_MAX_RETRIES: ${OCR_MAX_RETRIES:-3}
+      AUTH_JWT_SECRETS: ${AUTH_JWT_SECRETS:?set AUTH_JWT_SECRETS}
+      AUTH_JWT_ISSUER: ${AUTH_JWT_ISSUER:?set AUTH_JWT_ISSUER}
+      AUTH_JWT_AUDIENCE: ${AUTH_JWT_AUDIENCE:?set AUTH_JWT_AUDIENCE}
+      DATABASE_URL: ${DATABASE_URL_APP:?set DATABASE_URL_APP}
+      DATABASE_URL_MIGRATOR: ${DATABASE_URL_MIGRATOR:?set DATABASE_URL_MIGRATOR}
+      DATABASE_URL_QUEUE: ${DATABASE_URL_QUEUE:?set DATABASE_URL_QUEUE}
+      OCR_CLAMAV_HOST: clamav
+      OCR_CLAMAV_PORT: 3310
+    ports: ["127.0.0.1:53100:3100"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      clamav: { condition: service_healthy }
+    volumes: ["ocr_appdata:/var/lib/ocr"]
+  worker:
+    restart: unless-stopped
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+    environment:
+      OCR_ENV: production
+      OCR_STORAGE_ROOT: /var/lib/ocr
+      OCR_API_BASE_URL: ${OCR_API_BASE_URL:-https://ai.innoveraappcenter.com/ocr}
+      OCR_REQUEST_TIMEOUT: ${OCR_REQUEST_TIMEOUT:-120}
+      OCR_MAX_RETRIES: ${OCR_MAX_RETRIES:-3}
+      OCR_WORKER_ID: ${OCR_WORKER_ID:-worker-1}
+      DATABASE_URL_WORKER: ${DATABASE_URL_WORKER:?set DATABASE_URL_WORKER}
+      DATABASE_URL_QUEUE: ${DATABASE_URL_QUEUE:?set DATABASE_URL_QUEUE}
+      OCR_CLAMAV_HOST: clamav
+      OCR_CLAMAV_PORT: 3310
+    depends_on:
+      postgres: { condition: service_healthy }
+      clamav: { condition: service_healthy }
+    volumes: ["ocr_appdata:/var/lib/ocr"]
+
+volumes:
+  ocr_pgdata:
+  ocr_clamdb:
+  ocr_appdata:

@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: ocr-web
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["web:3100"]
+
+  # Enable these targets only when the corresponding existing exporters are installed.
+  - job_name: ocr-postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+  - job_name: ocr-node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+# The worker currently emits the same metrics through its process logger.
+# Export its registry through the deployment's preferred sidecar/collector before go-live.

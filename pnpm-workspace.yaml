@@ -1,0 +1,9 @@
+packages:
+  - "packages/*"
+  - "apps/*"
+  - "services/*"
+allowBuilds:
+  esbuild: true
+minimumReleaseAge: 10080
+onlyBuiltDependencies:
+  - esbuild
