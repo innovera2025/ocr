@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createHmac } from "node:crypto";
 import { loadConfig, redactLog } from "@innovera/ocr-config";
 import { handleRawUpload, type IngestDependencies } from "@innovera/ocr-ingest/http";
 import { OcrClient } from "@innovera/ocr-client";
@@ -31,6 +32,56 @@ export function healthResponse(pathname: string): { status: number; body: { stat
 function respond(response: ServerResponse, status: number, body: object): void {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   response.end(JSON.stringify(body));
+}
+
+
+function mintWebJwt(): string {
+  if (process.env.OCR_WEB_AUTO_AUTH !== "1") {
+    throw new Error("WEB_AUTO_AUTH_DISABLED");
+  }
+
+  const secret = (process.env.AUTH_JWT_SECRETS ?? "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean)[0];
+
+  const issuer = process.env.AUTH_JWT_ISSUER ?? "";
+  const audience = process.env.AUTH_JWT_AUDIENCE ?? "";
+  const tenantId = process.env.OCR_WEB_TENANT_ID ?? "";
+  const subjectId = process.env.OCR_WEB_SUBJECT_ID ?? "";
+
+  if (!secret || !issuer || !audience || !tenantId || !subjectId) {
+    throw new Error("WEB_AUTO_AUTH_CONFIG_REQUIRED");
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+
+  const header = {
+    alg: "HS256",
+    typ: "JWT"
+  };
+
+  const payload = {
+    sub: subjectId,
+    tenant_id: tenantId,
+    organization_id: tenantId,
+    iss: issuer,
+    aud: audience,
+    iat: now,
+    exp: now + 900
+  };
+
+  const encode = (value: unknown) =>
+    Buffer.from(JSON.stringify(value)).toString("base64url");
+
+  const h = encode(header);
+  const p = encode(payload);
+
+  const signature = createHmac("sha256", secret)
+    .update(`${h}.${p}`)
+    .digest("base64url");
+
+  return `${h}.${p}.${signature}`;
 }
 
 function respondHtml(response: ServerResponse, status: number, html: string): void {
@@ -67,6 +118,144 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
   return createServer(async (request: IncomingMessage, response: ServerResponse) => {
     const startedAt = Date.now();
     const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+
+
+    // OCR_WEB_AUTO_TOKEN_ROUTE
+    if (pathname === "/api/web-token" && request.method === "GET") {
+      try {
+        return respond(response, 200, {
+          token: mintWebJwt(),
+          expiresIn: 900
+        });
+      } catch {
+        return respond(response, 503, {
+          error: "WEB_AUTO_AUTH_UNAVAILABLE"
+        });
+      }
+    }
+
+    // INNOVERA_OCR_ROOT_UI
+    if (pathname === "/" && request.method === "GET") {
+      return respondHtml(response, 200, `<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>INNOVERA OCR</title>
+<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:920px;margin:40px auto;padding:0 20px;background:#f6f7f9;color:#1f2937}
+h1{margin:0 0 6px}
+.sub{color:#6b7280;margin-bottom:24px}
+.card{background:white;border:1px solid #e5e7eb;border-radius:14px;padding:22px;margin-top:18px}
+button{border:0;border-radius:9px;padding:11px 20px;background:#111827;color:white;font-size:15px;cursor:pointer}
+input[type=file]{margin:12px 0 18px}
+.status{font-weight:600;margin-top:16px}
+pre{white-space:pre-wrap;word-break:break-word;background:#111827;color:#e5e7eb;padding:18px;border-radius:10px;overflow:auto;min-height:100px}
+</style>
+</head>
+<body>
+
+<h1>INNOVERA OCR</h1>
+<div class="sub">Production OCR Test</div>
+
+<div class="card">
+  <h3>Upload Document</h3>
+  <input id="file" type="file" accept="image/png,image/jpeg,image/webp,application/pdf">
+  <br>
+  <button id="upload">Upload & OCR</button>
+  <div class="status" id="status"></div>
+</div>
+
+<div class="card">
+  <h3>OCR Result</h3>
+  <pre id="result">ยังไม่มีผลลัพธ์</pre>
+</div>
+
+<script>
+const statusEl = document.getElementById('status');
+const resultEl = document.getElementById('result');
+
+document.getElementById('upload').onclick = async () => {
+  try {
+    const file = document.getElementById('file').files[0];
+
+    if (!file) {
+      statusEl.textContent = 'กรุณาเลือกไฟล์';
+      return;
+    }
+
+    statusEl.textContent = 'Preparing secure session...';
+
+    const tokenResponse = await fetch('/api/web-token', {
+      cache: 'no-store'
+    });
+
+    const tokenData = await tokenResponse.json();
+
+    if (!tokenResponse.ok || !tokenData.token) {
+      statusEl.textContent = 'Authentication unavailable';
+      resultEl.textContent = JSON.stringify(tokenData, null, 2);
+      return;
+    }
+
+    const token = tokenData.token;
+
+    statusEl.textContent = 'Uploading...';
+    resultEl.textContent = '';
+
+    const upload = await fetch('/api/documents', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Idempotency-Key': 'web-' + Date.now(),
+        'Content-Type': file.type || 'application/octet-stream',
+        'X-Upload-Filename': file.name
+      },
+      body: file
+    });
+
+    const uploaded = await upload.json();
+
+    if (!upload.ok) {
+      statusEl.textContent = 'Upload failed: HTTP ' + upload.status;
+      resultEl.textContent = JSON.stringify(uploaded, null, 2);
+      return;
+    }
+
+    const id = uploaded.documentId;
+    statusEl.textContent = 'OCR Processing...';
+    resultEl.textContent = JSON.stringify(uploaded, null, 2);
+
+    for (let i = 0; i < 120; i++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      const res = await fetch('/api/documents/' + id + '/ocr', {
+        headers: {
+          'Authorization': 'Bearer ' + token
+        }
+      });
+
+      const data = await res.json();
+      resultEl.textContent = JSON.stringify(data, null, 2);
+
+      const st = data && data.document ? data.document.status : '';
+      statusEl.textContent = st || 'Processing...';
+
+      if (st === 'SUCCEEDED' || st === 'NEEDS_REVIEW' || st === 'FAILED') {
+        break;
+      }
+    }
+  } catch (err) {
+    statusEl.textContent = 'Error';
+    resultEl.textContent = String(err);
+  }
+};
+</script>
+
+</body>
+</html>`);
+    }
+
     const reqId = requestId(request.headers["x-request-id"]);
     response.setHeader("x-request-id", reqId);
     response.once("finish", () => {
@@ -148,7 +337,8 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
         });
         await app.reviewStore.saveCorrection(tenantId, confirmMatch[1]!, field, verifiedValue, "PENDING", undefined, undefined, { raw, verifiedBy });
         try {
-          await app.ocrClient.confirmResult({ documentId: current.ocrDocumentId, field, raw, verifiedValue });
+          const providerField = field === "therapistName" ? "therapist" : field;
+        await app.ocrClient.confirmResult({ documentId: current.ocrDocumentId, field: providerField, raw, verifiedValue });
           await app.reviewStore.saveCorrection(tenantId, confirmMatch[1]!, field, verifiedValue, "SUCCEEDED", undefined, hasOtherReview);
           return respond(response, 200, { status: "confirmed" });
         } catch (error) {
@@ -168,7 +358,7 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
 
 export async function createProductionAppServer(): Promise<{ server: ReturnType<typeof createAppServer>; close: () => Promise<void> }> {
   const migrationPool = createDatabasePool(process.env.DATABASE_URL_MIGRATOR || process.env.DATABASE_URL);
-  await runMigrationsWithPool(migrationPool, resolve(process.cwd(), "prisma/migrations"));
+  await runMigrationsWithPool(migrationPool, resolve(process.cwd(), "../../prisma/migrations"));
   await migrationPool.end();
   const pool = createDatabasePool(process.env.DATABASE_URL);
   await assertDatabaseReady(pool);

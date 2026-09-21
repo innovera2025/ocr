@@ -31,3 +31,44 @@ SQL
 
 COREPACK_HOME="${COREPACK_HOME:-/tmp/ocr-corepack}" pnpm exec tsx -e 'import {createDatabasePool,runMigrationsWithPool} from "./packages/db-runtime/src/index.ts"; const p=createDatabasePool(process.env.DATABASE_URL_MIGRATOR); runMigrationsWithPool(p,"./prisma/migrations").then(x=>{if(x.length) process.stdout.write(`applied=${x.join(",")}\n`); return p.end()}).catch(async e=>{process.stderr.write(`${String(e)}\n`); await p.end(); process.exit(1)})'
 DATABASE_URL_BOOTSTRAP="${DATABASE_URL_BOOTSTRAP}" DATABASE_URL_MIGRATOR="${DATABASE_URL_MIGRATOR}" DATABASE_URL_APP="${DATABASE_URL_APP:-}" DATABASE_URL_WORKER="${DATABASE_URL_WORKER:-}" DATABASE_URL_QUEUE="${DATABASE_URL_QUEUE:-}" ./deploy/verify-db-roles.sh
+
+# Queue SECURITY DEFINER owner.
+# Required because extraction_jobs uses FORCE ROW LEVEL SECURITY.
+psql "${DATABASE_URL_BOOTSTRAP}" -v ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_roles WHERE rolname='ocr_queue_definer'
+  ) THEN
+    CREATE ROLE ocr_queue_definer NOLOGIN BYPASSRLS;
+  ELSE
+    ALTER ROLE ocr_queue_definer NOLOGIN BYPASSRLS;
+  END IF;
+END
+$$;
+
+GRANT USAGE ON SCHEMA public TO ocr_queue_definer;
+GRANT SELECT, UPDATE ON extraction_jobs TO ocr_queue_definer;
+
+ALTER FUNCTION ocr_claim_v1(timestamptz)
+  OWNER TO ocr_queue_definer;
+
+ALTER FUNCTION ocr_heartbeat_v1(uuid,text,timestamptz)
+  OWNER TO ocr_queue_definer;
+
+ALTER FUNCTION ocr_finish_retry_v1(uuid,text,job_status,text,timestamptz)
+  OWNER TO ocr_queue_definer;
+
+ALTER FUNCTION ocr_recover_expired_v1(timestamptz)
+  OWNER TO ocr_queue_definer;
+
+REVOKE ALL ON FUNCTION ocr_claim_v1(timestamptz) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ocr_heartbeat_v1(uuid,text,timestamptz) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ocr_finish_retry_v1(uuid,text,job_status,text,timestamptz) FROM PUBLIC;
+REVOKE ALL ON FUNCTION ocr_recover_expired_v1(timestamptz) FROM PUBLIC;
+
+GRANT EXECUTE ON FUNCTION ocr_claim_v1(timestamptz) TO ocr_queue;
+GRANT EXECUTE ON FUNCTION ocr_heartbeat_v1(uuid,text,timestamptz) TO ocr_worker;
+GRANT EXECUTE ON FUNCTION ocr_finish_retry_v1(uuid,text,job_status,text,timestamptz) TO ocr_worker;
+GRANT EXECUTE ON FUNCTION ocr_recover_expired_v1(timestamptz) TO ocr_worker;
+SQL

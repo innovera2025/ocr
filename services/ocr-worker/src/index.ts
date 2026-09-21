@@ -79,13 +79,49 @@ export async function runWorkerOnce(dependencies: Readonly<{ queue: PostgresQueu
     await dependencies.queue.finish(claimed.jobId, claimed.leaseToken, "FAILED", "DOCUMENT_NOT_FOUND");
     return true;
   }
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
   try {
     await dependencies.store.markProcessing(document.organizationId, document.documentId);
-    await processOcrJob({ schemaVersion: 1, documentId: document.documentId, organizationId: document.organizationId, sourceKey: document.sourceKey, filename: document.filename, mimeType: document.mimeType }, { storage: dependencies.storage, ocrClient: dependencies.ocrClient, documentStore: dependencies.store });
-    await dependencies.queue.finish(claimed.jobId, claimed.leaseToken, "SUCCEEDED");
+
+    heartbeatTimer = setInterval(() => {
+      void dependencies.queue
+        .heartbeat(claimed.jobId, claimed.leaseToken)
+        .catch(() => undefined);
+    }, 30000);
+
+    await processOcrJob(
+      {
+        schemaVersion: 1,
+        documentId: document.documentId,
+        organizationId: document.organizationId,
+        sourceKey: document.sourceKey,
+        filename: document.filename,
+        mimeType: document.mimeType
+      },
+      {
+        storage: dependencies.storage,
+        ocrClient: dependencies.ocrClient,
+        documentStore: dependencies.store
+      }
+    );
+
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+
+    await dependencies.queue.finish(
+      claimed.jobId,
+      claimed.leaseToken,
+      "SUCCEEDED"
+    );
+
     metrics.increment("jobs_completed");
-    logEvent("job_completed", { job_id: claimed.jobId, tenant_id: document.organizationId, status: "SUCCEEDED" });
+    logEvent("job_completed", {
+      job_id: claimed.jobId,
+      tenant_id: document.organizationId,
+      status: "SUCCEEDED"
+    });
   } catch (error) {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
     const message = error instanceof Error ? error.message : "OCR_WORKER_FAILED";
     await dependencies.store.markFailure(document.organizationId, document.documentId, message).catch(() => undefined);
     await dependencies.queue.finish(claimed.jobId, claimed.leaseToken, "FAILED", message);
@@ -111,8 +147,10 @@ export async function startWorkerRuntime(): Promise<() => Promise<void>> {
       await queue.recoverExpired();
       await outbox.recoverExpired();
       await outbox.dispatchOnce(async (payload) => {
+        const field = String(payload.field);
+        const providerField = field === "therapistName" ? "therapist" : field;
         await ocrClient.confirmResult({
-          documentId: String(payload.documentId), field: String(payload.field), raw: String(payload.raw ?? ""), verifiedValue: String(payload.verifiedValue ?? "")
+          documentId: String(payload.documentId), field: providerField, raw: String(payload.raw ?? ""), verifiedValue: String(payload.verifiedValue ?? "")
         });
       });
       const worked = await runWorkerOnce({ queue, store, storage, ocrClient });

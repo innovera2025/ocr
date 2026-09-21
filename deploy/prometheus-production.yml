@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: ocr-web
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - web:3100

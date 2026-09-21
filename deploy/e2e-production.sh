@@ -7,9 +7,24 @@ set -euo pipefail
 
 key="ocr-e2e-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 started=$(date +%s)
+filename="$(basename "${SAMPLE_FILE}")"
+content_length="$(stat -c%s "${SAMPLE_FILE}")"
+
+case "${SAMPLE_FILE,,}" in
+  *.png)  mime_type="image/png" ;;
+  *.jpg|*.jpeg) mime_type="image/jpeg" ;;
+  *.webp) mime_type="image/webp" ;;
+  *.pdf)  mime_type="application/pdf" ;;
+  *) mime_type="${E2E_MIME_TYPE:-application/octet-stream}" ;;
+esac
+
 response=$(curl --fail-with-body --silent --show-error --location --request POST "${APP_BASE_URL%/}/api/documents" \
-  -H "Authorization: Bearer ${JWT_TOKEN}" -H "Idempotency-Key: ${key}" \
-  -F "file=@${SAMPLE_FILE}")
+  -H "Authorization: Bearer ${JWT_TOKEN}" \
+  -H "Idempotency-Key: ${key}" \
+  -H "Content-Type: ${mime_type}" \
+  -H "Content-Length: ${content_length}" \
+  -H "X-Upload-Filename: ${filename}" \
+  --data-binary "@${SAMPLE_FILE}")
 printf '%s\n' "$response" | sed -E 's/(documentId|runId|jobId|id)"[[:space:]]*:[[:space:]]*"[^"]+"/\1":"<redacted>"/g'
 document_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("documentId", ""))' <<<"$response")"
 [ -n "$document_id" ] || { echo "FAIL upload response has no documentId"; exit 1; }
