@@ -29,46 +29,25 @@ ALTER ROLE ocr_migrator LOGIN PASSWORD :'migrator_password' NOSUPERUSER NOCREATE
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 SQL
 
+# Historical migration 0002 runs CREATE ROLE inside an exception block that only tolerates duplicate_object.
+# PostgreSQL checks CREATEROLE before existence, so on a database where 0002 has not run yet the NOCREATEROLE
+# migrator needs CREATEROLE for this one migration run. Databases that already have 0002 are unaffected.
+needs_createrole="$(psql "${DATABASE_URL_BOOTSTRAP}" -AtX -v ON_ERROR_STOP=1 -c "SELECT (to_regprocedure('public.ocr_claim_v1(timestamptz)') IS NULL)::int")"
+if [ "${needs_createrole}" = "1" ]; then
+  psql "${DATABASE_URL_BOOTSTRAP}" -qX -v ON_ERROR_STOP=1 -c "ALTER ROLE ocr_migrator CREATEROLE"
+  trap 'psql "${DATABASE_URL_BOOTSTRAP}" -qX -v ON_ERROR_STOP=1 -c "ALTER ROLE ocr_migrator NOCREATEROLE"' EXIT
+fi
+
 COREPACK_HOME="${COREPACK_HOME:-/tmp/ocr-corepack}" pnpm exec tsx -e 'import {createDatabasePool,runMigrationsWithPool} from "./packages/db-runtime/src/index.ts"; const p=createDatabasePool(process.env.DATABASE_URL_MIGRATOR); runMigrationsWithPool(p,"./prisma/migrations").then(x=>{if(x.length) process.stdout.write(`applied=${x.join(",")}\n`); return p.end()}).catch(async e=>{process.stderr.write(`${String(e)}\n`); await p.end(); process.exit(1)})'
+if [ "${needs_createrole}" = "1" ]; then
+  psql "${DATABASE_URL_BOOTSTRAP}" -qX -v ON_ERROR_STOP=1 -c "ALTER ROLE ocr_migrator NOCREATEROLE"
+  trap - EXIT
+fi
+
+# SECURITY DEFINER owner (ocr_queue_definer, NOLOGIN BYPASSRLS) for the queue AND confirm-outbox functions.
+# Required because extraction_jobs and ocr_confirm_outbox use FORCE ROW LEVEL SECURITY. The SQL is shared with the
+# DB integration test (packages/ocr-persistence/src/batch.db.test.ts). Idempotent; runs before verification so a
+# failing check cannot leave the workers without a working queue.
+psql "${DATABASE_URL_BOOTSTRAP}" -qX -v ON_ERROR_STOP=1 --single-transaction -f "$(dirname "${BASH_SOURCE[0]}")/sql/queue-definer.sql"
+
 DATABASE_URL_BOOTSTRAP="${DATABASE_URL_BOOTSTRAP}" DATABASE_URL_MIGRATOR="${DATABASE_URL_MIGRATOR}" DATABASE_URL_APP="${DATABASE_URL_APP:-}" DATABASE_URL_WORKER="${DATABASE_URL_WORKER:-}" DATABASE_URL_QUEUE="${DATABASE_URL_QUEUE:-}" ./deploy/verify-db-roles.sh
-
-# Queue SECURITY DEFINER owner.
-# Required because extraction_jobs uses FORCE ROW LEVEL SECURITY.
-psql "${DATABASE_URL_BOOTSTRAP}" -v ON_ERROR_STOP=1 <<'SQL'
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_roles WHERE rolname='ocr_queue_definer'
-  ) THEN
-    CREATE ROLE ocr_queue_definer NOLOGIN BYPASSRLS;
-  ELSE
-    ALTER ROLE ocr_queue_definer NOLOGIN BYPASSRLS;
-  END IF;
-END
-$$;
-
-GRANT USAGE ON SCHEMA public TO ocr_queue_definer;
-GRANT SELECT, UPDATE ON extraction_jobs TO ocr_queue_definer;
-
-ALTER FUNCTION ocr_claim_v1(timestamptz)
-  OWNER TO ocr_queue_definer;
-
-ALTER FUNCTION ocr_heartbeat_v1(uuid,text,timestamptz)
-  OWNER TO ocr_queue_definer;
-
-ALTER FUNCTION ocr_finish_retry_v1(uuid,text,job_status,text,timestamptz)
-  OWNER TO ocr_queue_definer;
-
-ALTER FUNCTION ocr_recover_expired_v1(timestamptz)
-  OWNER TO ocr_queue_definer;
-
-REVOKE ALL ON FUNCTION ocr_claim_v1(timestamptz) FROM PUBLIC;
-REVOKE ALL ON FUNCTION ocr_heartbeat_v1(uuid,text,timestamptz) FROM PUBLIC;
-REVOKE ALL ON FUNCTION ocr_finish_retry_v1(uuid,text,job_status,text,timestamptz) FROM PUBLIC;
-REVOKE ALL ON FUNCTION ocr_recover_expired_v1(timestamptz) FROM PUBLIC;
-
-GRANT EXECUTE ON FUNCTION ocr_claim_v1(timestamptz) TO ocr_queue;
-GRANT EXECUTE ON FUNCTION ocr_heartbeat_v1(uuid,text,timestamptz) TO ocr_worker;
-GRANT EXECUTE ON FUNCTION ocr_finish_retry_v1(uuid,text,job_status,text,timestamptz) TO ocr_worker;
-GRANT EXECUTE ON FUNCTION ocr_recover_expired_v1(timestamptz) TO ocr_worker;
-SQL

@@ -2,6 +2,10 @@ import { Pool, type PoolConfig } from "pg";
 
 export type ClaimedJob = Readonly<{ jobId: string; organizationId: string; runId: string; kind: string; leaseToken: string }>;
 export type RetryPolicy = Readonly<{ maxAttempts: number; delaySeconds: number }>;
+export type FinishOutcome = "SUCCEEDED" | "FAILED" | "DEAD";
+export type FinalJobStatus = "PENDING" | "SUCCEEDED" | "FAILED" | "DEAD";
+export type FinishResult = Readonly<{ accepted: boolean; finalStatus: FinalJobStatus | null }>;
+const FINAL_STATUSES: readonly FinalJobStatus[] = ["PENDING", "SUCCEEDED", "FAILED", "DEAD"];
 
 export class PostgresQueue {
   readonly pool: Pool;
@@ -44,9 +48,16 @@ export class PostgresQueue {
     return result.rows[0]?.ocr_heartbeat_v1 === true;
   }
 
-  async finish(jobId: string, leaseToken: string, outcome: "SUCCEEDED" | "FAILED" | "DEAD", error?: string): Promise<boolean> {
-    const result = await this.workerPool.query<{ accepted: boolean }>("SELECT accepted FROM ocr_finish_retry_v1($1::uuid, $2::text, $3::job_status, $4::text, now())", [jobId, leaseToken, outcome, error ?? null]);
-    return result.rows[0]?.accepted === true;
+  async finish(jobId: string, leaseToken: string, outcome: FinishOutcome, error?: string): Promise<boolean> {
+    return (await this.finishDetailed(jobId, leaseToken, outcome, error)).accepted;
+  }
+
+  /** `finish` plus the status the retry policy chose (FAILED → PENDING while attempts remain, else DEAD). Lost lease → `{accepted:false, finalStatus:null}`. */
+  async finishDetailed(jobId: string, leaseToken: string, outcome: FinishOutcome, error?: string): Promise<FinishResult> {
+    const result = await this.workerPool.query<{ accepted: boolean; final_status: string | null }>("SELECT accepted, final_status::text AS final_status FROM ocr_finish_retry_v1($1::uuid, $2::text, $3::job_status, $4::text, now())", [jobId, leaseToken, outcome, error ?? null]);
+    const row = result.rows[0];
+    if (row?.accepted !== true) return { accepted: false, finalStatus: null };
+    return { accepted: true, finalStatus: FINAL_STATUSES.find((status) => status === row.final_status) ?? null };
   }
 
   async recoverExpired(now = new Date()): Promise<number> {
