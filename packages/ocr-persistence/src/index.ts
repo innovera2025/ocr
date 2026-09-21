@@ -43,12 +43,22 @@ export type ReviewStore = DocumentStore & Readonly<{
 }>;
 
 export function hasReviewFields(response: OcrResponse): boolean {
-  const fields = response.staffOnly;
-  return !!fields && Object.values(fields).some((field) => field.needsReview === true);
+  const visit = (value: unknown): boolean => {
+    if (Array.isArray(value)) return value.some(visit);
+    if (!value || typeof value !== "object") return false;
+    const record = value as Record<string, unknown>;
+    if (record.needsReview === true) return true;
+    return Object.values(record).some(visit);
+  };
+  return visit(response);
 }
 
 export function structuredStaffResult(response: OcrResponse): Readonly<Record<string, unknown>> {
   return response.staffOnly ?? {};
+}
+
+export function structuredDocumentResult(response: OcrResponse): Readonly<Record<string, unknown>> {
+  return response as Readonly<Record<string, unknown>>;
 }
 
 export class PostgresOcrDocumentStore implements ReviewStore {

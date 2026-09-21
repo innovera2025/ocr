@@ -9,12 +9,16 @@ export type OcrField = Readonly<{
   [key: string]: unknown;
 }>;
 
+export type OcrTreatment = Readonly<OcrField & { name?: string; duration?: string }>;
+
 export type OcrResponse = Readonly<{
   documentId: string;
   sourceFile?: string;
   engine?: string;
   version?: string;
-  staffOnly?: Readonly<Record<string, OcrField>>;
+  staffOnly?: Readonly<Record<string, unknown>>;
+  customerInformation?: Readonly<Record<string, unknown>>;
+  recommendationCard?: Readonly<Record<string, unknown>>;
   evidence?: Readonly<Record<string, unknown>>;
   [key: string]: unknown;
 }>;

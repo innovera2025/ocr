@@ -1,6 +1,6 @@
 import { limits } from "@innovera/ocr-config";
 import { OcrClient } from "@innovera/ocr-client";
-import { hasReviewFields, structuredStaffResult, type DocumentStore } from "@innovera/ocr-persistence";
+import { hasReviewFields, structuredDocumentResult, type DocumentStore } from "@innovera/ocr-persistence";
 import type { LocalStorage } from "@innovera/ocr-storage/local";
 import { PostgresQueue } from "@innovera/ocr-queue/postgres";
 import { PostgresConfirmOutbox } from "@innovera/ocr-queue/outbox";
@@ -60,7 +60,7 @@ export async function processOcrJob(
   const patch = {
     ocrDocumentId: result.documentId,
     rawResponse: result,
-    structuredResult: structuredStaffResult(result),
+    structuredResult: structuredDocumentResult(result),
     needsReview
   } as { ocrDocumentId: string; rawResponse: typeof result; structuredResult: Readonly<Record<string, unknown>>; needsReview: boolean; engine?: string; version?: string };
   if (result.engine !== undefined) patch.engine = result.engine;
