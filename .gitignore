@@ -5,3 +5,10 @@ node_modules/
 !.env.example
 ssh.env
 coverage/
+
+# Local AI test fixtures may contain real customer forms; keep them out of git.
+local-ai/tests/fixtures/*.png
+local-ai/tests/fixtures/*.jpg
+local-ai/**/__pycache__/
+local-ai/.pytest_cache/
+**/tsconfig.tsbuildinfo
