@@ -46,16 +46,26 @@ function cloneJson(value: unknown, depth = 0): unknown {
   return out;
 }
 
-/** "90 นาที" → 90, "1.5 ชม." → 90, "60 min" → 60, "90" → 90; anything else → null. */
+const HOUR_UNIT = "(?:ชั่วโมง|ชัวโมง|ช\\.ม\\.|ชม\\.?|ซม\\.?|hours?|hrs?\\.?|h(?![a-z]))";
+const MINUTE_UNIT = "(?:นาที|นท\\.?|น\\.|minutes?|mins?\\.?|m(?![a-z]))";
+/** The Local AI duration grammar (local-ai/ocr_normalize.py `DURATION_RE` + bare numbers), anchored: one whole duration. */
+const DURATION = new RegExp(`^(?:([0-4]):([0-5]\\d)|(\\d+(?:[.,]\\d+)?)\\s*(?:(${HOUR_UNIT})(?:\\s*(ครึ่ง))?(?:\\s*([0-5]?\\d)(?:\\s*${MINUTE_UNIT})?)?|(${MINUTE_UNIT}))?)\\.?$`, "i");
+const THAI_DIGITS = "๐๑๒๓๔๕๖๗๘๙";
+
+/**
+ * Minutes of one duration string, read like the Local AI: "90 นาที" → 90, "1.5 ชม." → 90, "1 ชม. 30 นาที" / "1 ชม. 30" /
+ * "1h30" / "1:30" / "1 ชั่วโมงครึ่ง" → 90, Thai digits, a bare number ≤ 4 is hours ("1.5" → 90) and above that minutes ("90").
+ * Anything that is not exactly one duration (e.g. "90 นาที + 1 ชม.") → null, never a partial parse.
+ */
 export function parseDurationMinutes(duration: unknown): number | null {
-  const source = text(duration);
-  if (!source) return null;
-  const match = /(\d+(?:[.,]\d+)?)\s*(นาที|ชั่วโมง|ชม\.?|minutes?|mins?|hours?|hrs?\.?|h)?/i.exec(source.trim());
+  const source = text(duration)?.replace(/[๐-๙]/g, (digit) => String(THAI_DIGITS.indexOf(digit))).trim();
+  const match = source ? DURATION.exec(source) : null;
   if (!match) return null;
-  const amount = Number(match[1]!.replace(",", "."));
+  if (match[1] !== undefined) return Number(match[1]) * 60 + Number(match[2]);
+  const amount = Number(match[3]!.replace(",", "."));
   if (!Number.isFinite(amount)) return null;
-  const unit = (match[2] ?? "").toLowerCase();
-  const minutes = /^(ชั่วโมง|ชม|hour|hr|h)/.test(unit) ? amount * 60 : amount;
+  const minutes = match[4] !== undefined ? amount * 60 + (match[5] ? 30 : 0) + (match[6] ? Number(match[6]) : 0)
+    : match[7] !== undefined ? amount : amount <= 4 ? amount * 60 : amount;
   return Math.round(minutes);
 }
 
@@ -107,14 +117,26 @@ function normalizeArray(key: string, value: unknown): Json[] {
   return mapped.filter((item): item is Json => item !== null);
 }
 
-/** v2.2 `staffOnly.treatment = {raw, durations, items, needsReview}` → `treatments[]`; never drops a needsReview signal. */
+/**
+ * v2.2 `staffOnly.treatment = {raw, durations, items, needsReview}` → `treatments[]`; never drops a needsReview signal.
+ * A v2.2 confirmation (legacy confirm of field "treatment") wrote the human answer to `treatment.value`: it is kept as a
+ * human-sourced item (overlaid on the single item, or replacing several items, since it answers the whole field).
+ */
 function legacyTreatments(treatment: unknown): Json[] {
   if (!isRecord(treatment)) return [];
   const items = normalizeArray("treatments", treatment.items);
-  if (items.length > 0) return items;
   const raw = text(treatment.raw);
+  const durations = Array.isArray(treatment.durations) ? treatment.durations.map(text).filter(nonEmpty) : [];
+  const confirmed = text(treatment.value);
+  if (nonEmpty(confirmed)) {
+    const human = { value: confirmed, confidence: 1, source: "human", needsReview: false };
+    if (items.length === 1) return [{ ...items[0]!, ...human }];
+    const duration = durations.length > 0 ? durations.join(" + ") : null;
+    return [{ raw, nameRaw: raw, duration, durationMinutes: parseDurationMinutes(duration), ...human }];
+  }
+  if (items.length > 0) return items;
   if (treatment.needsReview !== true && !nonEmpty(raw)) return [];
-  const duration = Array.isArray(treatment.durations) ? text(treatment.durations[0]) : null;
+  const duration = durations[0] ?? null;
   return [{ raw, nameRaw: raw, value: null, duration, durationMinutes: parseDurationMinutes(duration), confidence: 0, source: "none", needsReview: treatment.needsReview === true }];
 }
 
@@ -203,10 +225,13 @@ export function summarizeDocument(view: DocumentView): DocumentSummary {
   } catch { return { ...EMPTY_SUMMARY, treatments: [] }; }
 }
 
-/** Editable leaf: string (trimmed, "" → null) or null, at most 500 characters. */
+/** NUL and unpaired UTF-16 surrogates: PostgreSQL text/jsonb reject them (the request would fail with a 500). */
+export const UNSTORABLE_TEXT = /\u0000|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+
+/** Editable leaf: string (trimmed, "" → null) or null, at most 500 characters, storable by PostgreSQL. */
 function readValue(value: unknown): string | null {
   if (value === null || value === undefined) return null;
-  if (typeof value !== "string" || value.length > MAX_REVIEW_VALUE_LENGTH) throw reviewInvalid();
+  if (typeof value !== "string" || value.length > MAX_REVIEW_VALUE_LENGTH || UNSTORABLE_TEXT.test(value)) throw reviewInvalid();
   const trimmed = value.trim();
   return trimmed === "" ? null : trimmed;
 }
@@ -217,6 +242,31 @@ function clearNeedsReview(value: unknown, depth = 0): void {
   const record = value as Json;
   if (record.needsReview === true) record.needsReview = false;
   for (const item of Object.values(record)) clearNeedsReview(item, depth + 1);
+}
+
+/**
+ * A confirmed document has nothing left to review. Clears every `needsReview` flag of `view` in place and returns it —
+ * v2.2 confirmations only wrote `value`, so fields confirmed there still carry a stale `needsReview:true`.
+ */
+export function markReviewed(view: DocumentView): DocumentView {
+  for (const section of DOCUMENT_SECTIONS) clearNeedsReview(view[section]);
+  return view;
+}
+
+/**
+ * Target of a legacy single-field "treatment" confirmation among treatment items (index into `items`): the item whose
+ * `nameRaw` or `raw` equals `raw` (a flagged one when several match), else the only flagged item, else the only item.
+ * null when no single item qualifies — the confirmation is then ambiguous and must not be applied.
+ */
+export function legacyTreatmentIndex(items: unknown, raw: string): number | null {
+  if (!Array.isArray(items)) return null;
+  const candidates = items.flatMap((item, index) => isRecord(item) ? [{ item, index }] : []);
+  const only = (list: typeof candidates): number | null => list.length === 1 ? list[0]!.index : null;
+  const flagged = (list: typeof candidates) => list.filter(({ item }) => item.needsReview === true);
+  const key = raw.trim();
+  const matches = key ? candidates.filter(({ item }) => text(item.nameRaw)?.trim() === key || text(item.raw)?.trim() === key) : [];
+  if (matches.length > 0) return only(matches) ?? only(flagged(matches));
+  return only(flagged(candidates)) ?? only(candidates);
 }
 
 function mergeField(path: string, current: unknown, edited: unknown, provider: "therapist" | undefined, changes: ReviewChange[]): unknown {
@@ -295,8 +345,9 @@ function mergeArray(section: Section, key: string, current: readonly Json[], edi
     if (durationChanged) changes.push({ path: `${path}.duration`, oldRaw, oldValue: oldDuration, newValue: newDuration });
     result.push(next);
   }
-  // Removed items are reported at their original index.
-  current.forEach((item, index) => { if (!used[index]) changes.push({ path: `${base}[${index}]`, oldRaw: text(item.raw), oldValue: text(item.value), newValue: null }); });
+  // Removed items are reported at their original index with a ".removed" suffix, so a removal never shares a path
+  // (correction field) with the edit of the item that now sits at that index.
+  current.forEach((item, index) => { if (!used[index]) changes.push({ path: `${base}[${index}].removed`, oldRaw: text(item.raw), oldValue: text(item.value), newValue: null }); });
   return result;
 }
 

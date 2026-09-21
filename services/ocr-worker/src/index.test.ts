@@ -6,7 +6,7 @@ import { OcrClientError, type OcrResponse } from "@innovera/ocr-client";
 import { metrics } from "@innovera/ocr-observability";
 import type { OcrResultPatch } from "@innovera/ocr-persistence";
 import { createLocalStorage } from "@innovera/ocr-storage/local";
-import { confirmSender, processOcrJob, runMaintenanceOnce, runWorkerOnce, startWorkerLoops, workerConcurrency, type FinishOutcome, type FinishResult } from "./index.js";
+import { confirmSender, isOcrUnavailable, processOcrJob, runMaintenanceOnce, runWorkerOnce, startWorkerLoops, workerConcurrency, type FinishOutcome, type FinishResult } from "./index.js";
 
 const organizationId = "00000000-0000-0000-0000-000000000001";
 const documentId = "00000000-0000-0000-0000-000000000002";
@@ -28,7 +28,7 @@ const fullDocument = (needsReview: boolean): OcrResponse => ({
 });
 
 type Harness = ReturnType<typeof harness>;
-function harness(options: { process?: () => Promise<OcrResponse>; finalStatus?: FinishResult["finalStatus"]; accepted?: boolean; heartbeatMs?: number; documentMissing?: boolean; jobs?: number } = {}) {
+function harness(options: { process?: () => Promise<OcrResponse>; finalStatus?: FinishResult["finalStatus"]; accepted?: boolean; heartbeatMs?: number; documentMissing?: boolean; documentError?: Error; jobs?: number } = {}) {
   const calls: string[] = [];
   const saved: OcrResultPatch[] = [];
   let heartbeats = 0;
@@ -46,10 +46,14 @@ function harness(options: { process?: () => Promise<OcrResponse>; finalStatus?: 
     }
   };
   const store = {
-    getWorkerDocument: async () => options.documentMissing ? null : { documentId, organizationId, sourceKey, filename: "a.png", mimeType: "image/png" },
+    getWorkerDocument: async () => {
+      if (options.documentError) throw options.documentError;
+      return options.documentMissing ? null : { documentId, organizationId, sourceKey, filename: "a.png", mimeType: "image/png" };
+    },
     markProcessing: async () => { calls.push("markProcessing"); },
     markFailure: async (_tenant: string, _id: string, message: string) => { calls.push(`markFailure:${message}`); },
     markRetrying: async (_tenant: string, _id: string, message: string) => { calls.push(`markRetrying:${message}`); },
+    markRunFailure: async (_tenant: string, runId: string, message: string) => { calls.push(`markRunFailure:${runId}:${message}`); return true; },
     saveOcrResult: async (tenant: string, _id: string, patch: OcrResultPatch) => { assert.equal(tenant, organizationId); saved.push(patch); calls.push("saveOcrResult"); },
     saveCorrection: async () => undefined
   };
@@ -146,10 +150,19 @@ test("lost lease leaves the document untouched", async () => {
   assert.deepEqual(h.calls, ["markProcessing", "finish:FAILED:socket hang up"]);
 });
 
-test("missing document finishes the job DEAD without touching documents", async () => {
+test("missing document finishes the job DEAD; its run's row (if any) is marked failed instead of staying queued", async () => {
   const h = harness({ documentMissing: true });
   await run(h);
-  assert.deepEqual(h.calls, ["finish:DEAD:DOCUMENT_NOT_FOUND"]);
+  assert.deepEqual(h.calls, ["finish:DEAD:DOCUMENT_NOT_FOUND", "markRunFailure:00000000-0000-0000-0000-000000000003:DOCUMENT_NOT_FOUND"]);
+});
+
+test("a document that cannot be loaded on the last attempt is marked failed by run, never left CLEAN", async () => {
+  const retrying = harness({ documentError: new Error("connection reset"), finalStatus: "PENDING" });
+  await run(retrying);
+  assert.deepEqual(retrying.calls, ["finish:FAILED:connection reset"], "attempts left: the queue retries, the row stays queued");
+  const dead = harness({ documentError: new Error("connection reset"), finalStatus: "DEAD" });
+  await run(dead);
+  assert.deepEqual(dead.calls, ["finish:FAILED:connection reset", "markRunFailure:00000000-0000-0000-0000-000000000003:connection reset"]);
 });
 
 test("empty queue reports idle", async () => {
@@ -224,4 +237,81 @@ test("job loops run concurrently, survive thrown errors, and stop gracefully", a
   assert.equal(maxInFlight, 2);
   assert.ok(maintenanceTicks >= 3, "maintenance loop keeps running after an error");
   assert.match(metrics.snapshot(), /worker_loop_errors_total\{loop="maintenance"\} \d+/);
+});
+
+test("transport failures are the ones that pause claiming", () => {
+  assert.equal(isOcrUnavailable(new OcrClientError("network", "down", { retryable: true })), true);
+  assert.equal(isOcrUnavailable(new OcrClientError("timeout", "slow", { retryable: true })), true);
+  assert.equal(isOcrUnavailable(new OcrClientError("http", "HTTP 503", { status: 503, retryable: true })), true);
+  assert.equal(isOcrUnavailable(new OcrClientError("http", "HTTP 422", { status: 422, retryable: false })), false);
+  assert.equal(isOcrUnavailable(new OcrClientError("malformed", "bad json")), false);
+  assert.equal(isOcrUnavailable(new Error("DOCUMENT_NOT_FOUND")), false);
+});
+
+/** In-memory queue with the SQL semantics of ocr_claim_v1 / ocr_finish_retry_v1: attempts+1 per claim, FAILED → PENDING after
+ * `retryDelayMs` while attempts < 3, then DEAD. */
+function attemptQueue(jobs: number, retryDelayMs: number) {
+  const rows = Array.from({ length: jobs }, (_, index) => ({ jobId: `job-${index}`, status: "PENDING", attempts: 0, availableAt: 0 }));
+  return {
+    rows,
+    claim: async () => {
+      const row = rows.find((candidate) => candidate.status === "PENDING" && candidate.availableAt <= Date.now());
+      if (!row) return null;
+      row.status = "RUNNING"; row.attempts += 1;
+      return { jobId: row.jobId, organizationId, runId: "00000000-0000-0000-0000-000000000003", kind: "OCR", leaseToken: "lease" };
+    },
+    heartbeat: async () => true,
+    finishDetailed: async (jobId: string, _lease: string, outcome: FinishOutcome): Promise<FinishResult> => {
+      const row = rows.find((candidate) => candidate.jobId === jobId)!;
+      if (outcome === "FAILED" && row.attempts < 3) { row.status = "PENDING"; row.availableAt = Date.now() + retryDelayMs; return { accepted: true, finalStatus: "PENDING" }; }
+      row.status = outcome === "FAILED" ? "DEAD" : outcome;
+      return { accepted: true, finalStatus: row.status as FinishResult["finalStatus"] };
+    },
+    recoverExpired: async () => 0
+  };
+}
+
+test("an OCR API outage pauses every job loop instead of burning the batch's attempts, and work resumes afterwards", async () => {
+  let up = false;
+  let ocrCalls = 0;
+  let probes = 0;
+  const queue = attemptQueue(40, 5);
+  const h = harness();
+  const loops = startWorkerLoops({
+    ...h.dependencies, queue,
+    ocrClient: {
+      processDocument: async () => { ocrCalls += 1; if (!up) throw new OcrClientError("network", "OCR API request failed", { retryable: true }); return fullDocument(false); },
+      healthCheck: async () => { probes += 1; return up; }
+    },
+    outbox: { recoverExpired: async () => 0, dispatchOnce: async () => ({ claimed: false, delivered: false }) },
+    sendConfirmation: async () => undefined
+  }, { concurrency: 2, idleMs: 5, maintenanceMs: 5, maxBackoffMs: 40 });
+  try {
+    await delay(400); // ~80 idle periods of outage
+    assert.equal(queue.rows.filter((row) => row.status === "DEAD").length, 0, "no job may die while the OCR API is down");
+    assert.ok(ocrCalls <= 2, `only the jobs in flight when the outage began hit the API (got ${ocrCalls})`);
+    assert.ok(queue.rows.reduce((sum, row) => sum + row.attempts, 0) <= 2);
+    assert.ok(probes >= 3, "the loops keep probing GET /health");
+    up = true;
+    const deadline = Date.now() + 3000;
+    while (queue.rows.some((row) => row.status !== "SUCCEEDED") && Date.now() < deadline) await delay(5);
+    assert.deepEqual(new Set(queue.rows.map((row) => row.status)), new Set(["SUCCEEDED"]));
+  } finally { await loops.stop(); }
+});
+
+test("an OCR API that answers /health but fails every request loses at most one attempt per backoff window", async () => {
+  const queue = attemptQueue(20, 1);
+  const h = harness();
+  const loops = startWorkerLoops({
+    ...h.dependencies, queue,
+    ocrClient: { processDocument: async () => { throw new OcrClientError("http", "OCR API returned HTTP 500", { status: 500, retryable: true }); }, healthCheck: async () => true },
+    outbox: { recoverExpired: async () => 0, dispatchOnce: async () => ({ claimed: false, delivered: false }) },
+    sendConfirmation: async () => undefined
+  }, { concurrency: 2, idleMs: 10, maintenanceMs: 5, maxBackoffMs: 80 });
+  try {
+    await delay(500);
+    const attempts = queue.rows.reduce((sum, row) => sum + row.attempts, 0);
+    assert.ok(attempts <= 12, `backoff 10·2^n ms (≤ 80) allows only a handful of trials in 500 ms (got ${attempts})`);
+    assert.equal(queue.rows.filter((row) => row.status === "DEAD").length <= 4, true);
+  } finally { await loops.stop(); }
 });

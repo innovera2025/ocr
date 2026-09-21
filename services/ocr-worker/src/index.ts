@@ -35,9 +35,13 @@ export type WorkerStore = DocumentStore & Readonly<{
   markProcessing(tenantId: string, documentId: string): Promise<void>;
   markFailure(tenantId: string, documentId: string, message: string): Promise<void>;
   markRetrying(tenantId: string, documentId: string, message: string): Promise<void>;
+  /** DEAD job whose document could not be loaded: mark the run's document FAILED (see PostgresOcrDocumentStore). */
+  markRunFailure(tenantId: string, runId: string, message: string): Promise<boolean>;
 }>;
 export type WorkerOutbox = Readonly<{ recoverExpired(): Promise<number>; dispatchOnce(sender: ConfirmSender): Promise<OutboxDispatchResult> }>;
-export type WorkerDependencies = Readonly<{ queue: WorkerQueue; store: WorkerStore; storage: LocalStorage; ocrClient: Pick<OcrClient, "processDocument">; heartbeatMs?: number }>;
+/** `healthCheck` (GET /health) is probed before claiming again after the OCR API was unreachable. */
+export type WorkerOcrClient = Pick<OcrClient, "processDocument"> & Partial<Pick<OcrClient, "healthCheck">>;
+export type WorkerDependencies = Readonly<{ queue: WorkerQueue; store: WorkerStore; storage: LocalStorage; ocrClient: WorkerOcrClient; heartbeatMs?: number }>;
 export type MaintenanceDependencies = Readonly<{ queue: Readonly<{ recoverExpired(): Promise<number> }>; outbox: WorkerOutbox; sendConfirmation: ConfirmSender }>;
 export type WorkerLoopOptions = Readonly<{ concurrency?: number; idleMs?: number; maintenanceMs?: number; maxBackoffMs?: number; outboxBatch?: number }>;
 export type WorkerLoops = Readonly<{ concurrency: number; done: Promise<void>; stop(): Promise<void> }>;
@@ -121,14 +125,17 @@ async function failJob(dependencies: WorkerDependencies, claimed: ClaimedJob, do
     return;
   }
   const retrying = finished.finalStatus === "PENDING";
-  if (document) {
-    try {
+  try {
+    if (document) {
       if (retrying) await dependencies.store.markRetrying(document.organizationId, document.documentId, message);
       else await dependencies.store.markFailure(document.organizationId, document.documentId, message);
-    } catch (storeError) {
-      metrics.increment("worker_store_errors_total");
-      logEvent("document_status_update_failed", { ...fields, store_error: errorText(storeError, "STORE_FAILED").slice(0, 200) });
+    } else if (finished.finalStatus === "DEAD") {
+      // The document could not be loaded, but the job is over: never leave it queued (CLEAN) forever.
+      await dependencies.store.markRunFailure(claimed.organizationId, claimed.runId, message);
     }
+  } catch (storeError) {
+    metrics.increment("worker_store_errors_total");
+    logEvent("document_status_update_failed", { ...fields, store_error: errorText(storeError, "STORE_FAILED").slice(0, 200) });
   }
   const durationMs = Date.now() - startedAt;
   metrics.increment("document_processing_ms_sum", {}, durationMs);
@@ -253,13 +260,69 @@ async function runLoop(name: string, tick: () => Promise<boolean>, control: Loop
   }
 }
 
+/** Transport-level OCR failures (API down, restarting, overloaded): retrying at once only burns queue attempts. */
+export function isOcrUnavailable(error: unknown): boolean {
+  return error instanceof OcrClientError && (error.code === "network" || error.code === "timeout" || (error.code === "http" && error.retryable));
+}
+
+/**
+ * Shared by all job loops. After an OCR transport failure no loop claims a job until an exponential backoff (idleMs · 2^n,
+ * capped) has passed and, when available, GET /health answers ok; then a single trial job runs, and only a job that
+ * reached the OCR API reopens the gate. A Local AI restart therefore costs at most one attempt per loop instead of
+ * every job's attempts.
+ */
+export type OcrGate = Readonly<{ blocked(): boolean; waitMs(): number; trip(): void; reset(): void; failures(): number }>;
+export function createOcrGate(idleMs: number, maxBackoffMs: number, now: () => number = Date.now): OcrGate & { trial: boolean } {
+  let failures = 0;
+  let until = 0;
+  return {
+    trial: false,
+    blocked: () => failures > 0,
+    waitMs: () => Math.max(0, until - now()),
+    trip: () => { failures += 1; until = now() + Math.min(maxBackoffMs, idleMs * 2 ** Math.min(failures - 1, 10)); },
+    reset: () => { failures = 0; until = 0; },
+    failures: () => failures
+  };
+}
+
 /** `concurrency` independent job loops plus one maintenance loop (queue/outbox recovery + outbox drain). */
 export function startWorkerLoops(dependencies: WorkerDependencies & MaintenanceDependencies, options: WorkerLoopOptions = {}): WorkerLoops {
   const concurrency = Math.min(8, Math.max(1, Math.trunc(options.concurrency ?? 2)));
   const idleMs = options.idleMs ?? 1000;
   const maxBackoffMs = options.maxBackoffMs ?? 30_000;
   const control = createLoopControl();
-  const loops = Array.from({ length: concurrency }, (_, index) => runLoop(`job-${index + 1}`, () => runWorkerOnce(dependencies), control, idleMs, maxBackoffMs));
+  const gate = createOcrGate(idleMs, maxBackoffMs);
+  const client = dependencies.ocrClient;
+  const ocrClient: WorkerOcrClient = {
+    processDocument: async (...args) => {
+      try {
+        const result = await client.processDocument(...args);
+        gate.reset();
+        return result;
+      } catch (error) {
+        if (isOcrUnavailable(error)) {
+          gate.trip();
+          metrics.increment("ocr_unavailable_total");
+          logEvent("ocr_unavailable", { failures: gate.failures(), backoff_ms: gate.waitMs(), error: errorText(error, "OCR_UNAVAILABLE").slice(0, 200) });
+        } else if (error instanceof OcrClientError) gate.reset(); // the API answered (4xx / bad body): it is up
+        throw error;
+      }
+    }
+  };
+  const jobDependencies = { ...dependencies, ocrClient };
+  const jobTick = async (): Promise<boolean> => {
+    if (gate.blocked()) {
+      const wait = gate.waitMs();
+      if (wait > 0 || gate.trial) { await control.sleep(Math.max(wait, idleMs)); return true; }
+      gate.trial = true; // half-open: one loop probes and runs one job, the others wait
+      try {
+        if (client.healthCheck && !(await client.healthCheck())) { gate.trip(); return true; }
+        return await runWorkerOnce(jobDependencies);
+      } finally { gate.trial = false; }
+    }
+    return runWorkerOnce(jobDependencies);
+  };
+  const loops = Array.from({ length: concurrency }, (_, index) => runLoop(`job-${index + 1}`, jobTick, control, idleMs, maxBackoffMs));
   loops.push(runLoop("maintenance", () => runMaintenanceOnce(dependencies, options.outboxBatch ?? 10).then(() => false), control, options.maintenanceMs ?? 1000, maxBackoffMs));
   const done = Promise.all(loops).then(() => undefined);
   return { concurrency, done, stop: async () => { control.stop(); await done; } };

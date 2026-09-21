@@ -414,4 +414,117 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     assert.equal(await queue.claim(), null);
     assert.equal((await app.getBatch(TENANT_A, batchA))?.uploaded, 3, "tenant B activity never changes tenant A counters");
   });
+
+  /** Production v2.2 (845a053) saveCorrection, verbatim: `jsonb_set(…, ARRAY[field,'value'], …)` and never clears needsReview. */
+  async function v22Confirm(documentId: string, field: string, value: string, confirmStatus: "PENDING" | "SUCCEEDED", remainingNeedsReview: boolean | null) {
+    await asApp(TENANT_A, `UPDATE documents
+         SET structured_result = jsonb_set(COALESCE(structured_result, '{}'::jsonb), ARRAY[$1, 'value'], to_jsonb($2::text), true),
+             needs_review = CASE WHEN $3 = 'SUCCEEDED' AND $7::boolean IS NOT NULL THEN $7::boolean WHEN $3 = 'SUCCEEDED' THEN false ELSE needs_review END,
+             status = CASE WHEN $3 = 'SUCCEEDED' AND COALESCE($7::boolean, false) = false THEN 'SUCCEEDED'::document_status ELSE status END,
+             confirm_status = $3, confirm_error = $4, confirmed_at = CASE WHEN $3 = 'SUCCEEDED' THEN now() ELSE confirmed_at END,
+             updated_at = now()
+         WHERE id = $5::uuid AND organization_id = $6::uuid AND deleted_at IS NULL`, [field, value, confirmStatus, null, documentId, TENANT_A, remainingNeedsReview]);
+  }
+  async function storedResult(documentId: string): Promise<Record<string, unknown>> {
+    return (await superDb.query<{ structured_result: Record<string, unknown> }>("SELECT structured_result FROM documents WHERE id = $1", [documentId])).rows[0]!.structured_result;
+  }
+  async function processed(filename: string, response: Record<string, unknown> & { documentId: string }, structured?: Record<string, unknown>, batchId?: string) {
+    const doc = await upload(app, TENANT_A, filename, batchId ? { batchId } : {});
+    await app.updateScanStatus(TENANT_A, doc.documentId, "CLEAN");
+    await worker.markProcessing(TENANT_A, doc.documentId);
+    await saveResult(TENANT_A, doc.documentId, response, structured);
+    return doc;
+  }
+
+  test("v2.2 confirmations: the confirmed treatment is shown and survives a review save; confirmed rows count as confirmed", async () => {
+    const flat = { treatment: { raw: "ฟุต 60 นาที", durations: ["60 นาที"], items: [{ raw: "ฟุต", value: null, duration: "60 นาที", confidence: 0.41, source: "master-fuzzy", needsReview: true }], needsReview: true },
+      therapistName: field("พิพิ", null, 0.5, true, "master-fuzzy"), roomNo: field("12", "12", 0.95) };
+    const doc = await processed("v22-confirmed.png", { documentId: `local-${randomUUID()}` }, flat);
+    await v22Confirm(doc.documentId, "treatment", "นวดเท้า", "PENDING", null);
+    await v22Confirm(doc.documentId, "treatment", "นวดเท้า", "SUCCEEDED", true);
+    await v22Confirm(doc.documentId, "therapistName", "พีพี", "PENDING", null);
+    await v22Confirm(doc.documentId, "therapistName", "พีพี", "SUCCEEDED", false);
+    const listed = (await app.listDocuments(TENANT_A, { q: "v22-confirmed" })).documents[0]!;
+    assert.equal(listed.statusCategory, "confirmed");
+    assert.ok(listed.reviewedAt);
+    assert.deepEqual([listed.summary.treatments, listed.summary.therapist, listed.summary.reviewFieldCount], [[{ name: "นวดเท้า", duration: "60 นาที" }], "พีพี", 0]);
+    assert.ok((await app.listDocuments(TENANT_A, { status: "confirmed" })).documents.some((item) => item.documentId === doc.documentId));
+    assert.equal((await app.listDocuments(TENANT_A, { status: "succeeded" })).documents.some((item) => item.documentId === doc.documentId), false);
+    const review = (await app.getReviewDocument(TENANT_A, doc.documentId))!;
+    assert.equal(hasReviewFields(review.structuredResult), false);
+    const edited = structuredClone(review.structuredResult);
+    (edited.staffOnly.roomNo as Record<string, unknown>).value = "14";
+    const saved = await app.saveReview(TENANT_A, doc.documentId, { structuredResult: edited, reviewedBy: "user-a", expectedUpdatedAt: review.updatedAt });
+    assert.deepEqual([saved.corrections, saved.delivery], [1, "NOT_REQUIRED"], "fields confirmed in v2.2 are not re-sent to verified memory");
+    const stored = await storedResult(doc.documentId);
+    assert.deepEqual(((stored.staffOnly as Record<string, unknown>).treatments as Array<Record<string, unknown>>).map((item) => [item.value, item.source, item.needsReview]), [["นวดเท้า", "human", false]]);
+    assert.equal((await superDb.query("SELECT 1 FROM ocr_confirm_outbox o JOIN ocr_corrections c ON c.id = o.correction_id WHERE c.document_id = $1", [doc.documentId])).rowCount, 0);
+  });
+
+  test("legacy confirm of a treatment on a v3 row writes that item only, keeps other flags, and refuses to guess", async () => {
+    const response = { ...reviewResponse, documentId: `local-${randomUUID()}`, staffOnly: { ...reviewResponse.staffOnly, therapistName: field("พีพี", "พีพี", 1),
+      treatments: [treatment("ไทย 90 นาที", "ไทย", "นวดไทย", "90 นาที", 0.95), treatment("ฟุต 60 นาที", "ฟุต", null, "60 นาที", 0.41, true), treatment("หน้า 30 นาที", "หน้า", null, "30 นาที", 0.5, true)] } };
+    const doc = await processed("v3-legacy-confirm.png", response);
+    const before = await storedResult(doc.documentId);
+    await assert.rejects(app.saveCorrection(TENANT_A, doc.documentId, "treatment", "นวดเท้า", "PENDING", undefined, undefined, { raw: "ใทบ", verifiedBy: "user-a" }), { message: "CONFIRMATION_TARGET_AMBIGUOUS" });
+    assert.deepEqual(await storedResult(doc.documentId), before);
+    await app.saveCorrection(TENANT_A, doc.documentId, "treatment", "นวดเท้า", "PENDING", undefined, undefined, { raw: "ฟุต", verifiedBy: "user-a" });
+    await app.saveCorrection(TENANT_A, doc.documentId, "treatment", "นวดเท้า", "SUCCEEDED", undefined, true);
+    const stored = await storedResult(doc.documentId);
+    assert.equal("treatment" in stored, false, "no orphan top-level key");
+    const items = (stored.staffOnly as Record<string, unknown>).treatments as Array<Record<string, unknown>>;
+    assert.deepEqual(items.map((item) => [item.value, item.needsReview]), [["นวดไทย", false], ["นวดเท้า", false], [null, true]]);
+    const review = (await app.getReviewDocument(TENANT_A, doc.documentId))!;
+    assert.deepEqual([review.status, review.needsReview, review.confirmStatus], ["NEEDS_REVIEW", true, "SUCCEEDED"]);
+    const outbox = await superDb.query("SELECT o.payload FROM ocr_confirm_outbox o JOIN ocr_corrections c ON c.id = o.correction_id WHERE c.document_id = $1", [doc.documentId]);
+    assert.deepEqual(outbox.rows, [{ payload: { documentId: response.documentId, field: "treatment", raw: "ฟุต", verifiedValue: "นวดเท้า" } }]);
+  });
+
+  test("delivery status is not hidden when one review deletes an item and edits the item that moves into its place", async () => {
+    const response = { ...reviewResponse, documentId: `local-${randomUUID()}`, staffOnly: { ...reviewResponse.staffOnly, therapistName: field("พีพี", "พีพี", 1),
+      treatments: [treatment("ไทย 90 นาที", "ไทย", null, "90 นาที", 0.4, true), treatment("ฟุต 60 นาที", "ฟุต", "นวดเท้า", "60 นาที", 0.95)] } };
+    const doc = await processed("delete-and-edit.png", response);
+    const view = (await app.getReviewDocument(TENANT_A, doc.documentId))!.structuredResult;
+    const edited = structuredClone(view);
+    const foot = (edited.staffOnly.treatments as Array<Record<string, unknown>>)[1]!;
+    edited.staffOnly.treatments = [{ ...foot, value: "นวดเท้าสมุนไพร" }];
+    const saved = await app.saveReview(TENANT_A, doc.documentId, { structuredResult: edited, reviewedBy: "user-a" });
+    assert.deepEqual([saved.delivery, saved.document.deliveryStatus], ["PENDING", "PENDING"]);
+    const fields = await superDb.query<{ field: string }>("SELECT field FROM ocr_corrections WHERE document_id = $1 ORDER BY field", [doc.documentId]);
+    assert.deepEqual(fields.rows.map((row) => row.field), ["staffOnly.treatments[0]", "staffOnly.treatments[0].removed"]);
+    await superDb.query("UPDATE ocr_confirm_outbox o SET status = 'DEAD' FROM ocr_corrections c WHERE c.id = o.correction_id AND c.document_id = $1", [doc.documentId]);
+    assert.equal((await app.getReviewDocument(TENANT_A, doc.documentId))?.deliveryStatus, "FAILED");
+    assert.equal((await app.listDocuments(TENANT_A, { q: "delete-and-edit" })).documents[0]?.deliveryStatus, "FAILED");
+  });
+
+  test("a batch that received fewer files than expected stops its clock at the last completion", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3 });
+    const first = await processed("short-1.png", { ...cleanResponse, documentId: `local-${randomUUID()}` }, undefined, batch.batchId);
+    const second = await processed("short-2.png", { ...reviewResponse, documentId: `local-${randomUUID()}` }, undefined, batch.batchId);
+    await superDb.query("UPDATE ocr_batches SET created_at = now() - interval '62 minutes' WHERE id = $1", [batch.batchId]);
+    await superDb.query("UPDATE documents SET processed_at = now() - interval '60 minutes' WHERE id = ANY($1::uuid[])", [[first.documentId, second.documentId]]);
+    const summary = (await app.getBatch(TENANT_A, batch.batchId))!;
+    assert.deepEqual([summary.uploaded, summary.completed, summary.queued, summary.processing, summary.finishedAt], [2, 2, 0, 0, null]);
+    assert.ok(Math.abs(summary.durationMs! - 120_000) < 1000, `duration ends at the last completion (got ${summary.durationMs} ms)`);
+    assert.equal(summary.throughputPerMinute, 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal((await app.getBatch(TENANT_A, batch.batchId))!.durationMs, summary.durationMs, "the clock does not keep running");
+  });
+
+  test("originals carry their status; replays see what a resume needs; DEAD runs fail their document; NUL is REVIEW_INVALID", async () => {
+    assert.equal((await app.getOriginal(TENANT_A, docs.d1!.documentId))?.status, "SUCCEEDED");
+    const pending = await upload(app, TENANT_A, "interrupted.png", { idempotencyKey: "key-interrupted", requestFingerprint: "fp-interrupted" });
+    const replay = await app.findIdempotentUpload({ tenantId: TENANT_A, idempotencyKey: "key-interrupted", requestFingerprint: "fp-interrupted" });
+    assert.deepEqual([replay?.documentId, replay?.jobId, replay?.status, replay?.stale, replay?.storageKey?.startsWith(`org/${TENANT_A}/original/`)], [pending.documentId, undefined, "SCANNING", false, true]);
+    await superDb.query("UPDATE documents SET updated_at = now() - interval '5 minutes' WHERE id = $1", [pending.documentId]);
+    assert.equal((await app.findIdempotentUpload({ tenantId: TENANT_A, idempotencyKey: "key-interrupted", requestFingerprint: "fp-interrupted" }))?.stale, true);
+    await app.updateScanStatus(TENANT_A, pending.documentId, "CLEAN");
+    assert.equal(await worker.markRunFailure(TENANT_B, pending.runId, "DOCUMENT_NOT_FOUND"), false, "tenant scoped");
+    assert.equal(await worker.markRunFailure(TENANT_A, pending.runId, "DOCUMENT_NOT_FOUND"), true);
+    assert.deepEqual(await app.getReviewDocument(TENANT_A, pending.documentId).then((review) => [review?.status, review?.errorMessage]), ["FAILED", "DOCUMENT_NOT_FOUND"]);
+    assert.equal(await worker.markRunFailure(TENANT_A, pending.runId, "again"), false, "only queued/processing rows change");
+    for (const value of ["Som\u0000chai", "Som\ud800chai"]) {
+      await assert.rejects(app.saveReview(TENANT_A, docs.d2!.documentId, { structuredResult: { customerInformation: { name: { value } } }, reviewedBy: "user-a" }), { message: "REVIEW_INVALID" });
+    }
+  });
 });

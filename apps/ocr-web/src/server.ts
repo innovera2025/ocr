@@ -3,7 +3,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { loadConfig, redactLog } from "@innovera/ocr-config";
 import { handleRawUpload, type IngestDependencies } from "@innovera/ocr-ingest/http";
 import { OcrClient } from "@innovera/ocr-client";
-import { DOCUMENT_STATUS_CATEGORIES, normalizeStructuredResult, type DocumentStatusCategory, type ReviewStore } from "@innovera/ocr-persistence";
+import { DOCUMENT_STATUS_CATEGORIES, legacyTreatmentIndex, normalizeStructuredResult, type DocumentStatusCategory, type DocumentView, type ReviewStore } from "@innovera/ocr-persistence";
 import { assertDatabaseReady, createDatabasePool, runMigrationsWithPool } from "@innovera/ocr-db-runtime";
 import { resolve } from "node:path";
 import { PostgresOcrDocumentStore } from "@innovera/ocr-persistence";
@@ -39,7 +39,10 @@ type AppServerOptions = Readonly<{ readiness?: () => boolean | Promise<boolean>;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AUTH_ERRORS = new Set(["UNAUTHENTICATED", "AUTH_NOT_CONFIGURED", "INVALID_TOKEN", "TOKEN_EXPIRED", "INVALID_ISSUER", "INVALID_AUDIENCE", "INVALID_PRINCIPAL"]);
-const CONFLICT_ERRORS = new Set(["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT"]);
+const CONFLICT_ERRORS = new Set(["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT",
+  "DOCUMENT_QUARANTINED", "DOCUMENT_NOT_SCANNED", "CONFIRMATION_TARGET_AMBIGUOUS", "UPLOAD_IN_PROGRESS"]);
+/** Originals are only served once ClamAV let them through: quarantined bytes never reach a reviewer's browser. */
+const UNSERVED_CONTENT: ReadonlyMap<string, string> = new Map([["QUARANTINED", "DOCUMENT_QUARANTINED"], ["VALIDATING", "DOCUMENT_NOT_SCANNED"], ["SCANNING", "DOCUMENT_NOT_SCANNED"]]);
 const JSON_BODY_LIMIT = 1_048_576;
 const TIMESTAMP = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}(:?\d{2})?)?$/;
 
@@ -187,7 +190,7 @@ export function parseDocumentListQuery(params: URLSearchParams): DocumentListQue
   const status = params.get("status") || undefined;
   if (status !== undefined && !(DOCUMENT_STATUS_CATEGORIES as readonly string[]).includes(status)) throw new Error("INVALID_STATUS");
   const q = params.get("q")?.trim() || undefined;
-  if (q !== undefined && q.length > 100) throw new Error("INVALID_QUERY");
+  if (q !== undefined && (q.length > 100 || q.includes("\u0000"))) throw new Error("INVALID_QUERY");
   const batchId = params.get("batchId") || undefined;
   return {
     limit, offset,
@@ -217,9 +220,16 @@ function parseReviewInput(body: Record<string, unknown>): { structuredResult: Re
   return { structuredResult: structuredResult as Record<string, unknown>, expectedUpdatedAt: expected };
 }
 
-/** Legacy confirm: is anything other than the confirmed field still flagged? Legacy names resolve to canonical paths. */
-function hasOtherReview(view: unknown, field: string): boolean {
-  const excluded = field === "therapistName" || field === "roomNo" ? [`staffOnly.${field}`] : field === "treatment" ? ["staffOnly.treatments", "staffOnly.treatment"] : [field];
+/**
+ * Legacy confirm: is anything other than the confirmed field still flagged? Legacy names resolve to canonical paths; for
+ * "treatment" only the item the store will confirm (`legacyTreatmentIndex`, same rule) is excluded, so other flagged
+ * treatments keep the document in review. When no single item qualifies (flat v2.2 rows, whose whole `treatment`
+ * object is confirmed) every treatment is excluded.
+ */
+function hasOtherReview(view: DocumentView, field: string, raw: string): boolean {
+  const index = field === "treatment" ? legacyTreatmentIndex(view.staffOnly.treatments, raw) : null;
+  const excluded = field === "therapistName" || field === "roomNo" ? [`staffOnly.${field}`]
+    : field === "treatment" ? (index === null ? ["staffOnly.treatments", "staffOnly.treatment"] : [`staffOnly.treatments[${index}]`]) : [field];
   const visit = (value: unknown, path: string): boolean => {
     if (excluded.some((prefix) => path === prefix || path.startsWith(`${prefix}.`) || path.startsWith(`${prefix}[`))) return false;
     if (Array.isArray(value)) return value.some((item, index) => visit(item, `${path}[${index}]`));
@@ -294,6 +304,8 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
       const principal = principalFor(request);
       const original = await app.reviewStore.getOriginal(principal.tenantId, uuidOr404(documentMatch[1]!, "DOCUMENT_NOT_FOUND"));
       if (!original) throw new Error("DOCUMENT_NOT_FOUND");
+      const refused = UNSERVED_CONTENT.get(original.status);
+      if (refused) throw new Error(refused);
       let bytes: Uint8Array;
       try { bytes = await app.storage.get(original.storageKey); } catch { throw new Error("CONTENT_NOT_FOUND"); }
       response.writeHead(200, { "content-type": original.mimeType, "cache-control": "private, no-store", "x-content-type-options": "nosniff" });
@@ -337,10 +349,10 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
       const field = typeof body.field === "string" ? body.field : "";
       const raw = typeof body.raw === "string" ? body.raw : "";
       const verifiedValue = typeof body.verifiedValue === "string" ? body.verifiedValue : "";
-      if (!field || !verifiedValue) throw new Error("INVALID_CONFIRMATION");
+      if (!field || !verifiedValue || [field, raw, verifiedValue].some((value) => value.includes("\u0000"))) throw new Error("INVALID_CONFIRMATION");
       const current = await app.reviewStore.getReviewDocument(tenantId, documentId);
       if (!current?.ocrDocumentId) throw new Error("OCR_RESULT_NOT_FOUND");
-      const otherReview = hasOtherReview(normalizeStructuredResult(current.structuredResult), field);
+      const otherReview = hasOtherReview(normalizeStructuredResult(current.structuredResult), field, raw);
       await app.reviewStore.saveCorrection(tenantId, documentId, field, verifiedValue, "PENDING", undefined, undefined, { raw, verifiedBy });
       try {
         const providerField = field === "therapistName" ? "therapist" : field;

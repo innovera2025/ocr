@@ -1,4 +1,4 @@
-import { mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 export type LocalStorage = Readonly<{
@@ -13,9 +13,13 @@ function safePath(root: string, key: string): string {
   return result;
 }
 
-export function createLocalStorage(root: string): LocalStorage {
+/** Deletes an object; a missing object is not an error. */
+export type RemovableStorage = Readonly<{ remove: (key: string) => Promise<void> }>;
+
+export function createLocalStorage(root: string): LocalStorage & RemovableStorage {
   return {
     async put(key, bytes) { const path = safePath(root, key); await mkdir(dirname(path), { recursive: true }); await writeFile(path, bytes); },
-    async get(key) { return new Uint8Array(await readFile(safePath(root, key))); }
+    async get(key) { return new Uint8Array(await readFile(safePath(root, key))); },
+    async remove(key) { await rm(safePath(root, key), { force: true }); }
   };
 }

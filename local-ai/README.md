@@ -9,19 +9,19 @@ Contract: `docs/operations/full-document-batch-spec.md` §1. It is served as `uv
 | Area | v2.2 | v3.0 |
 |---|---|---|
 | Output | `staffOnly` only | Adds `customerInformation`, `recommendationCard`, `layout`, `timings` and top-level `needsReview` (spec §1). Legacy `staffOnly.treatment`, `therapistName`, `roomNo` and `evidence.staffCropRaw` keep their v2.2 shapes. |
-| Checkboxes (gender, 12 referral sources, 16 health conditions, pressure, 5 oils/scrubs) | – | Deterministic, with no model call. Pen ink is measured inside each box interior (printed border excluded) plus a 3px margin. A long stroke through a box is `needsReview`, never `checked`. Gender and pressure are single-choice (none or several marked ⇒ `needsReview`). Per-box scores go in `evidence.checkboxScores`. |
+| Checkboxes (gender, 12 referral sources, 16 health conditions, pressure, 5 oils/scrubs) | – | Deterministic, with no model call. Pen ink is measured inside each box interior (printed border excluded) plus a 3px margin. A long stroke through a box is `needsReview`, never `checked`. Gender and pressure are single-choice (none or several marked ⇒ `needsReview`). More than half of the referral or health boxes read as checked ⇒ layout warning, and every checkbox/ink field gets `needsReview`. Per-box scores go in `evidence.checkboxScores`. |
 | Body map (FRONT/BACK) | – | Pen ink around each printed label (or on the figure, near its leader dot) is classified as a circle (⇒ `preferredAreas`) or a cross (⇒ `avoidAreas`), e.g. `"Shoulder (front)"`. Low-confidence marks, marks on the figure and merged neighbouring marks get `needsReview:true`. |
 | Name / Nationality / Hotel | – | One extra model call on a crop of those rows (the Gender row is left out). A box with no ink returns `{raw:null, value:null, source:"ink-mark", confidence≥0.9}` and is never sent to the model; when all three are blank, the call is skipped. Nationality is matched against masters (English/Thai/Chinese, fuzzy). |
 | STAFF ONLY | crop `(410,485,710,570)` + prompt | Same crop and the same prompt, word for word, so the model gets pixel-identical input for an 805×569 scan (other sizes: same region, scaled). |
-| Treatments | durations paired **by index** | Split on `+ , / ; newline &`. Each name is paired with **its own** duration, normalised to `durationMinutes` (`นาที/min`, `ชม./ชั่วโมง/hr`, `1.5 ชม.`=90, `1 ชม. 30 นาที`=90, `ชม.ครึ่ง`, Thai digits). A duration not allowed for that treatment ⇒ `needsReview`. A trailing total equal to the sum (`… + หน้า 1 ชม. 2.5 ชม.`) is recognised as a total, not a treatment. |
-| Masters | hard-coded lists | `master_data.json` (editable; reloaded when the file changes). Treatments with aliases (`ไทย`⇒`นวดไทย`, `หน้า`⇒`นวดหน้า`, English names) and allowed durations, therapists (`ฟ้า`, `พีพี`, `เอี้ยง`), and nationalities. |
+| Treatments | durations paired **by index** | Split on `+ , / ; newline &`. Each name is paired with **its own** duration, normalised to `durationMinutes` (`นาที/min`, `ชม./ชั่วโมง/hr`, `1.5 ชม.`=90, `1 ชม. 30 นาที`=90, `1 ชม. 30`/`1h30`=90, `1:30`=90, `ชม.ครึ่ง`, Thai digits). A duration not allowed for that treatment ⇒ `needsReview`. A number that no duration used (`ไทย 90 นาที 15`) ⇒ warning + `needsReview`, never silently dropped. A trailing total equal to the sum (`… + หน้า 1 ชม. 2.5 ชม.`) is recognised as a total, not a treatment. |
+| Masters | hard-coded lists | `master_data.json` (editable; reloaded when the file changes; an edit that does not load, e.g. a JSON typo, keeps the last good masters in use and `/health` answers `status:"degraded"` with `masterData:"stale: …"` until the file is fixed). Treatments with aliases (`ไทย`⇒`นวดไทย`, `หน้า`⇒`นวดหน้า`, English names) and allowed durations, therapists (`ฟ้า`, `พีพี`, `เอี้ยง`), and nationalities. |
 | Verified memory | re-read `corrections.jsonl` on every lookup | Cached by file mtime and size. Treatment lookup tries `nameRaw`, then `raw`. `POST /v1/ocr/confirm` is unchanged (same body, same 400 for a bad `field`). |
 | Concurrency | `async def` endpoint doing blocking I/O on the event loop | Plain `def` endpoint (FastAPI threadpool). Section calls run concurrently in a `ThreadPoolExecutor`, and checkbox/body-map detection runs while the model works. Crops are sent as in-memory PNG; only the uploaded original is saved (as before). |
-| Inputs | PNG/JPG/JPEG | Adds WebP, EXIF rotation, alpha→white and any resolution (coordinates scale by width/805 and height/569; aspect mismatch ⇒ warning + `needsReview`). PDF (first page) works only when `pypdfium2` or `PyMuPDF` is importable, otherwise **415**. Other types **400**, undecodable files **400**, internal/model errors **500**, too large **413**. |
+| Inputs | PNG/JPG/JPEG | Adds WebP, EXIF rotation, alpha→white and any resolution (coordinates scale by width/805 and height/569; aspect mismatch ⇒ warning + `needsReview`). PDF (first page) works when `pypdfium2` or `PyMuPDF` is importable (the production base image has `pypdfium2` through `paddleocr` → `paddlex[ocr-core]`), otherwise **415**. Renders are serialised by a process-wide lock (neither library is thread-safe), the long side is rendered at 1610 px, and pages larger than 14400 pt are **400**. Raster images over 89.5 MP are **400**. Other types **400**, undecodable files **400**, internal/model errors **500**, too large **413**. |
 
 Extra, additive keys (not in the spec example, safe to ignore):
 - `evidence`: `checkboxNotes` (`stroke-through` / `faint` / `mark-beside-box`), `bodyMap` (shape features), `textInk` (ink pixels per handwriting box), `layoutOffset` (registration shift), `treatmentWarnings`, `treatmentTotalMinutes`.
-- `/health`: `engine`, `schemaVersion`, `model`, `pdfSupport`, `masterData`.
+- `/health`: `engine`, `schemaVersion`, `model`, `pdfSupport`, `masterData`. `status` is `"degraded"` (HTTP 200) while master data does not load.
 - `evidence.customerCropRaw` is `null` when the customer call was skipped.
 
 ## Files
@@ -67,7 +67,7 @@ Visual ground truth for that scan:
 - Body map: circles around **Shoulder (front)**, **Neck (back)** and **Back (back)**, no crosses.
 - STAFF ONLY: `ไทย 90 นาที + หน้า 1 ชม.` (+ `2.5 ชม.` written outside the box), therapist `พีพี`, room `3`.
 
-Ink model: blue pen strokes are bluish (B − max(R,G) ≥ 10–18). Printed text on this form is dark gray (luminance ≥ 73) or light cyan-gray, so it never counts as ink. Inside template-blank zones (box interiors, handwriting boxes, the body map minus labels, leader lines and figures), any darker-than-paper, non-orange pixel is also ink. This form dropout keeps black/red pens and JPEG uploads working. Registration searches ±5 px for the printed checkbox grid.
+Ink model: blue pen strokes are bluish (B − max(R,G) ≥ 10–18). Printed text on this form is dark gray (luminance ≥ 73) or light cyan-gray, so it never counts as ink. Inside template-blank zones (box interiors, handwriting boxes, the body map minus labels, leader lines and figures), any non-orange pixel more than 70 levels darker than the *local* paper (brightest level within ~10 px) is also ink, so shadows, dim photocopies and grayish photos do not fill the boxes. This form dropout keeps black/red pens and JPEG uploads working. Registration searches ±5 px for the printed checkbox grid.
 
 ## Testing
 
@@ -102,7 +102,7 @@ Measured locally (Docker Desktop, python 3.11, Pillow 12.3):
 1. **Ollama parallelism.** Two section calls run at once. If Ollama serialises them (`OLLAMA_NUM_PARALLEL=1`, or a CPU-bound box), `inferenceWallMs` ≈ `inferenceMs` and latency roughly doubles (≈ 3 s instead of 1.5–1.8 s).
    - Check `timings`, then set `OLLAMA_NUM_PARALLEL=2` on the Ollama service (this needs memory for a second context).
    - Otherwise accept the extra call, or set `OCR_SECTION_PARALLELISM=1` to keep a predictable order.
-2. **Customer prompt and parsing.** The code assumes the model answers with `Name: … / Nationality: … / Hotel Name: …` lines. The parser also accepts echoed Chinese labels (`姓名 国籍 酒店`), markdown bold, tables, HTML, full-width colons, placeholders such as `-` or `N/A`, and an unlabeled one-line-per-field answer (that last case is flagged `needsReview`).
+2. **Customer prompt and parsing.** The code assumes the model answers with `Name: … / Nationality: … / Hotel Name: …` lines. The parser also accepts echoed Chinese labels (`姓名 国籍 酒店`), markdown bold, tables, HTML, full-width colons, placeholders such as `-` or `N/A`, and an unlabeled one-line-per-field answer (that last case is flagged `needsReview`). A label word only counts at the start of a line or table cell, or right before a colon (Chinese labels also as separate words), so `Kaname`, `Hotel Nikko` or `Anna Hotelling` inside a value are kept whole.
    - Check `evidence.customerCropRaw` on 10–20 real forms.
    - The crop stacks the Name row over the Nationality + Hotel rows at native resolution (324×93 px for an 805×569 scan). If handwriting is misread, try `OCR_CUSTOMER_CROP_SCALE=2`.
 3. **STAFF ONLY output.** The crop pixels and the prompt are exactly v2.2's, so `evidence.staffCropRaw` should equal v2.2's output for the same file. The treatment capture is now multi-line: it runs until `Therapist Name` / `Room No`, and printed `STAFF ONLY / 仅前台使用 / PLOENCHIT / MAKKHA` lines are dropped. Confirm that the real output does not contain other printed text that would become a fake treatment.
@@ -175,7 +175,7 @@ docker rename innovera-ocr-v22 "$LIVE" && docker start "$LIVE"
 Notes:
 - Confirmations written by v3 use the unchanged JSONL format in the live `verified_dataset`, so rollback needs no data migration.
 - v3 is backward compatible for v2.2 readers, because the legacy fields are kept. So the app/worker upgrade can ship before or after this swap.
-- PDF uploads need `pypdfium2` added to `Dockerfile.api` (optional). Until then the service answers 415, and the worker treats that as non-retryable.
+- PDF uploads: check `pdfSupport` in `/health` (or `python -c 'import pypdfium2.version as v; print(v.PDFIUM_INFO)'` in the container). The production base image normally includes `pypdfium2` through `paddleocr`; without it the service answers 415, and the worker treats that as non-retryable.
 
 ## Known limitations
 

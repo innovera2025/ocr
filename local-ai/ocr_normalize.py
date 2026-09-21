@@ -26,10 +26,12 @@ def master_path():
 
 
 class _FileCache:
-    """Re-parses a file only when its (path, mtime_ns, size) changes."""
+    """Re-parses a file only when its (path, mtime_ns, size) changes. When a changed file does not load (e.g. a typo in
+    a hand-edited master_data.json), the last good value keeps being served and `error` says why; only a file that has
+    never loaded raises."""
 
     def __init__(self, loader):
-        self._loader, self._lock, self._key, self._value = loader, threading.Lock(), None, None
+        self._loader, self._lock, self._key, self._value, self._loaded, self.error = loader, threading.Lock(), None, None, False, None
 
     def get(self, path):
         try:
@@ -39,7 +41,13 @@ class _FileCache:
             key = (str(path), None, None)
         with self._lock:
             if key != self._key:
-                self._value, self._key = self._loader(path if key[1] is not None else None), key
+                self._key = key  # a broken file is parsed once, not on every lookup
+                try:
+                    self._value, self._loaded, self.error = self._loader(path if key[1] is not None else None), True, None
+                except Exception as error:  # keep the last good value
+                    self.error = error
+            if not self._loaded:
+                raise self.error.with_traceback(None)
             return self._value
 
 
@@ -63,7 +71,17 @@ def _load_verified(path):
 def _load_master(path):
     if path is None:
         raise FileNotFoundError(f"master data not found: {master_path()}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for section, name_key in (("treatments", "name"), ("therapists", "name"), ("nationalities", "value")):
+        entries = data.get(section) if isinstance(data, dict) else None
+        if not isinstance(entries, list) or not all(
+                isinstance(e, dict) and isinstance(e.get(name_key), str) and isinstance(e.get("aliases", []), list)
+                and all(isinstance(a, str) for a in e.get("aliases", [])) for e in entries):
+            raise ValueError(f"master data {path}: '{section}' must be a list of objects with a string '{name_key}' and string 'aliases'")
+    for entry in data["treatments"]:
+        if not isinstance(entry.get("durations", []), list) or not all(isinstance(d, int) for d in entry.get("durations", [])):
+            raise ValueError(f"master data {path}: durations of '{entry['name']}' must be a list of whole minutes")
+    return data
 
 
 _verified_cache, _master_cache = _FileCache(_load_verified), _FileCache(_load_master)
@@ -87,6 +105,16 @@ def append_verified(record):
 
 def master():
     return _master_cache.get(master_path())
+
+
+def master_state():
+    """'ok'; 'stale: …' while the last good master data is served because the file on disk does not load; 'error: …'
+    when it has never loaded (then every OCR request fails)."""
+    try:
+        master()
+    except Exception as error:
+        return f"error: {error}"
+    return "ok" if _master_cache.error is None else f"stale: {_master_cache.error}"
 
 
 def _key(text):
@@ -160,13 +188,19 @@ def normalize_room(raw):
 
 _HOUR = r"(?:ชั่วโมง|ชัวโมง|ช\.ม\.|ชม\.?|ซม\.?|hours?|hrs?\.?|h(?![a-z]))"
 _MIN = r"(?:นาที|นท\.?|น\.|minutes?|mins?\.?|m(?![a-z]))"
+# "1:30" (hours:minutes), or a number with an hour unit (+ "ครึ่ง" and/or minutes, whose unit may be left out:
+# "1 ชม. 30", "1h30"), or a number with a minute unit.
 DURATION_RE = re.compile(
-    rf"(?P<num>\d+(?:[.,]\d+)?)\s*(?:(?P<hour>{_HOUR})(?:\s*(?P<half>ครึ่ง))?(?:\s*(?P<num2>\d+)\s*{_MIN})?|(?P<min>{_MIN}))", re.I)
+    rf"(?<![\d:])(?P<hh>[0-4]):(?P<mm>[0-5]\d)(?![\d:])"
+    rf"|(?P<num>\d+(?:[.,]\d+)?)\s*(?:(?P<hour>{_HOUR})(?:\s*(?P<half>ครึ่ง))?"
+    rf"(?:\s*(?P<num2>[0-5]?\d)(?![\d.,:])(?!\s*{_HOUR})(?:\s*{_MIN})?)?|(?P<min>{_MIN}))", re.I)
 BARE_NUMBER_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)(?![\d.])")
 SEPARATOR_RE = re.compile(r"\s*(?:\+|＋|/|\n|;|、|，|(?<!\d),|,(?!\d)|\s&\s|\sและ\s)\s*")
 
 
 def _minutes(match):
+    if match.group("hh"):
+        return int(match.group("hh")) * 60 + int(match.group("mm"))
     number = float(match.group("num").replace(",", "."))
     if match.group("hour"):
         minutes = number * 60 + (30 if match.group("half") else 0) + (int(match.group("num2")) if match.group("num2") else 0)
@@ -182,34 +216,42 @@ def _clean_name(text):
 
 
 def _segment_groups(segment):
-    """Split one segment into [name, raw_start, raw_end, [(duration_text, minutes, bare)]] groups."""
-    groups, pos = [], 0
+    """Split one segment into (name, raw, [(duration_text, minutes, bare)], leftover numbers) groups. Leftover numbers are
+    numbers that no duration (and no bare-number fallback) used: they are reported instead of silently dropped."""
+    groups, pos, used = [], 0, []
     for m in DURATION_RE.finditer(segment):
         name = _clean_name(segment[pos:m.start()])
         if name or not groups:
             groups.append([name, pos, m.end(), []])
         groups[-1][2] = m.end()
         groups[-1][3].append((m.group(0).strip(), _minutes(m), False))
+        used.append(m.span())
         pos = m.end()
     tail = segment[pos:]
     tail_name = _clean_name(tail)
     if tail_name:
         groups.append([tail_name, pos, len(segment), []])
+    elif groups and BARE_NUMBER_RE.search(tail):  # "ไทย 90 นาที 15": the stray number belongs to the last item
+        groups[-1][2] = len(segment)
     for group in groups:  # "ไทย 90" -> bare number as duration
         if group[0] and not group[3]:
-            bare = BARE_NUMBER_RE.findall(segment[group[1]:group[2]])
+            bare = BARE_NUMBER_RE.search(segment, group[1], group[2])
             if bare:
-                number = float(bare[0])
+                number = float(bare.group(1))
                 minutes = int(round(number * 60)) if number <= 4 else int(round(number))
-                group[3].append((bare[0], minutes, True))
+                group[3].append((bare.group(1), minutes, True))
+                used.append(bare.span())
+    for group in groups:
+        group.append([n.group(1) for n in BARE_NUMBER_RE.finditer(segment, group[1], group[2])
+                      if not any(start <= n.start() < end for start, end in used)])
     merged = []
     for group in groups:  # "90 นาที ไทย": a leading duration belongs to the following name
         if merged and merged[-1][0] is None and group[0] and not group[3]:
-            group[3], group[1] = merged[-1][3], merged[-1][1]
+            group[3], group[1], group[4] = merged[-1][3], merged[-1][1], merged[-1][4] + group[4]
             merged[-1] = group
         else:
             merged.append(group)
-    return [(g[0], segment[g[1]:g[2]].strip(), g[3]) for g in merged]
+    return [(g[0], segment[g[1]:g[2]].strip(), g[3], g[4]) for g in merged]
 
 
 def _match_treatment(name_raw, raw):
@@ -241,17 +283,21 @@ def parse_treatments(raw):
     for segment in SEPARATOR_RE.split(text):
         if segment.strip():
             groups.extend(_segment_groups(segment))
-    durations_all = [d[0] for _, _, ds in groups for d in ds if not d[2]]
+    durations_all = [d[0] for _, _, ds, _ in groups for d in ds if not d[2]]
     total, warnings, items = None, [], []
-    named_minutes = [ds[0][1] for name, _, ds in groups if name and ds]
-    for index, (name, seg_raw, durs) in enumerate(groups):
+    named_minutes = [ds[0][1] for name, _, ds, _ in groups if name and ds]
+    for index, (name, seg_raw, durs, leftover) in enumerate(groups):
         last = index == len(groups) - 1
+        if leftover:
+            warnings.append(f"{name or seg_raw}: number(s) {', '.join(leftover)} not read as a duration")
         if name is None:
             if last and len(durs) == 1 and len(named_minutes) >= 2 and durs[0][1] == sum(named_minutes):
                 total = durs[0][1]
                 continue
             if items and items[-1]["duration"] is None:
                 items[-1].update(duration=durs[0][0], durationMinutes=durs[0][1], raw=f"{items[-1]['raw']} {seg_raw}".strip())
+                if leftover:
+                    items[-1]["needsReview"] = True
                 continue
         extra = durs[1:]
         if extra and last and len(extra) == 1 and extra[0][1] == sum(named_minutes):
@@ -259,7 +305,7 @@ def parse_treatments(raw):
         value, confidence, source = _match_treatment(name, seg_raw) if name else (None, 0.0, "none")
         item = {"raw": seg_raw or None, "nameRaw": name, "value": value, "duration": durs[0][0] if durs else None,
                 "durationMinutes": durs[0][1] if durs else None, "confidence": confidence, "source": source}
-        review = value is None or confidence < REVIEW_BELOW or item["duration"] is None
+        review = value is None or confidence < REVIEW_BELOW or item["duration"] is None or bool(leftover)
         if extra:
             review = True
             warnings.append(f"{name or seg_raw}: more than one duration ({', '.join(d[0] for d in durs)})")
@@ -291,8 +337,21 @@ def legacy_treatment(raw, items, durations):
 # ---------------------------------------------------------------- CUSTOMER INFORMATION
 
 _CUSTOMER_LABELS = re.compile(
-    r"(?P<hotelName>hotel\s*name|hotel|酒店|โรงแรม)|(?P<nationality>nationality|国籍|國籍|สัญชาติ)|(?P<name>(?<!hotel )(?<!hotel)name|姓名|ชื่อ)",
+    r"(?P<hotelName>\bhotel\s*name\b|\bhotel\b|酒店|โรงแรม)|(?P<nationality>\bnationality\b|国籍|國籍|สัญชาติ)|(?P<name>\bname\b|姓名|ชื่อ)",
     re.I)
+_CJK_LABELS = ("姓名", "国籍", "國籍", "酒店")
+
+
+def _is_label(text, m):
+    """A label word only counts at the start of a line / table cell or right before a colon, so "Kaname", "Hotel Nikko"
+    or "Anna Hotelling" inside a value never start a new field. Chinese labels also count as separate words
+    ("姓名 Chun 国籍 Chinese 酒店 Hilton"), but not inside a name ("曼谷洲际酒店")."""
+    before, after = text[:m.start()], text[m.end():]
+    if re.search(r"(?:^|[\n|])[^\S\n]*$", before) or re.match(r"[^\S\n]*[:：]", after):
+        return True
+    return m.group(0) in _CJK_LABELS and (not before or before[-1].isspace()) and (not after or after[0].isspace())
+
+
 _PLACEHOLDERS = {"", "-", "--", "—", "n/a", "na", "none", "null", "nil", "empty", "(empty)", "[empty]", "blank", "(blank)", "[blank]",
                  "ไม่มี", "无", "空", "..."}
 CUSTOMER_FIELDS = ("name", "nationality", "hotelName")
@@ -309,7 +368,7 @@ def _clean_value(text):
 def parse_customer_text(text, expected=CUSTOMER_FIELDS):
     """Customer transcription -> ({field: value|None}, used_fallback). `expected` = fields that have handwriting."""
     text = _clean_model_text(text)
-    found, matches = {}, list(_CUSTOMER_LABELS.finditer(text))
+    found, matches = {}, [m for m in _CUSTOMER_LABELS.finditer(text) if _is_label(text, m)]
     for i, m in enumerate(matches):
         key = m.lastgroup
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)

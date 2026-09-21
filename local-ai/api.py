@@ -7,6 +7,7 @@ two concurrent Typhoon OCR section calls (STAFF ONLY and CUSTOMER INFORMATION ha
 import functools
 import io
 import os
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +30,11 @@ app = FastAPI(title="INNOVERA OCR API", version=VERSION)
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 MIME_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf"}
 TEMPLATE_MIN_CONTRAST = 15  # mean printed-checkbox ring contrast below this => not the expected form / badly aligned
+MAX_PDF_PAGE_PT = 14400  # PDF page-size limit (200 in); bigger MediaBoxes are refused before anything is rendered
+MAX_RASTER_PIXELS = 89_478_485  # Pillow's decompression-bomb warning threshold, enforced as an error
+# PDFium (and MuPDF) keep process-global state and are not thread-safe. /v1/ocr runs in FastAPI's threadpool, so two
+# PDF renders at once could crash the whole process: every render runs under this lock.
+_PDF_LOCK = threading.Lock()
 
 
 def upload_dir():
@@ -58,9 +64,19 @@ def _ms(start, end=None):
     return int(round(((end if end is not None else time.perf_counter()) - start) * 1000))
 
 
+def _render_scale(width_pt, height_pt):
+    """Render scale for a PDF page: long side at 2x the reference width (at most 6x). The long side of the bitmap is
+    therefore never above 2 * REF_W px, whatever the MediaBox says. Pages outside 1..MAX_PDF_PAGE_PT pt are refused."""
+    long_side, short_side = max(width_pt, height_pt), min(width_pt, height_pt)
+    if not (0 < short_side and long_side <= MAX_PDF_PAGE_PT):
+        raise ValueError(f"PDF page size {width_pt:.0f}x{height_pt:.0f} pt is outside 1..{MAX_PDF_PAGE_PT} pt")
+    return min(6.0, 2 * L.REF_W / long_side)
+
+
 @functools.lru_cache(maxsize=1)
 def _pdf_renderer():
-    """First-page PDF renderer using pypdfium2 or PyMuPDF when importable, else None (PDF => HTTP 415)."""
+    """First-page PDF renderer using pypdfium2 or PyMuPDF when importable, else None (PDF => HTTP 415).
+    Callers must hold _PDF_LOCK: neither library is thread-safe."""
     try:
         import pypdfium2 as pdfium
 
@@ -68,9 +84,14 @@ def _pdf_renderer():
             pdf = pdfium.PdfDocument(data)
             try:
                 page = pdf[0]
-                width_pt, height_pt = page.get_size()
-                scale = max(0.5, min(6.0, 2 * L.REF_W / max(width_pt, height_pt)))
-                return page.render(scale=scale).to_pil().convert("RGB"), len(pdf)
+                try:
+                    bitmap = page.render(scale=_render_scale(*page.get_size()))
+                    try:
+                        return bitmap.to_pil().convert("RGB"), len(pdf)  # convert() copies out of the PDFium buffer
+                    finally:
+                        bitmap.close()
+                finally:
+                    page.close()  # close every PDFium object here, under the lock, never later from the GC
             finally:
                 pdf.close()
         return render_pdfium
@@ -83,7 +104,7 @@ def _pdf_renderer():
             doc = fitz.open(stream=data, filetype="pdf")
             try:
                 page = doc[0]
-                zoom = max(0.5, min(6.0, 2 * L.REF_W / max(page.rect.width, page.rect.height)))
+                zoom = _render_scale(page.rect.width, page.rect.height)
                 pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
                 return Image.frombytes("RGB", (pix.width, pix.height), pix.samples), doc.page_count
             finally:
@@ -98,14 +119,17 @@ def _decode(data, ext):
     warnings = []
     if ext == ".pdf":
         try:
-            image, pages = _pdf_renderer()(data)
-        except Exception as error:  # renderer-specific error types
+            with _PDF_LOCK:
+                image, pages = _pdf_renderer()(data)
+        except Exception as error:  # renderer-specific error types, oversize pages
             raise HTTPException(400, f"Cannot render the uploaded PDF: {error}") from error
         if pages > 1:
             warnings.append(f"PDF has {pages} pages; only page 1 was processed")
         return image, warnings
     try:
         image = Image.open(io.BytesIO(data))
+        if image.width * image.height > MAX_RASTER_PIXELS:  # checked on the header, before any pixel is decoded
+            raise ValueError(f"image is {image.width}x{image.height} px, more than {MAX_RASTER_PIXELS} pixels")
         image.load()
         image = ImageOps.exif_transpose(image)
     except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError, SyntaxError) as error:
@@ -240,6 +264,7 @@ def process_image(image, document_id, source_file, started, extra_warnings=()):
         checkbox_ms = _ms(t_checkbox)
         outputs = {name: future.result() for name, future in futures}
     inference_wall_ms = _ms(t_inference)
+    layout["warnings"].extend(M.implausible_checkboxes(checkboxes))
 
     t_normalize = time.perf_counter()
     staff_raw = outputs["staffOnly"][0]
@@ -280,13 +305,11 @@ def process_image(image, document_id, source_file, started, extra_warnings=()):
 
 @app.get("/health")
 def health():
-    try:
-        N.master()
-        master_state = "ok"
-    except Exception as error:  # reported, not raised: /health must answer
-        master_state = f"error: {error}"
-    return {"status": "ok", "service": "innovera-ocr", "version": VERSION, "engine": ENGINE, "schemaVersion": SCHEMA_VERSION,
-            "model": ocr_model.model_name(), "pdfSupport": _pdf_renderer() is not None, "masterData": master_state}
+    master_state = N.master_state()  # never raises: /health must answer
+    # Not "ok" while master data is broken, so OcrClient.healthCheck and monitoring see it (HTTP stays 200).
+    return {"status": "ok" if master_state == "ok" else "degraded", "service": "innovera-ocr", "version": VERSION, "engine": ENGINE,
+            "schemaVersion": SCHEMA_VERSION, "model": ocr_model.model_name(), "pdfSupport": _pdf_renderer() is not None,
+            "masterData": master_state}
 
 
 @app.post("/v1/ocr")

@@ -1,15 +1,22 @@
 """HTTP contract of the Local AI service (schema v3) with the model call mocked."""
 
 import io
+import json
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
+import pytest
 from PIL import Image, ImageDraw
 
 import api
+import ocr_layout
 import synthetic_form as S
 from conftest import CUSTOMER_TEXT, STAFF_TEXT, FakeModel, png_of
 
 FIELD_KEYS = {"raw", "value", "confidence", "source", "needsReview"}
+L_CHECKBOXES = ocr_layout.CHECKBOXES
 SOURCES = {"ocr", "checkbox", "ink-mark", "rule", "master-fuzzy", "verified-memory", "none", "human"}
 
 
@@ -198,6 +205,122 @@ def test_pdf_with_renderer_processes_first_page(client, fake_model, monkeypatch)
     body = post(client, b"%PDF-1.4 fake", "form.pdf", "application/pdf").json()
     assert body["customerInformation"]["gender"]["value"] == "Female"
     assert body["layout"]["warnings"] == ["PDF has 3 pages; only page 1 was processed"] and body["needsReview"]
+
+
+def make_pdf(media_box=(0, 0, 595, 842), text=True):
+    """Minimal one-page PDF; `text` adds a Helvetica text object (text pages are what crashed concurrent PDFium renders)."""
+    content = b"BT /F1 24 Tf 72 720 Td (Makkha intake form) Tj ET" if text else b""
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+               b"<< /Type /Page /Parent 2 0 R /MediaBox [%d %d %d %d] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>" % media_box,
+               b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+               b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    out, offsets = bytearray(b"%PDF-1.4\n"), []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1) + b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n" % (len(objects) + 1, xref) + b"%%EOF\n"
+    return bytes(out)
+
+
+def test_pdf_renders_never_overlap(client, fake_model, monkeypatch):
+    """/v1/ocr runs in a threadpool; PDFium/MuPDF are not thread-safe, so renders must be serialised."""
+    lock, active, peak = threading.Lock(), [0], [0]
+
+    def renderer(data):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.05)
+        with lock:
+            active[0] -= 1
+        return S.filled_form(), 1
+    monkeypatch.setattr(api, "_pdf_renderer", lambda: renderer)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        statuses = list(pool.map(lambda _: post(client, b"%PDF-1.4 fake", "form.pdf", "application/pdf").status_code, range(4)))
+    assert statuses == [200] * 4 and peak[0] == 1
+
+
+def test_real_pdf_renders_from_two_threads_do_not_crash():
+    """Without the lock this segfaults/aborts the interpreter within a few overlapping renders (pypdfium2 4.x/5.x)."""
+    pytest.importorskip("pypdfium2")
+    api._pdf_renderer.cache_clear()
+    pdf = make_pdf()
+
+    def render_many(_):
+        return [api._decode(pdf, ".pdf")[0].size for _ in range(40)]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sizes = {size for batch in pool.map(render_many, range(2)) for size in batch}
+    assert sizes == {(round(595 * 1610 / 842), 1610)}
+
+
+def test_pdf_render_scale_is_bounded_by_the_long_side():
+    assert api._render_scale(595, 842) == 2 * 805 / 842
+    assert api._render_scale(10, 20) == 6.0  # tiny pages: at most 6x
+    width, height = 14400 * api._render_scale(14400, 14400), 14400 * api._render_scale(14400, 14400)
+    assert round(width) == round(height) == 1610  # the largest allowed page still renders at 1610 px
+    for size in ((40000, 40000), (14401, 100), (0, 842), (595, 0), (float("nan"), 842)):
+        with pytest.raises(ValueError):
+            api._render_scale(*size)
+
+
+def test_oversize_pdf_page_is_rejected_before_rendering(client, fake_model):
+    pytest.importorskip("pypdfium2")
+    api._pdf_renderer.cache_clear()
+    response = post(client, make_pdf((0, 0, 40000, 40000), text=False), "bomb.pdf", "application/pdf")
+    assert response.status_code == 400 and "outside" in response.json()["detail"] and fake_model.calls == []
+    ok = post(client, make_pdf((0, 0, 842, 595), text=False), "form.pdf", "application/pdf")
+    assert ok.status_code == 200 and ok.json()["layout"]["imageWidth"] == 1610
+
+
+def test_raster_over_the_pixel_budget_is_400(client, fake_model):
+    huge = Image.new("1", (9500, 9500), 1)  # 90.25 MP: under Pillow's hard limit, over its decompression-bomb warning
+    response = post(client, png_of(huge))
+    assert response.status_code == 400 and "pixels" in response.json()["detail"] and fake_model.calls == []
+
+
+def test_master_data_typo_keeps_last_good_masters_and_health_degrades(client, fake_model, tmp_path, monkeypatch):
+    import ocr_normalize as N
+    good = (N.HERE / "master_data.json").read_text(encoding="utf-8")
+    custom = tmp_path / "master.json"
+    custom.write_text(good, encoding="utf-8")
+    monkeypatch.setenv("OCR_MASTER_DATA", str(custom))
+    assert post(client, png_of(S.filled_form())).status_code == 200
+    custom.write_text(good.replace('"durations": [60, 90, 120, 180] }', '"durations": [60, 90, 120, 180] },', 1), encoding="utf-8")  # typo
+    response = post(client, png_of(S.filled_form()))
+    assert response.status_code == 200 and response.json()["staffOnly"]["treatments"][0]["value"] == "นวดไทย"
+    health = client.get("/health").json()
+    assert health["status"] == "degraded" and health["masterData"].startswith("stale: ")
+    custom.write_text(json.dumps({"treatments": {}, "therapists": [], "nationalities": []}), encoding="utf-8")
+    assert client.get("/health").json()["masterData"].startswith("stale: ")  # a wrong structure is refused too
+    custom.write_text(good + "\n", encoding="utf-8")
+    assert client.get("/health").json()["status"] == "ok"
+
+
+def test_master_data_that_never_loaded_is_an_error(client, tmp_path, monkeypatch):
+    import ocr_normalize as N
+    broken = tmp_path / "broken.json"
+    broken.write_text("{", encoding="utf-8")
+    cache = N._FileCache(N._load_master)
+    with pytest.raises(ValueError):
+        cache.get(broken)
+    with pytest.raises(ValueError):  # cached failure, re-raised without re-parsing
+        cache.get(broken)
+    monkeypatch.setattr(N, "_master_cache", cache)
+    monkeypatch.setenv("OCR_MASTER_DATA", str(broken))
+    health = client.get("/health").json()
+    assert health["status"] == "degraded" and health["masterData"].startswith("error: ")
+
+
+def test_implausibly_many_checked_boxes_flag_the_whole_card(client, fake_model):
+    image = S.filled_form()
+    draw = ImageDraw.Draw(image)
+    for key, *_ in L_CHECKBOXES["healthConditions"][:10]:
+        S.tick(draw, "healthConditions", key)
+    body = post(client, png_of(image)).json()
+    assert any("healthConditions boxes read as checked" in w for w in body["layout"]["warnings"])
+    assert all(f["needsReview"] for f in body["customerInformation"]["healthConditions"]) and body["needsReview"] is True
 
 
 def test_corrupt_image_is_400(client, fake_model):

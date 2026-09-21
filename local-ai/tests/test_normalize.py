@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -35,10 +36,39 @@ def test_trailing_total_is_not_a_treatment_duration():
     ("90 นาที ไทย", [("นวดไทย", 90)]),
     ("Oil 1,5 hr", [("นวดน้ำมัน", 90)]),
     ("คอ บ่า ไหล่ 30 นาที", [("คอ บ่า ไหล่", 30)]),
+    ("ไทย 1 ชม. 30", [("นวดไทย", 90)]),  # minutes after an hour unit may omit their own unit
+    ("Thai 1h30", [("นวดไทย", 90)]),
+    ("Oil 1 hr 30", [("นวดน้ำมัน", 90)]),
+    ("ไทย 1ชม.30", [("นวดไทย", 90)]),
+    ("น้ำมัน 1 ชม.30", [("นวดน้ำมัน", 90)]),
+    ("ไทย 90 นาที + หน้า 1 ชม. 30", [("นวดไทย", 90), ("นวดหน้า", 90)]),
+    ("ไทย 1:30", [("นวดไทย", 90)]),
+    ("Foot 0:45", [("นวดเท้า", 45)]),
 ])
 def test_duration_normalization(text, expected):
     items, _, _, _ = N.parse_treatments(text)
     assert [(i["value"], i["durationMinutes"]) for i in items] == expected
+
+
+DURATION_CASES = json.loads((Path(__file__).parent / "duration_cases.json").read_text(encoding="utf-8"))["cases"]
+
+
+@pytest.mark.parametrize("duration, minutes", DURATION_CASES)
+def test_shared_duration_table(duration, minutes):
+    """Same table as packages/ocr-persistence parseDurationMinutes (reviewer-edited durations)."""
+    assert N.parse_treatments(f"ไทย {duration}")[0][0]["durationMinutes"] == minutes
+
+
+def test_unlabeled_minutes_are_kept_in_raw_and_duration():
+    items, durations, warnings, _ = N.parse_treatments("ไทย 1 ชม. 30")
+    assert names(items) == [("ไทย", "นวดไทย", "1 ชม. 30", 90, False)] and items[0]["raw"] == "ไทย 1 ชม. 30"
+    assert durations == ["1 ชม. 30"] and warnings == []
+
+
+@pytest.mark.parametrize("text", ["ไทย 90 นาที 15", "ไทย 10:30", "ไทย 2 90 นาที"])
+def test_numbers_not_read_as_a_duration_need_review(text):
+    items, _, warnings, _ = N.parse_treatments(text)
+    assert items[0]["needsReview"] and any("not read as a duration" in w for w in warnings)
 
 
 def test_duration_not_allowed_for_treatment_needs_review():
@@ -90,6 +120,19 @@ def test_customer_text_label_parsing(text, expected):
     assert parsed == expected and fallback is False
 
 
+@pytest.mark.parametrize("text, expected", [
+    ("Name: Kaname Sato", {"name": "Kaname Sato", "nationality": None, "hotelName": None}),
+    ("Name: Nameeta Shah", {"name": "Nameeta Shah", "nationality": None, "hotelName": None}),
+    ("Name: Anna Hotelling | Nationality: American | Hotel Name: Hilton", {"name": "Anna Hotelling", "nationality": "American", "hotelName": "Hilton"}),
+    ("Hotel Name: Hotel Nikko Bangkok", {"name": None, "nationality": None, "hotelName": "Hotel Nikko Bangkok"}),
+    ("Hotel Name: The Name Hotel", {"name": None, "nationality": None, "hotelName": "The Name Hotel"}),
+    ("Hotel Name: โรงแรมอินดิโก", {"name": None, "nationality": None, "hotelName": "โรงแรมอินดิโก"}),
+    ("Hotel Name 酒店 : 曼谷洲际酒店", {"name": None, "nationality": None, "hotelName": "曼谷洲际酒店"}),
+])
+def test_label_words_inside_values_do_not_start_a_new_field(text, expected):
+    assert N.parse_customer_text(text) == (expected, False)
+
+
 def test_customer_text_unlabeled_fallback_uses_written_boxes():
     parsed, fallback = N.parse_customer_text("Chun\nChinese", ("name", "nationality"))
     assert parsed == {"name": "Chun", "nationality": "Chinese", "hotelName": None} and fallback is True
@@ -124,6 +167,17 @@ def test_treatment_verified_memory_tries_name_raw_then_raw():
     N.append_verified({"field": "treatment", "ocrRaw": "ขัดผิว 45 นาที", "verifiedValue": "Body Scrub", "verifiedByHuman": True})
     items, _, _, _ = N.parse_treatments("ขัดผิว 45 นาที")
     assert items[0]["value"] == "Body Scrub" and items[0]["nameRaw"] == "ขัดผิว"
+
+
+def test_file_cache_keeps_last_good_value_when_a_changed_file_does_not_load(tmp_path):
+    path = tmp_path / "master.json"
+    path.write_text(N.master_path().read_text(encoding="utf-8"), encoding="utf-8")
+    cache = N._FileCache(N._load_master)
+    good = cache.get(path)
+    path.write_text('{"treatments": [], "therapists": [], "nationalities": [],}', encoding="utf-8")
+    assert cache.get(path) is good and isinstance(cache.error, ValueError)
+    path.write_text('{"treatments": [], "therapists": [], "nationalities": []}', encoding="utf-8")
+    assert cache.get(path)["treatments"] == [] and cache.error is None
 
 
 def test_master_data_is_editable_and_reloaded(tmp_path, monkeypatch):

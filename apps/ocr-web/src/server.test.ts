@@ -80,8 +80,9 @@ const canonical = (needsReview: { therapist?: boolean; name?: boolean } = {}) =>
   staffOnly: { treatments: [], therapistName: { raw: "พิพิ", value: "พิพิ", confidence: 0.4, source: "ocr", needsReview: needsReview.therapist ?? true }, roomNo: { raw: "1", value: "1", confidence: 0.9, source: "ocr", needsReview: false } }
 });
 
-function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; storeError?: Error; readiness?: () => Promise<boolean>; structuredResult?: unknown } = {}) {
+function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; storeError?: Error; readiness?: () => Promise<boolean>; structuredResult?: unknown; originalStatus?: string } = {}) {
   const calls: Call[] = [];
+  let contentReads = 0;
   const confirmCalls: unknown[] = [];
   const corrections: unknown[][] = [];
   const ingestCalls: unknown[][] = [];
@@ -117,7 +118,7 @@ function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; store
         rawResponse: {}, structuredResult: asView(options.structuredResult ?? canonical()), needsReview: true, confirmStatus: null, ...reviewExtras
       } : null;
     },
-    getOriginal: async (tenantId: string, id: string) => { record("getOriginal", tenantId, id); return id === documentId ? { storageKey: "org/x/original/ab/key", mimeType: "image/png" } : null; },
+    getOriginal: async (tenantId: string, id: string) => { record("getOriginal", tenantId, id); return id === documentId ? { storageKey: "org/x/original/ab/key", mimeType: "image/png", status: options.originalStatus ?? "NEEDS_REVIEW" } : null; },
     saveCorrection: async (...args: unknown[]) => { corrections.push(args); }
   };
   const ingest = (tenantId: string, idempotencyKey?: string, batch?: string): IngestDependencies => {
@@ -133,7 +134,7 @@ function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; store
   const dependencies: AppDependencies = {
     ingest: { stage: async () => { throw new Error("TENANT_REQUIRED"); }, scan: async () => "QUARANTINED", enqueue: async () => "never" },
     ingestForTenant: ingest, reviewStore, workbenchStore,
-    storage: { get: async () => new Uint8Array([137, 80, 78, 71]), put: async () => undefined },
+    storage: { get: async () => { contentReads += 1; return new Uint8Array([137, 80, 78, 71]); }, put: async () => undefined },
     ocrClient: { confirmResult: async (payload: unknown) => { confirmCalls.push(payload); return { accepted: true }; } } as never
   };
   const app = createAppServer(dependencies, {
@@ -144,7 +145,7 @@ function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; store
       throw new Error("UNAUTHENTICATED");
     }
   });
-  return { app, calls, confirmCalls, corrections, ingestCalls, persisted };
+  return { app, calls, confirmCalls, corrections, ingestCalls, persisted, contentReads: () => contentReads };
 }
 
 async function withServer(harness: ReturnType<typeof workbenchHarness>, run: (base: string) => Promise<void>): Promise<void> {
@@ -439,11 +440,59 @@ test("error codes map to spec statuses", () => {
   assert.equal(errorStatus("DOCUMENT_NOT_FOUND"), 404);
   assert.equal(errorStatus("DOCUMENT_NOT_FOUND_OR_FORBIDDEN"), 404);
   assert.equal(errorStatus("BATCH_NOT_FOUND"), 404);
-  for (const code of ["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT"]) assert.equal(errorStatus(code), 409);
+  for (const code of ["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT",
+    "DOCUMENT_QUARANTINED", "DOCUMENT_NOT_SCANNED", "CONFIRMATION_TARGET_AMBIGUOUS", "UPLOAD_IN_PROGRESS"]) assert.equal(errorStatus(code), 409);
   assert.equal(errorStatus("PAYLOAD_TOO_LARGE"), 413);
   assert.equal(errorStatus("UNSUPPORTED_MEDIA_TYPE"), 415);
   assert.equal(errorStatus("REVIEW_INVALID"), 400);
   assert.equal(errorStatus("INVALID_UPLOAD_HEADERS"), 400);
   assert.equal(errorStatus("CONTENT_NOT_CONFIGURED"), 503);
   assert.equal(errorStatus("INTERNAL_ERROR"), 500);
+});
+
+test("originals are never served before a clean scan: quarantined and unscanned content is refused", async () => {
+  for (const [status, error] of [["QUARANTINED", "DOCUMENT_QUARANTINED"], ["SCANNING", "DOCUMENT_NOT_SCANNED"], ["VALIDATING", "DOCUMENT_NOT_SCANNED"]] as const) {
+    const h = workbenchHarness({ originalStatus: status });
+    await withServer(h, async (base) => {
+      await expectError(await fetch(`${base}/api/documents/${documentId}/content`, { headers: auth }), 409, error);
+      assert.equal(h.contentReads(), 0, `${status}: the stored bytes are not even read`);
+    });
+  }
+  for (const status of ["CLEAN", "FAILED", "SUCCEEDED"]) {
+    const h = workbenchHarness({ originalStatus: status });
+    await withServer(h, async (base) => {
+      assert.equal((await fetch(`${base}/api/documents/${documentId}/content`, { headers: auth })).status, 200, status);
+    });
+  }
+});
+
+test("NUL characters are client errors, not database 500s", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    const before = h.calls.length;
+    await expectError(await fetch(`${base}/api/documents?q=${encodeURIComponent("a\u0000b")}`, { headers: auth }), 400, "INVALID_QUERY");
+    assert.equal(h.calls.length, before);
+    for (const payload of [{ field: "therapistName", raw: "พิพิ", verifiedValue: "พี\u0000พี" }, { field: "therapistName", raw: "\u0000", verifiedValue: "พีพี" }, { field: "therapist\u0000Name", raw: "x", verifiedValue: "พีพี" }]) {
+      await expectError(await fetch(`${base}/api/documents/${documentId}/ocr/confirm`, { method: "POST", headers: jsonAuth, body: JSON.stringify(payload) }), 400, "INVALID_CONFIRMATION");
+    }
+    assert.deepEqual(h.corrections, []);
+  });
+});
+
+test("legacy confirm of one treatment keeps the document in review while another treatment is flagged", async () => {
+  const view = canonical({ therapist: false });
+  const item = (nameRaw: string, needsReview: boolean) => ({ raw: `${nameRaw} 60 นาที`, nameRaw, value: null, duration: "60 นาที", durationMinutes: 60, confidence: 0.4, source: "master-fuzzy", needsReview });
+  const twoFlagged = { ...view, staffOnly: { ...view.staffOnly, treatments: [item("ฟุต", true), item("หน้า", true)] } };
+  const h = workbenchHarness({ structuredResult: twoFlagged });
+  await withServer(h, async (base) => {
+    const confirm = (raw: string) => fetch(`${base}/api/documents/${documentId}/ocr/confirm`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ field: "treatment", raw, verifiedValue: "นวดเท้า" }) });
+    assert.equal((await confirm("ฟุต")).status, 200);
+    assert.deepEqual(h.corrections.map((call) => call[4]), ["PENDING", "SUCCEEDED"]);
+    assert.equal(h.corrections[1]?.[6], true, "staffOnly.treatments[1] is still flagged");
+  });
+  const oneFlagged = workbenchHarness({ structuredResult: { ...view, staffOnly: { ...view.staffOnly, treatments: [item("ไทย", false), item("ฟุต", true)] } } });
+  await withServer(oneFlagged, async (base) => {
+    assert.equal((await fetch(`${base}/api/documents/${documentId}/ocr/confirm`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ field: "treatment", raw: "ฟุต", verifiedValue: "นวดเท้า" }) })).status, 200);
+    assert.equal(oneFlagged.corrections[1]?.[6], false, "the confirmed item was the only flagged field");
+  });
 });

@@ -1,6 +1,6 @@
 import { Pool, type PoolClient, type PoolConfig } from "pg";
 import type { OcrResponse } from "@innovera/ocr-client";
-import { applyReviewEdits, normalizeStructuredResult, summarizeDocument, type DocumentSummary, type DocumentView } from "./document-view.js";
+import { applyReviewEdits, legacyTreatmentIndex, markReviewed, normalizeStructuredResult, summarizeDocument, type DocumentSummary, type DocumentView } from "./document-view.js";
 
 export * from "./document-view.js";
 
@@ -56,14 +56,16 @@ export type ReviewDocument = Readonly<{
 
 export type ReviewStore = DocumentStore & Readonly<{
   getReviewDocument(tenantId: string, documentId: string): Promise<ReviewDocument | null>;
-  getOriginal?: (tenantId: string, documentId: string) => Promise<{ storageKey: string; mimeType: string } | null>;
+  /** `status` lets the content route refuse quarantined / not yet scanned originals. */
+  getOriginal?: (tenantId: string, documentId: string) => Promise<{ storageKey: string; mimeType: string; status: string } | null>;
 }>;
 
 export type BatchSummary = { batchId: string; label: string | null; createdAt: string; expectedTotal: number;
   uploaded: number; queued: number; processing: number; succeeded: number; needsReview: number;
   failed: number; confirmed: number; completed: number /* succeeded+needsReview+failed */;
   finishedAt: string | null /* last completion, once completed === expectedTotal */;
-  durationMs: number | null /* createdAt → finishedAt, or → now while running; null before the first upload */;
+  durationMs: number | null /* createdAt → last completion once nothing is queued or processing (also when fewer files than
+    expected arrived), else → now; null before the first upload */;
   throughputPerMinute: number | null /* completed per minute of durationMs */ };
 export type CreateBatchInput = { createdBy: string; expectedTotal: number; label?: string | null | undefined };
 export type DocumentListItem = { documentId: string; batchId: string | null; filename: string; mimeType: string;
@@ -111,22 +113,33 @@ export function statusCategoryOf(status: string, reviewedAt: unknown): DocumentS
   }
 }
 
+/**
+ * When document `d` was confirmed: reviewed in the workbench (`reviewed_at`), or — rows confirmed field by field through
+ * the legacy confirm endpoint, incl. every v2.2 confirmation, which never set `reviewed_at` — `confirmed_at` of a
+ * SUCCEEDED document whose last provider confirmation succeeded. NULL = not confirmed. Read-side on purpose: the
+ * migrator cannot backfill rows through FORCE RLS.
+ */
+const REVIEWED_AT_SQL = "(CASE WHEN d.reviewed_at IS NOT NULL THEN d.reviewed_at WHEN d.status = 'SUCCEEDED' AND d.confirm_status = 'SUCCEEDED' THEN d.confirmed_at END)";
+
 const CATEGORY_SQL: Readonly<Record<DocumentStatusCategory, string>> = {
   queued: "d.status IN ('VALIDATING','SCANNING','CLEAN')", processing: "d.status = 'PROCESSING'", review: "d.status = 'NEEDS_REVIEW'",
-  succeeded: "d.status = 'SUCCEEDED' AND d.reviewed_at IS NULL", confirmed: "d.status = 'SUCCEEDED' AND d.reviewed_at IS NOT NULL",
+  succeeded: `d.status = 'SUCCEEDED' AND ${REVIEWED_AT_SQL} IS NULL`, confirmed: `d.status = 'SUCCEEDED' AND ${REVIEWED_AT_SQL} IS NOT NULL`,
   failed: "d.status IN ('FAILED','QUARANTINED')"
 };
 
-/** Outbox state of the latest correction per field of document `d`. */
+/**
+ * Outbox state of the latest correction per field of document `d`. Corrections of one review share `verified_at`; the
+ * tie-break prefers the one with an outbox row, so a PENDING or dead delivery is never hidden behind a sibling change.
+ */
 const DELIVERY_SQL = `(SELECT CASE WHEN count(x.status) = 0 THEN 'NONE'
     WHEN bool_or(x.status IN ('DEAD','FAILED')) THEN 'FAILED' WHEN bool_or(x.status = 'RETRY') THEN 'RETRYING'
     WHEN bool_or(x.status IN ('PENDING','PROCESSING')) THEN 'PENDING' ELSE 'DELIVERED' END
   FROM (SELECT DISTINCT ON (c.field) o.status FROM ocr_corrections c
         LEFT JOIN ocr_confirm_outbox o ON o.correction_id = c.id AND o.organization_id = c.organization_id
-        WHERE c.organization_id = d.organization_id AND c.document_id = d.id ORDER BY c.field, c.verified_at DESC) x)`;
+        WHERE c.organization_id = d.organization_id AND c.document_id = d.id ORDER BY c.field, c.verified_at DESC, (o.id IS NOT NULL) DESC, c.id) x)`;
 
 const REVIEW_SELECT = `SELECT d.id, d.organization_id, d.batch_id, d.filename, d.mime_type, d.status::text AS status, d.ocr_document_id, d.ocr_engine, d.ocr_version,
-  d.raw_response, d.structured_result, d.needs_review, d.confirm_status, d.reviewed_at, d.reviewed_by, d.updated_at, d.error_message,
+  d.raw_response, d.structured_result, d.needs_review, d.confirm_status, ${REVIEWED_AT_SQL} AS reviewed_at, d.reviewed_by, d.updated_at, d.error_message,
   d.created_at, d.processed_at, ${DELIVERY_SQL} AS delivery_status
 FROM documents d WHERE d.id = $1::uuid AND d.organization_id = $2::uuid AND d.deleted_at IS NULL`;
 
@@ -138,7 +151,7 @@ const BATCH_SELECT = `SELECT b.id, b.label, b.created_at, b.expected_total, now(
   count(d.id) FILTER (WHERE d.status = 'SUCCEEDED')::int AS succeeded,
   count(d.id) FILTER (WHERE d.status = 'NEEDS_REVIEW')::int AS needs_review,
   count(d.id) FILTER (WHERE d.status IN ('FAILED','QUARANTINED'))::int AS failed,
-  count(d.id) FILTER (WHERE d.status = 'SUCCEEDED' AND d.reviewed_at IS NOT NULL)::int AS confirmed,
+  count(d.id) FILTER (WHERE d.status = 'SUCCEEDED' AND ${REVIEWED_AT_SQL} IS NOT NULL)::int AS confirmed,
   max(COALESCE(d.processed_at, d.updated_at)) FILTER (WHERE d.status IN ('SUCCEEDED','NEEDS_REVIEW','FAILED','QUARANTINED')) AS last_completed_at
 FROM ocr_batches b
 LEFT JOIN documents d ON d.batch_id = b.id AND d.organization_id = b.organization_id AND d.deleted_at IS NULL AND d.status <> 'DELETED'
@@ -146,6 +159,8 @@ WHERE b.organization_id = $1::uuid AND ($2::uuid IS NULL OR b.id = $2::uuid)
 GROUP BY b.id ORDER BY b.created_at DESC, b.id DESC LIMIT $3`;
 
 type Row = Record<string, unknown>;
+/** A replayed upload that is still SCANNING/CLEAN without a job after this long belongs to a request that died. */
+const RESUME_AFTER = "2 minutes";
 function iso(value: unknown): string | null { return value instanceof Date ? value.toISOString() : typeof value === "string" ? new Date(value).toISOString() : null; }
 function ms(value: unknown): number | null { return value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : null; }
 function str(value: unknown): string | null { return typeof value === "string" ? value : null; }
@@ -164,7 +179,10 @@ function toBatchSummary(row: Row): BatchSummary {
   const completed = succeeded + needsReview + failed;
   const lastCompleted = ms(row.last_completed_at);
   const finished = completed >= expectedTotal && lastCompleted !== null;
-  const end = finished ? lastCompleted : ms(row.db_now) ?? Date.now();
+  // Uploads rejected before persistence (or abandoned) never become documents, so a batch can stay below expectedTotal
+  // for good: the clock also stops at the last completion whenever nothing is queued or processing.
+  const idle = uploaded > 0 && num(row.queued) + num(row.processing) === 0 && lastCompleted !== null;
+  const end = finished || idle ? lastCompleted! : ms(row.db_now) ?? Date.now();
   const durationMs = uploaded > 0 ? Math.max(0, end - createdAt) : null;
   const throughputPerMinute = completed > 0 && durationMs !== null && durationMs > 0 ? Math.round((completed / (durationMs / 60_000)) * 100) / 100 : null;
   return { batchId: String(row.id), label: str(row.label), createdAt: iso(row.created_at) ?? "", expectedTotal, uploaded,
@@ -172,11 +190,17 @@ function toBatchSummary(row: Row): BatchSummary {
     finishedAt: finished ? iso(row.last_completed_at) : null, durationMs, throughputPerMinute };
 }
 
+/** Canonical view of a row; a confirmed row (see REVIEWED_AT_SQL) has nothing left to review. */
+function viewOf(row: Row): DocumentView {
+  const view = normalizeStructuredResult(row.structured_result);
+  return String(row.status) === "SUCCEEDED" && row.reviewed_at ? markReviewed(view) : view;
+}
+
 function toReviewDocument(row: Row): ReviewDocument {
   return {
     documentId: String(row.id), tenantId: String(row.organization_id), batchId: str(row.batch_id), filename: String(row.filename), mimeType: String(row.mime_type),
     status: String(row.status), ocrDocumentId: str(row.ocr_document_id), ocrEngine: str(row.ocr_engine), ocrVersion: str(row.ocr_version),
-    rawResponse: row.raw_response ?? null, structuredResult: normalizeStructuredResult(row.structured_result),
+    rawResponse: row.raw_response ?? null, structuredResult: viewOf(row),
     needsReview: row.needs_review === true, confirmStatus: str(row.confirm_status), reviewedAt: iso(row.reviewed_at), reviewedBy: str(row.reviewed_by),
     updatedAt: iso(row.updated_at) ?? "", errorMessage: str(row.error_message), createdAt: iso(row.created_at) ?? "", processedAt: iso(row.processed_at),
     deliveryStatus: delivery(row.delivery_status)
@@ -188,13 +212,28 @@ function toListItem(row: Row): DocumentListItem {
   return { documentId: String(row.id), batchId: str(row.batch_id), filename: String(row.filename), mimeType: String(row.mime_type), status,
     statusCategory: statusCategoryOf(status, row.reviewed_at) ?? "failed", needsReview: row.needs_review === true, errorMessage: str(row.error_message),
     createdAt: iso(row.created_at) ?? "", processedAt: iso(row.processed_at), reviewedAt: iso(row.reviewed_at), deliveryStatus: delivery(row.delivery_status),
-    summary: summarizeDocument(normalizeStructuredResult(row.structured_result)) };
+    summary: summarizeDocument(viewOf(row)) };
 }
 
-/** Legacy single-field confirm: sectioned rows keep therapistName/roomNo under `staffOnly`; old flat rows at the top level. */
-export function legacyFieldPath(structuredResult: unknown, field: string): string[] {
+/**
+ * Legacy single-field confirm: sectioned rows keep therapistName/roomNo under `staffOnly`; old flat rows at the top level.
+ * "treatment" on a sectioned row targets one canonical `staffOnly.treatments[i]` (`legacyTreatmentIndex` with the request's
+ * `raw`), or the v2.2 `staffOnly.treatment` object of a stored whole v2.2 response; CONFIRMATION_TARGET_AMBIGUOUS when no
+ * single item qualifies (instead of writing a top-level key the canonical view never reads).
+ */
+export function legacyFieldPath(structuredResult: unknown, field: string, raw = ""): string[] {
   const staffOnly = typeof structuredResult === "object" && structuredResult !== null ? (structuredResult as Row).staffOnly : undefined;
-  return (field === "therapistName" || field === "roomNo") && typeof staffOnly === "object" && staffOnly !== null && !Array.isArray(staffOnly) ? ["staffOnly", field] : [field];
+  if (typeof staffOnly !== "object" || staffOnly === null || Array.isArray(staffOnly)) return [field];
+  const staff = staffOnly as Row;
+  if (field === "therapistName" || field === "roomNo") return ["staffOnly", field];
+  if (field !== "treatment") return [field];
+  if (Array.isArray(staff.treatments) && staff.treatments.length > 0) {
+    const index = legacyTreatmentIndex(staff.treatments, raw);
+    if (index === null) throw new Error("CONFIRMATION_TARGET_AMBIGUOUS");
+    return ["staffOnly", "treatments", String(index)];
+  }
+  if (typeof staff.treatment === "object" && staff.treatment !== null && !Array.isArray(staff.treatment)) return ["staffOnly", "treatment"];
+  throw new Error("CONFIRMATION_TARGET_AMBIGUOUS");
 }
 
 export class PostgresOcrDocumentStore implements ReviewStore {
@@ -291,12 +330,18 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     finally { client.release(); }
   }
 
-  async findIdempotentUpload(input: { tenantId: string; idempotencyKey?: string; requestFingerprint: string }): Promise<UploadedDocument & { jobId?: string } | null> {
+  /**
+   * The upload an idempotency key already created, with its job (if any). `status`, `storageKey` and `stale` let a replay
+   * resume an upload whose request died before it was enqueued (`stale`: untouched for RESUME_AFTER, far longer than
+   * the scan and the two status transactions of a live request can take).
+   */
+  async findIdempotentUpload(input: { tenantId: string; idempotencyKey?: string; requestFingerprint: string }): Promise<UploadedDocument & { jobId?: string; status?: string; storageKey?: string; stale?: boolean } | null> {
     if (!input.idempotencyKey) return null;
     const client = await this.pool.connect();
     try { await client.query("BEGIN"); await client.query("SELECT set_config('app.current_org', $1, true)", [input.tenantId]);
-      const result = await client.query<{ document_id: string; request_fingerprint: string; run_id: string; job_id: string | null; batch_id: string | null }>(
-        `SELECT i.document_id, i.request_fingerprint, r.id AS run_id, j.id AS job_id, d.batch_id
+      const result = await client.query<{ document_id: string; request_fingerprint: string; run_id: string; job_id: string | null; batch_id: string | null; status: string | null; storage_key: string | null; stale: boolean | null }>(
+        `SELECT i.document_id, i.request_fingerprint, r.id AS run_id, j.id AS job_id, d.batch_id, d.status::text AS status, d.storage_key,
+                d.updated_at < now() - interval '${RESUME_AFTER}' AS stale
          FROM upload_idempotency_keys i JOIN document_runs r ON r.document_id=i.document_id AND r.organization_id=i.organization_id
          LEFT JOIN documents d ON d.id=i.document_id AND d.organization_id=i.organization_id
          LEFT JOIN extraction_jobs j ON j.run_id=r.id AND j.organization_id=r.organization_id
@@ -305,7 +350,8 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       const row = result.rows[0];
       if (!row) { await client.query("COMMIT"); return null; }
       if (row.request_fingerprint !== input.requestFingerprint) throw new Error("IDEMPOTENCY_CONFLICT");
-      await client.query("COMMIT"); return { tenantId: input.tenantId, documentId: row.document_id, runId: row.run_id, ...(row.job_id ? { jobId: row.job_id } : {}), ...(row.batch_id ? { batchId: row.batch_id } : {}) };
+      await client.query("COMMIT"); return { tenantId: input.tenantId, documentId: row.document_id, runId: row.run_id, ...(row.job_id ? { jobId: row.job_id } : {}), ...(row.batch_id ? { batchId: row.batch_id } : {}),
+        ...(row.status ? { status: row.status } : {}), ...(row.storage_key ? { storageKey: row.storage_key } : {}), stale: row.stale === true };
     } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; } finally { client.release(); }
   }
 
@@ -327,6 +373,20 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     const client = await this.pool.connect();
     try { await client.query("BEGIN"); await client.query("SELECT set_config('app.current_org', $1, true)", [tenantId]); const result = await client.query("UPDATE documents SET status='FAILED', error_message=$1, updated_at=now() WHERE id=$2::uuid AND organization_id=$3::uuid", [message.slice(0, 4000), documentId, tenantId]); if (result.rowCount !== 1) throw new Error("DOCUMENT_NOT_FOUND_OR_FORBIDDEN"); await client.query("COMMIT"); }
     catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; } finally { client.release(); }
+  }
+
+  /**
+   * The job of `runId` is DEAD but its document could not be loaded by the worker: mark the document FAILED (retryable)
+   * instead of leaving it queued forever. Only CLEAN/PROCESSING rows change. Returns whether a row changed.
+   */
+  async markRunFailure(tenantId: string, runId: string, message: string): Promise<boolean> {
+    return this.tenantTransaction(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE documents d SET status='FAILED', error_message=$1, updated_at=now() FROM document_runs r
+         WHERE r.id=$2::uuid AND r.organization_id=$3::uuid AND d.id=r.document_id AND d.organization_id=r.organization_id
+           AND d.deleted_at IS NULL AND d.status IN ('CLEAN','PROCESSING')`, [message.slice(0, 4000), runId, tenantId]);
+      return result.rowCount === 1;
+    });
   }
 
   /** The queue will retry the job: back to CLEAN (queued) with error_message `RETRYING: …`. */
@@ -378,9 +438,10 @@ export class PostgresOcrDocumentStore implements ReviewStore {
   }
 
   /**
-   * Legacy single-field confirm (flow unchanged). Path-aware: when the stored result has `staffOnly`, therapistName/roomNo
-   * resolve to `staffOnly.<field>`; otherwise the top level (old flat rows). The confirmed field gets `needsReview:false`;
-   * the audit row keeps the pre-correction raw/value.
+   * Legacy single-field confirm (flow unchanged). Path-aware (`legacyFieldPath`, with `audit.raw` choosing the treatment
+   * item). The PENDING call writes the value and `needsReview:false`; the later SUCCEEDED/RETRY calls of the same
+   * confirmation only update statuses, so they never re-resolve (and possibly move) the target. The audit row keeps the
+   * pre-correction raw/value.
    */
   async saveCorrection(tenantId: string, documentId: string, field: string, value: string, confirmStatus: ConfirmStatus, confirmError?: string, remainingNeedsReview?: boolean, audit: CorrectionAudit = { raw: "", verifiedBy: tenantId }): Promise<void> {
     const client = await this.pool.connect();
@@ -390,14 +451,15 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       const current = await client.query<{ structured_result: unknown }>("SELECT structured_result FROM documents WHERE id=$1::uuid AND organization_id=$2::uuid AND deleted_at IS NULL FOR UPDATE", [documentId, tenantId]);
       if (!current.rows[0]) throw new Error("DOCUMENT_NOT_FOUND_OR_FORBIDDEN");
       const stored = current.rows[0].structured_result;
-      const path = legacyFieldPath(stored, field);
-      const previous = path.reduce<unknown>((node, key) => typeof node === "object" && node !== null ? (node as Row)[key] : undefined, stored);
-      const previousField: Row = typeof previous === "object" && previous !== null ? previous as Row : {};
+      const path = confirmStatus === "PENDING" ? legacyFieldPath(stored, field, audit.raw) : null;
+      const previous = (path ?? []).reduce<unknown>((node, key) => typeof node === "object" && node !== null ? (node as Row)[key] : undefined, stored);
+      const previousField: Row = path && typeof previous === "object" && previous !== null ? previous as Row : {};
       const result = await client.query(
         `UPDATE documents
-         SET structured_result = jsonb_set(CASE WHEN jsonb_typeof(structured_result) = 'object' THEN structured_result ELSE '{}'::jsonb END, $7::text[],
+         SET structured_result = CASE WHEN $7::text[] IS NULL THEN structured_result ELSE
+               jsonb_set(CASE WHEN jsonb_typeof(structured_result) = 'object' THEN structured_result ELSE '{}'::jsonb END, $7::text[],
                (CASE WHEN jsonb_typeof(structured_result #> $7::text[]) = 'object' THEN structured_result #> $7::text[] ELSE '{}'::jsonb END)
-                 || jsonb_build_object('value', to_jsonb($1::text), 'needsReview', false), true),
+                 || jsonb_build_object('value', to_jsonb($1::text), 'needsReview', false), true) END,
              needs_review = CASE WHEN $2 = 'SUCCEEDED' AND $6::boolean IS NOT NULL THEN $6::boolean WHEN $2 = 'SUCCEEDED' THEN false ELSE needs_review END,
              status = CASE WHEN $2 = 'SUCCEEDED' AND COALESCE($6::boolean, false) = false THEN 'SUCCEEDED'::document_status ELSE status END,
              confirm_status = $2, confirm_error = $3, confirmed_at = CASE WHEN $2 = 'SUCCEEDED' THEN now() ELSE confirmed_at END,
@@ -451,13 +513,13 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     });
   }
 
-  async getOriginal(tenantId: string, documentId: string): Promise<{ storageKey: string; mimeType: string } | null> {
+  async getOriginal(tenantId: string, documentId: string): Promise<{ storageKey: string; mimeType: string; status: string } | null> {
     if (!isUuid(documentId)) return null;
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
       await client.query("SELECT set_config('app.current_org', $1, true)", [tenantId]);
-      const result = await client.query<{ storageKey: string; mimeType: string }>("SELECT storage_key AS \"storageKey\", mime_type AS \"mimeType\" FROM documents WHERE id=$1::uuid AND organization_id=$2::uuid AND deleted_at IS NULL", [documentId, tenantId]);
+      const result = await client.query<{ storageKey: string; mimeType: string; status: string }>("SELECT storage_key AS \"storageKey\", mime_type AS \"mimeType\", status::text AS status FROM documents WHERE id=$1::uuid AND organization_id=$2::uuid AND deleted_at IS NULL", [documentId, tenantId]);
       await client.query("COMMIT");
       return result.rows[0] ?? null;
     } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; }
@@ -517,7 +579,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       const total = await client.query<{ total: number }>(`SELECT count(*)::int AS total FROM documents d WHERE ${condition}`, params);
       const rows = await client.query<Row>(
         `SELECT d.id, d.batch_id, d.filename, d.mime_type, d.status::text AS status, d.needs_review, d.error_message, d.created_at, d.processed_at,
-                d.reviewed_at, d.structured_result, ${DELIVERY_SQL} AS delivery_status
+                ${REVIEWED_AT_SQL} AS reviewed_at, d.structured_result, ${DELIVERY_SQL} AS delivery_status
          FROM documents d WHERE ${condition} ORDER BY d.created_at DESC, d.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]);
       return { total: total.rows[0]?.total ?? 0, documents: rows.rows.map(toListItem) };
@@ -560,14 +622,16 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     const expected = input.expectedUpdatedAt === undefined ? null : Date.parse(input.expectedUpdatedAt);
     if (!reviewedBy || (expected !== null && !Number.isFinite(expected))) throw new Error("REVIEW_INVALID");
     return this.tenantTransaction(tenantId, async (client) => {
-      const locked = await client.query<{ status: string; structured_result: unknown; updated_at: unknown; ocr_document_id: string | null }>(
-        "SELECT status::text AS status, structured_result, updated_at, ocr_document_id FROM documents WHERE id=$1::uuid AND organization_id=$2::uuid AND deleted_at IS NULL FOR UPDATE",
+      const locked = await client.query<{ status: string; structured_result: unknown; updated_at: unknown; ocr_document_id: string | null; reviewed_at: unknown }>(
+        `SELECT d.status::text AS status, d.structured_result, d.updated_at, d.ocr_document_id, ${REVIEWED_AT_SQL} AS reviewed_at
+         FROM documents d WHERE d.id=$1::uuid AND d.organization_id=$2::uuid AND d.deleted_at IS NULL FOR UPDATE`,
         [documentId, tenantId]);
       const row = locked.rows[0];
       if (!row) throw new Error("DOCUMENT_NOT_FOUND");
       if (row.status !== "NEEDS_REVIEW" && row.status !== "SUCCEEDED") throw new Error("DOCUMENT_NOT_REVIEWABLE");
       if (expected !== null && ms(row.updated_at) !== expected) throw new Error("REVIEW_CONFLICT");
-      const { merged, changes } = applyReviewEdits(normalizeStructuredResult(row.structured_result), input.structuredResult);
+      // viewOf: fields of an already confirmed row (e.g. v2.2 confirmations) are not re-sent to the provider as "flagged".
+      const { merged, changes } = applyReviewEdits(viewOf(row), input.structuredResult);
       const deliver = row.ocr_document_id !== null && changes.some((change) => change.provider);
       await client.query(
         `UPDATE documents SET structured_result=$1::jsonb, needs_review=false, status='SUCCEEDED', reviewed_at=now(), reviewed_by=$2,

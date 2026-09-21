@@ -64,6 +64,10 @@ Engine `typhoon-sections`, version `3.0`. Backward compatible with v2.2 clients:
 - Empty but confidently blank field: `{raw:null, value:null, confidence:≥0.9, source:"ink-mark", needsReview:false}`.
 - Confirm API unchanged: `POST /v1/ocr/confirm {documentId, field: "treatment"|"therapist", raw, verifiedValue}`.
   Verified memory lookup for treatments tries `nameRaw` first, then `raw`.
+- Inputs: PDF first page when `pypdfium2`/PyMuPDF is installed (the production base image has `pypdfium2`), rendered under a
+  process-wide lock (neither library is thread-safe) with the long side at 1610 px; pages over 14400 pt → 400. Raster images
+  over 89.5 MP → 400. `GET /health` answers `status:"degraded"` (HTTP 200) while `master_data.json` does not load; the last
+  good master data keeps being served.
 
 ## 2. Canonical structured result stored by the app (`documents.structured_result`)
 
@@ -79,8 +83,10 @@ The app never stores evidence/timings in `structured_result` (they stay in `raw_
 Legacy rows already in production are flat v2.2 staff results
 (`{treatment:{raw,durations,items,needsReview}, therapistName, roomNo}`) or whole v2.2 responses
 (`{documentId, staffOnly:{treatment,...}}`). `normalizeStructuredResult(value)` converts any of these
-to the canonical shape (legacy `treatment.items` → `staffOnly.treatments`). Every read path
-(list, review GET, review save, legacy confirm) goes through it.
+to the canonical shape (legacy `treatment.items` → `staffOnly.treatments`; a v2.2 confirmation stored as
+`treatment.value` becomes a human item: overlaid on the single item, or one item replacing several). Every read path
+(list, review GET, review save, legacy confirm) goes through it. A confirmed row (§3) is read with every `needsReview`
+cleared, because v2.2 confirmations only wrote `value`.
 
 ## 3. Database — migration `prisma/migrations/0017_batch_processing/migration.sql`
 
@@ -117,7 +123,9 @@ GRANT REFERENCES ON ocr_batches TO ocr_app, ocr_worker;
 Batch counters are derived from document rows on read (no stored counters → nothing to drift or repair).
 Status buckets: `VALIDATING|SCANNING|CLEAN → queued`, `PROCESSING → processing`, `SUCCEEDED → succeeded`,
 `NEEDS_REVIEW → needsReview`, `FAILED|QUARANTINED → failed`, `DELETED` excluded.
-`confirmed` = rows with `reviewed_at IS NOT NULL` (a subset of succeeded).
+`confirmed` = SUCCEEDED rows with `reviewed_at IS NOT NULL`, or confirmed field by field through the legacy confirm endpoint
+(`confirm_status = 'SUCCEEDED'` and `confirmed_at` set — every v2.2 confirmation, which never set `reviewed_at`); a subset of
+succeeded. Derived on read: the migrator cannot backfill rows through FORCE RLS, and 0017 must not be edited (checksums).
 
 Provisioning (`deploy/provision-roles.sh`, bootstrap/superuser section): also record the production-only
 manual fix for the confirm outbox — `GRANT SELECT, UPDATE ON ocr_confirm_outbox TO ocr_queue_definer`,
@@ -146,8 +154,12 @@ export function applyReviewEdits(current: DocumentView, edited: unknown): { merg
 `applyReviewEdits` rules: only `value` and `duration` leaves are editable, plus adding/removing items of
 known arrays (`staffOnly.treatments`, `customerInformation.referralSources|healthConditions`,
 `recommendationCard.massageOilScrub|preferredAreas|avoidAreas`). All other keys come from `current`
-(raw/confidence/source preserved; unknown keys preserved). Values are strings ≤ 500 chars (else
-`REVIEW_INVALID`), at most 50 items per array. After merge every field gets `needsReview:false`; changed
+(raw/confidence/source preserved; unknown keys preserved). Values are strings ≤ 500 chars without NUL or unpaired
+surrogates (else `REVIEW_INVALID`), at most 50 items per array. Removed items are reported at their original index as
+`<array>[i].removed`, so they never share a correction field with the item edited at that index. A changed duration
+recomputes `durationMinutes` with the Local AI duration grammar (`parseDurationMinutes`, shared table
+`local-ai/tests/duration_cases.json`); a string that is not exactly one duration gives `null`.
+After merge every field gets `needsReview:false`; changed
 fields get `source:"human"` and keep `raw`. Added array items get `raw:null, source:"human"`.
 `provider` is set for treatment items (`field:"treatment"`, `raw = nameRaw ?? raw`) and
 `staffOnly.therapistName` (`field:"therapist"`) when the value changed OR the field had `needsReview:true`,
@@ -161,7 +173,8 @@ type BatchSummary = { batchId: string; label: string|null; createdAt: string; ex
   uploaded: number; queued: number; processing: number; succeeded: number; needsReview: number;
   failed: number; confirmed: number; completed: number /* succeeded+needsReview+failed */;
   finishedAt: string|null /* max(processed_at) once completed===expectedTotal */;
-  durationMs: number|null; throughputPerMinute: number|null };
+  durationMs: number|null /* createdAt → last completion once nothing is queued/processing (also when fewer files than
+    expected ever arrive), else → now */; throughputPerMinute: number|null };
 createBatch(tenantId, { createdBy, expectedTotal, label? }): Promise<BatchSummary>
 getBatch(tenantId, batchId): Promise<BatchSummary|null>
 listBatches(tenantId, limit = 20): Promise<BatchSummary[]>
@@ -172,6 +185,7 @@ type DocumentListItem = { documentId: string; batchId: string|null; filename: st
   needsReview: boolean; errorMessage: string|null; createdAt: string; processedAt: string|null;
   reviewedAt: string|null; deliveryStatus: DeliveryStatus; summary: DocumentSummary };
 type DeliveryStatus = "NONE"|"PENDING"|"DELIVERED"|"RETRYING"|"FAILED"; // derived from ocr_confirm_outbox rows of the document
+// (latest correction per field; ties within one review prefer the correction that has an outbox row)
 listDocuments(tenantId, { limit /*1..200, default 50*/, offset, status?: statusCategory, q?: string, batchId?: string }):
   Promise<{ total: number; documents: DocumentListItem[] }>
 // q: case-insensitive match on filename, customerInformation.name.value, staffOnly.therapistName.value (escape % _ \)
@@ -191,9 +205,16 @@ markRetrying(tenantId, documentId, message): Promise<void>   // status CLEAN, er
 ```
 
 `getReviewDocument` keeps its fields and adds `batchId, reviewedAt, reviewedBy, updatedAt, errorMessage,
-createdAt, processedAt, deliveryStatus`; its `structuredResult` is the canonical view.
+createdAt, processedAt, deliveryStatus`; its `structuredResult` is the canonical view. `reviewedAt` (also in the list) is
+`reviewed_at`, or `confirmed_at` for rows confirmed through the legacy endpoint (§3).
 Legacy `saveCorrection(…, field, …)` becomes path-aware: when the stored result has `staffOnly`,
-`therapistName|roomNo` resolve to `staffOnly.<field>`; otherwise top-level (old flat rows).
+`therapistName|roomNo` resolve to `staffOnly.<field>`, and `treatment` to the one `staffOnly.treatments[i]` chosen by
+`legacyTreatmentIndex(items, audit.raw)` (item whose `nameRaw`/`raw` equals the request raw, else the only flagged item, else
+the only item; a stored whole v2.2 response uses its `staffOnly.treatment` object) — `CONFIRMATION_TARGET_AMBIGUOUS` when no
+single item qualifies, before anything is written or sent to the provider; otherwise top-level (old flat rows). Only the
+PENDING call writes the value; the SUCCEEDED/RETRY calls of the same confirmation update statuses only.
+`getOriginal` also returns the document `status`. `findIdempotentUpload` also returns `status`, `storageKey` and `stale`
+(no update for 2 minutes). `markRunFailure(tenantId, runId, message)` marks the run's CLEAN/PROCESSING document FAILED.
 
 `packages/queue/src/postgres.ts`: add `finishDetailed(jobId, leaseToken, outcome, error?) →
 { accepted: boolean; finalStatus: "PENDING"|"SUCCEEDED"|"FAILED"|"DEAD"|null }` using the `final_status`
@@ -204,8 +225,10 @@ column already returned by `ocr_finish_retry_v1`. Keep `finish()`.
 All `/api/*` routes except `/api/web-token` authenticate with the Bearer JWT (`principalFor`); tenant is
 always `principal.tenantId` (headers such as `x-tenant-id` are ignored). Error body `{ error: CODE }`.
 Status mapping: auth errors 401; `*_NOT_FOUND` 404; `BATCH_FULL`, `IDEMPOTENCY_CONFLICT`,
-`DOCUMENT_NOT_RETRYABLE`, `DOCUMENT_NOT_REVIEWABLE`, `REVIEW_CONFLICT` 409; `PAYLOAD_TOO_LARGE` 413;
-`UNSUPPORTED_MEDIA_TYPE` 415; other validation 400.
+`DOCUMENT_NOT_RETRYABLE`, `DOCUMENT_NOT_REVIEWABLE`, `REVIEW_CONFLICT`, `DOCUMENT_QUARANTINED`, `DOCUMENT_NOT_SCANNED`,
+`CONFIRMATION_TARGET_AMBIGUOUS`, `UPLOAD_IN_PROGRESS` 409; `PAYLOAD_TOO_LARGE` 413;
+`UNSUPPORTED_MEDIA_TYPE` 415; other validation 400 (incl. NUL characters in `q` → `INVALID_QUERY` and in a legacy
+confirmation → `INVALID_CONFIRMATION`).
 
 | Method | Path | Body / query | Response |
 |---|---|---|---|
@@ -218,12 +241,16 @@ Status mapping: auth errors 401; `*_NOT_FOUND` 404; `BATCH_FULL`, `IDEMPOTENCY_C
 | POST | `/api/documents` | raw body (existing) + optional `X-Batch-Id: <uuid>`; `X-Upload-Filename-Encoding: uri` ⇒ filename is `encodeURIComponent`-encoded | 202 (existing shape + `batchId`) |
 | GET | `/api/documents` | `?limit&offset&status&q&batchId` | 200 `{ total, limit, offset, documents: DocumentListItem[] }` |
 | GET | `/api/documents/:id/ocr` | – | 200 `{ document: ReviewDocument }` (extended) |
-| GET | `/api/documents/:id/content` | – | original bytes (existing) |
+| GET | `/api/documents/:id/content` | – | original bytes (existing); 409 `DOCUMENT_QUARANTINED` for QUARANTINED, `DOCUMENT_NOT_SCANNED` for VALIDATING/SCANNING (quarantined bytes never reach a browser) |
 | POST | `/api/documents/:id/ocr/review` | `{ structuredResult, expectedUpdatedAt? }` (≤1 MiB) | 200 `{ status:"confirmed", delivery, corrections, document }` |
 | POST | `/api/documents/:id/retry` | – | 202 `{ status:"queued", jobId }` |
-| POST | `/api/documents/:id/ocr/confirm` | legacy single field | unchanged behaviour, path-aware |
+| POST | `/api/documents/:id/ocr/confirm` | legacy single field | unchanged behaviour, path-aware (§4); for `treatment` only the confirmed item is excluded from the "anything else flagged?" check |
 
 Invalid UUIDs in path/query → 404 (`DOCUMENT_NOT_FOUND`/`BATCH_NOT_FOUND`) without hitting SQL casts.
+Upload replays (same `Idempotency-Key`): an upload whose request died after persisting but before it was queued
+(SCANNING/CLEAN, no job) is resumed (scan → status → enqueue) once it has been untouched for 2 minutes; earlier the replay
+answers 409 `UPLOAD_IN_PROGRESS` (retryable) so a live request is never duplicated. A staged original that no document
+references (BATCH_FULL, BATCH_NOT_FOUND, IDEMPOTENCY_CONFLICT, or a lost idempotency race) is deleted.
 HTML responses add `x-content-type-options: nosniff`, `referrer-policy: no-referrer`,
 `content-security-policy` with `frame-ancestors 'none'`, `img-src 'self' blob: data:`,
 `frame-src 'self' blob:`, `script-src 'nonce-…'`, fonts only from Google Fonts.
@@ -238,6 +265,11 @@ HTML responses add `x-content-type-options: nosniff`, `referrer-policy: no-refer
 - Concurrency: `OCR_WORKER_CONCURRENCY` (1..8, default 2) independent job loops; one maintenance loop
   (every 1 s: `queue.recoverExpired`, `outbox.recoverExpired`, drain up to 10 outbox items). Every loop
   catches and logs errors with backoff (an exception must never kill a loop). Heartbeat unchanged (30 s).
+- OCR availability gate (shared by the job loops): an OCR transport failure (network, timeout, retryable 5xx/429/408)
+  stops all claiming for an exponential backoff (idle · 2^n, capped at 30 s); then one loop probes `GET /health` and runs a
+  single trial job; only a request that reached the OCR API reopens the gate. A Local AI restart costs at most one attempt
+  per loop instead of every queued job's attempts (the SQL retry delay is fixed and owned by `ocr_queue_definer`).
+- A DEAD job whose document could not be loaded marks the run's document FAILED (`markRunFailure`), never leaving it queued.
 - Outbox sender keeps `therapistName → therapist` mapping (new payloads already use `therapist`).
 
 ## 7. UI — `apps/ocr-web/src/workbench.ts`
@@ -254,16 +286,20 @@ display tracking −0.04em, body 14px, inputs ≥16px, 150 ms motion, `prefers-r
 Behaviour: header with connection status (auto-auth via `/api/web-token`, token kept in memory only);
 multi-file picker + drag/drop (≤100 files per selection, accept PNG/JPEG/WebP/PDF); `POST /api/batches`
 then per-file raw uploads (3 concurrent, XHR progress, `X-Batch-Id`, URI-encoded filename, per-file
-Idempotency-Key, per-file retry; one failure never blocks siblings); batch summary strip (total, queued,
+Idempotency-Key, per-file retry; one failure never blocks siblings; files the server always rejects — 0 bytes, over
+200 MB, names over 120 code points / 1080 UTF-8 bytes, other types — are refused before the batch is created and not counted
+in its total; deterministic upload errors get no retry button); batch summary strip (total, queued,
 processing, succeeded, needs review, failed, confirmed, elapsed, docs/min) from `GET /api/batches/:id`,
-restored after reload from `GET /api/batches?limit=1`; server-side search + status filter + batch
+restored after reload from `GET /api/batches?limit=1`; a batch with missing files that can no longer arrive (nothing
+pending, retryable or in flight) is shown as finished; server-side search + status filter + batch
 filter + pagination against `GET /api/documents`; table columns File, Customer, Gender, Nationality,
 Treatment (all treatments, one per line), Duration, Therapist, Room, Status, Confidence (min %, `—` if none),
 Actions (Review/Edit, Retry for failed); rows needing review highlighted; `—` for missing values;
 review drawer (`<dialog>`): original preview (image/PDF, zoom), grouped editor for customer /
 recommendation / staff sections, needsReview fields highlighted with raw OCR text shown, repeatable
 treatment items (add/remove), checkbox arrays editable as lists, “บันทึกและยืนยัน” posts the full edited
-`structuredResult` with `expectedUpdatedAt`, shows delivery state, conflicts keep the draft; optional
+`structuredResult` with `expectedUpdatedAt` (the editor is inert while the save is in flight), shows delivery state,
+conflicts keep the draft; QUARANTINED rows offer no preview, link or retry (retry only for FAILED); optional
 raw JSON (`rawResponse`) in a collapsed details block; open drawer from `?document=<id>`; polling every
 3 s while work is active, 15 s otherwise, paused when the tab is hidden, never overwriting a dirty draft.
 All OCR text enters the DOM via `textContent`.

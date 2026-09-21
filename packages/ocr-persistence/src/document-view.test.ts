@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { applyReviewEdits, normalizeStructuredResult, parseDurationMinutes, summarizeDocument, toStructuredResult, type DocumentView } from "./document-view.js";
+import { applyReviewEdits, legacyTreatmentIndex, markReviewed, normalizeStructuredResult, parseDurationMinutes, summarizeDocument, toStructuredResult, type DocumentView } from "./document-view.js";
 import { hasReviewFields } from "./index.js";
 
 const field = (raw: string | null, value: string | null, confidence: number, needsReview = false, source = "ocr") => ({ raw, value, confidence, source, needsReview });
@@ -112,6 +113,13 @@ test("parseDurationMinutes understands Thai and English units", () => {
   assert.equal(parseDurationMinutes(null), null);
 });
 
+test("parseDurationMinutes reads durations exactly like the Local AI (shared table) and never half-parses", () => {
+  const shared = JSON.parse(readFileSync(new URL("../../../local-ai/tests/duration_cases.json", import.meta.url), "utf8")) as { cases: Array<[string, number]> };
+  assert.ok(shared.cases.length >= 15);
+  for (const [duration, minutes] of shared.cases) assert.equal(parseDurationMinutes(duration), minutes, duration);
+  for (const duration of ["90 นาที + 1 ชม.", "1 ชม. 2.5 ชม.", "ไทย 90 นาที", "10:30", "90 นาที ประมาณ", ""]) assert.equal(parseDurationMinutes(duration), null, duration);
+});
+
 test("summarizeDocument extracts table columns, min confidence and review count", () => {
   const summary = summarizeDocument(normalizeStructuredResult(v3Response));
   assert.deepEqual(summary, {
@@ -169,7 +177,7 @@ test("applyReviewEdits: treatments support edit, removal and addition without mi
   assert.deepEqual(changes.filter((change) => change.path.startsWith("staffOnly.treatments")), [
     { path: "staffOnly.treatments[0]", oldRaw: "ฟุต 60 นาที", oldValue: null, newValue: "นวดเท้า", provider: { field: "treatment", raw: "ฟุต", verifiedValue: "นวดเท้า" } },
     { path: "staffOnly.treatments[1]", oldRaw: null, oldValue: null, newValue: "สครับ" },
-    { path: "staffOnly.treatments[0]", oldRaw: "ไทย 90 นาที", oldValue: "นวดไทย", newValue: null }
+    { path: "staffOnly.treatments[0].removed", oldRaw: "ไทย 90 นาที", oldValue: "นวดไทย", newValue: null }
   ]);
   assert.equal(thai!.value, "นวดไทย");
 });
@@ -197,7 +205,7 @@ test("applyReviewEdits: checkbox arrays are editable as lists of strings or item
   assert.deepEqual(merged.customerInformation.referralSources, []);
   // staffOnly was not sent: its needsReview therapist is accepted (needsReview:false) but not sent to provider memory.
   assert.deepEqual(changes, [
-    { path: "customerInformation.referralSources[0]", oldRaw: "Hotel", oldValue: "Hotel", newValue: null },
+    { path: "customerInformation.referralSources[0].removed", oldRaw: "Hotel", oldValue: "Hotel", newValue: null },
     { path: "customerInformation.healthConditions[1]", oldRaw: null, oldValue: null, newValue: "Pregnancy" }
   ]);
   assert.equal((merged.staffOnly.therapistName as Record<string, unknown>).needsReview, false);
@@ -227,6 +235,11 @@ test("applyReviewEdits rejects malformed or oversize input with REVIEW_INVALID",
   assert.throws(() => applyReviewEdits(current, { customerInformation: { name: { value: 5 } } }), invalid);
   assert.throws(() => applyReviewEdits(current, { customerInformation: { name: { value: "x".repeat(501) } } }), invalid);
   assert.doesNotThrow(() => applyReviewEdits(current, { customerInformation: { name: { value: "x".repeat(500) } } }));
+  // PostgreSQL cannot store NUL or unpaired surrogates in text/jsonb: 400, not a 500 from the database.
+  assert.throws(() => applyReviewEdits(current, { customerInformation: { name: { value: "Som\u0000chai" } } }), invalid);
+  assert.throws(() => applyReviewEdits(current, { customerInformation: { name: { value: "Som\ud800chai" } } }), invalid);
+  assert.throws(() => applyReviewEdits(current, { staffOnly: { treatments: [{ value: "นวดไทย", duration: "\udc0090 นาที" }] } }), invalid);
+  assert.doesNotThrow(() => applyReviewEdits(current, { customerInformation: { name: { value: "Chun 😀" } } }));
   assert.throws(() => applyReviewEdits(current, { staffOnly: { treatments: "ไทย" } }), invalid);
   assert.throws(() => applyReviewEdits(current, { staffOnly: { treatments: [42] } }), invalid);
   assert.throws(() => applyReviewEdits(current, { staffOnly: { treatments: [{ value: "a", duration: 90 }] } }), invalid);
@@ -240,4 +253,57 @@ test("applyReviewEdits on an empty legacy view can fill known fields", () => {
   assert.equal((merged.staffOnly.treatments as unknown[]).length, 1);
   assert.equal(changes.length, 2);
   assert.equal(changes.every((change) => change.provider === undefined), true);
+});
+
+/** v2.2 legacy confirm wrote `jsonb_set(structured_result, ARRAY['treatment','value'], …)` and left needsReview untouched. */
+const confirmedV2 = (items: unknown[], durations: string[]) => ({
+  treatment: { raw: "ฟุต 60 นาที", durations, items, needsReview: true, value: "นวดเท้า 60 นาที" },
+  therapistName: { ...field("พิพิ", null, 0.5, true, "master-fuzzy"), value: "พีพี" }, roomNo: field("12", "12", 0.95)
+});
+
+test("a v2.2 confirmed treatment (treatment.value) is a human item, and a later review save keeps it", () => {
+  const one = normalizeStructuredResult(confirmedV2([{ raw: "ฟุต", value: null, duration: "60 นาที", confidence: 0.41, source: "master-fuzzy", needsReview: true }], ["60 นาที"]));
+  assert.deepEqual(one.staffOnly.treatments, [{ raw: "ฟุต", value: "นวดเท้า 60 นาที", duration: "60 นาที", confidence: 1, source: "human", needsReview: false, nameRaw: "ฟุต", durationMinutes: 60 }]);
+  assert.deepEqual(summarizeDocument(one).treatments, [{ name: "นวดเท้า 60 นาที", duration: "60 นาที" }]);
+  const several = normalizeStructuredResult(confirmedV2(v2Treatment.items, ["90 นาที", "60 นาที"]));
+  assert.deepEqual(several.staffOnly.treatments, [{ raw: "ฟุต 60 นาที", nameRaw: "ฟุต 60 นาที", value: "นวดเท้า 60 นาที", duration: "90 นาที + 60 นาที", durationMinutes: null, confidence: 1, source: "human", needsReview: false }]);
+  const none = normalizeStructuredResult(confirmedV2([], ["60 นาที"]));
+  assert.deepEqual((none.staffOnly.treatments as Array<Record<string, unknown>>).map((item) => [item.value, item.duration, item.durationMinutes, item.needsReview]), [["นวดเท้า 60 นาที", "60 นาที", 60, false]]);
+  const edited = structuredClone(one);
+  (edited.staffOnly.roomNo as Record<string, unknown>).value = "14";
+  const { merged, changes } = applyReviewEdits(one, edited);
+  assert.equal((merged.staffOnly.treatments as Array<Record<string, unknown>>)[0]!.value, "นวดเท้า 60 นาที");
+  assert.equal(changes.some((change) => change.provider?.field === "treatment"), false, "a confirmed treatment is not re-sent to verified memory");
+});
+
+test("markReviewed clears stale needsReview flags of a confirmed document", () => {
+  const view = normalizeStructuredResult(confirmedV2([], []));
+  assert.equal(hasReviewFields(view), true);
+  assert.equal(markReviewed(view), view);
+  assert.equal(hasReviewFields(view), false);
+  const { changes } = applyReviewEdits(view, structuredClone(view));
+  assert.deepEqual(changes, [], "no provider confirmation for fields confirmed in v2.2");
+});
+
+test("legacyTreatmentIndex picks the confirmed treatment item or refuses to guess", () => {
+  const items = [treatment("ไทย 90 นาที", "ไทย", "นวดไทย", "90 นาที", 0.95), treatment("ฟุต 60 นาที", "ฟุต", null, "60 นาที", 0.41, true), treatment("หน้า 30 นาที", "หน้า", null, "30 นาที", 0.5, true)];
+  assert.equal(legacyTreatmentIndex(items, "ฟุต"), 1);
+  assert.equal(legacyTreatmentIndex(items, " หน้า 30 นาที "), 2);
+  assert.equal(legacyTreatmentIndex(items, "ไทย"), 0, "an exact raw match wins even when the item is not flagged");
+  assert.equal(legacyTreatmentIndex(items, "ใทบ"), null, "two flagged items and no match: ambiguous");
+  assert.equal(legacyTreatmentIndex(items.slice(0, 2), "ใทบ"), 1, "the only flagged item");
+  assert.equal(legacyTreatmentIndex(items.slice(0, 1), ""), 0, "the only item");
+  assert.equal(legacyTreatmentIndex([items[1], items[1]], "ฟุต"), null, "duplicates of a flagged item stay ambiguous");
+  assert.equal(legacyTreatmentIndex([], "ฟุต"), null);
+  assert.equal(legacyTreatmentIndex(["junk", items[1]], "ฟุต"), 1, "indices point into the stored array");
+});
+
+test("review removals never share a correction path with the item edited at that index", () => {
+  const current = v3View();
+  const [thai, foot] = structuredClone(current.staffOnly.treatments as Array<Record<string, unknown>>);
+  // Delete the first item and rename the second, which now sits at index 0 (one review, one verified_at).
+  const { changes } = applyReviewEdits(current, { staffOnly: { treatments: [{ ...foot, value: "นวดเท้า" }] } });
+  assert.deepEqual(changes.map((change) => change.path), ["staffOnly.treatments[0]", "staffOnly.treatments[0].removed"]);
+  assert.equal(changes[0]!.provider?.verifiedValue, "นวดเท้า");
+  assert.equal(thai!.value, "นวดไทย");
 });

@@ -1,6 +1,7 @@
 """Deterministic detection: checkboxes, handwriting boxes and body map (no model calls)."""
 
-from PIL import Image, ImageDraw
+import pytest
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 import ocr_layout as L
 import ocr_marks as M
@@ -152,3 +153,41 @@ def test_heavy_jpeg_still_finds_ticks(sample_image):
     assert result["text"] == {"name": "present", "nationality": "present", "hotelName": "empty"}
     # Known limitation: the scribble across the oil row loses its colour outside the boxes, so it is not recognised
     # as a stroke-through here (see README "Known limitations").
+
+
+def shaded(image, level, box=(0, 330, 420, 569), blur=12):
+    """A soft shadow (hand / phone) over the lower-left block: paper there drops to `level`."""
+    shade = Image.new("L", image.size, 255)
+    shade.paste(level, box)
+    shade = shade.filter(ImageFilter.GaussianBlur(blur))
+    return ImageChops.multiply(image, Image.merge("RGB", [shade] * 3))
+
+
+@pytest.mark.parametrize("level", [184, 160, 140])
+def test_shadowed_paper_is_not_ink(level):
+    """Shaded paper below the old absolute 185 threshold used to fill every health box ("checked", 0.99, no review)."""
+    result = analyse(shaded(S.filled_form(), level))
+    assert result["marked"] == {"gender.female": "checked", "healthConditions.menstruation": "checked", "pressure.standard": "checked"}
+
+
+@pytest.mark.parametrize("factor", [0.74, 0.72, 0.6])
+def test_dimmed_sample_keeps_its_marks(sample_image, factor):
+    result = analyse(Image.eval(sample_image, lambda v: int(v * factor)))
+    assert {k for k, v in result["marked"].items() if v == "checked"} == {k for k, v in SAMPLE_MARKED.items() if v == "checked"}
+    assert set(result["marked"]) <= set(SAMPLE_MARKED) | {f"massageOilScrub.{k}" for k, *_ in L.CHECKBOXES["massageOilScrub"]}
+    assert result["text"] == {"name": "present", "nationality": "present", "hotelName": "empty"}
+
+
+def test_paper_level_follows_local_shading():
+    paper = M.paper_level(shaded(S.blank_form(), 160).convert("L"))
+    assert paper.getpixel((600, 200)) >= 250 and 150 <= paper.getpixel((100, 450)) <= 170
+
+
+def test_implausible_checkbox_groups_are_reported():
+    image = S.blank_form()
+    draw = ImageDraw.Draw(image)
+    for key, *_ in L.CHECKBOXES["healthConditions"][:9]:
+        S.tick(draw, "healthConditions", key)
+    warnings = M.implausible_checkboxes(analyse(image)["boxes"])
+    assert warnings == ["9 of 16 healthConditions boxes read as checked; the page may be shaded or tinted"]
+    assert M.implausible_checkboxes(analyse(S.filled_form())["boxes"]) == []

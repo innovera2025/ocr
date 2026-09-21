@@ -40,9 +40,21 @@ test("legacy confirm resolves therapistName/roomNo under staffOnly only for sect
   assert.deepEqual(legacyFieldPath({ schemaVersion: 3, staffOnly: {} }, "therapistName"), ["staffOnly", "therapistName"]);
   assert.deepEqual(legacyFieldPath({ documentId: "x", staffOnly: { roomNo: {} } }, "roomNo"), ["staffOnly", "roomNo"]);
   assert.deepEqual(legacyFieldPath({ therapistName: { raw: "a" } }, "therapistName"), ["therapistName"]);
-  assert.deepEqual(legacyFieldPath({ staffOnly: {} }, "treatment"), ["treatment"]);
+  assert.deepEqual(legacyFieldPath({ treatment: { raw: "ไทย" } }, "treatment"), ["treatment"], "flat v2.2 rows keep the top-level object");
   assert.deepEqual(legacyFieldPath(null, "roomNo"), ["roomNo"]);
   assert.deepEqual(legacyFieldPath({ staffOnly: [] }, "roomNo"), ["roomNo"]);
+});
+
+test("legacy confirm of treatment targets one canonical item, never an orphan top-level key", () => {
+  const item = (nameRaw: string, needsReview: boolean) => ({ raw: `${nameRaw} 60 นาที`, nameRaw, value: null, needsReview });
+  const sectioned = { schemaVersion: 3, staffOnly: { treatments: [item("ไทย", false), item("ฟุต", true), item("หน้า", true)] } };
+  assert.deepEqual(legacyFieldPath(sectioned, "treatment", "ฟุต"), ["staffOnly", "treatments", "1"]);
+  assert.deepEqual(legacyFieldPath(sectioned, "treatment", "หน้า 60 นาที"), ["staffOnly", "treatments", "2"]);
+  assert.throws(() => legacyFieldPath(sectioned, "treatment", "ใทบ"), { message: "CONFIRMATION_TARGET_AMBIGUOUS" });
+  assert.throws(() => legacyFieldPath({ staffOnly: {} }, "treatment", "ไทย"), { message: "CONFIRMATION_TARGET_AMBIGUOUS" });
+  assert.throws(() => legacyFieldPath({ staffOnly: { treatments: [] } }, "treatment"), { message: "CONFIRMATION_TARGET_AMBIGUOUS" });
+  assert.deepEqual(legacyFieldPath({ staffOnly: { treatments: [item("ไทย", true)] } }, "treatment"), ["staffOnly", "treatments", "0"]);
+  assert.deepEqual(legacyFieldPath({ documentId: "x", staffOnly: { treatment: { raw: "ไทย" } } }, "treatment"), ["staffOnly", "treatment"], "whole v2.2 responses");
 });
 
 test("isUuid guards ids before they reach SQL casts", () => {

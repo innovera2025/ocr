@@ -35,6 +35,7 @@ export function createRuntimeIngest(pool: Pool, tenantId: string, idempotencyKey
       ...idempotency, ...(batchId ? { batchId } : {}), requestFingerprint: fingerprint(filename, mimeType, bytes)
     }),
     updateStatus: async ({ documentId, status, errorMessage }) => store.updateScanStatus(tenantId, documentId, status, errorMessage),
-    enqueuePersistent: async ({ runId }) => queue.enqueue({ organizationId: tenantId, runId })
+    enqueuePersistent: async ({ runId }) => queue.enqueue({ organizationId: tenantId, runId }),
+    discard: async (stagedKey) => storage.remove(stagedKey)
   };
 }

@@ -9,7 +9,7 @@ leader lines and figures). (b) is classic form dropout: it keeps black/red pens 
 
 import math
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageFilter
 
 import ocr_layout as L
 
@@ -18,6 +18,7 @@ BLUE_STRONG, LUM_STRONG = 10, 175      # blueness >= 10 and luminance < 175
 BLUE_FAINT, LUM_FAINT = 18, 215        # blueness >= 18 and luminance < 215 (faint, thin strokes)
 LUM_DARK = 60                          # any pixel darker than this (black pen); printed text is >= ~73
 LUM_PAPER, LUM_ANY_HUE, BLUE_MIN_PAPER = 185, 120, -25  # darker-than-paper inside blank zones (orange print excluded)
+PAPER_DROP = 255 - LUM_PAPER           # "darker than paper" = this much below the *local* paper level (white paper: < 185)
 FIGURE_LUM = 125                       # pen on the orange body figures shows up dark (orange is ~180)
 
 # Checkbox decision thresholds on the interior ink fraction.
@@ -43,13 +44,26 @@ def color_ink(rgb, lum):
     return ImageChops.lighter(ImageChops.lighter(strong, faint), dark)
 
 
-def darker_than_paper(rgb, lum):
-    """Any pixel clearly darker than paper, except orange/yellow print (blue far below red/green)."""
+def paper_level(lum):
+    """Local paper luminance (L image): the brightest level within ~10 px (4x reduce, 5x5 max filter, bilinear back up).
+    A shadow, a dim photocopy or a grayish photo lowers it, so shaded paper is not mistaken for ink."""
+    width, height = lum.size
+    small = lum.reduce(4) if min(width, height) >= 20 else lum
+    return small.filter(ImageFilter.MaxFilter(5)).resize((width, height), Image.BILINEAR)
+
+
+def darker_than_paper(rgb, lum, paper=None):
+    """Any pixel clearly darker than paper, except orange/yellow print (blue far below red/green). `paper` is the local
+    paper level (`paper_level`); without it the paper is taken as white."""
     r, g, b = rgb.split()
     # orange-ness = max(r, g) - b (clipped at 0); orange/yellow print has blue far below red/green
     not_orange = _mask(ImageChops.subtract(ImageChops.lighter(r, g), b), lambda v: v <= -BLUE_MIN_PAPER)
-    dark = ImageChops.darker(_mask(lum, lambda v: v < LUM_PAPER), not_orange)
-    return ImageChops.lighter(dark, _mask(lum, lambda v: v < LUM_ANY_HUE))
+    if paper is None:
+        below_paper = _mask(lum, lambda v: v < LUM_PAPER)
+    else:
+        below_paper = _mask(ImageChops.subtract(paper, lum), lambda v: v > PAPER_DROP)
+    very_dark = ImageChops.darker(below_paper, _mask(lum, lambda v: v < LUM_ANY_HUE))
+    return ImageChops.lighter(ImageChops.darker(below_paper, not_orange), very_dark)
 
 
 def blank_zones(size, dx=0, dy=0):
@@ -81,7 +95,7 @@ def ink_mask(rgb, lum=None, dx=0, dy=0):
     """Pen-ink mask (see module docstring) and the luminance image."""
     lum = lum if lum is not None else rgb.convert("L")
     blank = blank_zones(rgb.size, dx, dy)
-    return ImageChops.lighter(color_ink(rgb, lum), ImageChops.darker(darker_than_paper(rgb, lum), blank)), lum
+    return ImageChops.lighter(color_ink(rgb, lum), ImageChops.darker(darker_than_paper(rgb, lum, paper_level(lum)), blank)), lum
 
 
 def border_darkness(rgb, lum):
@@ -214,6 +228,17 @@ def detect_checkboxes(mask, dx=0, dy=0):
     mask_bytes = mask.tobytes()
     return {group: [(box[0], box[1], measure_checkbox(mask, mask_bytes, box, dx, dy)) for box in boxes]
             for group, boxes in L.CHECKBOXES.items()}
+
+
+def implausible_checkboxes(checkboxes, min_boxes=8):
+    """Warnings for multi-choice groups (>= min_boxes boxes) where more than half of the boxes read as checked: real
+    forms never look like that, a shaded or tinted page does. The caller flags every deterministic field for review."""
+    warnings = []
+    for group, items in checkboxes.items():
+        checked = sum(1 for _, _, m in items if m["state"] == "checked")
+        if group not in L.SINGLE_CHOICE and len(items) >= min_boxes and checked * 2 > len(items):
+            warnings.append(f"{checked} of {len(items)} {group} boxes read as checked; the page may be shaded or tinted")
+    return warnings
 
 
 def text_ink(mask, dx=0, dy=0):
