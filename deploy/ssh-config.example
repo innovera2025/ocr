@@ -1,0 +1,14 @@
+# Copy these entries to ~/.ssh/config for VS Code Remote-SSH.
+# Passwords are intentionally not stored here; VS Code will prompt securely.
+
+Host innovera-ai
+  HostName 187.53.143.23
+  User root
+  PreferredAuthentications password,keyboard-interactive
+  PubkeyAuthentication no
+
+Host innovera-app
+  HostName 72.61.123.78
+  User root
+  PreferredAuthentications password,keyboard-interactive
+  PubkeyAuthentication no
