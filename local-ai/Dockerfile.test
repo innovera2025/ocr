@@ -1,0 +1,7 @@
+# Throwaway test image (not used in production). Build without a context so no fixture is sent to the daemon:
+#   docker build -t ocr-local-ai-test:py311 - < local-ai/Dockerfile.test
+#   docker run --rm -v "$PWD/local-ai":/app -w /app -e PYTHONDONTWRITEBYTECODE=1 ocr-local-ai-test:py311
+FROM python:3.11-slim
+RUN pip install --no-cache-dir pillow numpy fastapi uvicorn python-multipart httpx pytest
+WORKDIR /app
+CMD ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"]

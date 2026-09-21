@@ -1,356 +1,322 @@
-import base64
-import json
-import re
-import difflib
+"""INNOVERA Local AI OCR service — schema v3 ("typhoon-sections").
+
+Full-document extraction for the Makkha intake form: deterministic checkbox / body-map / empty-box detection plus
+two concurrent Typhoon OCR section calls (STAFF ONLY and CUSTOMER INFORMATION handwriting).
+"""
+
+import functools
+import io
+import os
+import time
 import uuid
-import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
-from PIL import Image
+from PIL import Image, ImageOps, UnidentifiedImageError
+from pydantic import BaseModel
 
-app = FastAPI(title="INNOVERA OCR API", version="2.2")
+import ocr_layout as L
+import ocr_marks as M
+import ocr_model
+import ocr_normalize as N
 
-MODEL = "scb10x/typhoon-ocr1.5-3b"
-OLLAMA = "http://host.docker.internal:11434/v1/chat/completions"
+VERSION, ENGINE, SCHEMA_VERSION = "3.0", "typhoon-sections", 3
+app = FastAPI(title="INNOVERA OCR API", version=VERSION)
 
-UPLOAD_DIR = Path("/app/uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
-
-VERIFIED_FILE = Path("/app/verified_dataset/corrections.jsonl")
-
-TREATMENTS = [
-    "คอ บ่า ไหล่",
-    "นวดไทย",
-    "นวดน้ำมัน",
-    "อโรมา",
-    "นวดเท้า",
-    "Thai Massage",
-    "Oil Massage",
-    "Foot Massage",
-]
-
-THERAPISTS = [
-    "ฟ้า",
-    "พีพี",
-    "เอี้ยง",
-]
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+MIME_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf"}
+TEMPLATE_MIN_CONTRAST = 15  # mean printed-checkbox ring contrast below this => not the expected form / badly aligned
 
 
-def call_ocr(image_path, prompt, max_tokens=220):
-    with open(image_path, "rb") as f:
-        encoded = base64.b64encode(f.read()).decode()
-
-    payload = {
-        "model": MODEL,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "data:image/png;base64," + encoded
-                    }
-                }
-            ]
-        }],
-        "temperature": 0,
-        "max_tokens": max_tokens
-    }
-
-    req = urllib.request.Request(
-        OLLAMA,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"}
-    )
-
-    with urllib.request.urlopen(req, timeout=600) as r:
-        result = json.loads(r.read().decode("utf-8"))
-
-    return result["choices"][0]["message"]["content"]
+def upload_dir():
+    return Path(os.environ.get("OCR_UPLOAD_DIR", "/app/uploads"))
 
 
-def load_verified():
-    records = []
-
-    if not VERIFIED_FILE.exists():
-        return records
-
-    for line in VERIFIED_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        try:
-            records.append(json.loads(line))
-        except Exception:
-            pass
-
-    return records
+def _env_number(name, default, low, high, cast=float):
+    try:
+        return max(low, min(high, cast(os.environ.get(name, default))))
+    except ValueError:
+        return default
 
 
-def verified_match(field, raw):
-    if not raw:
+def section_parallelism():
+    return _env_number("OCR_SECTION_PARALLELISM", 2, 1, 8, int)
+
+
+def max_upload_bytes():
+    return _env_number("OCR_MAX_UPLOAD_BYTES", 30 * 1024 * 1024, 1024, 512 * 1024 * 1024, int)
+
+
+def customer_crop_scale():
+    return _env_number("OCR_CUSTOMER_CROP_SCALE", 1.0, 0.5, 4.0)
+
+
+def _ms(start, end=None):
+    return int(round(((end if end is not None else time.perf_counter()) - start) * 1000))
+
+
+@functools.lru_cache(maxsize=1)
+def _pdf_renderer():
+    """First-page PDF renderer using pypdfium2 or PyMuPDF when importable, else None (PDF => HTTP 415)."""
+    try:
+        import pypdfium2 as pdfium
+
+        def render_pdfium(data):
+            pdf = pdfium.PdfDocument(data)
+            try:
+                page = pdf[0]
+                width_pt, height_pt = page.get_size()
+                scale = max(0.5, min(6.0, 2 * L.REF_W / max(width_pt, height_pt)))
+                return page.render(scale=scale).to_pil().convert("RGB"), len(pdf)
+            finally:
+                pdf.close()
+        return render_pdfium
+    except ImportError:
+        pass
+    try:
+        import fitz
+
+        def render_fitz(data):
+            doc = fitz.open(stream=data, filetype="pdf")
+            try:
+                page = doc[0]
+                zoom = max(0.5, min(6.0, 2 * L.REF_W / max(page.rect.width, page.rect.height)))
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+                return Image.frombytes("RGB", (pix.width, pix.height), pix.samples), doc.page_count
+            finally:
+                doc.close()
+        return render_fitz
+    except ImportError:
         return None
 
-    for row in reversed(load_verified()):
-        if (
-            row.get("field") == field
-            and row.get("ocrRaw") == raw
-            and row.get("verifiedByHuman") is True
-        ):
-            return row.get("verifiedValue")
 
-    return None
-
-
-def similarity(a, b):
-    return difflib.SequenceMatcher(
-        None,
-        a.lower().strip(),
-        b.lower().strip()
-    ).ratio()
-
-
-def best_match(raw, candidates):
-    if not raw:
-        return None, 0.0
-
-    best = None
-    best_score = 0.0
-
-    for candidate in candidates:
-        score = similarity(raw, candidate)
-
-        if score > best_score:
-            best = candidate
-            best_score = score
-
-    return best, best_score
+def _decode(data, ext):
+    """Bytes -> (RGB image, warnings). Raises HTTPException(400) for undecodable input."""
+    warnings = []
+    if ext == ".pdf":
+        try:
+            image, pages = _pdf_renderer()(data)
+        except Exception as error:  # renderer-specific error types
+            raise HTTPException(400, f"Cannot render the uploaded PDF: {error}") from error
+        if pages > 1:
+            warnings.append(f"PDF has {pages} pages; only page 1 was processed")
+        return image, warnings
+    try:
+        image = Image.open(io.BytesIO(data))
+        image.load()
+        image = ImageOps.exif_transpose(image)
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError, SyntaxError) as error:
+        raise HTTPException(400, f"Cannot decode the uploaded {ext.lstrip('.').upper()} file: {error}") from error
+    if image.mode in ("RGBA", "LA", "PA") or (image.mode == "P" and "transparency" in image.info):
+        rgba = image.convert("RGBA")
+        background = Image.new("RGB", rgba.size, (255, 255, 255))
+        background.paste(rgba, mask=rgba.split()[-1])
+        return background, warnings
+    return image.convert("RGB"), warnings
 
 
-def extract_fields(text):
-    treatment = None
-    therapist = None
-    room = None
-
-    m = re.search(
-        r"Treatment\s*:\s*(.+?)(?=\n|Therapist Name|$)",
-        text,
-        re.I | re.S
-    )
-    if m:
-        treatment = m.group(1).strip()
-
-    m = re.search(
-        r"Therapist Name\s*:\s*(.+?)(?=Room No\.?|$)",
-        text,
-        re.I | re.S
-    )
-    if m:
-        therapist = m.group(1).strip()
-
-    m = re.search(
-        r"Room No\.?\s*:\s*([A-Za-z0-9ก-๙]+)",
-        text,
-        re.I
-    )
-    if m:
-        room = m.group(1).strip()
-
-    return treatment, therapist, room
+def _model_crop(image, rows, sx, sy, dx, dy, scale=1.0, clamp=True):
+    """Crop reference rows (scaled + registered) from the original image; stack them vertically; PNG bytes.
+    clamp=False keeps v2.2's behaviour for the STAFF crop (Pillow pads rows beyond the page with black)."""
+    width, height = image.size
+    parts = [image.crop(L.scale_box(row, sx, sy, dx, dy, width if clamp else None, height if clamp else None)) for row in rows]
+    if len(parts) == 1:
+        crop = parts[0]
+    else:
+        crop = Image.new("RGB", (max(p.width for p in parts), sum(p.height for p in parts) + 4 * (len(parts) - 1)), (255, 255, 255))
+        y = 0
+        for part in parts:
+            crop.paste(part, (0, y))
+            y += part.height + 4
+    limit = 2 * max(r[2] - r[0] for r in rows)  # never send more than 2x reference resolution
+    factor = min(scale, limit / crop.width) if crop.width else scale
+    if abs(factor - 1.0) > 1e-3:
+        crop = crop.resize((max(1, round(crop.width * factor)), max(1, round(crop.height * factor))), Image.LANCZOS)
+    return ocr_model.png_bytes(crop)
 
 
-def normalize_therapist(raw):
-    if not raw:
-        return {
-            "raw": raw,
-            "value": None,
-            "confidence": 0.0,
-            "source": "none",
-            "needsReview": True
-        }
-
-    verified = verified_match("therapist", raw)
-
-    if verified:
-        return {
-            "raw": raw,
-            "value": verified,
-            "confidence": 1.0,
-            "source": "verified-memory",
-            "needsReview": False
-        }
-
-    matched, score = best_match(raw, THERAPISTS)
-
-    value = matched if score >= 0.65 else None
-
-    return {
-        "raw": raw,
-        "value": value,
-        "confidence": round(score, 3),
-        "source": "master-fuzzy",
-        "needsReview": value is None or score < 0.85
-    }
+def _timed_call(png, prompt, max_tokens):
+    start = time.perf_counter()
+    text = ocr_model.call_ocr(png, prompt, max_tokens)
+    return text, _ms(start)
 
 
-def parse_treatment(raw):
-    if not raw:
-        return {
-            "raw": raw,
-            "durations": [],
-            "items": [],
-            "needsReview": True
-        }
+def _check_field(label, measurement, source="checkbox"):
+    review = measurement["state"] != "checked" or measurement["confidence"] < M.REVIEW_BELOW
+    return {**N.field(label, label, measurement["confidence"], source, review), "checked": True}
 
-    durations = re.findall(
-        r'\d+\s*(?:นาที|ชม\.?|ชั่วโมง|min(?:ute)?s?|hr(?:s)?\.?)',
-        raw,
-        re.I
-    )
 
-    service_text = re.sub(
-        r'\d+\s*(?:นาที|ชม\.?|ชั่วโมง|min(?:ute)?s?|hr(?:s)?\.?)',
-        ' ',
-        raw,
-        flags=re.I
-    )
+def _check_fields(results):
+    return [_check_field(label, m) for _, label, m in results if m["state"] in ("checked", "ambiguous")]
 
-    service_text = re.sub(r'[+,\d.]+', ' ', service_text)
 
-    parts = [
-        x.strip()
-        for x in service_text.split()
-        if x.strip()
-    ]
+def _single_choice(results):
+    checked = [(label, m) for _, label, m in results if m["state"] == "checked"]
+    ambiguous = [(label, m) for _, label, m in results if m["state"] == "ambiguous"]
+    if len(checked) == 1 and not ambiguous:
+        label, m = checked[0]
+        return N.field(label, label, m["confidence"], "checkbox", m["confidence"] < M.REVIEW_BELOW)
+    if len(checked) + len(ambiguous) == 1 or len(checked) == 1:  # one ambiguous mark, or one tick plus stray marks
+        label, m = (checked or ambiguous)[0]
+        return N.field(label, label, min(m["confidence"], 0.6), "checkbox", True)
+    if checked or ambiguous:  # several boxes marked
+        return N.field(", ".join(label for label, _ in checked + ambiguous), None, 0.3, "checkbox", True)
+    return N.field(None, None, min(m["confidence"] for _, _, m in results), "checkbox", True)  # nothing marked
 
-    items = []
 
-    for i, part in enumerate(parts):
-        verified = verified_match("treatment", part)
+def _body_fields(marks, kind):
+    return [{**N.field(m["area"], m["area"], m["confidence"], "ink-mark", m["needsReview"]), "checked": True}
+            for m in marks if m["kind"] == kind]
 
-        if verified:
-            value = verified
-            score = 1.0
-            source = "verified-memory"
 
-        elif part == "ไทย":
-            value = "นวดไทย"
-            score = 0.95
-            source = "rule"
-
+def _customer_text_fields(text_px, states, customer_raw, expected):
+    parsed, fallback = N.parse_customer_text(customer_raw, expected) if customer_raw is not None else ({}, False)
+    out = {}
+    for key in N.CUSTOMER_FIELDS:
+        state, value = states[key], parsed.get(key)
+        if state == "empty":
+            confidence = 0.9 + 0.09 * (1 - text_px[key] / (M.TEXT_EMPTY_MAX + 1))
+            out[key] = N.field(None, None, confidence, "ink-mark", False)
+        elif not value:
+            out[key] = N.field(None, None, 0.6, "ink-mark", True) if state == "uncertain" else N.field(None, None, 0.0, "none", True)
+        elif key == "nationality":
+            out[key] = N.normalize_nationality(value, fallback)
         else:
-            matched, score = best_match(part, TREATMENTS)
-            value = matched if score >= 0.72 else None
-            source = "master-fuzzy"
+            out[key] = N.normalize_free_text(value, fallback)
+    return out
 
-        items.append({
-            "raw": part,
-            "value": value,
-            "duration": durations[i] if i < len(durations) else None,
-            "confidence": round(score, 3),
-            "source": source,
-            "needsReview": value is None
-        })
 
-    return {
-        "raw": raw,
-        "durations": durations,
-        "items": items,
-        "needsReview": any(x["needsReview"] for x in items)
+def _any_review(node):
+    if isinstance(node, dict):
+        return node.get("needsReview") is True or any(_any_review(v) for v in node.values())
+    if isinstance(node, list):
+        return any(_any_review(v) for v in node)
+    return False
+
+
+def _flag_deterministic(node):
+    """Layout is doubtful: every checkbox / ink-mark field needs review."""
+    if isinstance(node, dict):
+        if node.get("source") in ("checkbox", "ink-mark"):
+            node["needsReview"] = True
+        for value in node.values():
+            _flag_deterministic(value)
+    elif isinstance(node, list):
+        for value in node:
+            _flag_deterministic(value)
+
+
+def process_image(image, document_id, source_file, started, extra_warnings=()):
+    """Full-document OCR of one decoded RGB page -> schema v3 response dict."""
+    t_pre = time.perf_counter()
+    width, height = image.size
+    layout = L.describe_layout(width, height)
+    layout["warnings"].extend(extra_warnings)
+    ref = image if image.size == (L.REF_W, L.REF_H) else image.resize((L.REF_W, L.REF_H), Image.BILINEAR)
+    lum = ref.convert("L")
+    dx, dy, contrast = M.register(M.border_darkness(ref, lum))
+    if contrast < TEMPLATE_MIN_CONTRAST:
+        layout["warnings"].append(f"printed checkbox grid of {L.TEMPLATE} not found (contrast {contrast}); results are unreliable")
+    mask, _ = M.ink_mask(ref, lum, dx, dy)
+    text_px = M.text_ink(mask, dx, dy)
+    text_states = {key: M.text_state(px) for key, px in text_px.items()}
+    expected = tuple(key for key in N.CUSTOMER_FIELDS if text_states[key] != "empty")
+    sx, sy = width / L.REF_W, height / L.REF_H
+    sections = [("staffOnly", _model_crop(image, [L.STAFF_CROP], sx, sy, dx, dy, clamp=False), ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS)]
+    if expected:  # no model call when every handwriting box is blank
+        sections.append(("customerInformation", _model_crop(image, L.CUSTOMER_CROP_ROWS, sx, sy, dx, dy, customer_crop_scale()),
+                         ocr_model.CUSTOMER_PROMPT, ocr_model.CUSTOMER_MAX_TOKENS))
+    preprocess_ms = _ms(t_pre)
+
+    t_inference = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=min(section_parallelism(), len(sections))) as pool:
+        futures = [(name, pool.submit(_timed_call, png, prompt, tokens)) for name, png, prompt, tokens in sections]
+        t_checkbox = time.perf_counter()  # deterministic analysis overlaps the model calls
+        checkboxes = M.detect_checkboxes(mask, dx, dy)
+        body_marks = M.detect_body_marks(mask, lum, dx, dy)
+        checkbox_ms = _ms(t_checkbox)
+        outputs = {name: future.result() for name, future in futures}
+    inference_wall_ms = _ms(t_inference)
+
+    t_normalize = time.perf_counter()
+    staff_raw = outputs["staffOnly"][0]
+    customer_raw = outputs["customerInformation"][0] if "customerInformation" in outputs else None
+    treatment_raw, therapist_raw, room_raw = N.extract_staff_fields(staff_raw)
+    treatments, durations, treatment_warnings, total_minutes = N.parse_treatments(treatment_raw)
+    text_fields = _customer_text_fields(text_px, text_states, customer_raw, expected)
+    customer = {"name": text_fields["name"], "gender": _single_choice(checkboxes["gender"]), "nationality": text_fields["nationality"],
+                "hotelName": text_fields["hotelName"], "referralSources": _check_fields(checkboxes["referralSources"]),
+                "healthConditions": _check_fields(checkboxes["healthConditions"])}
+    recommendation = {"pressure": _single_choice(checkboxes["pressure"]), "massageOilScrub": _check_fields(checkboxes["massageOilScrub"]),
+                      "preferredAreas": _body_fields(body_marks, "circle"), "avoidAreas": _body_fields(body_marks, "cross")}
+    staff = {"treatments": treatments, "treatment": N.legacy_treatment(treatment_raw, treatments, durations),
+             "therapistName": N.normalize_therapist(therapist_raw), "roomNo": N.normalize_room(room_raw)}
+    if layout["warnings"]:
+        _flag_deterministic(customer)
+        _flag_deterministic(recommendation)
+    evidence = {
+        "staffCropRaw": staff_raw, "customerCropRaw": customer_raw,
+        "checkboxScores": {f"{group}.{key}": round(m["score"], 3) for group, items in checkboxes.items() for key, _, m in items},
+        "checkboxNotes": {f"{group}.{key}": m["note"] for group, items in checkboxes.items() for key, _, m in items if m["note"]},
+        "bodyMap": [{k: m[k] for k in ("area", "kind", "confidence", "pixels", "onLabel", "coverage", "center", "diagonal") if k in m}
+                    for m in body_marks],
+        "textInk": text_px, "layoutOffset": {"dx": dx, "dy": dy, "contrast": contrast},
+        "treatmentWarnings": treatment_warnings, "treatmentTotalMinutes": total_minutes,
     }
-
-
-def normalize_room(raw):
-    ok = bool(raw and raw.isdigit())
-
-    return {
-        "raw": raw,
-        "value": raw if ok else None,
-        "confidence": 0.95 if ok else 0.0,
-        "source": "ocr",
-        "needsReview": not ok
+    normalize_ms = _ms(t_normalize)
+    section_timings = [{"name": name, "ms": ms} for name, (_, ms) in outputs.items()]
+    result = {
+        "documentId": document_id, "sourceFile": source_file, "engine": ENGINE, "version": VERSION, "schemaVersion": SCHEMA_VERSION,
+        "layout": layout, "customerInformation": customer, "recommendationCard": recommendation, "staffOnly": staff, "evidence": evidence,
+        "timings": {"preprocessMs": preprocess_ms, "checkboxMs": checkbox_ms, "inferenceMs": sum(t["ms"] for t in section_timings),
+                    "inferenceWallMs": inference_wall_ms, "normalizeMs": normalize_ms, "totalMs": _ms(started), "sections": section_timings},
     }
+    result["needsReview"] = bool(layout["warnings"]) or any(_any_review(result[k]) for k in ("customerInformation", "recommendationCard", "staffOnly"))
+    return result
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "service": "innovera-ocr",
-        "version": "2.2"
-    }
+    try:
+        N.master()
+        master_state = "ok"
+    except Exception as error:  # reported, not raised: /health must answer
+        master_state = f"error: {error}"
+    return {"status": "ok", "service": "innovera-ocr", "version": VERSION, "engine": ENGINE, "schemaVersion": SCHEMA_VERSION,
+            "model": ocr_model.model_name(), "pdfSupport": _pdf_renderer() is not None, "masterData": master_state}
 
 
 @app.post("/v1/ocr")
-async def ocr(file: UploadFile = File(...)):
-    ext = Path(file.filename).suffix.lower()
-
-    if ext not in [".png", ".jpg", ".jpeg"]:
-        raise HTTPException(
-            400,
-            "Only PNG/JPG/JPEG supported for now"
-        )
-
+def ocr(file: UploadFile = File(...)):
+    started = time.perf_counter()
+    filename = file.filename or "upload"
+    ext = Path(filename).suffix.lower() or MIME_EXTENSIONS.get((file.content_type or "").split(";")[0].strip().lower(), "")
+    if ext not in IMAGE_EXTENSIONS and ext != ".pdf":
+        raise HTTPException(400, "Only PNG/JPG/JPEG/WebP (and PDF when a renderer is installed) are supported")
+    if ext == ".pdf" and _pdf_renderer() is None:
+        raise HTTPException(415, "PDF input needs pypdfium2 or PyMuPDF in the Local AI image; upload PNG/JPG/WebP instead")
+    limit = max_upload_bytes()
+    data = file.file.read(limit + 1)
+    if len(data) > limit:
+        raise HTTPException(413, f"File larger than {limit} bytes")
     document_id = str(uuid.uuid4())
-
-    source = UPLOAD_DIR / f"{document_id}{ext}"
-    source.write_bytes(await file.read())
-
     try:
-        img = Image.open(source).convert("RGB")
+        directory = upload_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{document_id}{ext}").write_bytes(data)
+    except OSError as error:
+        raise HTTPException(500, f"Cannot store the upload: {error}") from error
+    image, warnings = _decode(data, ext)
+    try:
+        return JSONResponse(process_image(image, document_id, file.filename, started, warnings))
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(500, str(error)) from error
 
-        staff_crop = img.crop((410, 485, 710, 570))
-
-        staff_file = UPLOAD_DIR / f"{document_id}_staff.png"
-        staff_crop.save(staff_file)
-
-        staff_raw = call_ocr(
-            staff_file,
-            """
-Extract all text from this STAFF ONLY section.
-
-Focus on:
-- Treatment
-- Therapist Name
-- Room No.
-
-Read handwriting directly.
-Do not normalize.
-Do not guess.
-Preserve Thai and durations.
-Return clean OCR text only.
-""",
-            220
-        )
-
-        treatment_raw, therapist_raw, room_raw = extract_fields(staff_raw)
-
-        result = {
-            "documentId": document_id,
-            "sourceFile": file.filename,
-            "engine": "typhoon-crop-only",
-            "version": "2.2",
-            "staffOnly": {
-                "treatment": parse_treatment(treatment_raw),
-                "therapistName": normalize_therapist(therapist_raw),
-                "roomNo": normalize_room(room_raw)
-            },
-            "evidence": {
-                "staffCropRaw": staff_raw
-            }
-        }
-
-        return JSONResponse(result)
-
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-from pydantic import BaseModel
-from datetime import datetime, timezone
 
 class ConfirmRequest(BaseModel):
     documentId: str
@@ -361,46 +327,9 @@ class ConfirmRequest(BaseModel):
 
 @app.post("/v1/ocr/confirm")
 def confirm_ocr(data: ConfirmRequest):
-
-    allowed_fields = [
-        "treatment",
-        "therapist"
-    ]
-
-    if data.field not in allowed_fields:
-        raise HTTPException(
-            400,
-            "field must be treatment or therapist"
-        )
-
-    VERIFIED_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    record = {
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat(),
-        "documentId": data.documentId,
-        "field": data.field,
-        "ocrRaw": data.raw,
-        "verifiedValue": data.verifiedValue,
-        "verifiedByHuman": True
-    }
-
-    with VERIFIED_FILE.open(
-        "a",
-        encoding="utf-8"
-    ) as f:
-        f.write(
-            json.dumps(
-                record,
-                ensure_ascii=False
-            ) + "\n"
-        )
-
-    return {
-        "status": "saved",
-        "record": record
-    }
+    if data.field not in ("treatment", "therapist"):
+        raise HTTPException(400, "field must be treatment or therapist")
+    record = {"timestamp": datetime.now(timezone.utc).isoformat(), "documentId": data.documentId, "field": data.field,
+              "ocrRaw": data.raw, "verifiedValue": data.verifiedValue, "verifiedByHuman": True}
+    N.append_verified(record)
+    return {"status": "saved", "record": record}
