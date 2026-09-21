@@ -11,17 +11,45 @@ export type OcrField = Readonly<{
 
 export type OcrTreatment = Readonly<OcrField & { name?: string; duration?: string }>;
 
+/** Schema v3 (engine `typhoon-sections` 3.0) shapes. Responses are NOT validated against them — read defensively. */
+export type Source = "ocr" | "checkbox" | "ink-mark" | "rule" | "master-fuzzy" | "verified-memory" | "none" | "human";
+export type Field = Readonly<{ raw: string | null; value: string | null; confidence: number; source: Source; needsReview: boolean }>;
+export type CheckField = Readonly<Field & { checked: true }>;
+export type TreatmentField = Readonly<Field & { nameRaw: string | null; duration: string | null; durationMinutes: number | null }>;
+export type OcrSectionTiming = Readonly<{ name: string; ms: number }>;
+export type OcrTimings = Readonly<{
+  preprocessMs?: number; checkboxMs?: number; inferenceMs?: number; inferenceWallMs?: number;
+  normalizeMs?: number; totalMs?: number; sections?: readonly OcrSectionTiming[];
+}>;
+
 export type OcrResponse = Readonly<{
   documentId: string;
   sourceFile?: string;
   engine?: string;
   version?: string;
+  schemaVersion?: number;
+  layout?: Readonly<Record<string, unknown>>;
   staffOnly?: Readonly<Record<string, unknown>>;
   customerInformation?: Readonly<Record<string, unknown>>;
   recommendationCard?: Readonly<Record<string, unknown>>;
   evidence?: Readonly<Record<string, unknown>>;
+  /** Unvalidated `OcrTimings`; use `readOcrTimings`. */
+  timings?: unknown;
+  needsReview?: boolean;
   [key: string]: unknown;
 }>;
+
+/** Numeric timings of a v3 response; missing or malformed entries are dropped (never throws). */
+export function readOcrTimings(response: Readonly<{ timings?: unknown }>): OcrTimings {
+  const timings = isRecord(response.timings) ? response.timings : {};
+  const timing: Record<string, number> = {};
+  for (const key of ["preprocessMs", "checkboxMs", "inferenceMs", "inferenceWallMs", "normalizeMs", "totalMs"] as const) {
+    const value = timings[key];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) timing[key] = value;
+  }
+  const sections = Array.isArray(timings.sections) ? timings.sections.filter((entry): entry is OcrSectionTiming => isRecord(entry) && typeof entry.name === "string" && typeof entry.ms === "number" && Number.isFinite(entry.ms) && entry.ms >= 0) : [];
+  return sections.length > 0 ? { ...timing, sections } : timing;
+}
 
 export type ConfirmPayload = Readonly<{
   documentId: string;
@@ -99,10 +127,11 @@ export class OcrClient {
     });
   }
 
+  /** `GET /health` (FastAPI answers `HEAD /v1/ocr` with 405, so the old probe never succeeded). */
   async healthCheck(): Promise<boolean> {
     try {
-      await this.requestJson("/v1/ocr", { method: "HEAD" });
-      return true;
+      const body = await this.requestJson("/health", { method: "GET" });
+      return body.status === "ok";
     } catch {
       return false;
     }
@@ -116,7 +145,7 @@ export class OcrClient {
       try {
         const response = await this.fetchImpl(`${this.options.baseUrl}${path}`, { ...init, signal: controller.signal });
         if (!response.ok) {
-          const retryable = response.status >= 500 || response.status === 429;
+          const retryable = response.status >= 500 || response.status === 429 || response.status === 408;
           const error = new OcrClientError("http", `OCR API returned HTTP ${response.status}`, { status: response.status, retryable });
           if (!retryable || attempt === this.options.maxRetries) throw error;
           lastError = error;

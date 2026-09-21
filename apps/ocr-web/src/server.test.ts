@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createAppServer } from "./server.js";
+import { createAppServer, errorStatus, routeLabel, workbenchCsp, type AppDependencies, type DocumentListQuery, type WorkbenchStore } from "./server.js";
 import type { Principal } from "@innovera/ocr-auth";
+import type { IngestDependencies } from "@innovera/ocr-ingest";
+import type { ReviewDocument } from "@innovera/ocr-persistence";
 
 const tenant = "00000000-0000-0000-0000-000000000001";
 const documentId = "00000000-0000-0000-0000-000000000002";
+const otherTenant = "00000000-0000-0000-0000-000000000099";
+const userId = "00000000-0000-0000-0000-000000000009";
+const batchId = "10000000-0000-4000-8000-000000000001";
+const failedDocumentId = "20000000-0000-4000-8000-000000000002";
+const unknownId = "30000000-0000-4000-8000-000000000003";
+const auth = { authorization: "Bearer test-token" };
+const reviewExtras = { batchId: null, reviewedAt: null, reviewedBy: null, updatedAt: "2026-09-21T01:00:00.000Z", errorMessage: null, createdAt: "2026-09-21T00:59:00.000Z", processedAt: "2026-09-21T01:00:00.000Z", deliveryStatus: "NONE" } as const;
+/** Stored views are canonical; tests may still hand the server a legacy flat shape to prove it normalizes defensively. */
+const asView = (value: unknown) => value as ReviewDocument["structuredResult"];
+const jsonAuth = { ...auth, "content-type": "application/json" };
 
 function deps(confirmFails = false) {
   const calls: string[] = [];
@@ -12,7 +24,7 @@ function deps(confirmFails = false) {
     saveOcrResult: async () => undefined,
     getReviewDocument: async (tenantId: string, id: string) => tenantId === tenant && id === documentId ? {
       documentId, tenantId, filename: "sample.png", mimeType: "image/png", status: "NEEDS_REVIEW", ocrDocumentId: "ocr-1",
-      ocrEngine: "typhoon-crop-only", ocrVersion: "2.2", rawResponse: {}, structuredResult: { therapistName: { raw: "พิพิ", value: "พิพิ", needsReview: true } }, needsReview: true, confirmStatus: null
+      ocrEngine: "typhoon-crop-only", ocrVersion: "2.2", rawResponse: {}, structuredResult: asView({ therapistName: { raw: "พิพิ", value: "พิพิ", needsReview: true } }), needsReview: true, confirmStatus: null, ...reviewExtras
     } : null,
     saveCorrection: async (_tenantId: string, _id: string, _field: string, _value: string, status: string) => { calls.push(status); }
   };
@@ -26,8 +38,6 @@ function deps(confirmFails = false) {
   } });
   return { app, calls };
 }
-
-const userId = "00000000-0000-0000-0000-000000000009";
 
 test("review endpoint enforces tenant and confirm persists before external call", async () => {
   const { app, calls } = deps();
@@ -57,4 +67,383 @@ test("confirm keeps correction when OCR confirm is unavailable", async () => {
   assert.equal(response.status, 202);
   assert.deepEqual(calls, ["PENDING", "RETRY"]);
   await new Promise<void>((resolve, reject) => app.close((error) => error ? reject(error) : resolve()));
+});
+
+// ---- workbench API ---------------------------------------------------------------------------
+
+type Call = { method: string; tenantId: string; args: unknown[] };
+const summary = (id = batchId) => ({ batchId: id, label: "Morning", createdAt: "2026-09-21T01:00:00.000Z", expectedTotal: 3, uploaded: 1, queued: 1, processing: 0, succeeded: 0, needsReview: 0, failed: 0, confirmed: 0, completed: 0, finishedAt: null, durationMs: null, throughputPerMinute: null });
+const canonical = (needsReview: { therapist?: boolean; name?: boolean } = {}) => ({
+  schemaVersion: 3,
+  customerInformation: { name: { raw: "Anna", value: "Anna", confidence: 0.5, source: "ocr", needsReview: needsReview.name ?? false } },
+  recommendationCard: {},
+  staffOnly: { treatments: [], therapistName: { raw: "พิพิ", value: "พิพิ", confidence: 0.4, source: "ocr", needsReview: needsReview.therapist ?? true }, roomNo: { raw: "1", value: "1", confidence: 0.9, source: "ocr", needsReview: false } }
+});
+
+function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; storeError?: Error; readiness?: () => Promise<boolean>; structuredResult?: unknown } = {}) {
+  const calls: Call[] = [];
+  const confirmCalls: unknown[] = [];
+  const corrections: unknown[][] = [];
+  const ingestCalls: unknown[][] = [];
+  const persisted: unknown[] = [];
+  const record = (method: string, tenantId: string, ...args: unknown[]) => {
+    calls.push({ method, tenantId, args });
+    if (options.storeError) throw options.storeError;
+  };
+  const workbenchStore: WorkbenchStore = {
+    createBatch: async (tenantId, input) => { record("createBatch", tenantId, input); return { ...summary(), expectedTotal: input.expectedTotal, label: input.label ?? null }; },
+    getBatch: async (tenantId, id) => { record("getBatch", tenantId, id); return id === batchId ? summary() : null; },
+    listBatches: async (tenantId, limit) => { record("listBatches", tenantId, limit); return [summary()]; },
+    listDocuments: async (tenantId, query: DocumentListQuery) => { record("listDocuments", tenantId, query); return { total: 1, documents: [{ documentId, batchId, filename: "a.png", status: "NEEDS_REVIEW", statusCategory: "review" }] }; },
+    retryDocument: async (tenantId, id) => {
+      record("retryDocument", tenantId, id);
+      if (id === failedDocumentId) return { jobId: "40000000-0000-4000-8000-000000000004" };
+      throw new Error(id === documentId ? "DOCUMENT_NOT_RETRYABLE" : "DOCUMENT_NOT_FOUND");
+    },
+    saveReview: async (tenantId, id, input) => {
+      record("saveReview", tenantId, id, input);
+      if (id === failedDocumentId) throw new Error("DOCUMENT_NOT_REVIEWABLE");
+      if (input.expectedUpdatedAt === "2026-01-01T00:00:00.000Z") throw new Error("REVIEW_CONFLICT");
+      if ("invalid" in (input.structuredResult as object)) throw new Error("REVIEW_INVALID");
+      return { corrections: 2, delivery: "PENDING", document: { documentId, status: "SUCCEEDED", reviewedBy: input.reviewedBy } };
+    }
+  };
+  const reviewStore = {
+    saveOcrResult: async () => undefined,
+    getReviewDocument: async (tenantId: string, id: string) => {
+      record("getReviewDocument", tenantId, id);
+      return tenantId === tenant && id === documentId ? {
+        documentId, tenantId, filename: "a.png", mimeType: "image/png", status: "NEEDS_REVIEW", ocrDocumentId: "ocr-1", ocrEngine: "typhoon-sections", ocrVersion: "3.0",
+        rawResponse: {}, structuredResult: asView(options.structuredResult ?? canonical()), needsReview: true, confirmStatus: null, ...reviewExtras
+      } : null;
+    },
+    getOriginal: async (tenantId: string, id: string) => { record("getOriginal", tenantId, id); return id === documentId ? { storageKey: "org/x/original/ab/key", mimeType: "image/png" } : null; },
+    saveCorrection: async (...args: unknown[]) => { corrections.push(args); }
+  };
+  const ingest = (tenantId: string, idempotencyKey?: string, batch?: string): IngestDependencies => {
+    ingestCalls.push([tenantId, idempotencyKey, batch]);
+    return {
+      stage: async () => "org/x/original/ab/key", scan: async () => "CLEAN", enqueue: async () => "unused",
+      persistUpload: async (input) => { persisted.push(input.filename); return { tenantId, documentId, runId: "run-1" }; },
+      updateStatus: async () => undefined,
+      enqueuePersistent: async () => "job-1",
+      ...options.ingest
+    };
+  };
+  const dependencies: AppDependencies = {
+    ingest: { stage: async () => { throw new Error("TENANT_REQUIRED"); }, scan: async () => "QUARANTINED", enqueue: async () => "never" },
+    ingestForTenant: ingest, reviewStore, workbenchStore,
+    storage: { get: async () => new Uint8Array([137, 80, 78, 71]), put: async () => undefined },
+    ocrClient: { confirmResult: async (payload: unknown) => { confirmCalls.push(payload); return { accepted: true }; } } as never
+  };
+  const app = createAppServer(dependencies, {
+    ...(options.readiness ? { readiness: options.readiness } : {}),
+    authenticate: (request): Principal => {
+      if (request.headers.authorization === "Bearer test-token") return { userId, tenantId: tenant, claims: {} };
+      if (request.headers.authorization === "Bearer other-token") return { userId, tenantId: otherTenant, claims: {} };
+      throw new Error("UNAUTHENTICATED");
+    }
+  });
+  return { app, calls, confirmCalls, corrections, ingestCalls, persisted };
+}
+
+async function withServer(harness: ReturnType<typeof workbenchHarness>, run: (base: string) => Promise<void>): Promise<void> {
+  await new Promise<void>((resolve) => harness.app.listen(0, "127.0.0.1", resolve));
+  try { await run(`http://127.0.0.1:${(harness.app.address() as { port: number }).port}`); }
+  finally { await new Promise<void>((resolve, reject) => harness.app.close((error) => error ? reject(error) : resolve())); }
+}
+
+const body = async (response: Response): Promise<Record<string, unknown>> => await response.json() as Record<string, unknown>;
+async function expectError(response: Response, status: number, error: string): Promise<void> {
+  assert.equal(response.status, status, `expected ${status} ${error}`);
+  assert.deepEqual(await body(response), { error });
+}
+
+test("GET / serves the workbench with a fresh CSP script nonce and no token prompt", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    const nonces = new Set<string>();
+    for (let index = 0; index < 2; index += 1) {
+      const response = await fetch(`${base}/`);
+      assert.equal(response.status, 200);
+      assert.match(response.headers.get("content-type") ?? "", /^text\/html/);
+      const csp = response.headers.get("content-security-policy") ?? "";
+      const nonce = /script-src 'nonce-([A-Za-z0-9+/=]+)'/.exec(csp)?.[1] ?? "";
+      assert.equal(Buffer.from(nonce, "base64").byteLength, 16);
+      assert.equal(csp, workbenchCsp(nonce));
+      assert.match(csp, /frame-ancestors 'none'/);
+      assert.match(csp, /img-src 'self' blob: data:/);
+      assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+      assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      const html = await response.text();
+      assert.ok(html.includes(`nonce="${nonce}"`), "inline script carries the response nonce");
+      assert.doesNotMatch(html, /prompt\(/);
+      nonces.add(nonce);
+    }
+    assert.equal(nonces.size, 2);
+  });
+});
+
+test("GET /review/:id redirects to the workbench for UUIDs only", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    const redirected = await fetch(`${base}/review/${documentId.toUpperCase()}`, { redirect: "manual" });
+    assert.equal(redirected.status, 302);
+    assert.equal(redirected.headers.get("location"), `/?document=${documentId}`);
+    await expectError(await fetch(`${base}/review/%3Cscript%3E`, { redirect: "manual" }), 404, "DOCUMENT_NOT_FOUND");
+  });
+});
+
+test("every workbench API route requires the bearer token", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    const routes: Array<[string, string]> = [
+      ["POST", "/api/batches"], ["GET", "/api/batches"], ["GET", `/api/batches/${batchId}`], ["GET", "/api/documents"],
+      ["POST", "/api/documents"], ["GET", `/api/documents/${documentId}/ocr`], ["GET", `/api/documents/${documentId}/content`],
+      ["POST", `/api/documents/${documentId}/ocr/review`], ["POST", `/api/documents/${documentId}/retry`], ["POST", `/api/documents/${documentId}/ocr/confirm`]
+    ];
+    for (const [method, path] of routes) {
+      const response = await fetch(`${base}${path}`, { method, headers: { "x-tenant-id": tenant, "content-type": "application/json" }, ...(method === "POST" ? { body: "{}" } : {}) });
+      await expectError(response, 401, "UNAUTHENTICATED");
+    }
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.ingestCalls.length, 0);
+  });
+});
+
+test("tenant comes from the token only; tenant headers are ignored", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    const spoof = { "x-tenant-id": otherTenant, "x-organization-id": otherTenant };
+    assert.equal((await fetch(`${base}/api/documents`, { headers: { ...auth, ...spoof } })).status, 200);
+    assert.equal((await fetch(`${base}/api/batches/${batchId}`, { headers: { ...auth, ...spoof } })).status, 200);
+    assert.equal((await fetch(`${base}/api/documents/${documentId}/ocr`, { headers: { ...auth, ...spoof } })).status, 200);
+    assert.deepEqual(new Set(h.calls.map((call) => call.tenantId)), new Set([tenant]));
+    // A token for another tenant cannot read tenant A's document.
+    await expectError(await fetch(`${base}/api/documents/${documentId}/ocr`, { headers: { authorization: "Bearer other-token", "x-tenant-id": tenant } }), 404, "DOCUMENT_NOT_FOUND");
+  });
+});
+
+test("batches: create, get and list", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    const created = await fetch(`${base}/api/batches`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ total: 3, label: "  Morning\u0000 shift  " }) });
+    assert.equal(created.status, 201);
+    assert.equal((await body(created)).expectedTotal, 3);
+    assert.deepEqual(h.calls[0], { method: "createBatch", tenantId: tenant, args: [{ createdBy: userId, expectedTotal: 3, label: "Morning shift" }] });
+    const unlabeled = await fetch(`${base}/api/batches`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ total: 500, label: "   " }) });
+    assert.equal(unlabeled.status, 201);
+    assert.deepEqual(h.calls[1]?.args, [{ createdBy: userId, expectedTotal: 500 }]);
+    for (const total of [0, 501, 2.5, "3", null]) {
+      await expectError(await fetch(`${base}/api/batches`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ total }) }), 400, "INVALID_BATCH_TOTAL");
+    }
+    await expectError(await fetch(`${base}/api/batches`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ total: 1, label: "x".repeat(201) }) }), 400, "INVALID_BATCH_LABEL");
+    await expectError(await fetch(`${base}/api/batches`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ total: 1, label: 7 }) }), 400, "INVALID_BATCH_LABEL");
+    await expectError(await fetch(`${base}/api/batches`, { method: "POST", headers: jsonAuth, body: "{not json" }), 400, "INVALID_JSON");
+    await expectError(await fetch(`${base}/api/batches`, { method: "POST", headers: jsonAuth, body: "[]" }), 400, "INVALID_JSON");
+
+    const fetched = await fetch(`${base}/api/batches/${batchId}`, { headers: auth });
+    assert.equal(fetched.status, 200);
+    assert.equal((await body(fetched)).batchId, batchId);
+    await expectError(await fetch(`${base}/api/batches/${unknownId}`, { headers: auth }), 404, "BATCH_NOT_FOUND");
+    const before = h.calls.length;
+    await expectError(await fetch(`${base}/api/batches/not-a-uuid`, { headers: auth }), 404, "BATCH_NOT_FOUND");
+    await expectError(await fetch(`${base}/api/batches/${batchId}x`, { headers: auth }), 404, "BATCH_NOT_FOUND");
+    assert.equal(h.calls.length, before, "invalid ids never reach the store");
+
+    const listed = await fetch(`${base}/api/batches?limit=1`, { headers: auth });
+    assert.equal(listed.status, 200);
+    assert.equal(((await body(listed)).batches as unknown[]).length, 1);
+    assert.deepEqual(h.calls.at(-1), { method: "listBatches", tenantId: tenant, args: [1] });
+    await fetch(`${base}/api/batches`, { headers: auth });
+    assert.deepEqual(h.calls.at(-1)?.args, [20]);
+    await expectError(await fetch(`${base}/api/batches?limit=0`, { headers: auth }), 400, "INVALID_LIMIT");
+    await expectError(await fetch(`${base}/api/batches?limit=101`, { headers: auth }), 400, "INVALID_LIMIT");
+  });
+});
+
+test("documents list parses query parameters strictly", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    const defaults = await fetch(`${base}/api/documents?status=&q=`, { headers: auth });
+    assert.equal(defaults.status, 200);
+    assert.deepEqual(await body(defaults), { total: 1, limit: 50, offset: 0, documents: [{ documentId, batchId, filename: "a.png", status: "NEEDS_REVIEW", statusCategory: "review" }] });
+    assert.deepEqual(h.calls.at(-1)?.args, [{ limit: 50, offset: 0 }]);
+    const full = await fetch(`${base}/api/documents?limit=200&offset=400&status=review&q=${encodeURIComponent("  อันนา  ")}&batchId=${batchId.toUpperCase()}`, { headers: auth });
+    assert.equal(full.status, 200);
+    assert.deepEqual(h.calls.at(-1)?.args, [{ limit: 200, offset: 400, status: "review", q: "อันนา", batchId }]);
+    const count = h.calls.length;
+    for (const [query, status, code] of [
+      ["limit=0", 400, "INVALID_LIMIT"], ["limit=201", 400, "INVALID_LIMIT"], ["limit=abc", 400, "INVALID_LIMIT"], ["limit=1.5", 400, "INVALID_LIMIT"], ["limit=-1", 400, "INVALID_LIMIT"],
+      ["offset=-1", 400, "INVALID_OFFSET"], ["offset=1e3", 400, "INVALID_OFFSET"], ["offset=1000001", 400, "INVALID_OFFSET"],
+      ["status=SUCCEEDED", 400, "INVALID_STATUS"], ["status=bogus", 400, "INVALID_STATUS"],
+      [`q=${"a".repeat(101)}`, 400, "INVALID_QUERY"], ["batchId=nope", 404, "BATCH_NOT_FOUND"], ["batchId=1%27%20OR%201%3D1", 404, "BATCH_NOT_FOUND"]
+    ] as const) {
+      await expectError(await fetch(`${base}/api/documents?${query}`, { headers: auth }), status, code);
+    }
+    assert.equal(h.calls.length, count, "invalid queries never reach the store");
+    for (const status of ["queued", "processing", "review", "succeeded", "confirmed", "failed"]) {
+      assert.equal((await fetch(`${base}/api/documents?status=${status}`, { headers: auth })).status, 200);
+    }
+  });
+});
+
+test("review save: 200, conflict, validation, size limit, and bad ids", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    const url = `${base}/api/documents/${documentId}/ocr/review`;
+    const edited = canonical({ therapist: false });
+    const saved = await fetch(url, { method: "POST", headers: { ...jsonAuth, "x-tenant-id": otherTenant }, body: JSON.stringify({ structuredResult: edited, expectedUpdatedAt: "2026-09-21T01:02:03.456789+00:00" }) });
+    assert.equal(saved.status, 200);
+    assert.deepEqual(await body(saved), { status: "confirmed", delivery: "PENDING", corrections: 2, document: { documentId, status: "SUCCEEDED", reviewedBy: userId } });
+    assert.deepEqual(h.calls.at(-1), { method: "saveReview", tenantId: tenant, args: [documentId, { structuredResult: edited, expectedUpdatedAt: "2026-09-21T01:02:03.456789+00:00", reviewedBy: userId }] });
+    const withoutToken = await fetch(url, { method: "POST", headers: jsonAuth, body: JSON.stringify({ structuredResult: edited, reviewedBy: "spoofed" }) });
+    assert.equal(withoutToken.status, 200);
+    assert.deepEqual(h.calls.at(-1)?.args[1], { structuredResult: edited, reviewedBy: userId });
+
+    await expectError(await fetch(url, { method: "POST", headers: jsonAuth, body: JSON.stringify({ structuredResult: edited, expectedUpdatedAt: "2026-01-01T00:00:00.000Z" }) }), 409, "REVIEW_CONFLICT");
+    await expectError(await fetch(`${base}/api/documents/${failedDocumentId}/ocr/review`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ structuredResult: edited }) }), 409, "DOCUMENT_NOT_REVIEWABLE");
+    await expectError(await fetch(url, { method: "POST", headers: jsonAuth, body: JSON.stringify({ structuredResult: { invalid: true } }) }), 400, "REVIEW_INVALID");
+    const count = h.calls.length;
+    for (const payload of [{}, { structuredResult: [] }, { structuredResult: "x" }, { structuredResult: edited, expectedUpdatedAt: "yesterday" }, { structuredResult: edited, expectedUpdatedAt: 5 }]) {
+      await expectError(await fetch(url, { method: "POST", headers: jsonAuth, body: JSON.stringify(payload) }), 400, "REVIEW_INVALID");
+    }
+    await expectError(await fetch(url, { method: "POST", headers: jsonAuth, body: "not json" }), 400, "INVALID_JSON");
+    const oversize = JSON.stringify({ structuredResult: { note: "x".repeat(1_048_576) } });
+    await expectError(await fetch(url, { method: "POST", headers: jsonAuth, body: oversize }), 413, "PAYLOAD_TOO_LARGE");
+    await expectError(await fetch(`${base}/api/documents/123/ocr/review`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ structuredResult: edited }) }), 404, "DOCUMENT_NOT_FOUND");
+    assert.equal(h.calls.length, count, "rejected requests never reach the store");
+  });
+});
+
+test("retry: 202 queued, 409 when not failed, 404 for unknown or malformed ids", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    const retried = await fetch(`${base}/api/documents/${failedDocumentId}/retry`, { method: "POST", headers: auth });
+    assert.equal(retried.status, 202);
+    assert.deepEqual(await body(retried), { status: "queued", jobId: "40000000-0000-4000-8000-000000000004" });
+    assert.deepEqual(h.calls.at(-1), { method: "retryDocument", tenantId: tenant, args: [failedDocumentId] });
+    await expectError(await fetch(`${base}/api/documents/${documentId}/retry`, { method: "POST", headers: auth }), 409, "DOCUMENT_NOT_RETRYABLE");
+    await expectError(await fetch(`${base}/api/documents/${unknownId}/retry`, { method: "POST", headers: auth }), 404, "DOCUMENT_NOT_FOUND");
+    const count = h.calls.length;
+    await expectError(await fetch(`${base}/api/documents/..%2F..%2Fetc/retry`, { method: "POST", headers: auth }), 404, "DOCUMENT_NOT_FOUND");
+    assert.equal(h.calls.length, count);
+  });
+});
+
+test("document read routes reject malformed ids before the store", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    await expectError(await fetch(`${base}/api/documents/not-a-uuid/ocr`, { headers: auth }), 404, "DOCUMENT_NOT_FOUND");
+    await expectError(await fetch(`${base}/api/documents/not-a-uuid/content`, { headers: auth }), 404, "DOCUMENT_NOT_FOUND");
+    await expectError(await fetch(`${base}/api/documents/not-a-uuid/ocr/confirm`, { method: "POST", headers: jsonAuth, body: "{}" }), 404, "DOCUMENT_NOT_FOUND");
+    assert.equal(h.calls.length, 0);
+    const content = await fetch(`${base}/api/documents/${documentId}/content`, { headers: auth });
+    assert.equal(content.status, 200);
+    assert.equal(content.headers.get("content-type"), "image/png");
+    assert.deepEqual([...new Uint8Array(await content.arrayBuffer())], [137, 80, 78, 71]);
+    const review = await fetch(`${base}/api/documents/${documentId}/ocr`, { headers: auth });
+    assert.equal(review.status, 200);
+    assert.equal(((await body(review)).document as { documentId: string }).documentId, documentId);
+  });
+});
+
+test("legacy confirm maps therapistName to therapist and resolves the canonical path", async () => {
+  const h = workbenchHarness({ structuredResult: canonical({ therapist: true, name: true }) });
+  await withServer(h, async (base) => {
+    const response = await fetch(`${base}/api/documents/${documentId}/ocr/confirm`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ field: "therapistName", raw: "พิพิ", verifiedValue: "พีพี" }) });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await body(response), { status: "confirmed" });
+    assert.deepEqual(h.confirmCalls, [{ documentId: "ocr-1", field: "therapist", raw: "พิพิ", verifiedValue: "พีพี" }]);
+    assert.deepEqual(h.corrections.map((call) => call[4]), ["PENDING", "SUCCEEDED"]);
+    assert.deepEqual(h.corrections[0]?.slice(0, 4), [tenant, documentId, "therapistName", "พีพี"]);
+    assert.equal(h.corrections[1]?.[6], true, "customerInformation.name still needs review");
+    await expectError(await fetch(`${base}/api/documents/${documentId}/ocr/confirm`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ field: "therapistName" }) }), 400, "INVALID_CONFIRMATION");
+  });
+  const onlyTherapist = workbenchHarness({ structuredResult: { staffOnly: { treatment: { raw: "x", needsReview: false }, therapistName: { raw: "พิพิ", value: "พิพิ", needsReview: true } } } });
+  await withServer(onlyTherapist, async (base) => {
+    assert.equal((await fetch(`${base}/api/documents/${documentId}/ocr/confirm`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ field: "therapistName", raw: "พิพิ", verifiedValue: "พีพี" }) })).status, 200);
+    assert.equal(onlyTherapist.corrections[1]?.[6], false, "nothing else is flagged");
+  });
+});
+
+test("upload threads the batch id and decodes URI-encoded filenames", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    const name = "ใบลงทะเบียน 01.png";
+    const upload = (headers: Record<string, string>) => fetch(`${base}/api/documents`, { method: "POST", headers: { ...auth, "content-type": "image/png", "idempotency-key": "file-1", "x-upload-filename": encodeURIComponent(name), "x-upload-filename-encoding": "uri", ...headers }, body: new Uint8Array([137, 80, 78, 71]) });
+    const response = await upload({ "x-batch-id": batchId.toUpperCase(), "x-tenant-id": otherTenant });
+    assert.equal(response.status, 202);
+    const result = await body(response);
+    assert.equal(result.batchId, batchId);
+    assert.equal(result.documentId, documentId);
+    assert.equal(result.jobId, "job-1");
+    assert.equal("stagedKey" in result, false);
+    assert.deepEqual(h.ingestCalls, [[tenant, "file-1", batchId]]);
+    assert.deepEqual(h.persisted, [name]);
+    const unbatched = await upload({});
+    assert.equal(unbatched.status, 202);
+    assert.equal((await body(unbatched)).batchId, null);
+    assert.deepEqual(h.ingestCalls.at(-1), [tenant, "file-1", undefined]);
+    await expectError(await upload({ "x-batch-id": "batch-1" }), 400, "INVALID_BATCH_ID");
+    await expectError(await upload({ "x-upload-filename": "bad%E0%A4%A.png" }), 400, "INVALID_UPLOAD_HEADERS");
+    await expectError(await upload({ "content-type": "text/html" }), 415, "UNSUPPORTED_MEDIA_TYPE");
+  });
+  for (const [error, status] of [["BATCH_FULL", 409], ["BATCH_NOT_FOUND", 404], ["IDEMPOTENCY_CONFLICT", 409]] as const) {
+    const failing = workbenchHarness({ ingest: { persistUpload: async () => { throw new Error(error); } } });
+    await withServer(failing, async (base) => {
+      const response = await fetch(`${base}/api/documents`, { method: "POST", headers: { ...auth, "content-type": "image/png", "x-upload-filename": "a.png", "x-batch-id": batchId }, body: new Uint8Array([1]) });
+      await expectError(response, status, error);
+    });
+  }
+});
+
+test("internal errors are not leaked and readiness failures are 503", async () => {
+  const h = workbenchHarness({ storeError: new Error("relation \"documents\" does not exist"), readiness: async () => { throw new Error("connect ECONNREFUSED"); } });
+  await withServer(h, async (base) => {
+    await expectError(await fetch(`${base}/api/documents`, { headers: auth }), 500, "INTERNAL_ERROR");
+    const ready = await fetch(`${base}/health/ready`);
+    assert.equal(ready.status, 503);
+    assert.deepEqual(await body(ready), { status: "not_ready" });
+    assert.equal((await fetch(`${base}/health/live`)).status, 200);
+  });
+});
+
+test("workbench routes answer 503 when the store is not configured", async () => {
+  const { app } = deps();
+  await new Promise<void>((resolve) => app.listen(0, "127.0.0.1", resolve));
+  try {
+    const base = `http://127.0.0.1:${(app.address() as { port: number }).port}`;
+    await expectError(await fetch(`${base}/api/documents`, { headers: auth }), 503, "WORKBENCH_NOT_CONFIGURED");
+  } finally { await new Promise<void>((resolve, reject) => app.close((error) => error ? reject(error) : resolve())); }
+});
+
+test("metrics use templated routes", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    await fetch(`${base}/api/documents/${documentId}/ocr`, { headers: auth });
+    await fetch(`${base}/random/${unknownId}`);
+    const snapshot = await (await fetch(`${base}/metrics`)).text();
+    assert.match(snapshot, /route="\/api\/documents\/:id\/ocr"/);
+    assert.doesNotMatch(snapshot, new RegExp(unknownId));
+    assert.doesNotMatch(snapshot, new RegExp(`route="[^"]*${documentId}`));
+  });
+  assert.equal(routeLabel("/api/documents/abc/unknown/x"), "/api/documents/:id/*");
+  assert.equal(routeLabel("/wp-admin"), "unmatched");
+});
+
+test("error codes map to spec statuses", () => {
+  assert.equal(errorStatus("UNAUTHENTICATED"), 401);
+  assert.equal(errorStatus("INVALID_AUDIENCE"), 401);
+  assert.equal(errorStatus("DOCUMENT_NOT_FOUND"), 404);
+  assert.equal(errorStatus("DOCUMENT_NOT_FOUND_OR_FORBIDDEN"), 404);
+  assert.equal(errorStatus("BATCH_NOT_FOUND"), 404);
+  for (const code of ["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT"]) assert.equal(errorStatus(code), 409);
+  assert.equal(errorStatus("PAYLOAD_TOO_LARGE"), 413);
+  assert.equal(errorStatus("UNSUPPORTED_MEDIA_TYPE"), 415);
+  assert.equal(errorStatus("REVIEW_INVALID"), 400);
+  assert.equal(errorStatus("INVALID_UPLOAD_HEADERS"), 400);
+  assert.equal(errorStatus("CONTENT_NOT_CONFIGURED"), 503);
+  assert.equal(errorStatus("INTERNAL_ERROR"), 500);
 });

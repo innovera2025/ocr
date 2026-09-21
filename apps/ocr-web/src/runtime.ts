@@ -7,11 +7,13 @@ import { PostgresQueue } from "@innovera/ocr-queue/postgres";
 import { PostgresOcrDocumentStore } from "@innovera/ocr-persistence";
 import type { Pool } from "pg";
 
-export function createRuntimeIngest(pool: Pool, tenantId: string, idempotencyKey?: string): IngestDependencies {
+export function createRuntimeIngest(pool: Pool, tenantId: string, idempotencyKey?: string, batchId?: string): IngestDependencies {
   const storage = createLocalStorage(process.env.OCR_STORAGE_ROOT ?? "/var/lib/ocr");
   const queue = new PostgresQueue(pool);
   const store = new PostgresOcrDocumentStore(pool);
-  const fingerprint = (filename: string, mimeType: string, bytes: Uint8Array) => createHash("sha256").update(bytes).update(filename).update(mimeType).digest("hex");
+  // The batch is part of the request identity: replaying a key into another batch is an IDEMPOTENCY_CONFLICT.
+  // Without a batch the digest is byte-identical to the pre-batch fingerprint, so in-flight keys stay valid.
+  const fingerprint = (filename: string, mimeType: string, bytes: Uint8Array) => createHash("sha256").update(bytes).update(filename).update(mimeType).update(batchId ?? "").digest("hex");
   const scanner = createClamAvStorageScanner(storage, {
     host: process.env.OCR_CLAMAV_HOST ?? "clamav",
     port: Number(process.env.OCR_CLAMAV_PORT ?? 3310)
@@ -30,7 +32,7 @@ export function createRuntimeIngest(pool: Pool, tenantId: string, idempotencyKey
     persistUpload: async ({ filename, mimeType, bytes, stagedKey }) => store.createUploadedDocument({
       tenantId, filename, mimeType, sizeBytes: bytes.byteLength,
       contentHash: createHash("sha256").update(bytes).digest("hex"), storageKey: stagedKey,
-      ...idempotency, requestFingerprint: fingerprint(filename, mimeType, bytes)
+      ...idempotency, ...(batchId ? { batchId } : {}), requestFingerprint: fingerprint(filename, mimeType, bytes)
     }),
     updateStatus: async ({ documentId, status, errorMessage }) => store.updateScanStatus(tenantId, documentId, status, errorMessage),
     enqueuePersistent: async ({ runId }) => queue.enqueue({ organizationId: tenantId, runId })
