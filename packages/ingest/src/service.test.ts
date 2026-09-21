@@ -104,3 +104,31 @@ test("staged bytes that no document references are discarded", async () => {
   });
   assert.deepEqual(discarded, ["org/t/original/ab/loser"], "a failing discard never fails the upload");
 });
+
+test("concurrent replays of one stale upload resume it once: the replay that loses the claim is UPLOAD_IN_PROGRESS", async () => {
+  const calls: string[] = [];
+  let claimed = false;
+  const deps = {
+    lookupUpload: async () => ({ tenantId: "tenant", documentId: "doc-1", runId: "run-1", status: "SCANNING", storageKey: "org/tenant/original/ab/first", stale: true }),
+    claimResume: async ({ documentId }: { documentId: string }) => { calls.push(`claim:${documentId}`); const won = !claimed; claimed = true; return won; },
+    stage: async () => { calls.push("stage"); return "staged"; },
+    scan: async (key: string) => { calls.push(`scan:${key}`); await new Promise((resolveScan) => setTimeout(resolveScan, 10)); return "CLEAN" as const; },
+    enqueue: async () => "never",
+    updateStatus: async ({ status }: { status: string }) => { calls.push(`status:${status}`); },
+    enqueuePersistent: async ({ runId }: { runId: string }) => { calls.push(`enqueue:${runId}`); return "job-1"; }
+  };
+  const [first, second] = await Promise.allSettled([ingestDocument(upload, deps), ingestDocument(upload, deps)]);
+  assert.equal(first.status === "fulfilled" && first.value.jobId, "job-1");
+  assert.ok(second.status === "rejected" && /UPLOAD_IN_PROGRESS/.test(String(second.reason)));
+  assert.deepEqual(calls.filter((call) => !call.startsWith("claim:")), ["scan:org/tenant/original/ab/first", "status:CLEAN", "enqueue:run-1"], "one scan, one job");
+});
+
+test("a persistence error of unknown outcome keeps the staged original (the row may have been committed)", async () => {
+  const discarded: string[] = [];
+  await assert.rejects(() => ingestDocument(upload, {
+    stage: async () => "org/t/original/ab/maybe-committed", scan: async () => "CLEAN", enqueue: async () => "never",
+    persistUpload: async () => { throw new Error("Connection terminated unexpectedly"); },
+    discard: async (key) => { discarded.push(key); }
+  }), /Connection terminated/);
+  assert.deepEqual(discarded, []);
+});

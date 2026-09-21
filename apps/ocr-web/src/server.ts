@@ -222,9 +222,9 @@ function parseReviewInput(body: Record<string, unknown>): { structuredResult: Re
 
 /**
  * Legacy confirm: is anything other than the confirmed field still flagged? Legacy names resolve to canonical paths; for
- * "treatment" only the item the store will confirm (`legacyTreatmentIndex`, same rule) is excluded, so other flagged
- * treatments keep the document in review. When no single item qualifies (flat v2.2 rows, whose whole `treatment`
- * object is confirmed) every treatment is excluded.
+ * "treatment" only the item the store will confirm (`legacyTreatmentIndex`, same rule — also for the items of v2.2
+ * `treatment` objects) is excluded, so other flagged treatments keep the document in review. When no single item
+ * qualifies (the store then confirms a v2.2 `treatment` object as a whole) every treatment is excluded.
  */
 function hasOtherReview(view: DocumentView, field: string, raw: string): boolean {
   const index = field === "treatment" ? legacyTreatmentIndex(view.staffOnly.treatments, raw) : null;

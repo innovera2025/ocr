@@ -65,10 +65,11 @@ def test_unlabeled_minutes_are_kept_in_raw_and_duration():
     assert durations == ["1 ชม. 30"] and warnings == []
 
 
-@pytest.mark.parametrize("text", ["ไทย 90 นาที 15", "ไทย 10:30", "ไทย 2 90 นาที"])
+@pytest.mark.parametrize("text", ["ไทย 90 นาที 15", "ไทย 10:30", "ไทย 2 90 นาที",
+                                  "ไทย 90 นาที + 30", "ไทย 90 นาที\n15", "หน้า 1 ชม. + 30", "ไทย 60 นาที, 30", "30 + ไทย 90 นาที"])
 def test_numbers_not_read_as_a_duration_need_review(text):
     items, _, warnings, _ = N.parse_treatments(text)
-    assert items[0]["needsReview"] and any("not read as a duration" in w for w in warnings)
+    assert len(items) == 1 and items[0]["needsReview"] and any("not read as a duration" in w for w in warnings)
 
 
 def test_duration_not_allowed_for_treatment_needs_review():
@@ -114,6 +115,12 @@ def test_therapist_and_room_normalization():
     ("| Name 姓名 | Chun |\n| Nationality 国籍 | Chinese |\n| Hotel Name 酒店 | |", {"name": "Chun", "nationality": "Chinese", "hotelName": None}),
     ("姓名 Chun 国籍 Chinese 酒店 Hilton Sukhumvit", {"name": "Chun", "nationality": "Chinese", "hotelName": "Hilton Sukhumvit"}),
     ("**Name:** Anna Smith\n**Nationality:** British\n**Hotel Name:** N/A", {"name": "Anna Smith", "nationality": "British", "hotelName": None}),
+    # bilingual labels echoed in brackets, and numbered lines, never leak into the values
+    ("Name (姓名): Chun\nNationality (国籍): Chinese\nHotel Name (酒店): Hilton", {"name": "Chun", "nationality": "Chinese", "hotelName": "Hilton"}),
+    ("Name（姓名）：Chun\nNationality（国籍）：Chinese\nHotel Name（酒店）：Hilton", {"name": "Chun", "nationality": "Chinese", "hotelName": "Hilton"}),
+    ("Name [姓名]: Chun\nNationality [国籍]: Chinese\nHotel Name [酒店]: -", {"name": "Chun", "nationality": "Chinese", "hotelName": None}),
+    ("1. Name Chun\n2. Nationality Chinese\n3. Hotel Name Hilton", {"name": "Chun", "nationality": "Chinese", "hotelName": "Hilton"}),
+    ("- Name: Chun\n- Nationality: Chinese\n- Hotel Name:", {"name": "Chun", "nationality": "Chinese", "hotelName": None}),
 ])
 def test_customer_text_label_parsing(text, expected):
     parsed, fallback = N.parse_customer_text(text)

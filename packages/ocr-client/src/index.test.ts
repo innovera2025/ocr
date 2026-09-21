@@ -90,5 +90,11 @@ test("OCR health check probes GET /health", async () => {
   assert.equal(await client({ status: "ok", version: "3.0" }).healthCheck(), true);
   assert.deepEqual(seen, ["GET https://ocr.example/ocr/health"]);
   assert.equal(await client({ status: "degraded" }).healthCheck(), false);
+  // stale master data: the last good masters are served and /v1/ocr works, so the worker must not stop claiming
+  assert.equal(await client({ status: "degraded", masterData: "stale: Expecting ',' delimiter" }).healthCheck(), true);
+  assert.equal(await client({ status: "degraded", masterData: "error: master data not found" }).healthCheck(), false);
   assert.equal(await client({}, 405).healthCheck(), false);
+  // gateway without a /health route: unknown, so the worker's half-open trial job decides
+  assert.equal(await client({}, 404).healthCheck(), true);
+  assert.equal(await client({}, 502).healthCheck(), false);
 });

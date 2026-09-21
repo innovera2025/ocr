@@ -191,3 +191,15 @@ def test_implausible_checkbox_groups_are_reported():
     warnings = M.implausible_checkboxes(analyse(image)["boxes"])
     assert warnings == ["9 of 16 healthConditions boxes read as checked; the page may be shaded or tinted"]
     assert M.implausible_checkboxes(analyse(S.filled_form())["boxes"]) == []
+
+
+@pytest.mark.parametrize("factor, quality, side", [(0.85, 50, None), (0.85, 70, None), (0.8, 85, None), (0.9, 50, 1280), (0.8, 70, 1600)])
+def test_dim_jpeg_keeps_body_map_circles(sample_image, factor, quality, side):
+    """Phone photos / messenger forwards (paper ~200-230, JPEG): a paper-relative threshold alone dropped thin circles or
+    turned Neck (back) into an avoid-area cross; the absolute ceiling plus a smaller relative drop keeps all three."""
+    import io
+    image = sample_image if side is None else sample_image.resize((side, round(side * L.REF_H / L.REF_W)), Image.LANCZOS)
+    buffer = io.BytesIO()
+    Image.eval(image, lambda v: int(v * factor)).save(buffer, format="JPEG", quality=quality)
+    body = analyse(Image.open(io.BytesIO(buffer.getvalue())).convert("RGB"))["body"]
+    assert set(body) == {("Shoulder (front)", "circle"), ("Neck (back)", "circle"), ("Back (back)", "circle")}

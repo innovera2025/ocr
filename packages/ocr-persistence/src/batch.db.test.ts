@@ -480,6 +480,67 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     assert.deepEqual(outbox.rows, [{ payload: { documentId: response.documentId, field: "treatment", raw: "ฟุต", verifiedValue: "นวดเท้า" } }]);
   });
 
+  test("a whole v2.2 response 'confirmed' by v2.2 from one field stays unconfirmed with its flags until every field is resolved", async () => {
+    const whole = { documentId: `local-${randomUUID()}`, version: "2.2",
+      staffOnly: { treatment: { raw: "ฟุต 60 นาที", durations: ["60 นาที"], items: [{ raw: "ฟุต", value: null, duration: "60 นาที", confidence: 0.41, source: "master-fuzzy", needsReview: true }], needsReview: true },
+        therapistName: field("พิพิ", null, 0.5, true, "master-fuzzy"), roomNo: field("12", "12", 0.95) } };
+    const doc = await processed("whole-v22-confirm.png", { documentId: whole.documentId }, whole);
+    // v2.2 only looked at top-level keys (none flagged) and wrote a top-level therapistName that the row does not have.
+    await v22Confirm(doc.documentId, "therapistName", "พีพี", "PENDING", null);
+    await v22Confirm(doc.documentId, "therapistName", "พีพี", "SUCCEEDED", false);
+    const listed = async () => (await app.listDocuments(TENANT_A, { q: "whole-v22-confirm" })).documents[0]!;
+    let item = await listed();
+    assert.deepEqual([item.status, item.statusCategory, item.reviewedAt, item.summary.reviewFieldCount], ["SUCCEEDED", "succeeded", null, 2]);
+    assert.equal(hasReviewFields((await app.getReviewDocument(TENANT_A, doc.documentId))!.structuredResult), true, "unresolved fields stay flagged");
+    // After deploy the path-aware endpoint resolves each field where it is stored; with none left the row is confirmed.
+    await app.saveCorrection(TENANT_A, doc.documentId, "therapistName", "พีพี", "PENDING", undefined, undefined, { raw: "พิพิ", verifiedBy: "user-a" });
+    await app.saveCorrection(TENANT_A, doc.documentId, "therapistName", "พีพี", "SUCCEEDED", undefined, true);
+    assert.equal((await listed()).statusCategory, "succeeded");
+    await app.saveCorrection(TENANT_A, doc.documentId, "treatment", "นวดเท้า", "PENDING", undefined, undefined, { raw: "ฟุต", verifiedBy: "user-a" });
+    await app.saveCorrection(TENANT_A, doc.documentId, "treatment", "นวดเท้า", "SUCCEEDED", undefined, false);
+    item = await listed();
+    assert.deepEqual([item.statusCategory, item.summary.reviewFieldCount, item.summary.therapist, item.summary.treatments], ["confirmed", 0, "พีพี", [{ name: "นวดเท้า", duration: "60 นาที" }]]);
+  });
+
+  test("legacy confirm of one v2.2 treatment item keeps its correctly read siblings (flat and whole v2.2 rows)", async () => {
+    const treatmentObject = { raw: "ไทย 60 นาที ฟุต 30 นาที", durations: ["60 นาที", "30 นาที"], needsReview: true, items: [
+      { raw: "ไทย", value: "นวดไทย", duration: "60 นาที", confidence: 0.95, source: "rule", needsReview: false },
+      { raw: "ฟุต", value: null, duration: "30 นาที", confidence: 0.4, source: "none", needsReview: true }] };
+    const staff = { therapistName: field("พีพี", "พีพี", 1), roomNo: field("3", "3", 0.95) };
+    for (const [filename, structured] of [["v22-items-flat.png", { treatment: treatmentObject, ...staff }], ["v22-items-whole.png", { documentId: "x", staffOnly: { treatment: treatmentObject, ...staff } }]] as const) {
+      const doc = await processed(filename, { documentId: `local-${randomUUID()}` }, structured);
+      await app.saveCorrection(TENANT_A, doc.documentId, "treatment", "นวดเท้า", "PENDING", undefined, undefined, { raw: "ฟุต", verifiedBy: "user-a" });
+      await app.saveCorrection(TENANT_A, doc.documentId, "treatment", "นวดเท้า", "SUCCEEDED", undefined, false);
+      const review = (await app.getReviewDocument(TENANT_A, doc.documentId))!;
+      assert.deepEqual((review.structuredResult.staffOnly.treatments as Array<Record<string, unknown>>).map((entry) => [entry.raw, entry.value, entry.duration, entry.needsReview]),
+        [["ไทย", "นวดไทย", "60 นาที", false], ["ฟุต", "นวดเท้า", "30 นาที", false]], filename);
+      assert.deepEqual([review.status, (await app.listDocuments(TENANT_A, { q: filename })).documents[0]?.statusCategory], ["SUCCEEDED", "confirmed"], filename);
+      const audit = await superDb.query("SELECT old_raw, verified_value FROM ocr_corrections WHERE document_id = $1", [doc.documentId]);
+      assert.deepEqual(audit.rows, [{ old_raw: "ฟุต", verified_value: "นวดเท้า" }], filename);
+    }
+  });
+
+  test("a later legacy confirmation that is pending or ends in RETRY never un-confirms a confirmed row", async () => {
+    const flat = { treatment: { raw: "ไทย 60 นาที", durations: ["60 นาที"], items: [{ raw: "ไทย", value: "นวดไทย", duration: "60 นาที", confidence: 0.95, source: "rule", needsReview: false }], needsReview: false },
+      therapistName: field("พิพิ", null, 0.5, true, "master-fuzzy"), roomNo: field("12", "12", 0.95) };
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 1 });
+    const doc = await processed("sticky-confirm.png", { documentId: `local-${randomUUID()}` }, flat, batch.batchId);
+    await v22Confirm(doc.documentId, "therapistName", "พีพี", "PENDING", null);
+    await v22Confirm(doc.documentId, "therapistName", "พีพี", "SUCCEEDED", false);
+    const state = async () => {
+      const item = (await app.listDocuments(TENANT_A, { q: "sticky-confirm" })).documents[0]!;
+      return [item.statusCategory, item.summary.reviewFieldCount, (await app.getBatch(TENANT_A, batch.batchId))!.confirmed];
+    };
+    assert.deepEqual(await state(), ["confirmed", 0, 1]);
+    await app.saveCorrection(TENANT_A, doc.documentId, "roomNo", "12", "PENDING", undefined, undefined, { raw: "12", verifiedBy: "user-a" });
+    assert.deepEqual(await state(), ["confirmed", 0, 1], "while the provider call is in flight");
+    await app.saveCorrection(TENANT_A, doc.documentId, "roomNo", "12", "RETRY", "OCR API returned HTTP 400");
+    assert.deepEqual(await state(), ["confirmed", 0, 1], "after RETRY");
+    const review = (await app.getReviewDocument(TENANT_A, doc.documentId))!;
+    const saved = await app.saveReview(TENANT_A, doc.documentId, { structuredResult: review.structuredResult, reviewedBy: "user-a", expectedUpdatedAt: review.updatedAt });
+    assert.deepEqual([saved.corrections, saved.delivery], [0, "NOT_REQUIRED"], "the therapist v2.2 already confirmed is not re-sent to verified memory");
+  });
+
   test("delivery status is not hidden when one review deletes an item and edits the item that moves into its place", async () => {
     const response = { ...reviewResponse, documentId: `local-${randomUUID()}`, staffOnly: { ...reviewResponse.staffOnly, therapistName: field("พีพี", "พีพี", 1),
       treatments: [treatment("ไทย 90 นาที", "ไทย", null, "90 นาที", 0.4, true), treatment("ฟุต 60 นาที", "ฟุต", "นวดเท้า", "60 นาที", 0.95)] } };
@@ -502,13 +563,24 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     const first = await processed("short-1.png", { ...cleanResponse, documentId: `local-${randomUUID()}` }, undefined, batch.batchId);
     const second = await processed("short-2.png", { ...reviewResponse, documentId: `local-${randomUUID()}` }, undefined, batch.batchId);
     await superDb.query("UPDATE ocr_batches SET created_at = now() - interval '62 minutes' WHERE id = $1", [batch.batchId]);
-    await superDb.query("UPDATE documents SET processed_at = now() - interval '60 minutes' WHERE id = ANY($1::uuid[])", [[first.documentId, second.documentId]]);
+    await superDb.query("UPDATE documents SET created_at = now() - interval '61 minutes', processed_at = now() - interval '60 minutes' WHERE id = ANY($1::uuid[])", [[first.documentId, second.documentId]]);
     const summary = (await app.getBatch(TENANT_A, batch.batchId))!;
     assert.deepEqual([summary.uploaded, summary.completed, summary.queued, summary.processing, summary.finishedAt], [2, 2, 0, 0, null]);
     assert.ok(Math.abs(summary.durationMs! - 120_000) < 1000, `duration ends at the last completion (got ${summary.durationMs} ms)`);
     assert.equal(summary.throughputPerMinute, 1);
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.equal((await app.getBatch(TENANT_A, batch.batchId))!.durationMs, summary.durationMs, "the clock does not keep running");
+  });
+
+  test("the batch clock keeps running while OCR is ahead of files that are still uploading", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3 });
+    await processed("ahead-1.png", { ...cleanResponse, documentId: `local-${randomUUID()}` }, undefined, batch.batchId);
+    const first = (await app.getBatch(TENANT_A, batch.batchId))!;
+    assert.deepEqual([first.uploaded, first.completed, first.queued, first.processing], [1, 1, 0, 0]);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const later = (await app.getBatch(TENANT_A, batch.batchId))!;
+    assert.ok(later.durationMs! >= first.durationMs! + 100, `elapsed keeps growing (${first.durationMs} → ${later.durationMs} ms)`);
+    assert.ok(later.throughputPerMinute! < first.throughputPerMinute!, "docs/min is not frozen at the first completion");
   });
 
   test("originals carry their status; replays see what a resume needs; DEAD runs fail their document; NUL is REVIEW_INVALID", async () => {
@@ -518,6 +590,15 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     assert.deepEqual([replay?.documentId, replay?.jobId, replay?.status, replay?.stale, replay?.storageKey?.startsWith(`org/${TENANT_A}/original/`)], [pending.documentId, undefined, "SCANNING", false, true]);
     await superDb.query("UPDATE documents SET updated_at = now() - interval '5 minutes' WHERE id = $1", [pending.documentId]);
     assert.equal((await app.findIdempotentUpload({ tenantId: TENANT_A, idempotencyKey: "key-interrupted", requestFingerprint: "fp-interrupted" }))?.stale, true);
+    assert.equal(await app.claimStaleUpload(TENANT_B, pending.documentId), false, "resume claim is tenant scoped");
+    const claims = await Promise.all([app.claimStaleUpload(TENANT_A, pending.documentId), app.claimStaleUpload(TENANT_A, pending.documentId)]);
+    assert.deepEqual(claims.sort(), [false, true], "concurrent replays of a stale upload: exactly one resumes it");
+    assert.equal((await app.findIdempotentUpload({ tenantId: TENANT_A, idempotencyKey: "key-interrupted", requestFingerprint: "fp-interrupted" }))?.stale, false);
+    const queued = await upload(app, TENANT_A, "queued-stale.png");
+    await app.updateScanStatus(TENANT_A, queued.documentId, "CLEAN");
+    await appQueue.enqueue({ organizationId: TENANT_A, runId: queued.runId });
+    await superDb.query("UPDATE documents SET updated_at = now() - interval '5 minutes' WHERE id = $1", [queued.documentId]);
+    assert.equal(await app.claimStaleUpload(TENANT_A, queued.documentId), false, "an upload that already has a job is never resumed");
     await app.updateScanStatus(TENANT_A, pending.documentId, "CLEAN");
     assert.equal(await worker.markRunFailure(TENANT_B, pending.runId, "DOCUMENT_NOT_FOUND"), false, "tenant scoped");
     assert.equal(await worker.markRunFailure(TENANT_A, pending.runId, "DOCUMENT_NOT_FOUND"), true);

@@ -316,7 +316,12 @@ export function startWorkerLoops(dependencies: WorkerDependencies & MaintenanceD
       if (wait > 0 || gate.trial) { await control.sleep(Math.max(wait, idleMs)); return true; }
       gate.trial = true; // half-open: one loop probes and runs one job, the others wait
       try {
-        if (client.healthCheck && !(await client.healthCheck())) { gate.trip(); return true; }
+        if (client.healthCheck && !(await client.healthCheck())) {
+          gate.trip();
+          metrics.increment("ocr_health_probe_failed_total");
+          logEvent("ocr_health_probe_failed", { failures: gate.failures(), backoff_ms: gate.waitMs() });
+          return true;
+        }
         return await runWorkerOnce(jobDependencies);
       } finally { gate.trial = false; }
     }

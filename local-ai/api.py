@@ -31,7 +31,8 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 MIME_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf"}
 TEMPLATE_MIN_CONTRAST = 15  # mean printed-checkbox ring contrast below this => not the expected form / badly aligned
 MAX_PDF_PAGE_PT = 14400  # PDF page-size limit (200 in); bigger MediaBoxes are refused before anything is rendered
-MAX_RASTER_PIXELS = 89_478_485  # Pillow's decompression-bomb warning threshold, enforced as an error
+MAX_RASTER_PIXELS = 89_478_485  # Pillow's decompression-bomb warning threshold, enforced as an error (after JPEG draft)
+JPEG_DRAFT_SIDE = 4096  # a bigger JPEG (e.g. a 108 MP phone photo) is decoded at 1/2..1/8 scale, still >= this on both sides
 # PDFium (and MuPDF) keep process-global state and are not thread-safe. /v1/ocr runs in FastAPI's threadpool, so two
 # PDF renders at once could crash the whole process: every render runs under this lock.
 _PDF_LOCK = threading.Lock()
@@ -128,6 +129,8 @@ def _decode(data, ext):
         return image, warnings
     try:
         image = Image.open(io.BytesIO(data))
+        if image.width * image.height > MAX_RASTER_PIXELS and image.format == "JPEG":
+            image.draft(image.mode, (JPEG_DRAFT_SIDE, JPEG_DRAFT_SIDE))  # DCT scaling: cheaper than decoding full size
         if image.width * image.height > MAX_RASTER_PIXELS:  # checked on the header, before any pixel is decoded
             raise ValueError(f"image is {image.width}x{image.height} px, more than {MAX_RASTER_PIXELS} pixels")
         image.load()

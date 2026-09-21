@@ -127,13 +127,19 @@ export class OcrClient {
     });
   }
 
-  /** `GET /health` (FastAPI answers `HEAD /v1/ocr` with 405, so the old probe never succeeded). */
+  /**
+   * `GET /health` (FastAPI answers `HEAD /v1/ocr` with 405, so the old probe never succeeded). True when the service can
+   * read documents: status "ok", or "degraded" while it serves the last good master data (`masterData: "stale: …"`).
+   * Master data that never loaded (`"error: …"`, every OCR request fails) is not up.
+   * A 404 means the gateway in front of the Local AI does not route `/health`; that says nothing about OCR, so it counts
+   * as up and the worker's single half-open trial job decides instead of the gate staying closed forever.
+   */
   async healthCheck(): Promise<boolean> {
     try {
       const body = await this.requestJson("/health", { method: "GET" });
-      return body.status === "ok";
-    } catch {
-      return false;
+      return body.status === "ok" || (body.status === "degraded" && typeof body.masterData === "string" && body.masterData.startsWith("stale:"));
+    } catch (error) {
+      return error instanceof OcrClientError && error.code === "http" && error.status === 404;
     }
   }
 

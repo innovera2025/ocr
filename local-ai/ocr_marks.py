@@ -18,7 +18,7 @@ BLUE_STRONG, LUM_STRONG = 10, 175      # blueness >= 10 and luminance < 175
 BLUE_FAINT, LUM_FAINT = 18, 215        # blueness >= 18 and luminance < 215 (faint, thin strokes)
 LUM_DARK = 60                          # any pixel darker than this (black pen); printed text is >= ~73
 LUM_PAPER, LUM_ANY_HUE, BLUE_MIN_PAPER = 185, 120, -25  # darker-than-paper inside blank zones (orange print excluded)
-PAPER_DROP = 255 - LUM_PAPER           # "darker than paper" = this much below the *local* paper level (white paper: < 185)
+PAPER_MIN_DROP = 30                    # ...and at least this far below the *local* paper level (shadows, dim photos)
 FIGURE_LUM = 125                       # pen on the orange body figures shows up dark (orange is ~180)
 
 # Checkbox decision thresholds on the interior ink fraction.
@@ -54,14 +54,17 @@ def paper_level(lum):
 
 def darker_than_paper(rgb, lum, paper=None):
     """Any pixel clearly darker than paper, except orange/yellow print (blue far below red/green). `paper` is the local
-    paper level (`paper_level`); without it the paper is taken as white."""
+    paper level (`paper_level`); without it the paper is taken as white. With it a pixel must be both below LUM_PAPER
+    and PAPER_MIN_DROP below the local paper: the absolute ceiling keeps thin pen strokes on dim JPEGs (paper ~200-230),
+    the relative drop rejects shadows and dim paper that fall below LUM_PAPER."""
     r, g, b = rgb.split()
     # orange-ness = max(r, g) - b (clipped at 0); orange/yellow print has blue far below red/green
     not_orange = _mask(ImageChops.subtract(ImageChops.lighter(r, g), b), lambda v: v <= -BLUE_MIN_PAPER)
     if paper is None:
         below_paper = _mask(lum, lambda v: v < LUM_PAPER)
     else:
-        below_paper = _mask(ImageChops.subtract(paper, lum), lambda v: v > PAPER_DROP)
+        below_paper = ImageChops.darker(_mask(lum, lambda v: v < LUM_PAPER),
+                                        _mask(ImageChops.subtract(paper, lum), lambda v: v > PAPER_MIN_DROP))
     very_dark = ImageChops.darker(below_paper, _mask(lum, lambda v: v < LUM_ANY_HUE))
     return ImageChops.lighter(ImageChops.darker(below_paper, not_orange), very_dark)
 

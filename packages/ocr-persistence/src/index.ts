@@ -64,8 +64,8 @@ export type BatchSummary = { batchId: string; label: string | null; createdAt: s
   uploaded: number; queued: number; processing: number; succeeded: number; needsReview: number;
   failed: number; confirmed: number; completed: number /* succeeded+needsReview+failed */;
   finishedAt: string | null /* last completion, once completed === expectedTotal */;
-  durationMs: number | null /* createdAt → last completion once nothing is queued or processing (also when fewer files than
-    expected arrived), else → now; null before the first upload */;
+  durationMs: number | null /* createdAt → last completion once finished, or once nothing is queued or processing and
+    nothing arrived or completed for 5 minutes (fewer files than expected arrived), else → now; null before the first upload */;
   throughputPerMinute: number | null /* completed per minute of durationMs */ };
 export type CreateBatchInput = { createdBy: string; expectedTotal: number; label?: string | null | undefined };
 export type DocumentListItem = { documentId: string; batchId: string | null; filename: string; mimeType: string;
@@ -116,10 +116,19 @@ export function statusCategoryOf(status: string, reviewedAt: unknown): DocumentS
 /**
  * When document `d` was confirmed: reviewed in the workbench (`reviewed_at`), or — rows confirmed field by field through
  * the legacy confirm endpoint, incl. every v2.2 confirmation, which never set `reviewed_at` — `confirmed_at` of a
- * SUCCEEDED document whose last provider confirmation succeeded. NULL = not confirmed. Read-side on purpose: the
- * migrator cannot backfill rows through FORCE RLS.
+ * SUCCEEDED document with nothing left to review (`needs_review` false). `confirmed_at` is only set by a successful
+ * provider confirmation and never cleared, so a later confirmation that is PENDING or ends in RETRY does not un-confirm
+ * the row. A stored whole v2.2 response (`{documentId, staffOnly:{treatment,…}}`, not schema 3) only counts once no
+ * field flag is left in `staffOnly`: v2.2 confirmed such rows from one field and wrote the value to a top-level key, so
+ * their flags still mark unresolved fields (the aggregate `treatment.needsReview` counts only without items, as in the
+ * view). NULL = not confirmed. Read-side on purpose: the migrator cannot backfill rows through FORCE RLS.
  */
-const REVIEWED_AT_SQL = "(CASE WHEN d.reviewed_at IS NOT NULL THEN d.reviewed_at WHEN d.status = 'SUCCEEDED' AND d.confirm_status = 'SUCCEEDED' THEN d.confirmed_at END)";
+const REVIEWED_AT_SQL = `(CASE WHEN d.reviewed_at IS NOT NULL THEN d.reviewed_at
+  WHEN d.status = 'SUCCEEDED' AND d.needs_review = false AND d.confirmed_at IS NOT NULL
+    AND NOT (COALESCE(jsonb_typeof(d.structured_result -> 'staffOnly') = 'object', false)
+      AND (d.structured_result ->> 'schemaVersion') IS DISTINCT FROM '3'
+      AND jsonb_path_exists(d.structured_result -> 'staffOnly', 'lax $.** ? (@.needsReview == true && !(exists(@.items[0])))'))
+  THEN d.confirmed_at END)`;
 
 const CATEGORY_SQL: Readonly<Record<DocumentStatusCategory, string>> = {
   queued: "d.status IN ('VALIDATING','SCANNING','CLEAN')", processing: "d.status = 'PROCESSING'", review: "d.status = 'NEEDS_REVIEW'",
@@ -152,7 +161,8 @@ const BATCH_SELECT = `SELECT b.id, b.label, b.created_at, b.expected_total, now(
   count(d.id) FILTER (WHERE d.status = 'NEEDS_REVIEW')::int AS needs_review,
   count(d.id) FILTER (WHERE d.status IN ('FAILED','QUARANTINED'))::int AS failed,
   count(d.id) FILTER (WHERE d.status = 'SUCCEEDED' AND ${REVIEWED_AT_SQL} IS NOT NULL)::int AS confirmed,
-  max(COALESCE(d.processed_at, d.updated_at)) FILTER (WHERE d.status IN ('SUCCEEDED','NEEDS_REVIEW','FAILED','QUARANTINED')) AS last_completed_at
+  max(COALESCE(d.processed_at, d.updated_at)) FILTER (WHERE d.status IN ('SUCCEEDED','NEEDS_REVIEW','FAILED','QUARANTINED')) AS last_completed_at,
+  max(d.created_at) AS last_created_at
 FROM ocr_batches b
 LEFT JOIN documents d ON d.batch_id = b.id AND d.organization_id = b.organization_id AND d.deleted_at IS NULL AND d.status <> 'DELETED'
 WHERE b.organization_id = $1::uuid AND ($2::uuid IS NULL OR b.id = $2::uuid)
@@ -161,6 +171,9 @@ GROUP BY b.id ORDER BY b.created_at DESC, b.id DESC LIMIT $3`;
 type Row = Record<string, unknown>;
 /** A replayed upload that is still SCANNING/CLEAN without a job after this long belongs to a request that died. */
 const RESUME_AFTER = "2 minutes";
+/** A short batch with nothing queued/processing stops its clock only after this long without a new document or completion
+ * (a file may still be uploading: its row exists only once the whole body arrived). */
+const BATCH_IDLE_AFTER_MS = 5 * 60_000;
 function iso(value: unknown): string | null { return value instanceof Date ? value.toISOString() : typeof value === "string" ? new Date(value).toISOString() : null; }
 function ms(value: unknown): number | null { return value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : null; }
 function str(value: unknown): string | null { return typeof value === "string" ? value : null; }
@@ -178,11 +191,14 @@ function toBatchSummary(row: Row): BatchSummary {
   const uploaded = num(row.uploaded), succeeded = num(row.succeeded), needsReview = num(row.needs_review), failed = num(row.failed);
   const completed = succeeded + needsReview + failed;
   const lastCompleted = ms(row.last_completed_at);
+  const now = ms(row.db_now) ?? Date.now();
   const finished = completed >= expectedTotal && lastCompleted !== null;
   // Uploads rejected before persistence (or abandoned) never become documents, so a batch can stay below expectedTotal
-  // for good: the clock also stops at the last completion whenever nothing is queued or processing.
-  const idle = uploaded > 0 && num(row.queued) + num(row.processing) === 0 && lastCompleted !== null;
-  const end = finished || idle ? lastCompleted! : ms(row.db_now) ?? Date.now();
+  // for good: the clock also stops at the last completion once nothing is queued or processing and nothing new has
+  // arrived or completed for BATCH_IDLE_AFTER_MS (before that, OCR may just be ahead of a file still uploading).
+  const lastActivity = Math.max(lastCompleted ?? 0, ms(row.last_created_at) ?? 0);
+  const idle = uploaded > 0 && num(row.queued) + num(row.processing) === 0 && lastCompleted !== null && now - lastActivity >= BATCH_IDLE_AFTER_MS;
+  const end = finished || idle ? lastCompleted! : now;
   const durationMs = uploaded > 0 ? Math.max(0, end - createdAt) : null;
   const throughputPerMinute = completed > 0 && durationMs !== null && durationMs > 0 ? Math.round((completed / (durationMs / 60_000)) * 100) / 100 : null;
   return { batchId: String(row.id), label: str(row.label), createdAt: iso(row.created_at) ?? "", expectedTotal, uploaded,
@@ -215,16 +231,33 @@ function toListItem(row: Row): DocumentListItem {
     summary: summarizeDocument(viewOf(row)) };
 }
 
+function isRow(value: unknown): value is Row { return typeof value === "object" && value !== null && !Array.isArray(value); }
+
+/**
+ * Target inside a v2.2 `treatment` object ({raw, durations, items, needsReview}) at `prefix`: the one item
+ * `legacyTreatmentIndex(items, raw)` picks (the same rule the server uses to exclude that item from "anything else
+ * flagged?"), or `treatment` itself — a whole-field answer that replaces every item — when `raw` is the whole field's raw
+ * or no single item qualifies.
+ */
+function v22TreatmentPath(prefix: string[], treatment: Row, raw: string): string[] {
+  const index = legacyTreatmentIndex(treatment.items, raw);
+  const wholeField = typeof treatment.raw === "string" && raw.trim() === treatment.raw.trim();
+  return index !== null && !wholeField ? [...prefix, "treatment", "items", String(index)] : [...prefix, "treatment"];
+}
+
 /**
  * Legacy single-field confirm: sectioned rows keep therapistName/roomNo under `staffOnly`; old flat rows at the top level.
  * "treatment" on a sectioned row targets one canonical `staffOnly.treatments[i]` (`legacyTreatmentIndex` with the request's
  * `raw`), or the v2.2 `staffOnly.treatment` object of a stored whole v2.2 response; CONFIRMATION_TARGET_AMBIGUOUS when no
- * single item qualifies (instead of writing a top-level key the canonical view never reads).
+ * single item qualifies (instead of writing a top-level key the canonical view never reads). On v2.2 treatment objects
+ * (flat or whole) an item-level confirmation writes that item only (`v22TreatmentPath`), so its siblings are kept.
  */
 export function legacyFieldPath(structuredResult: unknown, field: string, raw = ""): string[] {
-  const staffOnly = typeof structuredResult === "object" && structuredResult !== null ? (structuredResult as Row).staffOnly : undefined;
-  if (typeof staffOnly !== "object" || staffOnly === null || Array.isArray(staffOnly)) return [field];
-  const staff = staffOnly as Row;
+  const staffOnly = isRow(structuredResult) ? structuredResult.staffOnly : undefined;
+  if (!isRow(staffOnly)) {
+    return field === "treatment" && isRow(structuredResult) && isRow(structuredResult.treatment) ? v22TreatmentPath([], structuredResult.treatment, raw) : [field];
+  }
+  const staff = staffOnly;
   if (field === "therapistName" || field === "roomNo") return ["staffOnly", field];
   if (field !== "treatment") return [field];
   if (Array.isArray(staff.treatments) && staff.treatments.length > 0) {
@@ -232,7 +265,7 @@ export function legacyFieldPath(structuredResult: unknown, field: string, raw = 
     if (index === null) throw new Error("CONFIRMATION_TARGET_AMBIGUOUS");
     return ["staffOnly", "treatments", String(index)];
   }
-  if (typeof staff.treatment === "object" && staff.treatment !== null && !Array.isArray(staff.treatment)) return ["staffOnly", "treatment"];
+  if (isRow(staff.treatment)) return v22TreatmentPath(["staffOnly"], staff.treatment, raw);
   throw new Error("CONFIRMATION_TARGET_AMBIGUOUS");
 }
 
@@ -353,6 +386,24 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       await client.query("COMMIT"); return { tenantId: input.tenantId, documentId: row.document_id, runId: row.run_id, ...(row.job_id ? { jobId: row.job_id } : {}), ...(row.batch_id ? { batchId: row.batch_id } : {}),
         ...(row.status ? { status: row.status } : {}), ...(row.storage_key ? { storageKey: row.storage_key } : {}), stale: row.stale === true };
     } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; } finally { client.release(); }
+  }
+
+  /**
+   * Takes over an upload whose request died before it was queued, before a replay resumes it: bumps `updated_at` only
+   * while the document is still SCANNING/CLEAN, untouched for RESUME_AFTER and without a job. Concurrent replays
+   * serialise on the row lock and re-check `updated_at`, so exactly one gets true.
+   */
+  async claimStaleUpload(tenantId: string, documentId: string): Promise<boolean> {
+    if (!isUuid(documentId)) return false;
+    return this.tenantTransaction(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE documents d SET updated_at = now()
+         WHERE d.id = $1::uuid AND d.organization_id = $2::uuid AND d.deleted_at IS NULL AND d.status IN ('SCANNING','CLEAN')
+           AND d.updated_at < now() - interval '${RESUME_AFTER}'
+           AND NOT EXISTS (SELECT 1 FROM extraction_jobs j JOIN document_runs r ON r.id = j.run_id AND r.organization_id = j.organization_id
+                           WHERE r.document_id = d.id AND r.organization_id = d.organization_id)`, [documentId, tenantId]);
+      return result.rowCount === 1;
+    });
   }
 
   async updateScanStatus(tenantId: string, documentId: string, status: "CLEAN" | "QUARANTINED" | "FAILED", errorMessage?: string): Promise<void> {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
-import { OcrClientError, type OcrResponse } from "@innovera/ocr-client";
+import { OcrClient, OcrClientError, type OcrResponse } from "@innovera/ocr-client";
 import { metrics } from "@innovera/ocr-observability";
 import type { OcrResultPatch } from "@innovera/ocr-persistence";
 import { createLocalStorage } from "@innovera/ocr-storage/local";
@@ -292,6 +292,7 @@ test("an OCR API outage pauses every job loop instead of burning the batch's att
     assert.ok(ocrCalls <= 2, `only the jobs in flight when the outage began hit the API (got ${ocrCalls})`);
     assert.ok(queue.rows.reduce((sum, row) => sum + row.attempts, 0) <= 2);
     assert.ok(probes >= 3, "the loops keep probing GET /health");
+    assert.match(metrics.snapshot(), /ocr_health_probe_failed_total \d+/, "failed probes are counted, never silent");
     up = true;
     const deadline = Date.now() + 3000;
     while (queue.rows.some((row) => row.status !== "SUCCEEDED") && Date.now() < deadline) await delay(5);
@@ -313,5 +314,30 @@ test("an OCR API that answers /health but fails every request loses at most one 
     const attempts = queue.rows.reduce((sum, row) => sum + row.attempts, 0);
     assert.ok(attempts <= 12, `backoff 10·2^n ms (≤ 80) allows only a handful of trials in 500 ms (got ${attempts})`);
     assert.equal(queue.rows.filter((row) => row.status === "DEAD").length <= 4, true);
+  } finally { await loops.stop(); }
+});
+
+test("stale master data (/health degraded, OCR still answering) never stalls the job loops after a transient failure", async () => {
+  let ocrFetches = 0;
+  let healthFetches = 0;
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  const ocrClient = new OcrClient({ baseUrl: "https://ocr.example/ocr", timeoutMs: 1000, maxRetries: 3, fetchImpl: async (input) => {
+    if (String(input).endsWith("/health")) { healthFetches += 1; return json({ status: "degraded", masterData: "stale: Expecting ',' delimiter" }); }
+    ocrFetches += 1;
+    if (ocrFetches <= 8) throw new TypeError("fetch failed"); // both in-flight jobs exhaust their 4 attempts
+    return json(fullDocument(false));
+  } });
+  const queue = attemptQueue(10, 1);
+  const h = harness();
+  const loops = startWorkerLoops({
+    ...h.dependencies, queue, ocrClient,
+    outbox: { recoverExpired: async () => 0, dispatchOnce: async () => ({ claimed: false, delivered: false }) },
+    sendConfirmation: async () => undefined
+  }, { concurrency: 2, idleMs: 5, maintenanceMs: 5, maxBackoffMs: 40 });
+  try {
+    const deadline = Date.now() + 3000;
+    while (queue.rows.some((row) => row.status !== "SUCCEEDED") && Date.now() < deadline) await delay(5);
+    assert.deepEqual(new Set(queue.rows.map((row) => row.status)), new Set(["SUCCEEDED"]));
+    assert.ok(healthFetches >= 1, "the half-open trial probed /health");
   } finally { await loops.stop(); }
 });

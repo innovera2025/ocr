@@ -66,8 +66,10 @@ Engine `typhoon-sections`, version `3.0`. Backward compatible with v2.2 clients:
   Verified memory lookup for treatments tries `nameRaw` first, then `raw`.
 - Inputs: PDF first page when `pypdfium2`/PyMuPDF is installed (the production base image has `pypdfium2`), rendered under a
   process-wide lock (neither library is thread-safe) with the long side at 1610 px; pages over 14400 pt → 400. Raster images
-  over 89.5 MP → 400. `GET /health` answers `status:"degraded"` (HTTP 200) while `master_data.json` does not load; the last
-  good master data keeps being served.
+  over 89.5 MP → 400, except JPEGs, which are first decoded at 1/2–1/8 scale (DCT draft, ≥ 4096 px on both sides; e.g. 108 MP
+  phone photos). `GET /health` answers `status:"degraded"` (HTTP 200) while `master_data.json` does not load:
+  `masterData:"stale: …"` while the last good master data keeps being served (OCR works), `"error: …"` when it never loaded
+  (every OCR request fails). A missing master section or `"durations": null` reads as an empty list.
 
 ## 2. Canonical structured result stored by the app (`documents.structured_result`)
 
@@ -124,8 +126,12 @@ Batch counters are derived from document rows on read (no stored counters → no
 Status buckets: `VALIDATING|SCANNING|CLEAN → queued`, `PROCESSING → processing`, `SUCCEEDED → succeeded`,
 `NEEDS_REVIEW → needsReview`, `FAILED|QUARANTINED → failed`, `DELETED` excluded.
 `confirmed` = SUCCEEDED rows with `reviewed_at IS NOT NULL`, or confirmed field by field through the legacy confirm endpoint
-(`confirm_status = 'SUCCEEDED'` and `confirmed_at` set — every v2.2 confirmation, which never set `reviewed_at`); a subset of
-succeeded. Derived on read: the migrator cannot backfill rows through FORCE RLS, and 0017 must not be edited (checksums).
+(`confirmed_at` set — only a successful provider confirmation sets it, never cleared — and `needs_review = false`; every v2.2
+confirmation never set `reviewed_at`); a subset of succeeded. Sticky: a later legacy confirmation that is PENDING or ends in
+RETRY does not un-confirm the row. A stored whole v2.2 response (`staffOnly` object, not schema 3) counts only once no field
+flag is left under `staffOnly` (the aggregate `treatment.needsReview` only when it has no items): v2.2 confirmed such rows
+from a single field and wrote the value to a top-level key. Derived on read: the migrator cannot backfill rows through
+FORCE RLS, and 0017 must not be edited (checksums).
 
 Provisioning (`deploy/provision-roles.sh`, bootstrap/superuser section): also record the production-only
 manual fix for the confirm outbox — `GRANT SELECT, UPDATE ON ocr_confirm_outbox TO ocr_queue_definer`,
@@ -173,8 +179,8 @@ type BatchSummary = { batchId: string; label: string|null; createdAt: string; ex
   uploaded: number; queued: number; processing: number; succeeded: number; needsReview: number;
   failed: number; confirmed: number; completed: number /* succeeded+needsReview+failed */;
   finishedAt: string|null /* max(processed_at) once completed===expectedTotal */;
-  durationMs: number|null /* createdAt → last completion once nothing is queued/processing (also when fewer files than
-    expected ever arrive), else → now */; throughputPerMinute: number|null };
+  durationMs: number|null /* createdAt → last completion once finished, or once nothing is queued/processing and no
+    document arrived or completed for 5 minutes (fewer files than expected ever arrive), else → now */; throughputPerMinute: number|null };
 createBatch(tenantId, { createdBy, expectedTotal, label? }): Promise<BatchSummary>
 getBatch(tenantId, batchId): Promise<BatchSummary|null>
 listBatches(tenantId, limit = 20): Promise<BatchSummary[]>
@@ -211,10 +217,14 @@ Legacy `saveCorrection(…, field, …)` becomes path-aware: when the stored res
 `therapistName|roomNo` resolve to `staffOnly.<field>`, and `treatment` to the one `staffOnly.treatments[i]` chosen by
 `legacyTreatmentIndex(items, audit.raw)` (item whose `nameRaw`/`raw` equals the request raw, else the only flagged item, else
 the only item; a stored whole v2.2 response uses its `staffOnly.treatment` object) — `CONFIRMATION_TARGET_AMBIGUOUS` when no
-single item qualifies, before anything is written or sent to the provider; otherwise top-level (old flat rows). Only the
+single item qualifies, before anything is written or sent to the provider; otherwise top-level (old flat rows). On a v2.2
+`treatment` object (flat or whole) the same rule picks one of its `items` (`…treatment.items[i]`, siblings kept); only a raw
+equal to the whole field's raw, or no single qualifying item, writes `treatment.value` (a whole-field answer). Only the
 PENDING call writes the value; the SUCCEEDED/RETRY calls of the same confirmation update statuses only.
 `getOriginal` also returns the document `status`. `findIdempotentUpload` also returns `status`, `storageKey` and `stale`
-(no update for 2 minutes). `markRunFailure(tenantId, runId, message)` marks the run's CLEAN/PROCESSING document FAILED.
+(no update for 2 minutes). `claimStaleUpload(tenantId, documentId) → boolean` atomically takes over such an upload before a
+replay resumes it (bumps `updated_at` while it is SCANNING/CLEAN, stale and without a job; one concurrent caller wins).
+`markRunFailure(tenantId, runId, message)` marks the run's CLEAN/PROCESSING document FAILED.
 
 `packages/queue/src/postgres.ts`: add `finishDetailed(jobId, leaseToken, outcome, error?) →
 { accepted: boolean; finalStatus: "PENDING"|"SUCCEEDED"|"FAILED"|"DEAD"|null }` using the `final_status`
@@ -248,9 +258,11 @@ confirmation → `INVALID_CONFIRMATION`).
 
 Invalid UUIDs in path/query → 404 (`DOCUMENT_NOT_FOUND`/`BATCH_NOT_FOUND`) without hitting SQL casts.
 Upload replays (same `Idempotency-Key`): an upload whose request died after persisting but before it was queued
-(SCANNING/CLEAN, no job) is resumed (scan → status → enqueue) once it has been untouched for 2 minutes; earlier the replay
-answers 409 `UPLOAD_IN_PROGRESS` (retryable) so a live request is never duplicated. A staged original that no document
-references (BATCH_FULL, BATCH_NOT_FOUND, IDEMPOTENCY_CONFLICT, or a lost idempotency race) is deleted.
+(SCANNING/CLEAN, no job) is resumed (scan → status → enqueue) once it has been untouched for 2 minutes and the replay has
+claimed it (`claimStaleUpload`); earlier, or when a concurrent replay holds the claim, the replay answers 409
+`UPLOAD_IN_PROGRESS` (retryable) so a live request is never duplicated. A staged original that no document references
+(BATCH_FULL, BATCH_NOT_FOUND, IDEMPOTENCY_CONFLICT, or a lost idempotency race) is deleted; after any other persistence error
+(e.g. a connection lost around COMMIT) it is kept, since a committed row may reference it.
 HTML responses add `x-content-type-options: nosniff`, `referrer-policy: no-referrer`,
 `content-security-policy` with `frame-ancestors 'none'`, `img-src 'self' blob: data:`,
 `frame-src 'self' blob:`, `script-src 'nonce-…'`, fonts only from Google Fonts.
@@ -267,7 +279,9 @@ HTML responses add `x-content-type-options: nosniff`, `referrer-policy: no-refer
   catches and logs errors with backoff (an exception must never kill a loop). Heartbeat unchanged (30 s).
 - OCR availability gate (shared by the job loops): an OCR transport failure (network, timeout, retryable 5xx/429/408)
   stops all claiming for an exponential backoff (idle · 2^n, capped at 30 s); then one loop probes `GET /health` and runs a
-  single trial job; only a request that reached the OCR API reopens the gate. A Local AI restart costs at most one attempt
+  single trial job; only a request that reached the OCR API reopens the gate. The probe counts `status:"ok"` and
+  `status:"degraded"` with `masterData:"stale: …"` (OCR still works) as up; a failed probe re-trips the gate and is logged
+  (`ocr_health_probe_failed`) and counted (`ocr_health_probe_failed_total`). A Local AI restart costs at most one attempt
   per loop instead of every queued job's attempts (the SQL retry delay is fixed and owned by `ocr_queue_definer`).
 - A DEAD job whose document could not be loaded marks the run's document FAILED (`markRunFailure`), never leaving it queued.
 - Outbox sender keeps `therapistName → therapist` mapping (new payloads already use `therapist`).

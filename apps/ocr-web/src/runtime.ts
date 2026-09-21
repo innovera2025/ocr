@@ -21,6 +21,7 @@ export function createRuntimeIngest(pool: Pool, tenantId: string, idempotencyKey
   const idempotency = idempotencyKey ? { idempotencyKey } : {};
   return {
     lookupUpload: async ({ filename, mimeType, bytes }) => store.findIdempotentUpload({ tenantId, ...idempotency, requestFingerprint: fingerprint(filename, mimeType, bytes) }),
+    claimResume: async ({ documentId }) => store.claimStaleUpload(tenantId, documentId),
     stage: async ({ bytes }) => {
       const publicId = randomBytes(16).toString("hex");
       const key = mintOriginalKey(tenantId, publicId);

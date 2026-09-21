@@ -57,6 +57,17 @@ test("legacy confirm of treatment targets one canonical item, never an orphan to
   assert.deepEqual(legacyFieldPath({ documentId: "x", staffOnly: { treatment: { raw: "ไทย" } } }, "treatment"), ["staffOnly", "treatment"], "whole v2.2 responses");
 });
 
+test("legacy confirm of one v2.2 treatment item writes that item, so its siblings survive (flat and whole v2.2 rows)", () => {
+  const treatment = { raw: "ไทย 60 นาที ฟุต 30 นาที", durations: ["60 นาที", "30 นาที"], needsReview: true,
+    items: [{ raw: "ไทย", value: "นวดไทย", duration: "60 นาที", needsReview: false }, { raw: "ฟุต", value: null, duration: "30 นาที", needsReview: true }] };
+  assert.deepEqual(legacyFieldPath({ treatment }, "treatment", "ฟุต"), ["treatment", "items", "1"]);
+  assert.deepEqual(legacyFieldPath({ documentId: "x", staffOnly: { treatment } }, "treatment", "ฟุต"), ["staffOnly", "treatment", "items", "1"]);
+  assert.deepEqual(legacyFieldPath({ treatment }, "treatment", ""), ["treatment", "items", "1"], "no raw: the only flagged item");
+  assert.deepEqual(legacyFieldPath({ treatment }, "treatment", " ไทย 60 นาที ฟุต 30 นาที "), ["treatment"], "the whole field's raw answers the whole field");
+  const bothFlagged = { ...treatment, items: treatment.items.map((item) => ({ ...item, needsReview: true })) };
+  assert.deepEqual(legacyFieldPath({ treatment: bothFlagged }, "treatment", "ใทบ"), ["treatment"], "no single item qualifies: whole field, as before");
+});
+
 test("isUuid guards ids before they reach SQL casts", () => {
   assert.equal(isUuid("0b7e9f5e-3b1c-4c0e-9d53-2a5f0c7c8f11"), true);
   for (const value of ["", "abc", "0b7e9f5e3b1c4c0e9d532a5f0c7c8f11", "0b7e9f5e-3b1c-4c0e-9d53-2a5f0c7c8f11'--", null, 5]) assert.equal(isUuid(value), false);

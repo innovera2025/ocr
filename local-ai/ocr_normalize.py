@@ -72,14 +72,20 @@ def _load_master(path):
     if path is None:
         raise FileNotFoundError(f"master data not found: {master_path()}")
     data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"master data {path}: must be a JSON object")
     for section, name_key in (("treatments", "name"), ("therapists", "name"), ("nationalities", "value")):
-        entries = data.get(section) if isinstance(data, dict) else None
+        if data.get(section) is None:  # a missing section is an empty master list, as every lookup reads it
+            data[section] = []
+        entries = data[section]
         if not isinstance(entries, list) or not all(
                 isinstance(e, dict) and isinstance(e.get(name_key), str) and isinstance(e.get("aliases", []), list)
                 and all(isinstance(a, str) for a in e.get("aliases", [])) for e in entries):
             raise ValueError(f"master data {path}: '{section}' must be a list of objects with a string '{name_key}' and string 'aliases'")
     for entry in data["treatments"]:
-        if not isinstance(entry.get("durations", []), list) or not all(isinstance(d, int) for d in entry.get("durations", [])):
+        if entry.get("durations") is None:  # like an empty list: no duration restriction
+            entry["durations"] = []
+        if not isinstance(entry["durations"], list) or not all(isinstance(d, int) for d in entry["durations"]):
             raise ValueError(f"master data {path}: durations of '{entry['name']}' must be a list of whole minutes")
     return data
 
@@ -233,6 +239,8 @@ def _segment_groups(segment):
         groups.append([tail_name, pos, len(segment), []])
     elif groups and BARE_NUMBER_RE.search(tail):  # "ไทย 90 นาที 15": the stray number belongs to the last item
         groups[-1][2] = len(segment)
+    elif BARE_NUMBER_RE.search(tail):  # a segment of bare numbers only ("ไทย 90 นาที + 30"): reported, not dropped
+        groups.append([None, pos, len(segment), []])
     for group in groups:  # "ไทย 90" -> bare number as duration
         if group[0] and not group[3]:
             bare = BARE_NUMBER_RE.search(segment, group[1], group[2])
@@ -284,12 +292,18 @@ def parse_treatments(raw):
         if segment.strip():
             groups.extend(_segment_groups(segment))
     durations_all = [d[0] for _, _, ds, _ in groups for d in ds if not d[2]]
-    total, warnings, items = None, [], []
+    total, warnings, items, review_next = None, [], [], False
     named_minutes = [ds[0][1] for name, _, ds, _ in groups if name and ds]
     for index, (name, seg_raw, durs, leftover) in enumerate(groups):
         last = index == len(groups) - 1
         if leftover:
             warnings.append(f"{name or seg_raw}: number(s) {', '.join(leftover)} not read as a duration")
+        if name is None and not durs:  # bare numbers only: the previous item (else the next one) needs review
+            if items:
+                items[-1]["needsReview"] = True
+            else:
+                review_next = True
+            continue
         if name is None:
             if last and len(durs) == 1 and len(named_minutes) >= 2 and durs[0][1] == sum(named_minutes):
                 total = durs[0][1]
@@ -305,7 +319,8 @@ def parse_treatments(raw):
         value, confidence, source = _match_treatment(name, seg_raw) if name else (None, 0.0, "none")
         item = {"raw": seg_raw or None, "nameRaw": name, "value": value, "duration": durs[0][0] if durs else None,
                 "durationMinutes": durs[0][1] if durs else None, "confidence": confidence, "source": source}
-        review = value is None or confidence < REVIEW_BELOW or item["duration"] is None or bool(leftover)
+        review = value is None or confidence < REVIEW_BELOW or item["duration"] is None or bool(leftover) or review_next
+        review_next = False
         if extra:
             review = True
             warnings.append(f"{name or seg_raw}: more than one duration ({', '.join(d[0] for d in durs)})")
@@ -340,6 +355,10 @@ _CUSTOMER_LABELS = re.compile(
     r"(?P<hotelName>\bhotel\s*name\b|\bhotel\b|酒店|โรงแรม)|(?P<nationality>\bnationality\b|国籍|國籍|สัญชาติ)|(?P<name>\bname\b|姓名|ชื่อ)",
     re.I)
 _CJK_LABELS = ("姓名", "国籍", "國籍", "酒店")
+# The printed labels are bilingual ("Name 姓名"); a model may echo the second one in brackets ("Name (姓名): Chun") or
+# number its lines ("1. Name Chun"). Both are removed before label matching so they never end up in a value.
+_ECHOED_LABEL = re.compile(r"[(\[（【][^\S\n]*(?:姓名|国籍|國籍|酒店|ชื่อ|สัญชาติ|โรงแรม)[^\S\n]*[)\]）】]")
+_LIST_MARKER = re.compile(r"(?m)^[^\S\n]*(?:\d+[.)]|[-*•])[^\S\n]+")
 
 
 def _is_label(text, m):
@@ -367,7 +386,7 @@ def _clean_value(text):
 
 def parse_customer_text(text, expected=CUSTOMER_FIELDS):
     """Customer transcription -> ({field: value|None}, used_fallback). `expected` = fields that have handwriting."""
-    text = _clean_model_text(text)
+    text = _LIST_MARKER.sub("", _ECHOED_LABEL.sub(" ", _clean_model_text(text)))
     found, matches = {}, [m for m in _CUSTOMER_LABELS.finditer(text) if _is_label(text, m)]
     for i, m in enumerate(matches):
         key = m.lastgroup

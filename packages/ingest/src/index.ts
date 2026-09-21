@@ -42,14 +42,18 @@ export type IngestDependencies = Readonly<{
   enqueue: (stagedKey: string) => Promise<string>;
   /** `status`/`storageKey`/`stale` (no activity for minutes) let a replay resume an upload whose request died before enqueueing. */
   lookupUpload?: (input: { filename: string; mimeType: SupportedMimeType; bytes: Uint8Array }) => Promise<{ tenantId: string; documentId: string; runId: string; jobId?: string; status?: string; storageKey?: string; stale?: boolean } | null>;
+  /** Atomically takes over a stale upload before it is resumed; false when a concurrent replay already took it. */
+  claimResume?: (input: { tenantId: string; documentId: string }) => Promise<boolean>;
   persistUpload?: (input: { filename: string; mimeType: SupportedMimeType; bytes: Uint8Array; stagedKey: string }) => Promise<{ tenantId: string; documentId: string; runId: string; reused?: boolean }>;
   updateStatus?: (input: { tenantId: string; documentId: string; status: "CLEAN" | "QUARANTINED" | "FAILED"; errorMessage?: string }) => Promise<void>;
   enqueuePersistent?: (input: { tenantId: string; documentId: string; runId: string; stagedKey: string }) => Promise<string>;
-  /** Deletes a staged original that no document references (persistUpload refused it or reused another upload). */
+  /** Deletes a staged original that no document references (persistUpload refused it with a known pre-insert error or reused another upload). */
   discard?: (stagedKey: string) => Promise<void>;
 }>;
 
 type Persisted = { tenantId: string; documentId: string; runId: string };
+/** persistUpload rejections after which no document references the staged original. */
+const UNREFERENCED_UPLOAD_ERRORS: ReadonlySet<string> = new Set(["BATCH_FULL", "BATCH_NOT_FOUND", "IDEMPOTENCY_CONFLICT"]);
 export type IngestResult = Readonly<{ status: "CLEAN" | "QUARANTINED"; stagedKey: string; jobId?: string; tenantId?: string; documentId?: string; runId?: string; reused?: boolean }>;
 
 /** Scan → status → enqueue for a persisted upload (fresh, or resumed after its request died). */
@@ -81,6 +85,8 @@ export async function ingestDocument(input: { filename: string; bytes: Uint8Arra
     // the pipeline; while that request may still be alive (scan in progress) the replay is refused, never duplicated.
     if (!ids.jobId && (status === "SCANNING" || status === "CLEAN") && storageKey) {
       if (!stale) throw new Error("UPLOAD_IN_PROGRESS");
+      // Two replays can both see the upload as stale: only the one that claims it resumes, the other is refused.
+      if (deps.claimResume && !(await deps.claimResume({ tenantId: ids.tenantId, documentId: ids.documentId }))) throw new Error("UPLOAD_IN_PROGRESS");
       const { jobId: _none, ...persisted } = ids;
       const resumed = await scanAndEnqueue(persisted, storageKey, deps, status === "CLEAN" ? "CLEAN" : undefined);
       return { ...resumed, stagedKey: "" };
@@ -92,8 +98,9 @@ export async function ingestDocument(input: { filename: string; bytes: Uint8Arra
   try {
     persisted = deps.persistUpload ? await deps.persistUpload({ ...input, filename: valid.filename, mimeType: valid.mimeType, stagedKey }) : undefined;
   } catch (error) {
-    // BATCH_FULL, BATCH_NOT_FOUND, IDEMPOTENCY_CONFLICT…: no document references the staged bytes.
-    await deps.discard?.(stagedKey).catch(() => undefined);
+    // Only rejections known to happen before the document row exists prove that nothing references the staged bytes.
+    // Any other error (e.g. the connection dropped after COMMIT) may have committed a row pointing at them: keep them.
+    if (error instanceof Error && UNREFERENCED_UPLOAD_ERRORS.has(error.message)) await deps.discard?.(stagedKey).catch(() => undefined);
     throw error;
   }
   // A concurrent request may win the idempotency race while this request was staging.

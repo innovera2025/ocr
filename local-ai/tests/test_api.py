@@ -280,6 +280,27 @@ def test_raster_over_the_pixel_budget_is_400(client, fake_model):
     assert response.status_code == 400 and "pixels" in response.json()["detail"] and fake_model.calls == []
 
 
+def test_oversize_jpeg_is_decoded_at_reduced_scale(client, fake_model):
+    photo = png_of(Image.new("L", (12000, 9000), 255), "JPEG", quality=50)  # 108 MP phone mode: 1/2 scale, not a 400
+    image, _ = api._decode(photo, ".jpg")
+    assert image.size == (6000, 4500) and image.mode == "RGB"
+    assert post(client, photo, "photo.jpg", "image/jpeg").status_code == 200
+
+
+def test_master_data_optional_shapes_still_load(client, fake_model, tmp_path, monkeypatch):
+    import ocr_normalize as N
+    data = json.loads((N.HERE / "master_data.json").read_text(encoding="utf-8"))
+    del data["therapists"]  # lookups read a missing section as []
+    face = next(entry for entry in data["treatments"] if entry["name"] == "นวดหน้า")
+    face["durations"] = None  # like []: no duration restriction
+    custom = tmp_path / "master.json"
+    custom.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("OCR_MASTER_DATA", str(custom))
+    assert N.master_state() == "ok" and client.get("/health").json()["status"] == "ok"
+    assert post(client, png_of(S.filled_form())).status_code == 200
+    assert N.parse_treatments("หน้า 50 นาที")[0][0]["needsReview"] is False
+
+
 def test_master_data_typo_keeps_last_good_masters_and_health_degrades(client, fake_model, tmp_path, monkeypatch):
     import ocr_normalize as N
     good = (N.HERE / "master_data.json").read_text(encoding="utf-8")
