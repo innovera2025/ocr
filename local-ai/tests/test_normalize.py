@@ -614,3 +614,23 @@ def test_doubt_notes_are_not_cleaned_away(text):
     assert items[0]["needsReview"] is True
     therapist = N.normalize_therapist(N.extract_staff_fields(text.replace("พีพี", "พีพี (illegible)"))[1])
     assert therapist["needsReview"] is True
+
+
+@pytest.mark.parametrize("text, number", [
+    ("DATE 日期 No. 07927 TIME 时间", "07927"),                      # whole header on one line (real answers)
+    ("DATE 日期 No.07844 TIME时间\n\nName 姓名 Day1 Low", "07844"),
+    ("No. 07912\nTIME 时间", "07912"),
+    ("Room No. 3", None),                                            # never the room number
+    ("I have no 2 bags", None),                                      # a plain word "no" with a short number
+])
+def test_form_number_is_found_anywhere_on_the_line(text, number):
+    found, _ = N.extract_header_fields(text)
+    assert found["formNumber"] == number
+
+
+def test_words_after_an_empty_time_label_stay_for_the_customer_parser():
+    """Real answer shape: 'DATE 日期: No. 07904 TIME时间: <name> Nationality国籍 Hotel Name酒店: 60'."""
+    found, rest = N.extract_header_fields("DATE 日期: No. 07904 TIME时间: Anna Bell Nationality国籍 Hotel Name酒店:")
+    assert found["formNumber"] == "07904" and found["time"] is None
+    assert "Anna Bell" in rest
+    assert N.extract_header_fields("DATE 日期: 16 Aug 2026 TIME: 14:30")[0] == {"formNumber": None, "date": "16 Aug 2026", "time": "14:30"}

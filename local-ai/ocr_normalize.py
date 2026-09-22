@@ -388,6 +388,15 @@ def extract_header_fields(text):
         if i + 1 < len(matches) and matches[i + 1].start() < end:
             end = matches[i + 1].start()
         value = _HEADER_ECHO.sub("", text[m.end():end]).strip(" \t|:-*")
+        if (value and m.lastgroup in ("date", "time") and re.search(r"[^\W\d_]{3,}", value)
+                and (parse_date if m.lastgroup == "date" else parse_time)(value) is None):
+            # Words that are no date/time belong to the next field the model wrote on the same line
+            # ("TIME时间: Michael Lee Nationality…"): leave them in the text for the customer parser.
+            value, end = "", m.end()
+        if value and m.lastgroup == "formNumber":
+            number = re.match(r"[#\s]*([0-9Oo]{4,7})(?![0-9])", value.translate(THAI_DIGITS))
+            if number:  # "07927 TIME": the unlabelled TIME word the model wrote after the number is not part of it
+                value = number.group(1)
         if not value and end == line_end:
             next_end = text.find("\n", end + 1)
             next_end = len(text) if next_end < 0 else next_end
@@ -409,6 +418,10 @@ def _is_header_label(text, m):
     line_start = bool(re.search(r"(?:^|[\n|])[^\S\n]*$", before))
     if m.lastgroup == "formNumber" and re.search(r"room\s*$", before, re.I):
         return False
+    if m.lastgroup == "formNumber" and re.match(r"[^\S\n]*[.:：]?[^\S\n]*\d{4,7}(?!\d)", after.translate(THAI_DIGITS)):
+        # The printed form number: the model often writes the whole header on one line ("DATE 日期 No. 07927 TIME 时间"),
+        # so "No." followed by a 4-7 digit number is the label wherever it stands (real answers, 2026-09-22).
+        return True
     if m.lastgroup == "formNumber" and not re.match(r"[\s.:]*\d", after.translate(THAI_DIGITS)):
         # Without a number it is still the printed label when it starts a line as "No." / "No:" / "เลขที่" (its number
         # unread, "N/A" or misread as "O7832"); a plain word "no" never is.
