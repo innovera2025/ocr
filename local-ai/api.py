@@ -1,7 +1,8 @@
-"""INNOVERA Local AI OCR service — schema v3 ("typhoon-sections").
+"""INNOVERA Local AI OCR service — schema v3, version 3.1 ("typhoon-sections").
 
-Full-document extraction for the Makkha intake form: deterministic checkbox / body-map / empty-box detection plus
-two concurrent Typhoon OCR section calls (STAFF ONLY and CUSTOMER INFORMATION handwriting).
+Full-document extraction for the Makkha intake form: fitted registration and template verdict, deterministic checkbox /
+body-map / empty-box detection, and one Typhoon OCR call on the header, customer rows and STAFF ONLY crop stacked in one
+image (OCR_SECTION_MODE=separate keeps two calls).
 """
 
 import functools
@@ -19,17 +20,20 @@ from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel
 
+import numpy as np
+
 import ocr_layout as L
 import ocr_marks as M
 import ocr_model
 import ocr_normalize as N
+import ocr_register as R
 
-VERSION, ENGINE, SCHEMA_VERSION = "3.0", "typhoon-sections", 3
+VERSION, ENGINE, SCHEMA_VERSION = "3.1", "typhoon-sections", 3
 app = FastAPI(title="INNOVERA OCR API", version=VERSION)
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 MIME_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf"}
-TEMPLATE_MIN_CONTRAST = 15  # mean printed-checkbox ring contrast below this => not the expected form / badly aligned
+STAMP_RED_MIN = 40  # red minus max(green, blue) of a pink/red stamp pixel (PAID stamps), removed from model crops
 MAX_PDF_PAGE_PT = 14400  # PDF page-size limit (200 in); bigger MediaBoxes are refused before anything is rendered
 MAX_RASTER_PIXELS = 89_478_485  # Pillow's decompression-bomb warning threshold, enforced as an error (after JPEG draft)
 JPEG_DRAFT_SIDE = 4096  # a bigger JPEG (e.g. a 108 MP phone photo) is decoded at 1/2..1/8 scale, still >= this on both sides
@@ -150,35 +154,83 @@ def _decode(data, ext):
     return image.convert("RGB"), warnings
 
 
-def _model_crop(image, rows, sx, sy, dx, dy, scale=1.0, clamp=True):
-    """Crop reference rows (scaled + registered) from the original image; stack them vertically; PNG bytes.
-    clamp=False keeps v2.2's behaviour for the STAFF crop (Pillow pads rows beyond the page with black)."""
-    width, height = image.size
-    parts = [image.crop(L.scale_box(row, sx, sy, dx, dy, width if clamp else None, height if clamp else None)) for row in rows]
-    if len(parts) == 1:
-        crop = parts[0]
-    else:
-        crop = Image.new("RGB", (max(p.width for p in parts), sum(p.height for p in parts) + 4 * (len(parts) - 1)), (255, 255, 255))
-        y = 0
-        for part in parts:
-            crop.paste(part, (0, y))
-            y += part.height + 4
-    limit = 2 * max(r[2] - r[0] for r in rows)  # never send more than 2x reference resolution
-    factor = min(scale, limit / crop.width) if crop.width else scale
-    if abs(factor - 1.0) > 1e-3:
-        crop = crop.resize((max(1, round(crop.width * factor)), max(1, round(crop.height * factor))), Image.LANCZOS)
-    return ocr_model.png_bytes(crop)
+class _Crops:
+    """Model crops cut from the original image through the fitted geometry. Template boxes are in reference px; the image
+    has width/805 x height/569 pixels per reference px. Above ROTATE_CROPS_ABOVE_DEG of fitted rotation a crop is
+    resampled from the de-rotated page (Pillow AFFINE transform of just the crop area, equivalent to rotating the whole
+    page first); below it the crop is a plain pixel copy, so an unrotated 805x569 scan gives v2.2's exact STAFF pixels."""
+
+    def __init__(self, image, geo):
+        self.image, self.geo = image, geo
+        self.kx, self.ky = image.width / L.REF_W, image.height / L.REF_H
+        self.rotated = abs(geo.rotation_deg) > R.ROTATE_CROPS_ABOVE_DEG
+        self.stamp_pixels = 0
+
+    def region(self, box, clamp=True):
+        """clamp=False keeps v2.2's behaviour for the STAFF crop (rows beyond the page are black padding)."""
+        x0, y0, x1, y1 = box
+        if self.rotated:
+            sx, sy = self.geo.scale
+            density = (self.kx * sx, self.ky * sy)
+            size = (max(1, round((x1 - x0) * density[0])), max(1, round((y1 - y0) * density[1])))
+            data = self.geo.inverse_coefficients(self.kx, self.ky, (x0, y0), density)
+            crop = self.image.transform(size, Image.AFFINE, data, resample=Image.BILINEAR,
+                                        fillcolor=(255, 255, 255) if clamp else (0, 0, 0))
+        else:
+            (qx0, qy0), (qx1, qy1) = self.geo.point(x0, y0), self.geo.point(x1, y1)
+            rect = [round(qx0 * self.kx), round(qy0 * self.ky), round(qx1 * self.kx), round(qy1 * self.ky)]
+            if clamp:
+                rect = [max(0, min(self.image.width, rect[0])), max(0, min(self.image.height, rect[1])),
+                        max(0, min(self.image.width, rect[2])), max(0, min(self.image.height, rect[3]))]
+            crop = self.image.crop(tuple(rect))
+        if not crop.width or not crop.height:  # a region entirely off the page (only on a badly fitted page)
+            crop = Image.new("RGB", (1, 1), (255, 255, 255))
+        return self._stamp_free(crop)
+
+    def _stamp_free(self, crop):
+        """Pink/red stamp pixels (a PAID stamp) become paper white before the crop is sent to the model (release1 A7).
+        Blue and black pen, gray print and the orange form print are kept: orange has blue far below green."""
+        arr = np.asarray(crop)
+        if arr.ndim != 3 or not arr.size:
+            return crop
+        r, g, b = (arr[..., i].astype(np.int16) for i in range(3))
+        stamp = (r - np.maximum(g, b) >= STAMP_RED_MIN) & (b >= g - 5) & (r >= 120)
+        found = int(stamp.sum())
+        if not found:
+            return crop
+        self.stamp_pixels += found
+        clean = arr.copy()
+        clean[stamp] = 255
+        return Image.fromarray(clean)
+
+    def rows(self, rows, scale=1.0, clamp=True):
+        """Reference rows cropped and stacked vertically (4 px white gap), at most 2x reference resolution."""
+        parts = [self.region(row, clamp) for row in rows]
+        crop = parts[0] if len(parts) == 1 else _stack(parts, gap=4)
+        limit = 2 * max(r[2] - r[0] for r in rows)  # never send more than 2x reference resolution
+        factor = min(scale, limit / crop.width) if crop.width else scale
+        if abs(factor - 1.0) > 1e-3:
+            crop = crop.resize((max(1, round(crop.width * factor)), max(1, round(crop.height * factor))), Image.LANCZOS)
+        return crop
+
+    def side_by_side(self, parts, gap=8):
+        images = [self.region(part) for part in parts]
+        canvas = Image.new("RGB", (sum(p.width for p in images) + gap * (len(images) - 1), max(p.height for p in images)), (255, 255, 255))
+        x = 0
+        for part in images:
+            canvas.paste(part, (x, 0))
+            x += part.width + gap
+        return canvas
 
 
-def _stack_pngs(pngs, gap=12):
-    """Stack PNG crops vertically on white (top first) -> PNG bytes; each crop keeps its own pixels."""
-    parts = [Image.open(io.BytesIO(png)).convert("RGB") for png in pngs]
+def _stack(parts, gap=12):
+    """Stack images vertically on white (top first); each keeps its own pixels."""
     canvas = Image.new("RGB", (max(p.width for p in parts), sum(p.height for p in parts) + gap * (len(parts) - 1)), (255, 255, 255))
     y = 0
     for part in parts:
         canvas.paste(part, (0, y))
         y += part.height + gap
-    return ocr_model.png_bytes(canvas)
+    return canvas
 
 
 def _timed_call(png, prompt, max_tokens):
@@ -192,21 +244,32 @@ def _check_field(label, measurement, source="checkbox"):
     return {**N.field(label, label, measurement["confidence"], source, review), "checked": True}
 
 
+def _struck_field(results):
+    """One marker for the boxes a stroke goes through (struck out = no selection): value null, needsReview."""
+    struck = [label for _, label, m in results if m["state"] == "struck"]
+    return {**N.field("struck out: " + ", ".join(struck), None, 0.35, "checkbox", True), "checked": True} if struck else None
+
+
 def _check_fields(results):
-    return [_check_field(label, m) for _, label, m in results if m["state"] in ("checked", "ambiguous")]
+    fields = [_check_field(label, m) for _, label, m in results if m["state"] in ("checked", "ambiguous")]
+    marker = _struck_field(results)
+    return fields + [marker] if marker else fields
 
 
 def _single_choice(results):
     checked = [(label, m) for _, label, m in results if m["state"] == "checked"]
     ambiguous = [(label, m) for _, label, m in results if m["state"] == "ambiguous"]
+    struck = _struck_field(results)
     if len(checked) == 1 and not ambiguous:
         label, m = checked[0]
-        return N.field(label, label, m["confidence"], "checkbox", m["confidence"] < M.REVIEW_BELOW)
+        return N.field(label, label, m["confidence"], "checkbox", m["confidence"] < M.REVIEW_BELOW or struck is not None)
     if len(checked) + len(ambiguous) == 1 or len(checked) == 1:  # one ambiguous mark, or one tick plus stray marks
         label, m = (checked or ambiguous)[0]
         return N.field(label, label, min(m["confidence"], 0.6), "checkbox", True)
     if checked or ambiguous:  # several boxes marked
         return N.field(", ".join(label for label, _ in checked + ambiguous), None, 0.3, "checkbox", True)
+    if struck:
+        return N.field(struck["raw"], None, 0.35, "checkbox", True)
     return N.field(None, None, min(m["confidence"] for _, _, m in results), "checkbox", True)  # nothing marked
 
 
@@ -240,70 +303,108 @@ def _any_review(node):
     return False
 
 
-def _flag_deterministic(node):
-    """Layout is doubtful: every checkbox / ink-mark field needs review."""
+def _flag(node, sources=None):
+    """Mark fields for review: every checkbox / ink-mark field (layout doubtful), or every field (sources=None)."""
     if isinstance(node, dict):
-        if node.get("source") in ("checkbox", "ink-mark"):
+        if "needsReview" in node and (sources is None or node.get("source") in sources):
             node["needsReview"] = True
         for value in node.values():
-            _flag_deterministic(value)
+            _flag(value, sources)
     elif isinstance(node, list):
         for value in node:
-            _flag_deterministic(value)
+            _flag(value, sources)
+
+
+SECTIONS = ("header", "customerInformation", "recommendationCard", "staffOnly")
+
+
+def _empty_sections():
+    """Every section with its keys but nothing read (page not recognised as the template): all fields need review."""
+    def none():
+        return N.field(None, None, 0.0, "none", True)
+    return {
+        "header": {key: none() for key in N.HEADER_FIELDS},
+        "customerInformation": {"name": none(), "gender": none(), "nationality": none(), "hotelName": none(),
+                                "referralSources": [], "healthConditions": []},
+        "recommendationCard": {"pressure": none(), "massageOilScrub": [], "preferredAreas": [], "avoidAreas": []},
+        "staffOnly": {"treatments": [], "treatment": N.legacy_treatment(None, [], []), "therapistName": none(), "roomNo": none(),
+                      "branch": none(), "totalMinutes": None},
+    }
+
+
+def _response(document_id, source_file, layout, sections, evidence, timings):
+    result = {"documentId": document_id, "sourceFile": source_file, "engine": ENGINE, "version": VERSION, "schemaVersion": SCHEMA_VERSION,
+              "layout": layout, **sections, "evidence": evidence, "timings": timings}
+    result["needsReview"] = bool(layout["warnings"]) or any(_any_review(result[k]) for k in SECTIONS)
+    return result
 
 
 def process_image(image, document_id, source_file, started, extra_warnings=()):
-    """Full-document OCR of one decoded RGB page -> schema v3 response dict."""
+    """Full-document OCR of one decoded RGB page -> schema v3 (version 3.1) response dict."""
     t_pre = time.perf_counter()
     width, height = image.size
     layout = L.describe_layout(width, height)
     layout["warnings"].extend(extra_warnings)
     ref = image if image.size == (L.REF_W, L.REF_H) else image.resize((L.REF_W, L.REF_H), Image.BILINEAR)
     lum = ref.convert("L")
-    dx, dy, contrast = M.register(M.border_darkness(ref, lum))
-    if contrast < TEMPLATE_MIN_CONTRAST:
-        layout["warnings"].append(f"printed checkbox grid of {L.TEMPLATE} not found (contrast {contrast}); results are unreliable")
-    mask, _ = M.ink_mask(ref, lum, dx, dy)
-    text_px = M.text_ink(mask, dx, dy)
+    geo, detection = R.register(np.asarray(M.border_darkness(ref, lum)))
+    layout["detection"] = detection
+    if detection["verdict"] == "unknown":  # not this form: no template crop, no checkbox reading (generic path: Release 3)
+        layout["warnings"].append(f"page is not recognised as {L.TEMPLATE} (template score {detection['score']}); no field was read")
+        evidence = {"staffCropRaw": None, "customerCropRaw": None, "combinedRaw": None, "checkboxScores": {}}
+        preprocess_ms = _ms(t_pre)
+        timings = {"preprocessMs": preprocess_ms, "checkboxMs": 0, "inferenceMs": 0, "inferenceWallMs": 0, "normalizeMs": 0,
+                   "totalMs": _ms(started), "sections": []}
+        return _response(document_id, source_file, layout, _empty_sections(), evidence, timings)
+    if detection["verdict"] == "uncertain":
+        layout["warnings"].append(f"printed checkbox grid of {L.TEMPLATE} matches only weakly (template score {detection['score']}); "
+                                  "every field needs review")
+    mask, _ = M.ink_mask(ref, lum, geo)
+    text_px = M.text_ink(mask, geo)
+    header_px = M.text_ink(mask, geo, L.HEADER_TEXT_BOXES, L.HEADER_BESIDE_ZONES)
     text_states = {key: M.text_state(px) for key, px in text_px.items()}
+    header_states = {key: M.text_state(px) for key, px in header_px.items()}
     expected = tuple(key for key in N.CUSTOMER_FIELDS if text_states[key] != "empty")
-    sx, sy = width / L.REF_W, height / L.REF_H
-    staff_png = _model_crop(image, [L.STAFF_CROP], sx, sy, dx, dy, clamp=False)
-    if not expected:  # every handwriting box is blank: only the STAFF crop, exactly like v2.2
-        sections = [("staffOnly", staff_png, ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS)]
+    crops = _Crops(image, geo)
+    staff_img = crops.rows([L.STAFF_CROP], clamp=False)
+    customer_img = crops.rows(L.CUSTOMER_CROP_ROWS, customer_crop_scale()) if expected else None
+    if section_mode() == "combined":  # one call: header, customer rows (when written) and the STAFF crop in one image
+        parts = [crops.side_by_side(L.HEADER_CROP_PARTS), *([customer_img] if customer_img else []), staff_img]
+        sections = [("combined", ocr_model.png_bytes(_stack(parts)), ocr_model.COMBINED_PROMPT, ocr_model.COMBINED_MAX_TOKENS)]
     else:
-        customer_png = _model_crop(image, L.CUSTOMER_CROP_ROWS, sx, sy, dx, dy, customer_crop_scale())
-        if section_mode() == "combined":
-            sections = [("combined", _stack_pngs([customer_png, staff_png]), ocr_model.COMBINED_PROMPT, ocr_model.COMBINED_MAX_TOKENS)]
-        else:
-            sections = [("staffOnly", staff_png, ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS),
-                        ("customerInformation", customer_png, ocr_model.CUSTOMER_PROMPT, ocr_model.CUSTOMER_MAX_TOKENS)]
+        sections = [("staffOnly", ocr_model.png_bytes(staff_img), ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS)]
+        if expected:
+            sections.append(("customerInformation", ocr_model.png_bytes(customer_img), ocr_model.CUSTOMER_PROMPT, ocr_model.CUSTOMER_MAX_TOKENS))
     preprocess_ms = _ms(t_pre)
 
     t_inference = time.perf_counter()
     with ThreadPoolExecutor(max_workers=min(section_parallelism(), len(sections))) as pool:
         futures = [(name, pool.submit(_timed_call, png, prompt, tokens)) for name, png, prompt, tokens in sections]
         t_checkbox = time.perf_counter()  # deterministic analysis overlaps the model calls
-        checkboxes = M.detect_checkboxes(mask, dx, dy)
-        body_marks = M.detect_body_marks(mask, lum, dx, dy)
+        checkboxes = M.detect_checkboxes(mask, geo)
+        body_marks = M.detect_body_marks(mask, lum, geo)
         checkbox_ms = _ms(t_checkbox)
         outputs = {name: future.result() for name, future in futures}
     combined_raw = outputs["combined"][0] if "combined" in outputs else None
+    header_raw = {key: None for key in N.HEADER_FIELDS}
     if combined_raw is not None:
-        customer_raw, staff_raw = N.split_combined_text(combined_raw)
+        customer_part, staff_raw = N.split_combined_text(combined_raw)
+        header_raw, customer_raw = N.extract_header_fields(customer_part)
         # Re-read a section alone with its proven prompt when the combined answer lost it: no staff label at all, or
         # written customer boxes with no value parsed (Typhoon occasionally answers with its own training prompt).
         fallbacks = []
         if not any(N.extract_staff_fields(staff_raw)):
-            fallbacks.append(("staffOnlyFallback", staff_png, ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS))
-        if not any(N.parse_customer_text(customer_raw, expected)[0].values()):
-            fallbacks.append(("customerInformationFallback", customer_png, ocr_model.CUSTOMER_PROMPT, ocr_model.CUSTOMER_MAX_TOKENS))
+            fallbacks.append(("staffOnlyFallback", staff_img, ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS))
+        if expected and not any(N.parse_customer_text(customer_raw, expected)[0].values()):
+            fallbacks.append(("customerInformationFallback", customer_img, ocr_model.CUSTOMER_PROMPT, ocr_model.CUSTOMER_MAX_TOKENS))
         if fallbacks:
             with ThreadPoolExecutor(max_workers=min(section_parallelism(), len(fallbacks))) as pool:
-                pending = [(name, pool.submit(_timed_call, png, prompt, tokens)) for name, png, prompt, tokens in fallbacks]
+                pending = [(name, pool.submit(_timed_call, ocr_model.png_bytes(img), prompt, tokens)) for name, img, prompt, tokens in fallbacks]
                 outputs.update((name, future.result()) for name, future in pending)
             staff_raw = outputs["staffOnlyFallback"][0] if "staffOnlyFallback" in outputs else staff_raw
             customer_raw = outputs["customerInformationFallback"][0] if "customerInformationFallback" in outputs else customer_raw
+        if not expected:
+            customer_raw = None
     else:
         staff_raw = outputs["staffOnly"][0]
         customer_raw = outputs["customerInformation"][0] if "customerInformation" in outputs else None
@@ -311,38 +412,41 @@ def process_image(image, document_id, source_file, started, extra_warnings=()):
     layout["warnings"].extend(M.implausible_checkboxes(checkboxes))
 
     t_normalize = time.perf_counter()
+    branch = N.detect_branch(staff_raw)
     treatment_raw, therapist_raw, room_raw = N.extract_staff_fields(staff_raw)
     treatments, durations, treatment_warnings, total_minutes = N.parse_treatments(treatment_raw)
     text_fields = _customer_text_fields(text_px, text_states, customer_raw, expected)
+    header = N.header_fields(header_raw, header_states, read=combined_raw is not None)
     customer = {"name": text_fields["name"], "gender": _single_choice(checkboxes["gender"]), "nationality": text_fields["nationality"],
                 "hotelName": text_fields["hotelName"], "referralSources": _check_fields(checkboxes["referralSources"]),
                 "healthConditions": _check_fields(checkboxes["healthConditions"])}
     recommendation = {"pressure": _single_choice(checkboxes["pressure"]), "massageOilScrub": _check_fields(checkboxes["massageOilScrub"]),
                       "preferredAreas": _body_fields(body_marks, "circle"), "avoidAreas": _body_fields(body_marks, "cross")}
     staff = {"treatments": treatments, "treatment": N.legacy_treatment(treatment_raw, treatments, durations),
-             "therapistName": N.normalize_therapist(therapist_raw), "roomNo": N.normalize_room(room_raw)}
-    if layout["warnings"]:
-        _flag_deterministic(customer)
-        _flag_deterministic(recommendation)
+             "therapistName": N.normalize_therapist(therapist_raw, branch["value"]), "roomNo": N.normalize_room(room_raw),
+             "branch": branch, "totalMinutes": total_minutes}
+    sections_out = {"header": header, "customerInformation": customer, "recommendationCard": recommendation, "staffOnly": staff}
+    if detection["verdict"] == "uncertain":
+        for section in sections_out.values():
+            _flag(section)
+    elif layout["warnings"]:
+        for section in (header, customer, recommendation):
+            _flag(section, ("checkbox", "ink-mark"))
     evidence = {
         "staffCropRaw": staff_raw, "customerCropRaw": customer_raw, "combinedRaw": combined_raw,
         "checkboxScores": {f"{group}.{key}": round(m["score"], 3) for group, items in checkboxes.items() for key, _, m in items},
         "checkboxNotes": {f"{group}.{key}": m["note"] for group, items in checkboxes.items() for key, _, m in items if m["note"]},
         "bodyMap": [{k: m[k] for k in ("area", "kind", "confidence", "pixels", "onLabel", "coverage", "center", "diagonal") if k in m}
                     for m in body_marks],
-        "textInk": text_px, "layoutOffset": {"dx": dx, "dy": dy, "contrast": contrast},
-        "treatmentWarnings": treatment_warnings, "treatmentTotalMinutes": total_minutes,
+        "textInk": {**text_px, **header_px},
+        "layoutOffset": {"dx": round(detection["dx"]), "dy": round(detection["dy"]), "contrast": detection["score"]},
+        "stampPixelsRemoved": crops.stamp_pixels, "treatmentWarnings": treatment_warnings, "treatmentTotalMinutes": total_minutes,
     }
     normalize_ms = _ms(t_normalize)
     section_timings = [{"name": name, "ms": ms} for name, (_, ms) in outputs.items()]
-    result = {
-        "documentId": document_id, "sourceFile": source_file, "engine": ENGINE, "version": VERSION, "schemaVersion": SCHEMA_VERSION,
-        "layout": layout, "customerInformation": customer, "recommendationCard": recommendation, "staffOnly": staff, "evidence": evidence,
-        "timings": {"preprocessMs": preprocess_ms, "checkboxMs": checkbox_ms, "inferenceMs": sum(t["ms"] for t in section_timings),
-                    "inferenceWallMs": inference_wall_ms, "normalizeMs": normalize_ms, "totalMs": _ms(started), "sections": section_timings},
-    }
-    result["needsReview"] = bool(layout["warnings"]) or any(_any_review(result[k]) for k in ("customerInformation", "recommendationCard", "staffOnly"))
-    return result
+    timings = {"preprocessMs": preprocess_ms, "checkboxMs": checkbox_ms, "inferenceMs": sum(t["ms"] for t in section_timings),
+               "inferenceWallMs": inference_wall_ms, "normalizeMs": normalize_ms, "totalMs": _ms(started), "sections": section_timings}
+    return _response(document_id, source_file, layout, sections_out, evidence, timings)
 
 
 @app.get("/health")

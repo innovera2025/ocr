@@ -13,11 +13,16 @@ from PIL import Image, ImageDraw
 import api
 import ocr_layout
 import synthetic_form as S
-from conftest import CUSTOMER_TEXT, STAFF_TEXT, FakeModel, png_of
+from conftest import CUSTOMER_TEXT, HEADER_TEXT, STAFF_TEXT, FakeModel, png_of
 
 FIELD_KEYS = {"raw", "value", "confidence", "source", "needsReview"}
 L_CHECKBOXES = ocr_layout.CHECKBOXES
 SOURCES = {"ocr", "checkbox", "ink-mark", "rule", "master-fuzzy", "verified-memory", "none", "human"}
+
+
+def ocr_model_module():
+    import ocr_model
+    return ocr_model
 
 
 def post(client, data, filename="form.png", content_type="image/png"):
@@ -31,11 +36,17 @@ def assert_field(value, extra=()):
     assert 0.0 <= value["confidence"] <= 1.0 and value["source"] in SOURCES and isinstance(value["needsReview"], bool)
 
 
-def assert_v3_shape(body):
-    assert list(body) == ["documentId", "sourceFile", "engine", "version", "schemaVersion", "layout", "customerInformation",
+def assert_v3_shape(body, checkboxes=39):
+    assert list(body) == ["documentId", "sourceFile", "engine", "version", "schemaVersion", "layout", "header", "customerInformation",
                           "recommendationCard", "staffOnly", "evidence", "timings", "needsReview"]
-    assert body["engine"] == "typhoon-sections" and body["version"] == "3.0" and body["schemaVersion"] == 3
-    assert set(body["layout"]) == {"template", "imageWidth", "imageHeight", "scaleX", "scaleY", "aspectMatch", "warnings"}
+    assert body["engine"] == "typhoon-sections" and body["version"] == "3.1" and body["schemaVersion"] == 3
+    assert set(body["layout"]) == {"template", "imageWidth", "imageHeight", "scaleX", "scaleY", "aspectMatch", "warnings", "detection"}
+    detection = body["layout"]["detection"]
+    assert list(detection) == ["verdict", "score", "foundRatio", "rmsPx", "scaleX", "scaleY", "rotationDeg", "dx", "dy"]
+    assert detection["verdict"] in ("known", "uncertain", "unknown") and all(isinstance(detection[k], (int, float)) for k in list(detection)[1:])
+    assert list(body["header"]) == ["formNumber", "date", "time"]
+    for key in ("formNumber", "date", "time"):
+        assert_field(body["header"][key])
     customer = body["customerInformation"]
     assert list(customer) == ["name", "gender", "nationality", "hotelName", "referralSources", "healthConditions"]
     for key in ("name", "gender", "nationality", "hotelName"):
@@ -48,16 +59,19 @@ def assert_v3_shape(body):
         assert_field(item, {"checked"})
         assert item["checked"] is True
     staff = body["staffOnly"]
-    assert list(staff) == ["treatments", "treatment", "therapistName", "roomNo"]
+    assert list(staff) == ["treatments", "treatment", "therapistName", "roomNo", "branch", "totalMinutes"]
     for item in staff["treatments"]:
-        assert_field(item, {"nameRaw", "duration", "durationMinutes"})
+        assert_field(item, {"nameRaw", "duration", "durationMinutes", "guests"})
+        assert item["guests"] is None or isinstance(item["guests"], int)
     assert set(staff["treatment"]) == {"raw", "durations", "items", "needsReview"}
     assert staff["treatment"]["items"] == staff["treatments"]
     assert_field(staff["therapistName"])
     assert_field(staff["roomNo"])
+    assert_field(staff["branch"])
+    assert staff["totalMinutes"] is None or isinstance(staff["totalMinutes"], int)
     assert {"staffCropRaw", "customerCropRaw", "checkboxScores"} <= set(body["evidence"])
     assert all(isinstance(v, float) for v in body["evidence"]["checkboxScores"].values())
-    assert len(body["evidence"]["checkboxScores"]) == 39
+    assert len(body["evidence"]["checkboxScores"]) == checkboxes
     timings = body["timings"]
     assert set(timings) == {"preprocessMs", "checkboxMs", "inferenceMs", "inferenceWallMs", "normalizeMs", "totalMs", "sections"}
     assert all(isinstance(timings[k], int) and timings[k] >= 0 for k in timings if k != "sections")
@@ -86,14 +100,17 @@ def test_full_document_response_on_sample2(client, fake_model, sample_png):
     assert customer["referralSources"] == []
     assert values(customer["healthConditions"]) == [("Menstruation", False)]
     assert recommendation["pressure"]["value"] == "Standard" and not recommendation["pressure"]["needsReview"]
-    assert values(recommendation["massageOilScrub"]) == [("Jasmine", True), ("Rose", True), ("Lavender", True)]  # scribbled row
+    # one stroke through Jasmine, Rose and Lavender: the row is struck out -> no selection, one marker for review
+    assert recommendation["massageOilScrub"] == [{"raw": "struck out: Jasmine, Rose, Lavender", "value": None, "confidence": 0.35,
+                                                  "source": "checkbox", "needsReview": True, "checked": True}]
     assert values(recommendation["preferredAreas"]) == [("Shoulder (front)", False), ("Neck (back)", False), ("Back (back)", False)]
     assert recommendation["avoidAreas"] == []
     assert [(t["nameRaw"], t["value"], t["duration"], t["durationMinutes"]) for t in staff["treatments"]] == \
         [("ไทย", "นวดไทย", "90 นาที", 90), ("หน้า", "นวดหน้า", "1 ชม.", 60)]
     assert staff["therapistName"]["value"] == "พีพี" and staff["roomNo"]["value"] == "3"
     assert body["evidence"]["staffCropRaw"] == STAFF_TEXT and body["evidence"]["customerCropRaw"] == CUSTOMER_TEXT
-    assert body["evidence"]["combinedRaw"] == CUSTOMER_TEXT + "\n\n" + STAFF_TEXT
+    assert body["evidence"]["combinedRaw"] == HEADER_TEXT + "\n" + CUSTOMER_TEXT + "\n\n" + STAFF_TEXT
+    assert body["header"]["formNumber"]["value"] == "01234" and body["layout"]["detection"]["verdict"] == "known"
     assert 0.2 < body["evidence"]["checkboxScores"]["gender.female"] < 0.5
     assert body["evidence"]["checkboxScores"]["gender.male"] == 0.0
     assert body["needsReview"] is True  # the scribbled massage-oil row must be reviewed
@@ -122,14 +139,16 @@ def test_synthetic_form_full_shape_without_fixture(client, fake_model):
     assert body["needsReview"] is False
 
 
-def test_empty_handwriting_boxes_skip_the_customer_model_call(client, fake_model):
+def test_empty_handwriting_boxes_skip_the_customer_rows(client, fake_model):
     body = post(client, png_of(S.blank_form())).json()
-    assert len(fake_model.calls) == 1 and "STAFF ONLY" in fake_model.calls[0]["prompt"]
+    assert len(fake_model.calls) == 1 and fake_model.calls[0]["prompt"] == ocr_model_module().COMBINED_PROMPT
+    image = Image.open(io.BytesIO(fake_model.calls[0]["png"]))
+    assert image.height < 200  # header + STAFF crop only: the customer rows are not sent
     for key in ("name", "nationality", "hotelName"):
         field = body["customerInformation"][key]
         assert field["value"] is None and field["source"] == "ink-mark" and field["confidence"] >= 0.9 and not field["needsReview"]
     assert body["evidence"]["customerCropRaw"] is None
-    assert [s["name"] for s in body["timings"]["sections"]] == ["staffOnly"]
+    assert [s["name"] for s in body["timings"]["sections"]] == ["combined"]
     gender = body["customerInformation"]["gender"]
     assert gender["value"] is None and gender["needsReview"]  # single choice with nothing marked
     assert body["needsReview"] is True
@@ -397,31 +416,43 @@ def test_aspect_mismatch_is_reported_and_reviewed(client, fake_model):
     assert body["layout"]["aspectMatch"] is False and body["layout"]["warnings"] and body["needsReview"] is True
 
 
-def test_non_form_image_is_flagged(client, fake_model):
+def test_non_form_image_is_unknown_and_nothing_is_read(client, fake_model):
     body = post(client, png_of(Image.new("RGB", (805, 569), (255, 255, 255)))).json()
-    assert any("not found" in w for w in body["layout"]["warnings"]) and body["needsReview"] is True
+    assert_v3_shape(body, checkboxes=0)
+    assert body["layout"]["detection"]["verdict"] == "unknown" and body["layout"]["detection"]["score"] < 20
+    assert any("not recognised" in w for w in body["layout"]["warnings"]) and body["needsReview"] is True
+    assert fake_model.calls == [] and body["timings"]["sections"] == []  # no template crop is sent to the model
+    customer, recommendation, staff = body["customerInformation"], body["recommendationCard"], body["staffOnly"]
+    assert customer["referralSources"] == customer["healthConditions"] == recommendation["massageOilScrub"] == staff["treatments"] == []
+    assert all(customer[k]["needsReview"] and customer[k]["value"] is None for k in ("name", "gender", "nationality", "hotelName"))
+    assert staff["treatment"] == {"raw": None, "durations": [], "items": [], "needsReview": True} and staff["totalMinutes"] is None
 
 
 def test_health_reports_v3(client):
     body = client.get("/health").json()
-    assert body["status"] == "ok" and body["version"] == "3.0" and body["engine"] == "typhoon-sections" and body["masterData"] == "ok"
+    assert body["status"] == "ok" and body["version"] == "3.1" and body["engine"] == "typhoon-sections" and body["masterData"] == "ok"
 
 
-def test_combined_mode_sends_one_image_customer_rows_above_the_unchanged_staff_crop(client, fake_model, monkeypatch):
+def test_combined_mode_sends_one_image_header_and_customer_rows_above_the_unchanged_staff_crop(client, fake_model, monkeypatch):
     post(client, png_of(S.filled_form()))
     assert len(fake_model.calls) == 1
     call = fake_model.calls[0]
-    assert "CUSTOMER INFORMATION" in call["prompt"] and "STAFF ONLY" in call["prompt"] and call["max_tokens"] == 340
+    assert "CUSTOMER INFORMATION" in call["prompt"] and "STAFF ONLY" in call["prompt"] and call["max_tokens"] == 380
+    assert all(f"\n{label}\n" in call["prompt"] for label in ("No.:", "Date:", "Time:", "Name:", "Treatment:", "Room No.:"))
     combined = Image.open(io.BytesIO(call["png"])).convert("RGB")
     fake_model.calls.clear()
     monkeypatch.setenv("OCR_SECTION_MODE", "separate")
     post(client, png_of(S.filled_form()))
     crops = {("staff" if "STAFF ONLY" in c["prompt"] else "customer"): Image.open(io.BytesIO(c["png"])).convert("RGB") for c in fake_model.calls}
     staff, customer = crops["staff"], crops["customer"]
-    assert combined.size == (max(staff.width, customer.width), customer.height + 12 + staff.height)
-    assert combined.crop((0, 0, customer.width, customer.height)).tobytes() == customer.tobytes()
-    bottom = combined.crop((0, customer.height + 12, staff.width, customer.height + 12 + staff.height))
-    assert bottom.tobytes() == staff.tobytes()  # the STAFF pixels the v2.2 prompt was proven on
+    widths = [round((b[2] - b[0])) for b in ocr_layout.HEADER_CROP_PARTS]
+    heights = [round((b[3] - b[1])) for b in ocr_layout.HEADER_CROP_PARTS]
+    header_w, header_h = sum(widths) + 8, max(heights)
+    assert combined.size == (max(header_w, staff.width, customer.width), header_h + 12 + customer.height + 12 + staff.height)
+    middle = combined.crop((0, header_h + 12, customer.width, header_h + 12 + customer.height))
+    assert middle.tobytes() == customer.tobytes()
+    top = header_h + 12 + customer.height + 12
+    assert combined.crop((0, top, staff.width, top + staff.height)).tobytes() == staff.tobytes()  # the v2.2 STAFF pixels
 
 
 def test_combined_mode_parses_real_model_output(client, monkeypatch):
@@ -489,3 +520,145 @@ def test_good_combined_answer_needs_no_fallback(client, monkeypatch):
     monkeypatch.setattr(ocr_model, "call_ocr", _section_model(CUSTOMER_TEXT + "\n\n" + STAFF_TEXT, calls))
     body = post(client, png_of(S.filled_form())).json()
     assert len(calls) == 1 and [s["name"] for s in body["timings"]["sections"]] == ["combined"]
+
+
+# ---------------------------------------------------------------- release 1 (v3.1)
+
+def _crops_of(calls):
+    return [Image.open(io.BytesIO(c["png"])).convert("RGB") for c in calls]
+
+
+def test_scaled_and_rotated_page_is_registered_and_read_like_the_original(client, fake_model):
+    """Real SUKHUMVIT 33 scans are ~0.7% smaller than the template and rotated by up to -0.4 degrees."""
+    body = post(client, png_of(S.transformed(S.filled_form(), 0.99, -0.4))).json()
+    assert_v3_shape(body)
+    detection = body["layout"]["detection"]
+    assert detection["verdict"] == "known" and detection["foundRatio"] == 1.0 and detection["rmsPx"] <= 1.0
+    assert abs(detection["scaleX"] - 0.99) < 0.003 and abs(detection["scaleY"] - 0.99) < 0.003 and abs(detection["rotationDeg"] + 0.4) < 0.05
+    customer, recommendation = body["customerInformation"], body["recommendationCard"]
+    assert customer["gender"]["value"] == "Female" and recommendation["pressure"]["value"] == "Standard"
+    assert values(customer["healthConditions"]) == [("Menstruation", False)] and customer["referralSources"] == []
+    assert recommendation["massageOilScrub"] == []
+    assert [f["value"] for f in recommendation["preferredAreas"]] == ["Shoulder (front)"]
+    assert [f["value"] for f in recommendation["avoidAreas"]] == ["Calf (back)"]
+    assert customer["name"]["value"] == "Chun" and customer["hotelName"]["source"] == "ink-mark"  # written vs blank boxes kept
+    assert body["layout"]["warnings"] == []
+
+
+def test_crops_follow_the_fitted_rotation(client, fake_model, monkeypatch):
+    """Above 0.3 degrees the crops are cut from the de-rotated page: the STAFF box outline is still at the crop's edge."""
+    monkeypatch.setenv("OCR_SECTION_MODE", "separate")
+    post(client, png_of(S.transformed(S.filled_form(), 0.99, -0.4)))
+    staff = next(img for img, c in zip(_crops_of(fake_model.calls), fake_model.calls, strict=True) if "STAFF ONLY" in c["prompt"])
+    assert abs(staff.width - 297) <= 1 and abs(staff.height - 84) <= 1  # 300x85 reference px at the fitted 0.99 scale
+
+    def orange_rows(img):
+        px = img.load()
+        return [y for y in range(img.height) if sum(1 for x in range(img.width) if px[x, y][0] > 180 and px[x, y][2] < 150) > img.width * 0.6]
+    rows = orange_rows(staff)
+    assert rows and rows[0] <= 2  # the box's top border is the first row(s) of the crop, as on an unrotated scan
+
+
+def test_pink_paid_stamp_is_removed_from_the_model_image(client, fake_model):
+    image = S.filled_form()
+    draw = ImageDraw.Draw(image)
+    S.pink_stamp(draw, (120, 118, 250, 150))   # over the Nationality box, as on 2 of the 95 real pages
+    S.pink_stamp(draw, (560, 500, 690, 540))   # over the STAFF ONLY box
+    body = post(client, png_of(image)).json()
+    combined = _crops_of(fake_model.calls)[0]
+    px = combined.load()
+    pink = sum(1 for y in range(combined.height) for x in range(combined.width)
+               if px[x, y][0] - max(px[x, y][1], px[x, y][2]) >= api.STAMP_RED_MIN and px[x, y][2] >= px[x, y][1] - 5)
+    assert pink == 0 and body["evidence"]["stampPixelsRemoved"] > 500
+    reference = post(client, png_of(S.filled_form())).json()
+    for key in ("customerInformation", "recommendationCard"):  # the deterministic reading does not change
+        assert body[key] == reference[key]
+
+
+def test_stamp_removal_keeps_pen_and_print_pixels():
+    crops = api._Crops(Image.new("RGB", (4, 1)), R_IDENTITY())
+    image = Image.new("RGB", (5, 1))
+    image.putdata([(40, 45, 150), (85, 85, 90), (224, 159, 84), (236, 118, 170), (200, 40, 50)])  # blue, black, orange, pink, red
+    assert list(crops._stamp_free(image).getdata()) == [(40, 45, 150), (85, 85, 90), (224, 159, 84), (255, 255, 255), (255, 255, 255)]
+
+
+def R_IDENTITY():
+    import ocr_register
+    return ocr_register.IDENTITY
+
+
+def test_struck_out_oil_row_is_no_selection_and_needs_review(client, fake_model):
+    image = S.filled_form()
+    ImageDraw.Draw(image).line((505, 104, 790, 106), fill=S.BLUE_PEN, width=2)  # one stroke through Jasmine, Rose, Citronella
+    body = post(client, png_of(image)).json()
+    assert body["recommendationCard"]["massageOilScrub"] == [
+        {"raw": "struck out: Jasmine, Rose, Citronella", "value": None, "confidence": 0.35, "source": "checkbox", "needsReview": True,
+         "checked": True}]
+    assert body["evidence"]["checkboxNotes"]["massageOilScrub.rose"] == "row-struck-out" and body["needsReview"] is True
+
+
+def test_tick_beside_the_box_on_its_label_counts_for_review(client, fake_model):
+    image = S.blank_form()
+    draw = ImageDraw.Draw(image)
+    S.write_in_box(draw, "name")
+    _, _, x, y, s = S.box_of("gender", "male")
+    draw.line((x + s + 4, y + 6, x + s + 8, y + s, x + s + 18, y - 4), fill=S.BLUE_PEN, width=2)  # on the "Male" label
+    body = post(client, png_of(image)).json()
+    gender = body["customerInformation"]["gender"]
+    assert gender["value"] == "Male" and gender["needsReview"] is True
+    assert body["evidence"]["checkboxNotes"]["gender.male"] == "mark-beside-box"
+
+
+def test_header_fields_from_the_combined_answer(client, fake_model):
+    image = S.filled_form()
+    draw = ImageDraw.Draw(image)
+    S.write_in_box(draw, "date")
+    S.write_in_box(draw, "time")
+    header = post(client, png_of(image)).json()["header"]
+    assert header == {"formNumber": {"raw": "01234", "value": "01234", "confidence": 0.9, "source": "ocr", "needsReview": False},
+                      "date": {"raw": "16/08/26", "value": "2026-08-16", "confidence": 0.8, "source": "ocr", "needsReview": False},
+                      "time": {"raw": "14:30", "value": "14:30", "confidence": 0.8, "source": "ocr", "needsReview": False}}
+    blank = post(client, png_of(S.filled_form())).json()["header"]  # empty DATE/TIME boxes: confident blanks, model text ignored
+    assert blank["date"]["value"] is None and blank["date"]["source"] == "ink-mark" and not blank["date"]["needsReview"]
+
+
+def test_branch_seed_therapist_totals_and_guests_in_the_response(client, monkeypatch):
+    import ocr_model
+    staff = "STAFF ONLY 仅前台使用\nSUKHUMVIT 33\nTreatment: 4 ไทย + เท้า 30 = 90\nTherapist Name: เพ็ญ / ฟ้า\nRoom No.: 5"
+    monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(staff=staff))
+    body = post(client, png_of(S.filled_form())).json()
+    assert_v3_shape(body)
+    s = body["staffOnly"]
+    assert s["branch"] == {"raw": "SUKHUMVIT 33", "value": "SUKHUMVIT 33", "confidence": 1.0, "source": "rule", "needsReview": False}
+    assert [(t["value"], t["durationMinutes"], t["guests"]) for t in s["treatments"]] == [("นวดไทย", 60, 4), ("นวดเท้า", 30, 4)]
+    assert s["totalMinutes"] == 90 and body["evidence"]["treatmentTotalMinutes"] == 90
+    assert "SUKHUMVIT" not in s["treatment"]["raw"]
+    assert s["therapistName"]["value"] == "เพ็ญ / ฟ้า" and s["therapistName"]["needsReview"] is True  # a seed never auto-confirms
+
+
+def test_uncertain_template_is_read_but_every_field_needs_review(client, fake_model):
+    faded = Image.eval(S.filled_form(), lambda v: int(255 - (255 - v) * 0.23))  # printed grid barely visible
+    body = post(client, png_of(faded)).json()
+    assert_v3_shape(body)
+    assert body["layout"]["detection"]["verdict"] == "uncertain" and 20 <= body["layout"]["detection"]["score"] < 28
+    assert any("matches only weakly" in w for w in body["layout"]["warnings"]) and len(fake_model.calls) == 1
+
+    def fields(node):
+        if isinstance(node, dict):
+            if "needsReview" in node and "raw" in node:
+                yield node
+            for value in node.values():
+                yield from fields(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from fields(value)
+    every = [f for key in ("header", "customerInformation", "recommendationCard", "staffOnly") for f in fields(body[key])]
+    assert every and all(f["needsReview"] for f in every) and body["needsReview"] is True
+
+
+def test_separate_mode_does_not_read_the_header(client, fake_model, monkeypatch):
+    monkeypatch.setenv("OCR_SECTION_MODE", "separate")
+    body = post(client, png_of(S.filled_form())).json()
+    assert [s["name"] for s in body["timings"]["sections"]] == ["staffOnly", "customerInformation"]
+    assert body["header"]["formNumber"] == {"raw": None, "value": None, "confidence": 0.0, "source": "none", "needsReview": False}
+    assert body["header"]["date"]["source"] == "ink-mark"

@@ -16,7 +16,7 @@ def blank_form():
     for boxes in L.CHECKBOXES.values():
         for _, _, x, y, s in boxes:
             draw.rectangle((x, y, x + s - 1, y + s - 1), outline=(150, 150, 150), width=2)
-    for x0, y0, x1, y1 in L.TEXT_BOXES.values():
+    for x0, y0, x1, y1 in (*L.TEXT_BOXES.values(), *L.HEADER_TEXT_BOXES.values()):
         draw.rounded_rectangle((x0, y0, x1, y1), radius=4, outline=(170, 170, 170), width=2)
     for _, side, lx0, ly0, lx1, ly1, ax, ay in L.BODY_LABELS:
         draw.rectangle((lx0, ly0, lx1, ly1), fill=(95, 95, 95))  # printed label text stand-in (dark gray)
@@ -56,7 +56,7 @@ def cross_label(draw, area, side, color=BLUE_PEN, width=2):
 
 
 def write_in_box(draw, key, color=BLUE_PEN):
-    x0, y0, x1, y1 = L.TEXT_BOXES[key]
+    x0, y0, x1, y1 = L.TEXT_BOXES[key] if key in L.TEXT_BOXES else L.HEADER_TEXT_BOXES[key]
     for i in range(6):  # a few "letters"
         lx = x0 + 10 + i * 12
         draw.line((lx, y1 - 5, lx + 4, y0 + 5, lx + 8, y1 - 5), fill=color, width=2)
@@ -74,3 +74,25 @@ def filled_form():
     circle_label(draw, "Shoulder", "front")
     cross_label(draw, "Calf", "back")
     return image
+
+
+def transformed(image, scale=1.0, rotation_deg=0.0):
+    """The page scaled about its centre and rotated (the ocr_register convention: positive = clockwise on screen), as a
+    slightly shrunk and skewed scan would be (real SUKHUMVIT 33 scans: scale ~0.993, rotation -0.4..+0.1 degrees)."""
+    import math
+    cx, cy = L.REF_W / 2, L.REF_H / 2
+    t = math.radians(rotation_deg)
+    c, s = math.cos(t) / scale, math.sin(t) / scale
+    # output q -> source p = R(-t)(q - C) / scale + C
+    data = (c, s, cx - c * cx - s * cy, -s, c, cy + s * cx - c * cy)
+    return image.transform(image.size, Image.AFFINE, data, resample=Image.BICUBIC, fillcolor=(255, 255, 255))
+
+
+def pink_stamp(draw, box, color=(236, 118, 170)):
+    """A PAID-like stamp: a thick pink frame with block letters inside."""
+    x0, y0, x1, y1 = box
+    draw.rectangle(box, outline=color, width=3)
+    step = (x1 - x0 - 8) // 4
+    for i in range(4):
+        lx = x0 + 6 + i * step
+        draw.rectangle((lx, y0 + 5, lx + step - 6, y1 - 5), outline=color, width=3)

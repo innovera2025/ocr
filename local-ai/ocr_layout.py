@@ -1,8 +1,9 @@
 """Reference layout of the Makkha Health & Spa intake form (template ``makkha-intake-v1``).
 
 Every coordinate is in *reference pixels* of an 805x569 scan (calibrated on tests/fixtures/sample2.png).
-Other image sizes are resized to the reference size for deterministic analysis, and model crops are taken
-from the original image at coordinates scaled by (width/805, height/569).
+Other image sizes are resized to the reference size for deterministic analysis. The printed geometry of a scan is fitted
+to these coordinates (``ocr_register``: scale, rotation, shift) and every region is placed through that fit; model crops
+are cut from the original image through the same fit (coordinates scaled by width/805 and height/569).
 """
 
 REF_W, REF_H = 805, 569
@@ -42,15 +43,16 @@ CHECKBOXES = {
 }
 SINGLE_CHOICE = ("gender", "pressure")
 
-# Boxes used to register the scan against the template (spread over the page, printed borders only).
-REGISTRATION_BOXES = (
-    ("gender", "male"), ("gender", "other"), ("referralSources", "google"), ("referralSources", "others"),
-    ("healthConditions", "heartDisease"), ("healthConditions", "others"), ("healthConditions", "sle"),
-    ("pressure", "strong"), ("pressure", "soft"), ("massageOilScrub", "citronella"),
-)
-
 # Handwriting boxes (outer rounded rectangle x0, y0, x1, y1).
 TEXT_BOXES = {"name": (105, 75, 349, 96), "nationality": (105, 126, 349, 146), "hotelName": (105, 156, 349, 177)}
+# Form header: handwritten DATE and TIME boxes, the paper next to them where a date or time is often written instead
+# (right of the printed label, right of the box; seen on real SUKHUMVIT 33 scans), and the model crop of the header =
+# [DATE label + box + that paper] beside [printed "No." form number + TIME label + box + that paper].
+HEADER_TEXT_BOXES = {"date": (253, 50, 349, 64), "time": (686, 52, 780, 65)}
+HEADER_BESIDE_ZONES = {"date": ((326, 26, 405, 49), (349, 49, 405, 76)), "time": ((755, 31, 797, 50), (780, 50, 797, 70))}
+HEADER_CROP_PARTS = ((248, 26, 405, 76), (676, 8, 797, 72))
+# Writing line after the referral "Others 其他" label (customers write the reason there, e.g. "friend").
+REFERRAL_OTHERS_LINE = (333, 280, 400, 300)
 
 # Model crops. STAFF ONLY keeps the exact v2.2 crop (410,485,710,570); on a 569px page its last row is black padding.
 STAFF_CROP = (410, 485, 710, 570)
@@ -74,17 +76,6 @@ BODY_FIGURES = {"front": (525, 178, 598, 346), "back": (599, 178, 672, 346)}
 
 def body_area_value(area, side):
     return f"{area} ({side})"
-
-
-def scale_box(box, sx, sy, dx=0, dy=0, width=None, height=None):
-    """Scale a reference box (x0, y0, x1, y1) shifted by (dx, dy) reference px; clamp to the image when size is known."""
-    x0, y0, x1, y1 = box
-    out = [round((x0 + dx) * sx), round((y0 + dy) * sy), round((x1 + dx) * sx), round((y1 + dy) * sy)]
-    if width is not None:
-        out[0], out[2] = max(0, min(width, out[0])), max(0, min(width, out[2]))
-    if height is not None:
-        out[1], out[3] = max(0, min(height, out[1])), max(0, min(height, out[3]))
-    return tuple(out)
 
 
 def describe_layout(width, height):

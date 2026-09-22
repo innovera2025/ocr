@@ -1,18 +1,38 @@
 {
   "version": 1,
-  "_comment": "Editable masters for Local AI normalization. Reloaded automatically when the file changes (mtime/size). Treatment 'durations' are the allowed minutes; an empty list disables the duration check. Placeholder durations: confirm them against the spa menu.",
+  "_comment": "Editable masters for Local AI normalization. Reloaded automatically when the file changes (mtime/size). Treatment 'durations' are the allowed minutes; an empty list disables the duration check. Placeholder durations: confirm them against the spa menu. Therapists: optional 'branch' (null = every branch) and 'seed' (true = a frequent name read from real scans, a suggestion only: a match never clears needsReview; the client's official lists replace seeds). 'branches' are the branch names printed in the STAFF ONLY box.",
   "treatments": [
     { "name": "นวดไทย", "aliases": ["ไทย", "นวดแผนไทย", "แผนไทย", "Thai Massage", "Thai"], "durations": [60, 90, 120, 180] },
-    { "name": "นวดน้ำมัน", "aliases": ["น้ำมัน", "Oil Massage", "Oil"], "durations": [60, 90, 120] },
+    { "name": "นวดน้ำมัน", "aliases": ["น้ำมัน", "ออย", "ออยล์", "Oil Massage", "Oil"], "durations": [60, 90, 120] },
     { "name": "อโรมา", "aliases": ["อโรม่า", "นวดอโรมา", "Aroma", "Aromatherapy", "Aroma Massage"], "durations": [60, 90, 120] },
     { "name": "นวดเท้า", "aliases": ["เท้า", "นวดฝ่าเท้า", "Foot Massage", "Foot", "Foot Reflexology"], "durations": [30, 45, 60, 90] },
-    { "name": "คอ บ่า ไหล่", "aliases": ["คอบ่าไหล่", "บ่าไหล่", "Neck Shoulder", "Neck & Shoulder", "Head Neck Shoulder"], "durations": [30, 45, 60] },
-    { "name": "นวดหน้า", "aliases": ["หน้า", "Face", "Facial", "Face Massage"], "durations": [30, 45, 60, 90] }
+    { "name": "คอ บ่า ไหล่", "aliases": ["คอบ่าไหล่", "บ่าไหล่", "คอบ่า", "บ่าคอไหล่", "Neck Shoulder", "Neck & Shoulder", "Head Neck Shoulder"], "durations": [30, 45, 60] },
+    { "name": "นวดหน้า", "aliases": ["หน้า", "Face", "Facial", "Face Massage"], "durations": [30, 45, 60, 90] },
+    { "name": "ประคบ", "aliases": ["ประคบสมุนไพร", "Compress", "Herbal Compress"], "durations": [] },
+    { "name": "ยาหม่อง", "aliases": [], "durations": [] },
+    { "name": "สครับ", "aliases": ["Scrub", "Body Scrub"], "durations": [] },
+    { "name": "ออยร้อน", "aliases": ["ออยล์ร้อน", "ออยวอม", "Hot Oil", "Warm Oil"], "durations": [] },
+    { "name": "หินร้อน", "aliases": ["Hot Stone"], "durations": [] },
+    { "name": "หัวอินเดีย", "aliases": ["Indian Head", "Indian Head Massage"], "durations": [] }
   ],
   "therapists": [
-    { "name": "ฟ้า", "aliases": [] },
-    { "name": "พีพี", "aliases": ["PP"] },
-    { "name": "เอี้ยง", "aliases": [] }
+    { "name": "ฟ้า", "aliases": [], "branch": null },
+    { "name": "พีพี", "aliases": ["PP"], "branch": null },
+    { "name": "เอี้ยง", "aliases": [], "branch": null },
+    { "name": "เพ็ญ", "aliases": [], "branch": "SUKHUMVIT 33", "seed": true },
+    { "name": "กุ้ง", "aliases": [], "branch": "SUKHUMVIT 33", "seed": true },
+    { "name": "น้อง", "aliases": [], "branch": "SUKHUMVIT 33", "seed": true },
+    { "name": "อ้อ", "aliases": [], "branch": "SUKHUMVIT 33", "seed": true },
+    { "name": "ตาร์", "aliases": [], "branch": "SUKHUMVIT 33", "seed": true },
+    { "name": "นิริน", "aliases": [], "branch": "SUKHUMVIT 33", "seed": true },
+    { "name": "ธธ", "aliases": [], "branch": "SUKHUMVIT 33", "seed": true },
+    { "name": "ดาว", "aliases": [], "branch": "SUKHUMVIT 33", "seed": true },
+    { "name": "นก", "aliases": [], "branch": "SUKHUMVIT 33", "seed": true },
+    { "name": "ติ", "aliases": [], "branch": "SUKHUMVIT 33", "seed": true }
+  ],
+  "branches": [
+    { "name": "SUKHUMVIT 33", "aliases": ["สุขุมวิท 33", "Sukhumvit Soi 33"] },
+    { "name": "PLOENCHIT", "aliases": ["เพลินจิต"] }
   ],
   "nationalities": [
     { "value": "Thai", "aliases": ["Thailand", "ไทย", "คนไทย", "泰国"] },

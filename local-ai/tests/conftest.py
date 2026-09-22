@@ -14,6 +14,7 @@ SAMPLE = TESTS / "fixtures" / "sample2.png"
 
 STAFF_TEXT = "Treatment : ไทย 90 นาที + หน้า 1 ชม.\nTherapist Name : พีพี\nRoom No. : 3"
 CUSTOMER_TEXT = "Name 姓名 : Chun\nNationality 国籍 : Chinese\nHotel Name 酒店 :"
+HEADER_TEXT = "No. 01234\nDate 日期 : 16/08/26\nTime 时间 : 14:30"
 
 
 @pytest.fixture(autouse=True)
@@ -45,8 +46,8 @@ def sample_png():
 class FakeModel:
     """Replaces ocr_model.call_ocr: answers by prompt keyword, records calls."""
 
-    def __init__(self, staff=STAFF_TEXT, customer=CUSTOMER_TEXT, delay=0.0, fail=False):
-        self.staff, self.customer, self.delay, self.fail, self.calls = staff, customer, delay, fail, []
+    def __init__(self, staff=STAFF_TEXT, customer=CUSTOMER_TEXT, delay=0.0, fail=False, header=HEADER_TEXT):
+        self.staff, self.customer, self.delay, self.fail, self.header, self.calls = staff, customer, delay, fail, header, []
 
     def __call__(self, png, prompt, max_tokens=220):
         import time
@@ -56,8 +57,8 @@ class FakeModel:
             time.sleep(self.delay)
         if self.fail:
             raise ConnectionError("model unavailable")
-        if "STAFF ONLY" in prompt and "CUSTOMER INFORMATION" in prompt:  # combined call: customer rows above the staff crop
-            return self.customer + "\n\n" + self.staff
+        if "STAFF ONLY" in prompt and "CUSTOMER INFORMATION" in prompt:  # combined call: header, customer rows, staff crop
+            return "\n".join(part for part in (self.header, self.customer) if part) + "\n\n" + self.staff
         return self.staff if "STAFF ONLY" in prompt else self.customer
 
 

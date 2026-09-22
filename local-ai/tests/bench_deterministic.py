@@ -22,6 +22,14 @@ from PIL import Image  # noqa: E402
 
 STAFF = "Treatment : ไทย 90 นาที + หน้า 1 ชม.\nTherapist Name : พีพี\nRoom No. : 3"
 CUSTOMER = "Name 姓名 : Chun\nNationality 国籍 : Chinese\nHotel Name 酒店 :"
+HEADER = "No. 01234\nDate 日期 : 16/08/26\nTime 时间 :"
+
+
+def canned(png, prompt, max_tokens=220):
+    """Instant model answer; the combined prompt gets all its sections, so no fallback call is triggered."""
+    if "STAFF ONLY" in prompt and "CUSTOMER INFORMATION" in prompt:
+        return f"{HEADER}\n{CUSTOMER}\n\n{STAFF}"
+    return STAFF if "STAFF ONLY" in prompt else CUSTOMER
 
 
 def main():
@@ -35,7 +43,7 @@ def main():
         buffer = io.BytesIO()
         synthetic_form.filled_form().save(buffer, format="PNG")
         data, ext = buffer.getvalue(), ".png"
-    ocr_model.call_ocr = lambda png, prompt, max_tokens=220: STAFF if "STAFF ONLY" in prompt else CUSTOMER
+    ocr_model.call_ocr = canned
     rows = []
     for _ in range(args.runs + 3):
         started = time.perf_counter()

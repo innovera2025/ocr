@@ -1,10 +1,38 @@
-# INNOVERA Local AI OCR — v3.0 (`typhoon-sections`)
+# INNOVERA Local AI OCR — v3.1 (`typhoon-sections`)
 
-FastAPI service that reads a scanned **Makkha Health & Spa intake form** and returns the whole document as schema v3.
-Contract: `docs/operations/full-document-batch-spec.md` §1. It is served as `uvicorn api:app` on port 5000, with
+FastAPI service that reads a scanned **Makkha Health & Spa intake form** and returns the whole document as schema v3
+(version `3.1`). Contract: `docs/operations/full-document-batch-spec.md` §1 plus the v3.1 additions of
+`docs/operations/real-data/release1-plan.md` (Workstream A). It is served as `uvicorn api:app` on port 5000, with
 `/app = /opt/innovera-ocr`, and talks to Ollama (`scb10x/typhoon-ocr1.5-3b`) through the OpenAI-compatible endpoint.
 
-## What changed since v2.2 (`typhoon-crop-only`)
+## What changed in v3.1 (release 1: real SUKHUMVIT 33 scans)
+
+v3.0 was calibrated on one PLOENCHIT scan. On the first real production file (95 pages, one form per page) its
+translation-only registration put every region 1.5-7.6 px off (the scans are ~0.7 % smaller after resizing and rotated
+by up to -0.4 degrees), so printed box borders were counted as ticks and the model crops missed their text.
+
+| Area | v3.0 | v3.1 |
+|---|---|---|
+| Registration (A1, `ocr_register.py`) | shift only, ±5 px, 10 boxes | Fitted over all 39 printed checkboxes (numpy): coarse scale 0.97-1.02 (step 0.0025) x shift ±24 px, per-box search ±3 px, weighted least-squares affine (scale x/y, rotation, shift) dropping boxes > 1.5 px off, then one more local search + fit. **Every** region is placed through the fit: each checkbox window at its own fitted position, handwriting boxes as 4 strips (a rotated border never enters the interior), body-map labels, leader lines, dots and figures one by one, and every model crop. Crops are plain pixel copies up to 0.3 degrees of fitted rotation, above that they are resampled from the de-rotated page (AFFINE transform of the crop area). ~14 ms. |
+| Template verdict (A3) | contrast < 15 ⇒ warning | `layout.detection` = `{verdict, score, foundRatio, rmsPx, scaleX, scaleY, rotationDeg, dx, dy}`. S = mean ring contrast of the 39 boxes at their fitted positions, `foundRatio` = share with contrast ≥ 20 within ±1 px. **known**: S ≥ 28, foundRatio ≥ 0.75, rmsPx ≤ 1.0, scale 0.95-1.05, rotation ≤ 3 degrees. **uncertain** (otherwise, S ≥ 20): read as the form, every field `needsReview` + warning. **unknown** (S < 20): no model call and no checkbox reading, every section present with empty fields (`needsReview:true`) + warning; the generic full-page path comes in Release 3. |
+| Checkbox scoring (A2) | ink at a 2 px inset; any stroke > 48 px ⇒ review | Blue pen counts at a 2 px inset, darker-than-paper (non-blue) pixels only at a 3 px inset (real printed borders have luminance ~180). A stroke through a box is **struck** (never a selection) when it runs through ≥ 3 boxes (row struck out), is longer than any tick (≥ 110 px), is a flat line longer than the box, or is flat and passes both opposite sides; big long-tailed ticks stay ticks. A struck group returns one marker `{raw:"struck out: Jasmine, Rose, …", value:null, checked:true, needsReview:true}` (no selection), drops faint/light fragments and flags its other ticks. A tick next to a box (6 px ring or its printed label, compact, not a straight line, not the start of a handwritten note) counts as an unsure mark (`needsReview`). Light ticks (fill < 16 %), filled boxes (≥ 50 %: X marks and scribbles look alike) and ticks reaching 8+ px past both sides are `needsReview`. Handwriting on the referral "Others" line counts as an unsure Others. Single choice (gender, pressure) with ≠ 1 mark or a struck box ⇒ `needsReview`. Notes per box in `evidence.checkboxNotes`. |
+| Header + branch (A4) | – | `header: {formNumber, date, time}`. The combined image now stacks **header** (DATE label + box, printed "No." number + TIME label + box, with the paper next to them where dates are often written) + customer rows + the unchanged STAFF crop; `COMBINED_PROMPT` gains `No.:`, `Date:`, `Time:` lines (still one model call). `formNumber` = the printed digits; `date` = ISO `YYYY-MM-DD` (day first, Buddhist-era years such as `16.8.69` converted), `null` + `needsReview` when the year is missing; `time` = `HH:MM`; an empty DATE/TIME area is a confident ink-mark blank. `staffOnly.branch` is matched against the new `branches` masters (`SUKHUMVIT 33`, `PLOENCHIT`) in the STAFF text; branch names are removed from the treatment text (no more fake "SUKHUMVIT 33" treatment). `OCR_SECTION_MODE=separate` does not read the header. |
+| Masters (A5) | 6 treatments, 3 therapists | New services with unrestricted durations (`[]`): ประคบ (ประคบสมุนไพร, Compress), ยาหม่อง, สครับ (Scrub), ออยร้อน (Hot Oil, ออยวอม), หินร้อน (Hot Stone), หัวอินเดีย (Indian Head); ออย/ออยล์/oil ⇒ นวดน้ำมัน; คอบ่า/บ่าคอไหล่ ⇒ คอ บ่า ไหล่. Therapists get optional `branch` (null = every branch) and `seed`; 10 **seed** names for `SUKHUMVIT 33` (names on ≥ 2 hand-labelled real pages) are suggestions only: a seed match never clears `needsReview`. The client's official lists replace the seeds. |
+| Parsing (A6) | – | Written totals (`= 90`, `> 2 ชม`, `รวม …`, `= 2 ช`) become `staffOnly.totalMinutes`; exactly one treatment without a duration gets it derived from the total (`ไทย + เท้า 30 = 90` ⇒ ไทย 60, with a warning); a total that does not add up flags every item; several treatments without durations keep `null` (review). Without a marker, a duration written only after the last of several treatments (`ออย + หน้า 2 ชม`) is their total. A leading guest count (`4 ไทย 1 ชม.`) goes to `guests` on every item (TreatmentField gains `guests`). Two therapists (`อิน / ป๊อป`, `A + B`) give one Field whose value joins the names with " / " (unmatched names as written), `needsReview` unless all are confident non-seed masters. An empty `Treatment`/`Therapist Name` label no longer captures the next label ("Room No. 5"); a treatment written before its label is recovered. |
+| PAID stamp (A7) | – | Pink/red stamp pixels (red − max(green, blue) ≥ 40, blue ≥ green − 5) become white in every model crop (`evidence.stampPixelsRemoved`). Blue/black pen, gray print and the orange form print are kept; a red pen would be removed too. |
+| Body map | nearest label or dot | A mark only counts as "on the label" when it overlaps the printed label; otherwise it is kept but flagged (staff notes written left of the labels were read as circles). |
+
+Response additions (backward compatible; v3.0 readers ignore them):
+```jsonc
+"layout": { …, "detection": { "verdict": "known", "score": 45.3, "foundRatio": 1.0, "rmsPx": 0.5, "scaleX": 0.993, "scaleY": 0.993,
+                              "rotationDeg": -0.15, "dx": 1.2, "dy": -2.0 } },
+"header": { "formNumber": Field, "date": Field, "time": Field },                  // after "layout"
+"staffOnly": { …, "branch": Field, "totalMinutes": number|null }                  // TreatmentField gains "guests": number|null
+```
+`version` is `"3.1"`, `schemaVersion` stays `3`, and `engine` stays `typhoon-sections`. Evidence gains `stampPixelsRemoved` and the
+header ink counts in `textInk`; `layoutOffset` now reports the fitted shift and template score.
+
+## What changed in v3.0 (since v2.2 `typhoon-crop-only`)
 
 | Area | v2.2 | v3.0 |
 |---|---|---|
@@ -28,16 +56,18 @@ Extra, additive keys (not in the spec example, safe to ignore):
 
 | File | Role |
 |---|---|
-| `api.py` | FastAPI app: upload handling, orchestration, response assembly, `/health`, `/v1/ocr`, `/v1/ocr/confirm` |
-| `ocr_layout.py` | Template `makkha-intake-v1`: calibrated reference coordinates (805×569), scaling, `layout` block |
-| `ocr_marks.py` | Deterministic ink detection: pen mask with form dropout, registration, checkboxes, handwriting emptiness, body map |
-| `ocr_normalize.py` | Masters, verified memory, STAFF ONLY and customer transcription parsing, treatments and durations |
-| `ocr_model.py` | Ollama/OpenAI-compatible client and both prompts |
-| `master_data.json` | Editable masters (treatments + allowed durations, therapists, nationalities) |
-| `tests/` | pytest suite, `synthetic_form.py` (draws the template), `fake_ollama.py`, `bench_deterministic.py` |
+| `api.py` | FastAPI app: upload handling, orchestration, crops (fitted geometry, stamp removal), response assembly, `/health`, `/v1/ocr`, `/v1/ocr/confirm` |
+| `ocr_register.py` | Fitted registration (numpy) and the template verdict; `Geometry` maps template coordinates to the scan |
+| `ocr_layout.py` | Template `makkha-intake-v1`: calibrated reference coordinates (805×569), header regions, `layout` block |
+| `ocr_marks.py` | Deterministic ink detection: pen mask with form dropout, checkboxes (strokes, strikes, beside-box marks), handwriting emptiness, body map |
+| `ocr_normalize.py` | Masters, verified memory, header / STAFF ONLY / customer parsing, branch, treatments, totals, guests, therapists |
+| `ocr_model.py` | Ollama/OpenAI-compatible client and the prompts |
+| `master_data.json` | Editable masters (treatments + allowed durations, therapists with branch/seed, branches, nationalities) |
+| `tests/` | pytest suite, `synthetic_form.py` (draws the template; scaled/rotated pages, PAID-like stamps), `fake_ollama.py`, `bench_deterministic.py` |
 | `Dockerfile.test` | Throwaway python:3.11 test image |
 
-Runtime dependencies are unchanged: fastapi, uvicorn, python-multipart and Pillow (from the paddleocr base image). numpy is not used.
+Runtime dependencies: fastapi, uvicorn, python-multipart, Pillow and **numpy** (new in v3.1, for the registration and stamp
+removal; the production base image has it through `paddlepaddle`/`paddleocr`). OpenCV is not needed.
 
 ## Environment variables
 
@@ -67,7 +97,38 @@ Visual ground truth for that scan:
 - Body map: circles around **Shoulder (front)**, **Neck (back)** and **Back (back)**, no crosses.
 - STAFF ONLY: `ไทย 90 นาที + หน้า 1 ชม.` (+ `2.5 ชม.` written outside the box), therapist `พีพี`, room `3`.
 
-Ink model: blue pen strokes are bluish (B − max(R,G) ≥ 10–18). Printed text on this form is dark gray (luminance ≥ 73) or light cyan-gray, so it never counts as ink. Inside template-blank zones (box interiors, handwriting boxes, the body map minus labels, leader lines and figures), any non-orange pixel darker than luminance 185 *and* more than 30 levels darker than the *local* paper (brightest level within ~10 px) is also ink, so shadows, dim photocopies and grayish photos do not fill the boxes while thin pen strokes on dim JPEGs still count. This form dropout keeps black/red pens and JPEG uploads working. Registration searches ±5 px for the printed checkbox grid.
+Ink model: blue pen strokes are bluish (B − max(R,G) ≥ 10–18). Printed text on this form is dark gray (luminance ≥ 73) or light cyan-gray, so it never counts as ink. Inside template-blank zones (box interiors, handwriting boxes, the body map minus labels, leader lines and figures), any non-orange pixel darker than luminance 185 *and* more than 30 levels darker than the *local* paper (brightest level within ~10 px) is also ink, so shadows, dim photocopies and grayish photos do not fill the boxes while thin pen strokes on dim JPEGs still count. This form dropout keeps black/red pens and JPEG uploads working. Inside checkboxes the dark-only part counts only from a 3 px inset (v3.1).
+
+## Real-scan calibration and evaluation (v3.1)
+
+The v3.1 rules were calibrated and measured on the 95 pages of the first production upload (SUKHUMVIT 33, clean flatbed
+scans, 1400×995 JPEG renders), hand-labelled page by page. Labels, page images and the evaluation scripts stay in the
+operator's scratch directory and are not in git (customer data). The evaluation runs the real `api.process_image` with the
+model stubbed, so it measures everything except the model. Aggregate results (v3.0 → v3.1):
+
+| Measure (95 pages) | v3.0 | v3.1 | Target |
+|---|---|---|---|
+| Template verdict `known` | – (11 "grid not found") | 95/95 (score 42.2-50.0, rmsPx 0.38-0.73, foundRatio 1.0) | 95/95 |
+| Gender value right | 37 (38.9 %) | 94 (98.9 %), 0 wrong and unflagged | ≥ 95 % |
+| Pressure value right | 11 (11.6 %) | 89 (93.7 %), 0 wrong and unflagged | ≥ 90 % |
+| Referral / health / oil lists exactly right (per page, all three) | 0 (0 %) | 87 (91.6 %) | ≥ 90 % |
+| … referral / health / oils exact | 41 / 27 / 2 | 94 / 91 / 92 | |
+| Unflagged false positives in those lists | 450 | **0** | 0 |
+| Body map preferred / avoid exact (not targeted) | 41 / 60, 3 unflagged FPs | 42 / 56, 2 unflagged FPs | |
+| Name / nationality / hotel blank-vs-written | 86 / 73 / 60 right | 94 / 94 / 88 right (the rest `uncertain`, still read), 0 written read as blank | |
+| Parser: treatment names right (labelled lines) | 40 (42 %) | 89 (94 %); 95 (100 %) counting the labels' own "hot oil = นวดน้ำมัน" naming | ≥ 90 % |
+| Parser: guest counts / written totals | 0/6 / 0/31 | 6/6 / 31/31 | |
+
+Remaining misses, by category: genuine double marks in pressure (4 pages, flagged), a pressure tick joined to the oil-row
+strike (1), a circled pressure pair (1), a loop drawn around a gender box (1, flagged); flagged false entries from a
+handwritten note or a strike fragment through a health box (2), the start or hook of a diagonal strike in the health "Others" box (2), a
+scribbled-out oil box (1) and a staff note on the referral "Others" line (1); two oil ticks whose tail becomes the strike line
+(struck marker, flagged). Visual check of the fitted STAFF, customer and header crops on 6 pages (both crop paths, both
+PAID-stamp pages): every crop covers its region; totals written to the right of the Treatment box (e.g. "= 3 ชม") can be cut
+at the unchanged STAFF crop's right edge.
+
+Registration limits (synthetic pages): exact for scale 0.97-1.02 and rotation up to ±1.0 degree; from ~1.2 degrees the fit
+fails visibly (verdict `uncertain`, everything flagged), never silently. Real scans stay within ±0.4 degrees.
 
 ## Testing
 
@@ -93,9 +154,17 @@ OCR_VERIFIED_FILE=/tmp/ocr-verified/corrections.jsonl uvicorn api:app --port 500
 curl -s -F file=@tests/fixtures/sample2.png http://127.0.0.1:5000/v1/ocr | python -m json.tool
 ```
 
-Measured locally (Docker Desktop, python 3.11, Pillow 12.3):
-- Deterministic path on sample2: median ≈ 69 ms in total. Decode is ≈ 24 ms (v2.2 also decoded), preprocess ≈ 24 ms, checkbox + body map ≈ 18 ms (overlaps inference) and normalize ≈ 2 ms.
-- With fake 800 ms model calls: `inferenceMs` ≈ 1615 ms, `inferenceWallMs` ≈ 810 ms and `totalMs` ≈ 870 ms.
+Measured locally (Docker Desktop, python 3.11, Pillow 12.3, numpy 2.4; `bench_deterministic.py`, same script run against
+v3.0 and v3.1 interleaved, median totalMs):
+
+| Input | v3.0 | v3.1 |
+|---|---|---|
+| Real page (1400×995 JPEG), 3 pages | 85-88 ms | 90-93 ms |
+| sample2.png (805×569) | 61 ms | 70 ms |
+| synthetic form | 45 ms | 73 ms |
+
+The registration costs ~14 ms; the single combined PNG encode is cheaper than v3.0's two encodes plus re-stack. Checkbox
+and body-map detection (7-22 ms) overlaps the model call in production.
 
 ## Measured on the production Local AI VPS (2026-09-22)
 
@@ -118,20 +187,24 @@ second, STAFF-only call only when its answer contains no staff label.
 
 ## Must be validated against the real model on the Local AI VPS
 
-1. **Ollama parallelism.** Two section calls run at once. If Ollama serialises them (`OLLAMA_NUM_PARALLEL=1`, or a CPU-bound box), `inferenceWallMs` ≈ `inferenceMs` and latency roughly doubles (≈ 3 s instead of 1.5–1.8 s).
-   - Check `timings`, then set `OLLAMA_NUM_PARALLEL=2` on the Ollama service (this needs memory for a second context).
-   - Otherwise accept the extra call, or set `OCR_SECTION_PARALLELISM=1` to keep a predictable order.
-2. **Customer prompt and parsing.** The code assumes the model answers with `Name: … / Nationality: … / Hotel Name: …` lines. The parser also accepts echoed Chinese labels (`姓名 国籍 酒店`), markdown bold, tables, HTML, full-width colons, placeholders such as `-` or `N/A`, and an unlabeled one-line-per-field answer (that last case is flagged `needsReview`). A label word only counts at the start of a line or table cell, or right before a colon (Chinese labels also as separate words), so `Kaname`, `Hotel Nikko` or `Anna Hotelling` inside a value are kept whole.
-   - Check `evidence.customerCropRaw` on 10–20 real forms.
-   - The crop stacks the Name row over the Nationality + Hotel rows at native resolution (324×93 px for an 805×569 scan). If handwriting is misread, try `OCR_CUSTOMER_CROP_SCALE=2`.
-3. **STAFF ONLY output.** The crop pixels and the prompt are exactly v2.2's, so `evidence.staffCropRaw` should equal v2.2's output for the same file. The treatment capture is now multi-line: it runs until `Therapist Name` / `Room No`, and printed `STAFF ONLY / 仅前台使用 / PLOENCHIT / MAKKHA` lines are dropped. Confirm that the real output does not contain other printed text that would become a fake treatment.
-4. **Totals outside the box.** Check whether the model transcribes the `2.5 ชม.` total that sits outside the Treatment box. If it does, the parser treats it as a total, not a treatment.
-5. **Unit spelling.** Watch for `ชม.` read as `ซม.` (accepted as hours) and for durations without a unit (read as minutes with a warning).
-6. **Durations in `master_data.json`** are placeholders. Confirm them against the spa menu; any other value is flagged `needsReview`.
+v3.1 changes what the model sees (fitted crops, header part, stamp removal) but not how it is called: still one combined
+call, the STAFF crop region and STAFF_PROMPT are unchanged, and the combined prompt only gains three label lines. Check on
+the 95-page run (isolated evaluation container, as for the v3.0 baseline):
+
+1. **Header lines.** `evidence.combinedRaw` should start with `No. …`, `Date …`, `Time …`; the number of fallback calls
+   (`timings.sections`) must not grow. `COMBINED_MAX_TOKENS` is 380 (was 340).
+2. **Branch.** The model reads the printed `SUKHUMVIT 33`: `staffOnly.branch` must be set and no treatment may contain it.
+3. **Treatment text.** v3.0 read `ชม.` as `5ม.` on several real pages (`1 5ม.`) and put values before their labels; the parser
+   recovers the second case, not the first (such items stay `needsReview`).
+4. **Totals outside the Treatment box.** Totals written past the box's right edge can be cut by the STAFF crop; if the real
+   answers lose them often, widening the crop is a separate decision (it changes the proven STAFF input).
+5. **Customer names / hotels.** With the fitted crop the customer rows are complete; compare with the labels (v3.0: name 30 %).
+6. **Durations in `master_data.json`** are placeholders; the new services accept any duration. Seeds are suggestions only.
 
 ## Safe blue/green deployment on the Local AI VPS
 
-No new dependencies, so the **same image** as the live v2.2 container is used. Only the code directory changes.
+No new dependencies beyond numpy (already in the paddleocr base image: check with `python -c "import numpy"` in the live
+container first), so the **same image** as the live container is used. Only the code directory changes.
 Run everything as the service owner, and never overwrite `/opt/innovera-ocr` in place.
 
 ```bash
@@ -155,7 +228,7 @@ cp -a /opt/innovera-ocr/verified_dataset /opt/innovera-ocr-v3/verified_dataset  
 docker run -d --name innovera-ocr-v3 -p 127.0.0.1:5001:5000 \
   -v /opt/innovera-ocr-v3:/app --add-host=host.docker.internal:host-gateway \
   -e OCR_SECTION_PARALLELISM=2 "$IMAGE" uvicorn api:app --host 0.0.0.0 --port 5000
-curl -s http://127.0.0.1:5001/health          # expect "version":"3.0","masterData":"ok"
+curl -s http://127.0.0.1:5001/health          # expect "version":"3.1","masterData":"ok"
 
 # 4. Compare with the live v2.2 on forms that are ALREADY on the server (e.g. the upload of the sample2 form and a few
 #    recent ones in /opt/innovera-ocr/uploads). Do not copy the repo fixture to the server.
@@ -184,7 +257,7 @@ docker run -d --name "$LIVE" --restart unless-stopped -p <LIVE PORT MAPPING FROM
   -v /opt/innovera-ocr/uploads:/app/uploads \
   --add-host=host.docker.internal:host-gateway -e OCR_SECTION_PARALLELISM=2 \
   "$IMAGE" uvicorn api:app --host 0.0.0.0 --port 5000
-curl -s http://127.0.0.1:5000/health          # version 3.0; then push one real document through the app
+curl -s http://127.0.0.1:5000/health          # version 3.1; then push one real document through the app
 
 # 6. Rollback (seconds): the v2.2 container and /opt/innovera-ocr are untouched
 docker stop "$LIVE" && docker rename "$LIVE" innovera-ocr-v3-failed
@@ -198,7 +271,16 @@ Notes:
 
 ## Known limitations
 
-- **Fixed template.** Only `makkha-intake-v1` is supported. Small shifts (±5 px) and uniform scaling are handled. Rotated or perspective photos are not: the aspect warning or the "checkbox grid not found" warning sets `needsReview`.
-- **Heavy JPEG.** At quality ≤ ~75 with 4:2:0 chroma subsampling, ticks and handwriting presence are still detected (form dropout). A long scribble through a row of boxes can lose its colour outside the boxes and then reads as ticks instead of `needsReview`. Faint body-map circles drop to `needsReview`. PNG, or JPEG ≥ 90, is recommended for scans.
-- **Body map.** Marks drawn on the figure itself are mapped to the nearest leader dot and flagged for review. Circling two adjacent labels with one stroke (Back/Waist, Calf/Plantar) is reported once, with `needsReview`.
-- **Free text.** Customer name and hotel have no master, so they are taken as read (confidence 0.8) unless the answer looks malformed.
+- **One template.** Only `makkha-intake-v1` (PLOENCHIT and SUKHUMVIT 33 prints share its geometry). Other layouts are
+  `unknown` (nothing read, flagged); the generic full-page path, orientation (90/180/270) and deskew beyond ~1 degree come in
+  Release 3. Phone photos with perspective are not corrected.
+- **Heavy JPEG.** At quality ≤ ~75 with 4:2:0 chroma subsampling, ticks and handwriting presence are still detected (form
+  dropout). A long scribble through a row of boxes can lose its colour outside the boxes. PNG, or JPEG ≥ 90, is recommended.
+- **Body map** is the weakest part (real scans: preferred areas exactly right on 44 % of pages, avoid areas 59 %): marks on
+  the figure itself, ticks and hearts instead of circles, one loop around two labels, and areas the map has no label for
+  (chest, abdomen, buttocks). Uncertain marks are flagged.
+- **Strikes and ticks drawn as one stroke** (a tick whose tail becomes the strike line) are read as struck, with a
+  review marker. X marks and scribbled-out boxes are equally dense: both are returned for review.
+- **Free text.** Customer name and hotel have no master, so they are taken as read (confidence 0.8) unless the answer looks
+  malformed. Dates without a year are returned for review.
+- **Red pen** is removed from model crops together with pink/red stamps.

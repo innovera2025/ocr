@@ -4,7 +4,8 @@
     OLLAMA_URL=http://127.0.0.1:11434/v1/chat/completions uvicorn api:app --port 5000   (from local-ai/)
 
 POST /v1/chat/completions returns canned OCR text chosen by prompt keywords (STAFF ONLY / CUSTOMER INFORMATION).
-Override the canned text with FAKE_OLLAMA_STAFF_TEXT / FAKE_OLLAMA_CUSTOMER_TEXT. GET /v1/models and /api/tags list the model.
+Override the canned text with FAKE_OLLAMA_STAFF_TEXT / FAKE_OLLAMA_CUSTOMER_TEXT / FAKE_OLLAMA_HEADER_TEXT.
+GET /v1/models and /api/tags list the model.
 Requests without a PNG data-URL image are rejected with 400 so client regressions show up.
 """
 
@@ -19,11 +20,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 MODEL = "scb10x/typhoon-ocr1.5-3b"
 STAFF_TEXT = "Treatment : ไทย 90 นาที + หน้า 1 ชม.\nTherapist Name : พีพี\nRoom No. : 3"
 CUSTOMER_TEXT = "Name 姓名 : Chun\nNationality 国籍 : Chinese\nHotel Name 酒店 :"
+HEADER_TEXT = "No. 01234\nDate 日期 : 16/08/26\nTime 时间 :"
 
 
 def canned_text(prompt):
-    if "STAFF ONLY" in prompt and "CUSTOMER INFORMATION" in prompt:  # combined call
-        return os.environ.get("FAKE_OLLAMA_CUSTOMER_TEXT", CUSTOMER_TEXT) + "\n\n" + os.environ.get("FAKE_OLLAMA_STAFF_TEXT", STAFF_TEXT)
+    if "STAFF ONLY" in prompt and "CUSTOMER INFORMATION" in prompt:  # combined call: header, customer rows, staff crop
+        return (os.environ.get("FAKE_OLLAMA_HEADER_TEXT", HEADER_TEXT) + "\n" + os.environ.get("FAKE_OLLAMA_CUSTOMER_TEXT", CUSTOMER_TEXT)
+                + "\n\n" + os.environ.get("FAKE_OLLAMA_STAFF_TEXT", STAFF_TEXT))
     if "STAFF ONLY" in prompt:
         return os.environ.get("FAKE_OLLAMA_STAFF_TEXT", STAFF_TEXT)
     if "CUSTOMER INFORMATION" in prompt:

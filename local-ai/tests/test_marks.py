@@ -1,10 +1,12 @@
 """Deterministic detection: checkboxes, handwriting boxes and body map (no model calls)."""
 
+import numpy as np
 import pytest
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 import ocr_layout as L
 import ocr_marks as M
+import ocr_register as R
 import synthetic_form as S
 
 
@@ -12,31 +14,34 @@ def analyse(image):
     if image.size != (L.REF_W, L.REF_H):
         image = image.resize((L.REF_W, L.REF_H), Image.BILINEAR)
     lum = image.convert("L")
-    dx, dy, contrast = M.register(M.border_darkness(image, lum))
-    mask, _ = M.ink_mask(image, lum, dx, dy)
-    boxes = M.detect_checkboxes(mask, dx, dy)
+    geo, detection = R.register(np.asarray(M.border_darkness(image, lum)))
+    mask, _ = M.ink_mask(image, lum, geo)
+    boxes = M.detect_checkboxes(mask, geo)
     states = {f"{group}.{key}": m["state"] for group, items in boxes.items() for key, _, m in items}
-    return {"offset": (dx, dy), "contrast": contrast, "boxes": boxes, "marked": {k: v for k, v in states.items() if v != "unchecked"},
-            "text": {k: M.text_state(v) for k, v in M.text_ink(mask, dx, dy).items()},
-            "body": {(m["area"], m["kind"]): m for m in M.detect_body_marks(mask, lum, dx, dy)}}
+    return {"offset": (round(detection["dx"]), round(detection["dy"])), "detection": detection, "contrast": detection["score"],
+            "boxes": boxes, "notes": {f"{group}.{key}": m["note"] for group, items in boxes.items() for key, _, m in items if m["note"]},
+            "marked": {k: v for k, v in states.items() if v != "unchecked"},
+            "text": {k: M.text_state(v) for k, v in M.text_ink(mask, geo).items()},
+            "body": {(m["area"], m["kind"]): m for m in M.detect_body_marks(mask, lum, geo)}}
 
 
 # Ground truth read visually from tests/fixtures/sample2.png (zoomed crops): Female, Menstruation and Standard are
 # ticked; a wavy pen line is scribbled across the whole massage-oil row (through Jasmine, Rose and Lavender, beside
-# Citronella and Orange-Cinnamon); no referral source is ticked; the Name box says "Chun", Nationality "Chinese",
-# Hotel Name is empty; the body map has circles around Shoulder (front), Neck (back) and Back (back) and no crosses.
+# Citronella and Orange-Cinnamon): one stroke through 3 boxes = the row is struck out; no referral source is ticked;
+# the Name box says "Chun", Nationality "Chinese", Hotel Name is empty; the body map has circles around Shoulder (front),
+# Neck (back) and Back (back) and no crosses.
 SAMPLE_MARKED = {
     "gender.female": "checked", "healthConditions.menstruation": "checked", "pressure.standard": "checked",
-    "massageOilScrub.jasmine": "ambiguous", "massageOilScrub.rose": "ambiguous", "massageOilScrub.lavender": "ambiguous",
+    "massageOilScrub.jasmine": "struck", "massageOilScrub.rose": "struck", "massageOilScrub.lavender": "struck",
 }
 
 
 def test_sample2_checkboxes_match_visual_ground_truth(sample_image):
     result = analyse(sample_image)
-    assert result["offset"] == (0, 0)
+    assert result["offset"] == (0, 0) and result["detection"]["verdict"] == "known"
     assert result["marked"] == SAMPLE_MARKED
-    notes = {key: m["note"] for key, _, m in result["boxes"]["massageOilScrub"] if m["state"] == "ambiguous"}
-    assert set(notes.values()) == {"stroke-through"}
+    notes = {key: m["note"] for key, _, m in result["boxes"]["massageOilScrub"] if m["state"] == "struck"}
+    assert set(notes.values()) == {"row-struck-out"}
     female = next(m for key, _, m in result["boxes"]["gender"] if key == "female")
     assert female["confidence"] >= 0.9 and 0.2 < female["score"] < 0.5
 
@@ -63,10 +68,10 @@ def test_registration_recovers_a_shifted_scan(sample_image):
 def test_higher_resolution_scan_gives_same_marks(sample_image):
     result = analyse(sample_image.resize((1610, 1138), Image.LANCZOS))
     checked = {k for k, v in result["marked"].items() if v == "checked"}
-    ambiguous = {k for k, v in result["marked"].items() if v == "ambiguous"}
+    struck = {k for k, v in result["marked"].items() if v == "struck"}
     assert checked == {k for k, v in SAMPLE_MARKED.items() if v == "checked"}
-    # resampling blur can push the scribble that grazes Orange-Cinnamon's corner inside that box too: review, never "checked"
-    assert {k for k, v in SAMPLE_MARKED.items() if v == "ambiguous"} <= ambiguous <= {f"massageOilScrub.{k}" for k, *_ in L.CHECKBOXES["massageOilScrub"]}
+    # resampling blur can push the scribble that grazes Orange-Cinnamon's corner inside that box too: struck, never "checked"
+    assert {k for k, v in SAMPLE_MARKED.items() if v == "struck"} <= struck <= {f"massageOilScrub.{k}" for k, *_ in L.CHECKBOXES["massageOilScrub"]}
     assert result["text"]["hotelName"] == "empty"
 
 
@@ -98,12 +103,13 @@ def test_synthetic_form_blue_and_black_pen():
     assert set(result["body"]) == {("Shoulder (front)", "circle"), ("Calf (back)", "cross")}
 
 
-def test_long_stroke_through_boxes_is_ambiguous_not_checked():
+def test_long_stroke_through_a_row_is_struck_out_not_checked():
     image = S.blank_form()
     draw = ImageDraw.Draw(image)
     draw.line((505, 104, 790, 104), fill=S.BLUE_PEN, width=2)  # scribble across the whole first oil row
-    marked = analyse(image)["marked"]
-    assert marked == {"massageOilScrub.jasmine": "ambiguous", "massageOilScrub.rose": "ambiguous", "massageOilScrub.citronella": "ambiguous"}
+    result = analyse(image)
+    assert result["marked"] == {"massageOilScrub.jasmine": "struck", "massageOilScrub.rose": "struck", "massageOilScrub.citronella": "struck"}
+    assert set(result["notes"].values()) == {"row-struck-out"}
 
 
 def test_faint_mark_is_ambiguous():
@@ -203,3 +209,88 @@ def test_dim_jpeg_keeps_body_map_circles(sample_image, factor, quality, side):
     Image.eval(image, lambda v: int(v * factor)).save(buffer, format="JPEG", quality=quality)
     body = analyse(Image.open(io.BytesIO(buffer.getvalue())).convert("RGB"))["body"]
     assert set(body) == {("Shoulder (front)", "circle"), ("Neck (back)", "circle"), ("Back (back)", "circle")}
+
+
+# ---------------------------------------------------------------- release 1 (v3.1) checkbox rules, calibrated on 95 real scans
+
+def test_long_tailed_tick_is_checked_not_a_strike():
+    image = S.blank_form()
+    _, _, x, y, s = S.box_of("pressure", "standard")
+    ImageDraw.Draw(image).line((x - 3, y + 5, x + 5, y + s - 2, x + 55, y - 30), fill=S.BLUE_PEN, width=2)  # starts left, long tail
+    result = analyse(image)
+    assert result["marked"] == {"pressure.standard": "checked"}
+
+
+def test_tick_whose_tail_crosses_the_box_above_counts_only_for_its_own_box():
+    image = S.blank_form()
+    _, _, x, y, s = S.box_of("massageOilScrub", "orangeCinnamon")  # Jasmine is right above it
+    ImageDraw.Draw(image).line((x + 2, y + 5, x + 5, y + s - 2, x + 9, y - 10), fill=S.BLUE_PEN, width=2)
+    marked = analyse(image)["marked"]
+    assert marked.get("massageOilScrub.orangeCinnamon") in ("checked",) and marked.get("massageOilScrub.jasmine", "struck") == "struck"
+
+
+def test_strike_fragments_in_a_struck_row_are_dropped():
+    image = S.blank_form()
+    draw = ImageDraw.Draw(image)
+    draw.line((505, 104, 790, 104), fill=S.BLUE_PEN, width=2)  # row struck out
+    _, _, x, y, s = S.box_of("massageOilScrub", "lavender")
+    draw.point((x + 5, y + 5), fill=S.BLUE_PEN)
+    draw.point((x + 6, y + 5), fill=S.BLUE_PEN)
+    draw.point((x + 5, y + 6), fill=S.BLUE_PEN)  # a faint speck that would be "ambiguous" on its own
+    result = analyse(image)
+    assert result["marked"] == {"massageOilScrub.jasmine": "struck", "massageOilScrub.rose": "struck", "massageOilScrub.citronella": "struck"}
+    assert result["notes"]["massageOilScrub.lavender"] == "strike-fragment"
+
+
+def test_light_tick_needs_review():
+    image = S.blank_form()
+    _, _, x, y, s = S.box_of("referralSources", "google")
+    ImageDraw.Draw(image).point([(x + 3 + i, y + 5 + i) for i in range(4)] + [(x + 4 + i, y + 5 + i) for i in range(4)], fill=S.BLUE_PEN)
+    m = next(m for key, _, m in analyse(image)["boxes"]["referralSources"] if key == "google")
+    assert m["state"] == "checked" and m["note"] == "light" and m["confidence"] < M.REVIEW_BELOW
+
+
+def test_tick_at_the_box_corner_counts_but_a_straight_line_on_the_label_does_not():
+    image = S.blank_form()
+    draw = ImageDraw.Draw(image)
+    _, _, x, y, s = S.box_of("gender", "female")
+    draw.line((x + s + 1, y + s, x + s + 4, y + s + 3, x + s + 22, y - 12), fill=S.BLUE_PEN, width=2)  # vertex just outside the corner
+    _, _, x2, y2, s2 = S.box_of("healthConditions", "diabetes")
+    draw.line((x2 + s2 + 12, y2 + s2, x2 + s2 + 60, y2 - 30), fill=S.BLUE_PEN, width=2)  # a strike line passing over the label
+    marked = analyse(image)["marked"]
+    assert marked.get("gender.female") == "ambiguous" and "healthConditions.diabetes" not in marked
+
+
+def test_staff_note_starting_next_to_a_box_is_not_a_tick():
+    image = S.blank_form()
+    draw = ImageDraw.Draw(image)
+    _, _, x, y, s = S.box_of("referralSources", "redBook")
+    for i in range(9):  # an asterisk and a line of handwriting right after the box
+        lx = x + s + 8 + i * 9
+        draw.line((lx, y + s, lx + 4, y - 2, lx + 8, y + s), fill=S.BLUE_PEN, width=2)
+    assert "referralSources.redBook" not in analyse(image)["marked"]
+
+
+def test_text_on_the_referral_others_line_is_an_unsure_others():
+    image = S.blank_form()
+    x0, y0, x1, y1 = L.REFERRAL_OTHERS_LINE
+    draw = ImageDraw.Draw(image)
+    for i in range(5):
+        lx = x0 + 4 + i * 11
+        draw.line((lx, y1 - 5, lx + 4, y0 + 6, lx + 8, y1 - 5), fill=S.BLUE_PEN, width=2)
+    result = analyse(image)
+    assert result["marked"] == {"referralSources.others": "ambiguous"} and result["notes"]["referralSources.others"] == "text-on-others-line"
+
+
+def test_header_boxes_count_handwriting_beside_them():
+    image = S.blank_form()
+    draw = ImageDraw.Draw(image)
+    x0, y0, x1, y1 = L.HEADER_BESIDE_ZONES["date"][0]
+    for i in range(4):  # a date written right of the DATE label instead of in the box
+        lx = x0 + 6 + i * 12
+        draw.line((lx, y1 - 4, lx + 4, y0 + 6, lx + 8, y1 - 4), fill=S.BLUE_PEN, width=2)
+    lum = image.convert("L")
+    geo, _ = R.register(np.asarray(M.border_darkness(image, lum)))
+    mask, _ = M.ink_mask(image, lum, geo)
+    ink = M.text_ink(mask, geo, L.HEADER_TEXT_BOXES, L.HEADER_BESIDE_ZONES)
+    assert M.text_state(ink["date"]) == "present" and M.text_state(ink["time"]) == "empty"

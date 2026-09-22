@@ -1,6 +1,7 @@
 """Text normalization: master data (master_data.json), verified memory (corrections.jsonl), parsing of the model's
 STAFF ONLY / CUSTOMER INFORMATION transcriptions into schema-v3 fields."""
 
+import datetime
 import difflib
 import json
 import os
@@ -74,7 +75,7 @@ def _load_master(path):
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"master data {path}: must be a JSON object")
-    for section, name_key in (("treatments", "name"), ("therapists", "name"), ("nationalities", "value")):
+    for section, name_key in (("treatments", "name"), ("therapists", "name"), ("nationalities", "value"), ("branches", "name")):
         if data.get(section) is None:  # a missing section is an empty master list, as every lookup reads it
             data[section] = []
         entries = data[section]
@@ -87,6 +88,9 @@ def _load_master(path):
             entry["durations"] = []
         if not isinstance(entry["durations"], list) or not all(isinstance(d, int) for d in entry["durations"]):
             raise ValueError(f"master data {path}: durations of '{entry['name']}' must be a list of whole minutes")
+    for entry in data["therapists"]:  # optional "branch" (null = every branch) and "seed" (a suggestion, never confident)
+        if not isinstance(entry.get("branch"), (str, type(None))) or not isinstance(entry.get("seed", False), bool):
+            raise ValueError(f"master data {path}: therapist '{entry['name']}' needs a string or null 'branch' and a boolean 'seed'")
     return data
 
 
@@ -159,11 +163,47 @@ def _best(raw, entries, name_key):
 
 # ---------------------------------------------------------------- STAFF ONLY
 
-# Printed text of the STAFF ONLY box (heading, its Chinese label, branch, logo). The model sometimes appends it to the
-# handwritten treatment line ("ไทย 90 นาที+หน้า 1 ชม. PLOENCHIT"), so it is removed inline, not by dropping the line.
-_NOISE_TEXT = re.compile(r"staff\s*only|[(（]?\s*仅[^\s)）]*\s*[)）]?|ploenchit|makkha|health\s*&\s*spa", re.I)
+# Printed text of the STAFF ONLY box (heading, its Chinese label, logo) plus every branch name of the masters (the
+# branch is printed in the box: "PLOENCHIT", "SUKHUMVIT 33"). The model sometimes appends it to the handwritten
+# treatment line ("ไทย 90 นาที+หน้า 1 ชม. PLOENCHIT"), so it is removed inline, not by dropping the line.
+_BASE_NOISE = r"staff\s*only|[(（]?\s*仅[^\s)）]*\s*[)）]?|ploenchit|makkha|health\s*&\s*spa"
 # Where the STAFF ONLY part starts in a combined (customer + staff) transcription.
 _STAFF_START = re.compile(r"staff\s*only|仅[限前]|treatment\s*:?", re.I)
+_noise_cache = [None, None]  # (masters object, compiled noise regex)
+
+
+def _branch_pattern(name):
+    """'SUKHUMVIT 33' -> regex that also matches 'Sukhumvit33' / 'SUKHUMVIT  ๓๓' (Thai digits are translated first)."""
+    tokens = [re.escape(t) for t in re.split(r"\s+", name.strip()) if t]
+    return r"(?<![A-Za-z0-9])" + r"\s*".join(tokens) + r"(?![A-Za-z0-9])"
+
+
+def _branch_entries():
+    try:
+        return master().get("branches", [])
+    except Exception:  # broken masters: printed-text removal must still work
+        return []
+
+
+def _noise_text():
+    data = _branch_entries()
+    if _noise_cache[0] is not data:
+        names = [c for entry in data for c in (entry["name"], *entry.get("aliases", []))]
+        _noise_cache[:] = [data, re.compile("|".join([_BASE_NOISE, *(_branch_pattern(n) for n in names)]), re.I)]
+    return _noise_cache[1]
+
+
+def detect_branch(staff_text):
+    """Branch printed in the STAFF ONLY box, matched against the ``branches`` masters in the STAFF text only (a hotel "on
+    Sukhumvit 33" in the customer rows must not set it) -> Field. Not found: value null, source "none", needsReview false
+    (the branch is informational)."""
+    text = (staff_text or "").translate(THAI_DIGITS)
+    for entry in _branch_entries():
+        for candidate in (entry["name"], *entry.get("aliases", [])):
+            m = re.search(_branch_pattern(candidate.translate(THAI_DIGITS)), text, re.I)
+            if m:
+                return field(m.group(0), entry["name"], 1.0 if candidate == entry["name"] else 0.95, "rule", False)
+    return field(None, None, 0.0, "none", False)
 
 
 def _clean_model_text(text):
@@ -172,8 +212,9 @@ def _clean_model_text(text):
 
 
 def split_combined_text(text):
-    """Combined transcription (customer rows above the STAFF crop) -> (customer part, staff part), each stripped.
-    Without a staff marker the whole text goes to both parsers; their label sets do not overlap."""
+    """Combined transcription (header + customer rows above the STAFF crop) -> (customer part, staff part), each stripped.
+    Without a staff marker the whole text goes to both parsers; their label sets do not overlap. The header lines stay
+    in the customer part (see ``extract_header_fields``)."""
     text = text or ""
     m = _STAFF_START.search(text)
     if not m:
@@ -181,16 +222,26 @@ def split_combined_text(text):
     return text[:m.start()].strip(), text[m.start():].strip()
 
 
+_LABEL_LINE = re.compile(r"^(?:treatment|therapist\s*name|room\s*no\.?)\b", re.I)
+
+
 def extract_staff_fields(text):
-    """(treatment, therapist, room) raw strings from the STAFF ONLY transcription (v2.2 label regexes, hardened)."""
-    text = _clean_model_text(text)
+    """(treatment, therapist, room) raw strings from the STAFF ONLY transcription (v2.2 label regexes, hardened). Printed
+    box text and branch names are removed first. When the treatment label has no value but unlabeled lines precede it
+    ("SUKHUMVIT 33\nไทย 1 ชม.\nTreatment\nRoom No. 5"), those lines are the treatment."""
+    text = _noise_text().sub(" ", _clean_model_text(text))
     treatment = therapist = room = None
-    m = re.search(r"Treatment\s*:?\s*(.+?)(?=Therapist\s*Name|Room\s*No|$)", text, re.I | re.S)
+    # values may be empty: capture up to the next label, never into it ("Treatment\nRoom No. 5" has no treatment)
+    m = re.search(r"Treatment\s*:?((?:(?!Therapist\s*Name|Room\s*No).)*)", text, re.I | re.S)
     if m:
-        lines = [_NOISE_TEXT.sub(" ", ln).strip(" \t|-") for ln in m.group(1).splitlines()]
-        lines = [re.sub(r"\s{2,}", " ", ln) for ln in lines if ln]
+        lines = [re.sub(r"\s{2,}", " ", ln.strip(" \t|-")) for ln in m.group(1).splitlines()]
+        lines = [ln for ln in lines if ln and not re.fullmatch(r"[\s|:\-]*", ln)]
         treatment = "\n".join(lines) or None
-    m = re.search(r"Therapist\s*Name\s*:?\s*(.+?)(?=Room\s*No\.?|$)", text, re.I | re.S)
+        if treatment is None:
+            before = [ln.strip(" \t|:-") for ln in text[:m.start()].splitlines()]
+            before = [ln for ln in before if ln and not _LABEL_LINE.match(ln)]
+            treatment = before[-1] if before else None
+    m = re.search(r"Therapist\s*Name\s*:?((?:(?!Room\s*No).)*)", text, re.I | re.S)
     if m:
         lines = [ln.strip(" \t|:-") for ln in m.group(1).splitlines() if ln.strip(" \t|:-")]
         therapist = lines[0] if lines else None
@@ -200,15 +251,45 @@ def extract_staff_fields(text):
     return treatment, therapist, room
 
 
-def normalize_therapist(raw):
+_THERAPIST_SPLIT = re.compile(r"\s*(?:/|\+|＋|&|,|，|\sและ\s)\s*")
+SEED_CONFIDENCE = 0.8  # a seed name is a suggestion: its confidence stays below the review threshold
+
+
+def _therapist_entries(branch):
+    entries = master().get("therapists", [])
+    return [e for e in entries if not e.get("branch") or e["branch"] == branch] if branch else entries
+
+
+def _match_therapist(raw, branch):
+    """One therapist name -> (value, confidence, source, confident)."""
+    verified = verified_match("therapist", raw)
+    if verified:
+        return verified, 1.0, "verified-memory", True
+    entry, score, _ = _best(raw, _therapist_entries(branch), "name")
+    if not entry or score < 0.65:
+        return None, score, "master-fuzzy", False
+    if entry.get("seed"):
+        return entry["name"], min(score, SEED_CONFIDENCE), "master-fuzzy", False
+    return entry["name"], score, "master-fuzzy", score >= REVIEW_BELOW
+
+
+def normalize_therapist(raw, branch=None):
+    """Therapist Field. Master names are matched among the therapists of the page's branch (or of every branch); a match
+    to a seed name is only a suggestion. Two therapists ("อิน / ป๊อป", "A + B") give one Field whose value joins the
+    names with " / " (an unmatched name is kept as written); it needs review unless every name is a confident match."""
     if not raw:
         return field(raw, None, 0.0, "none", True)
     verified = verified_match("therapist", raw)
     if verified:
         return field(raw, verified, 1.0, "verified-memory", False)
-    entry, score, _ = _best(raw, master().get("therapists", []), "name")
-    value = entry["name"] if entry and score >= 0.65 else None
-    return field(raw, value, score, "master-fuzzy", value is None or score < REVIEW_BELOW)
+    parts = [p.strip() for p in _THERAPIST_SPLIT.split(raw.strip()) if p.strip(" .")]
+    if len(parts) <= 1:
+        value, confidence, source, confident = _match_therapist(raw, branch)
+        return field(raw, value, confidence, source, not confident)
+    matches = [_match_therapist(part, branch) for part in parts]
+    value = " / ".join(m[0] or part for m, part in zip(matches, parts, strict=True))
+    source = "verified-memory" if all(m[2] == "verified-memory" for m in matches) else "master-fuzzy"
+    return field(raw, value, min(m[1] for m in matches), source, not all(m[0] and m[3] for m in matches))
 
 
 def normalize_room(raw):
@@ -217,19 +298,144 @@ def normalize_room(raw):
     return field(raw, clean if ok else None, 0.95 if ok else 0.0, "ocr", not ok)
 
 
+# ---------------------------------------------------------------- form header
+
+# "No." (printed form number), DATE / TIME (handwritten). A label counts at the start of a line / table cell or before a
+# colon; "Room No." never counts. The echoed Chinese label ("DATE 日期", "TIME 时间") is dropped from the value.
+_HEADER_LABELS = re.compile(r"(?P<formNumber>\bno\b\.?|เลขที่)|(?P<date>\bdate\b|日期|วันที่)|(?P<time>\btime\b|时间|時間|เวลา)", re.I)
+_HEADER_ECHO = re.compile(r"^[\s:.\-|]*(?:日期|时间|時間|วันที่|เวลา)?[\s:.\-|]*")
+HEADER_FIELDS = ("formNumber", "date", "time")
+_MONTHS = {m: i + 1 for i, names in enumerate((
+    ("jan", "january", "ม.ค.", "มค", "มกราคม"), ("feb", "february", "ก.พ.", "กพ", "กุมภาพันธ์"), ("mar", "march", "มี.ค.", "มีค", "มีนาคม"),
+    ("apr", "april", "เม.ย.", "เมย", "เมษายน"), ("may", "พ.ค.", "พค", "พฤษภาคม"), ("jun", "june", "มิ.ย.", "มิย", "มิถุนายน"),
+    ("jul", "july", "ก.ค.", "กค", "กรกฎาคม"), ("aug", "august", "ส.ค.", "สค", "สิงหาคม"), ("sep", "sept", "september", "ก.ย.", "กย", "กันยายน"),
+    ("oct", "october", "ต.ค.", "ตค", "ตุลาคม"), ("nov", "november", "พ.ย.", "พย", "พฤศจิกายน"), ("dec", "december", "ธ.ค.", "ธค", "ธันวาคม"),
+)) for m in names}
+
+
+def extract_header_fields(text):
+    """Header values from the customer part of a combined answer -> ({formNumber, date, time: raw|None}, rest of the text
+    with the header labels and values removed, for the customer parser)."""
+    text = _clean_model_text(text)
+    found, spans = {}, []
+    matches = [m for m in _HEADER_LABELS.finditer(text) if _is_header_label(text, m)]
+    for i, m in enumerate(matches):
+        line_end = text.find("\n", m.end())
+        end = len(text) if line_end < 0 else line_end
+        if i + 1 < len(matches) and matches[i + 1].start() < end:
+            end = matches[i + 1].start()
+        value = _HEADER_ECHO.sub("", text[m.end():end]).strip(" \t|:-*")
+        spans.append((m.start(), end))
+        if value and value.lower() not in _PLACEHOLDERS and not found.get(m.lastgroup):
+            found[m.lastgroup] = value
+    rest, pos = [], 0
+    for start, end in spans:
+        rest.append(text[pos:start])
+        pos = end
+    rest.append(text[pos:])
+    return {k: found.get(k) for k in HEADER_FIELDS}, "".join(rest).strip()
+
+
+def _is_header_label(text, m):
+    before, after = text[:m.start()], text[m.end():]
+    if m.lastgroup == "formNumber" and re.search(r"room\s*$", before, re.I):
+        return False
+    if m.lastgroup == "formNumber" and not re.match(r"[\s.:]*\d", after.translate(THAI_DIGITS)):
+        return False  # "No." without a number is not the printed form number
+    return bool(re.search(r"(?:^|[\n|])[^\S\n]*$", before) or re.match(r"[^\S\n]*[:：]", after)
+                or m.group(0) in ("日期", "时间", "時間"))
+
+
+def _year(text):
+    year = int(text)
+    if year < 100:
+        year += 2500 if year >= 50 else 2000  # two-digit years >= 50 are Buddhist era (69 = 2569)
+    return year - 543 if year >= 2400 else year
+
+
+def parse_date(raw):
+    """Handwritten date -> ISO 'YYYY-MM-DD', or None when day, month or year is missing or impossible. Day before month
+    ('16/08/26', '16 Aug 2026', '16.8.69' in the Buddhist era); 'Aug 16 2026' also works."""
+    if not raw:
+        return None
+    text = raw.translate(THAI_DIGITS).lower()
+    words = re.findall(r"[a-zก-๙.]+", text)
+    month = next((_MONTHS[w.strip(".")] if w.strip(".") in _MONTHS else _MONTHS.get(w) for w in words
+                  if w.strip(".") in _MONTHS or w in _MONTHS), None)
+    numbers = [int(n) for n in re.findall(r"\d+", text)]
+    if month is not None:
+        if len(numbers) < 2:
+            return None
+        day, year = (numbers[0], numbers[1]) if numbers[0] <= 31 else (numbers[1], numbers[0])
+    else:
+        if len(numbers) != 3:
+            return None
+        day, month, year = numbers if numbers[0] <= 31 else numbers[::-1]  # year first: 2026-08-16
+        if month > 12 >= day:  # month/day/year
+            day, month = month, day
+    year = _year(year)
+    try:
+        return datetime.date(year, month, day).isoformat() if 2000 <= year <= 2100 else None
+    except ValueError:
+        return None
+
+
+def parse_time(raw):
+    """Handwritten clock time -> 'HH:MM' (24 h), or None ('14:30', '14.30 น.', '2.30 pm', '1430')."""
+    if not raw:
+        return None
+    text = raw.translate(THAI_DIGITS).lower().strip()
+    m = re.fullmatch(r"(\d{1,2})\s*[:.;,h ]\s*(\d{2})\s*(am|pm|a\.m\.|p\.m\.|น\.?|นาฬิกา)?\.?", text) or \
+        re.fullmatch(r"(\d{2})(\d{2})\s*(น\.?)?", text) or re.fullmatch(r"(\d{1,2})\s*()(am|pm)", text)
+    if not m:
+        return None
+    hour, minute, suffix = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "")
+    if suffix.startswith("p") and hour < 12:
+        hour += 12
+    if suffix.startswith("a") and hour == 12:
+        hour = 0
+    return f"{hour:02d}:{minute:02d}" if hour < 24 and minute < 60 else None
+
+
+def header_fields(raw, ink_states, read=True):
+    """Header Fields. `raw` from ``extract_header_fields``; `ink_states` = {date, time: empty|uncertain|present} from the
+    handwriting boxes; `read` False when no model call read the header (OCR_SECTION_MODE=separate)."""
+    number = raw.get("formNumber")
+    digits = re.sub(r"\D", "", number.translate(THAI_DIGITS)) if number else ""
+    if 4 <= len(digits) <= 7:
+        out = {"formNumber": field(number, digits, 0.9, "ocr", False)}
+    else:
+        out = {"formNumber": field(number, None, 0.0, "ocr" if number else "none", read)}
+    for key, parse in (("date", parse_date), ("time", parse_time)):
+        value, state = raw.get(key), ink_states.get(key, "present")
+        if state == "empty":
+            out[key] = field(None, None, 0.95, "ink-mark", False)
+        elif not value:
+            out[key] = field(None, None, 0.0, "none", read or state == "present")
+        else:
+            parsed = parse(value)
+            out[key] = field(value, parsed, 0.8 if parsed else 0.4, "ocr", parsed is None)
+    return out
+
+
 # ---------------------------------------------------------------- treatments
 
-_HOUR = r"(?:ชั่วโมง|ชัวโมง|ช\.ม\.|ชม\.?|ซม\.?|hours?|hrs?\.?|h(?![a-z]))"
+_HOUR = r"(?:ชั่วโมง|ชัวโมง|ช\.ม\.|ชม\.?|ซม\.?|hours?|hrs?\.?|h(?![a-z])|ช\.?(?![ก-๙]))"
 _MIN = r"(?:นาที|นท\.?|น\.|minutes?|mins?\.?|m(?![a-z]))"
 # "1:30" (hours:minutes), or a number with an hour unit (+ "ครึ่ง" and/or minutes, whose unit may be left out:
 # "1 ชม. 30", "1h30"), or a number with a minute unit. Unlabelled minutes after an hour unit need two digits
 # (10-59): the real model reads "1 ชม. 2.5 ชม." as "1 ชม.2", which must stay 60 min plus a flagged leftover "2".
+# A lone "ช" right after a number is a truncated "ชม." ("= 2 ช").
 DURATION_RE = re.compile(
     rf"(?<![\d:])(?P<hh>[0-4]):(?P<mm>[0-5]\d)(?![\d:])"
     rf"|(?P<num>\d+(?:[.,]\d+)?)\s*(?:(?P<hour>{_HOUR})(?:\s*(?P<half>ครึ่ง))?"
     rf"(?:\s*(?P<num2>[1-5]\d|\d(?=\s*{_MIN}))(?![\d.,:])(?!\s*{_HOUR})(?:\s*{_MIN})?)?|(?P<min>{_MIN}))", re.I)
 BARE_NUMBER_RE = re.compile(r"(?<!\d)(?<!\d[.,])(\d+(?:\.\d+)?)(?!\d|\.\d)")  # "ชม.2": a dot after a unit is not a decimal point
 SEPARATOR_RE = re.compile(r"\s*(?:\+|＋|/|\n|;|、|，|(?<!\d),|,(?!\d)|\s&\s|\sและ\s)\s*")
+# Written total: "ไทย + เท้า 30 = 90", "สครับ + ออย = 2 ชม.", "ไทย + ประคบ > 2 ชม", "... รวม 90 นาที".
+TOTAL_MARK_RE = re.compile(r"\s*(?:=+>?|＝|->|→|>|รวม|\btotal\b)\s*", re.I)
+# Leading guest count: "4 ไทย 1 ชม." (4 guests, one hour each), "2 คน ออย 90 นาที".
+GUESTS_RE = re.compile(r"^\s*(?P<n>[1-9]|1\d|20)\s*(?:คน|ท่าน|pax|persons?|guests?|x|×)?\s+(?=[^\W\d_])", re.I)
 
 
 def _minutes(match):
@@ -310,16 +516,61 @@ def _allowed_durations(value):
     return []
 
 
+def _single_duration(text):
+    """Exactly one duration (with or without a unit) and nothing else -> (minutes, duration text, has unit) or None."""
+    text = text.strip().rstrip(".")
+    matches = list(DURATION_RE.finditer(text))
+    if len(matches) == 1 and not re.search(r"[^\W_]", text[:matches[0].start()] + text[matches[0].end():]):
+        return _minutes(matches[0]), matches[0].group(0).strip(), True
+    bare = BARE_NUMBER_RE.fullmatch(text)
+    if bare:
+        number = float(bare.group(1))
+        return (int(round(number * 60)) if number <= 4 else int(round(number))), bare.group(1), False
+    return None
+
+
+def _split_total(text):
+    """'A + B 30 = 90' -> ('A + B 30', 90, '90', has_unit=False); no total -> (text, None, None, False). The last total
+    marker must be followed by one duration only."""
+    for m in reversed(list(TOTAL_MARK_RE.finditer(text))):
+        head, tail = text[:m.start()], text[m.end():]
+        if not re.search(r"[^\W\d_]", head):
+            continue  # nothing named before the marker
+        total = _single_duration(tail)
+        if total:
+            return (head, *total)
+    return text, None, None, False
+
+
+def _split_guests(text, has_total=False):
+    """Leading guest count, only when the line has a duration of its own after it or a written total ("4 ไทย 1 ชม.",
+    "4 ไทย + เท้า 30 = 90"): -> (text, guests). A lone "2 ไทย" stays a duration (v3.0 reading)."""
+    m = GUESTS_RE.match(text)
+    if not m or DURATION_RE.match(text, m.start("n")):
+        return text, None
+    if not (has_total or DURATION_RE.search(text, m.end()) or BARE_NUMBER_RE.search(text, m.end())):
+        return text, None
+    return text[m.end():], int(m.group("n"))
+
+
 def parse_treatments(raw):
-    """Treatment transcription -> (items: [TreatmentField], all duration strings, warnings, total minutes|None)."""
+    """Treatment transcription -> (items: [TreatmentField], all duration strings, warnings, total minutes|None).
+
+    Totals: a written total ("= 90", "> 2 ชม", "รวม 2 ชม.") becomes the total; when exactly one treatment has no
+    duration of its own, its duration is derived from the total ("ไทย + เท้า 30 = 90" -> ไทย 60); a total that does not
+    add up flags every item. Without a total marker, a trailing duration equal to the sum is the total, and a duration
+    written only after the last of several treatments ("ออย + หน้า 2 ชม") is read as their total. A leading guest count
+    ("4 ไทย 1 ชม.") goes to ``guests`` of every item."""
     if not raw:
         return [], [], [], None
     text = raw.translate(THAI_DIGITS)
+    text, written_total, total_text, total_unit = _split_total(text)
+    text, guests = _split_guests(text, written_total is not None)
     groups = []
     for segment in SEPARATOR_RE.split(text):
         if segment.strip():
             groups.extend(_segment_groups(segment))
-    durations_all = [d[0] for _, _, ds, _ in groups for d in ds if not d[2]]
+    durations_all = [d[0] for _, _, ds, _ in groups for d in ds if not d[2]] + ([total_text] if total_unit else [])
     total, warnings, items, review_next = None, [], [], False
     named_minutes = [ds[0][1] for name, _, ds, _ in groups if name and ds]
     for index, (name, seg_raw, durs, leftover) in enumerate(groups):
@@ -328,47 +579,78 @@ def parse_treatments(raw):
             warnings.append(f"{name or seg_raw}: number(s) {', '.join(leftover)} not read as a duration")
         if name is None and not durs:  # bare numbers only: the previous item (else the next one) needs review
             if items:
-                items[-1]["needsReview"] = True
+                items[-1]["_review"].add("leftover")
             else:
                 review_next = True
             continue
         if name is None:
-            if last and len(durs) == 1 and len(named_minutes) >= 2 and durs[0][1] == sum(named_minutes):
+            if written_total is None and last and len(durs) == 1 and len(named_minutes) >= 2 and durs[0][1] == sum(named_minutes):
                 total = durs[0][1]
                 continue
             if items and items[-1]["duration"] is None:
-                items[-1].update(duration=durs[0][0], durationMinutes=durs[0][1], raw=f"{items[-1]['raw']} {seg_raw}".strip())
+                items[-1].update(duration=durs[0][0], durationMinutes=durs[0][1], raw=f"{items[-1]['raw']} {seg_raw}".strip(),
+                                 _bare=durs[0][2])
                 if leftover:
-                    items[-1]["needsReview"] = True
+                    items[-1]["_review"].add("leftover")
                 continue
         extra = durs[1:]
-        if extra and last and len(extra) == 1 and extra[0][1] == sum(named_minutes):
+        if extra and written_total is None and last and len(extra) == 1 and extra[0][1] == sum(named_minutes):
             total, extra = extra[0][1], []
         value, confidence, source = _match_treatment(name, seg_raw) if name else (None, 0.0, "none")
         item = {"raw": seg_raw or None, "nameRaw": name, "value": value, "duration": durs[0][0] if durs else None,
-                "durationMinutes": durs[0][1] if durs else None, "confidence": confidence, "source": source}
-        review = value is None or confidence < REVIEW_BELOW or item["duration"] is None or bool(leftover) or review_next
-        review_next = False
+                "durationMinutes": durs[0][1] if durs else None, "confidence": confidence, "source": source,
+                "guests": guests, "_bare": bool(durs and durs[0][2]), "_review": set()}
+        if leftover:
+            item["_review"].add("leftover")
+        if review_next:
+            item["_review"].add("leftover")
+            review_next = False
         if extra:
-            review = True
+            item["_review"].add("extra")
             warnings.append(f"{name or seg_raw}: more than one duration ({', '.join(d[0] for d in durs)})")
         if durs and durs[0][2]:
             warnings.append(f"{name}: duration '{durs[0][0]}' has no unit; read as {durs[0][1]} min")
+        items.append(item)
+    named = [item for item in items if item["nameRaw"]]
+    if written_total is not None:
+        total = written_total
+        missing = [item for item in named if item["durationMinutes"] is None]
+        known = sum(item["durationMinutes"] for item in named if item["durationMinutes"] is not None)
+        if len(missing) == 1:
+            derived = total - known
+            if derived > 0:
+                missing[0].update(duration=f"{derived} นาที", durationMinutes=derived)
+                warnings.append(f"{missing[0]['nameRaw']}: {derived} min derived from the written total ({total} min)")
+                if any(item["_review"] for item in named if item is not missing[0]):
+                    missing[0]["_review"].add("derived")  # derived from a duration that itself needs review
+            else:
+                for item in named:
+                    item["_review"].add("total")
+                warnings.append(f"written total {total} min is not more than the other durations ({known} min)")
+        elif not missing and named and known != total:
+            for item in named:
+                item["_review"].add("total")
+            warnings.append(f"written total {total} min differs from the sum of the durations ({known} min)")
+        elif len(missing) > 1:
+            warnings.append(f"written total {total} min covers {len(missing)} treatments without their own duration")
+    elif total is None and len(named) >= 2 and named[-1]["durationMinutes"] is not None and not named[-1]["_bare"] \
+            and all(item["durationMinutes"] is None for item in named[:-1]):
+        last_item = named[-1]
+        total = last_item["durationMinutes"]
+        last_item.update(duration=None, durationMinutes=None)
+        warnings.append(f"{total} min written after the last of {len(named)} treatments is read as their total")
+    for item in items:
+        reasons = item.pop("_review")
+        item.pop("_bare")
+        value = item["value"]
         allowed = _allowed_durations(value) if value else []
         if allowed and item["durationMinutes"] is not None and item["durationMinutes"] not in allowed:
-            review = True
-            confidence = min(confidence, 0.6)
+            reasons.add("duration")
+            item["confidence"] = min(item["confidence"], 0.6)
             warnings.append(f"{value}: {item['durationMinutes']} min is not an allowed duration ({', '.join(str(a) for a in allowed)})")
-        item["confidence"], item["needsReview"] = round(float(confidence), 3), bool(review)
-        items.append(item)
-    for item in items:  # re-run for items whose duration was attached late (orphan durations)
-        if item["value"] and item["durationMinutes"] is not None:
-            allowed = _allowed_durations(item["value"])
-            if allowed and item["durationMinutes"] not in allowed and not item["needsReview"]:
-                item["needsReview"], item["confidence"] = True, min(item["confidence"], 0.6)
-        elif item["duration"] is None:
-            item["needsReview"] = True
-    ordered = [{k: item[k] for k in ("raw", "value", "confidence", "source", "needsReview", "nameRaw", "duration", "durationMinutes")}
+        review = bool(reasons) or value is None or item["confidence"] < REVIEW_BELOW or item["durationMinutes"] is None
+        item["confidence"], item["needsReview"] = round(float(item["confidence"]), 3), review
+    ordered = [{k: item[k] for k in ("raw", "value", "confidence", "source", "needsReview", "nameRaw", "duration", "durationMinutes", "guests")}
                for item in items]
     return ordered, durations_all, warnings, total
 
