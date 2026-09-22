@@ -61,6 +61,11 @@ def customer_crop_scale():
     return _env_number("OCR_CUSTOMER_CROP_SCALE", 1.0, 0.5, 4.0)
 
 
+def section_mode():
+    """"combined" (default): one model call on the customer rows stacked above the STAFF crop; "separate": v3.0's two calls."""
+    return "separate" if os.environ.get("OCR_SECTION_MODE", "combined").strip().lower() == "separate" else "combined"
+
+
 def _ms(start, end=None):
     return int(round(((end if end is not None else time.perf_counter()) - start) * 1000))
 
@@ -165,6 +170,17 @@ def _model_crop(image, rows, sx, sy, dx, dy, scale=1.0, clamp=True):
     return ocr_model.png_bytes(crop)
 
 
+def _stack_pngs(pngs, gap=12):
+    """Stack PNG crops vertically on white (top first) -> PNG bytes; each crop keeps its own pixels."""
+    parts = [Image.open(io.BytesIO(png)).convert("RGB") for png in pngs]
+    canvas = Image.new("RGB", (max(p.width for p in parts), sum(p.height for p in parts) + gap * (len(parts) - 1)), (255, 255, 255))
+    y = 0
+    for part in parts:
+        canvas.paste(part, (0, y))
+        y += part.height + gap
+    return ocr_model.png_bytes(canvas)
+
+
 def _timed_call(png, prompt, max_tokens):
     start = time.perf_counter()
     text = ocr_model.call_ocr(png, prompt, max_tokens)
@@ -252,10 +268,16 @@ def process_image(image, document_id, source_file, started, extra_warnings=()):
     text_states = {key: M.text_state(px) for key, px in text_px.items()}
     expected = tuple(key for key in N.CUSTOMER_FIELDS if text_states[key] != "empty")
     sx, sy = width / L.REF_W, height / L.REF_H
-    sections = [("staffOnly", _model_crop(image, [L.STAFF_CROP], sx, sy, dx, dy, clamp=False), ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS)]
-    if expected:  # no model call when every handwriting box is blank
-        sections.append(("customerInformation", _model_crop(image, L.CUSTOMER_CROP_ROWS, sx, sy, dx, dy, customer_crop_scale()),
-                         ocr_model.CUSTOMER_PROMPT, ocr_model.CUSTOMER_MAX_TOKENS))
+    staff_png = _model_crop(image, [L.STAFF_CROP], sx, sy, dx, dy, clamp=False)
+    if not expected:  # every handwriting box is blank: only the STAFF crop, exactly like v2.2
+        sections = [("staffOnly", staff_png, ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS)]
+    else:
+        customer_png = _model_crop(image, L.CUSTOMER_CROP_ROWS, sx, sy, dx, dy, customer_crop_scale())
+        if section_mode() == "combined":
+            sections = [("combined", _stack_pngs([customer_png, staff_png]), ocr_model.COMBINED_PROMPT, ocr_model.COMBINED_MAX_TOKENS)]
+        else:
+            sections = [("staffOnly", staff_png, ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS),
+                        ("customerInformation", customer_png, ocr_model.CUSTOMER_PROMPT, ocr_model.CUSTOMER_MAX_TOKENS)]
     preprocess_ms = _ms(t_pre)
 
     t_inference = time.perf_counter()
@@ -266,12 +288,19 @@ def process_image(image, document_id, source_file, started, extra_warnings=()):
         body_marks = M.detect_body_marks(mask, lum, dx, dy)
         checkbox_ms = _ms(t_checkbox)
         outputs = {name: future.result() for name, future in futures}
+    combined_raw = outputs["combined"][0] if "combined" in outputs else None
+    if combined_raw is not None:
+        customer_raw, staff_raw = N.split_combined_text(combined_raw)
+        if not any(N.extract_staff_fields(staff_raw)):  # no staff label survived: re-read the STAFF crop with the proven prompt
+            outputs["staffOnlyFallback"] = _timed_call(staff_png, ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS)
+            staff_raw = outputs["staffOnlyFallback"][0]
+    else:
+        staff_raw = outputs["staffOnly"][0]
+        customer_raw = outputs["customerInformation"][0] if "customerInformation" in outputs else None
     inference_wall_ms = _ms(t_inference)
     layout["warnings"].extend(M.implausible_checkboxes(checkboxes))
 
     t_normalize = time.perf_counter()
-    staff_raw = outputs["staffOnly"][0]
-    customer_raw = outputs["customerInformation"][0] if "customerInformation" in outputs else None
     treatment_raw, therapist_raw, room_raw = N.extract_staff_fields(staff_raw)
     treatments, durations, treatment_warnings, total_minutes = N.parse_treatments(treatment_raw)
     text_fields = _customer_text_fields(text_px, text_states, customer_raw, expected)
@@ -286,7 +315,7 @@ def process_image(image, document_id, source_file, started, extra_warnings=()):
         _flag_deterministic(customer)
         _flag_deterministic(recommendation)
     evidence = {
-        "staffCropRaw": staff_raw, "customerCropRaw": customer_raw,
+        "staffCropRaw": staff_raw, "customerCropRaw": customer_raw, "combinedRaw": combined_raw,
         "checkboxScores": {f"{group}.{key}": round(m["score"], 3) for group, items in checkboxes.items() for key, _, m in items},
         "checkboxNotes": {f"{group}.{key}": m["note"] for group, items in checkboxes.items() for key, _, m in items if m["note"]},
         "bodyMap": [{k: m[k] for k in ("area", "kind", "confidence", "pixels", "onLabel", "coverage", "center", "diagonal") if k in m}

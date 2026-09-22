@@ -93,11 +93,12 @@ def test_full_document_response_on_sample2(client, fake_model, sample_png):
         [("ไทย", "นวดไทย", "90 นาที", 90), ("หน้า", "นวดหน้า", "1 ชม.", 60)]
     assert staff["therapistName"]["value"] == "พีพี" and staff["roomNo"]["value"] == "3"
     assert body["evidence"]["staffCropRaw"] == STAFF_TEXT and body["evidence"]["customerCropRaw"] == CUSTOMER_TEXT
+    assert body["evidence"]["combinedRaw"] == CUSTOMER_TEXT + "\n\n" + STAFF_TEXT
     assert 0.2 < body["evidence"]["checkboxScores"]["gender.female"] < 0.5
     assert body["evidence"]["checkboxScores"]["gender.male"] == 0.0
     assert body["needsReview"] is True  # the scribbled massage-oil row must be reviewed
-    assert [s["name"] for s in body["timings"]["sections"]] == ["staffOnly", "customerInformation"]
-    assert len(fake_model.calls) == 2
+    assert [s["name"] for s in body["timings"]["sections"]] == ["combined"]
+    assert len(fake_model.calls) == 1
 
 
 def test_legacy_v22_fields_keep_their_shape(client, fake_model):
@@ -150,6 +151,7 @@ def test_customer_text_written_in_box_but_unread_needs_review(client, monkeypatc
 
 def test_section_calls_run_concurrently(client, monkeypatch):
     import ocr_model
+    monkeypatch.setenv("OCR_SECTION_MODE", "separate")
     monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(delay=0.3))
     timings = post(client, png_of(S.filled_form())).json()["timings"]
     assert timings["inferenceMs"] >= 580 and timings["inferenceWallMs"] < 0.8 * timings["inferenceMs"]
@@ -374,7 +376,8 @@ def test_upload_is_saved_and_crops_stay_in_memory(client, fake_model, isolated_p
     assert files == [f"{body['documentId']}.png"]
 
 
-def test_model_crops_match_v22_geometry_and_scale(client, fake_model):
+def test_model_crops_match_v22_geometry_and_scale(client, fake_model, monkeypatch):
+    monkeypatch.setenv("OCR_SECTION_MODE", "separate")
     post(client, png_of(S.filled_form()))
     crops = {("staff" if "STAFF ONLY" in c["prompt"] else "customer"): Image.open(io.BytesIO(c["png"])) for c in fake_model.calls}
     staff, customer = crops["staff"], crops["customer"]
@@ -402,3 +405,60 @@ def test_non_form_image_is_flagged(client, fake_model):
 def test_health_reports_v3(client):
     body = client.get("/health").json()
     assert body["status"] == "ok" and body["version"] == "3.0" and body["engine"] == "typhoon-sections" and body["masterData"] == "ok"
+
+
+def test_combined_mode_sends_one_image_customer_rows_above_the_unchanged_staff_crop(client, fake_model, monkeypatch):
+    post(client, png_of(S.filled_form()))
+    assert len(fake_model.calls) == 1
+    call = fake_model.calls[0]
+    assert "CUSTOMER INFORMATION" in call["prompt"] and "STAFF ONLY" in call["prompt"] and call["max_tokens"] == 340
+    combined = Image.open(io.BytesIO(call["png"])).convert("RGB")
+    fake_model.calls.clear()
+    monkeypatch.setenv("OCR_SECTION_MODE", "separate")
+    post(client, png_of(S.filled_form()))
+    crops = {("staff" if "STAFF ONLY" in c["prompt"] else "customer"): Image.open(io.BytesIO(c["png"])).convert("RGB") for c in fake_model.calls}
+    staff, customer = crops["staff"], crops["customer"]
+    assert combined.size == (max(staff.width, customer.width), customer.height + 12 + staff.height)
+    assert combined.crop((0, 0, customer.width, customer.height)).tobytes() == customer.tobytes()
+    bottom = combined.crop((0, customer.height + 12, staff.width, customer.height + 12 + staff.height))
+    assert bottom.tobytes() == staff.tobytes()  # the STAFF pixels the v2.2 prompt was proven on
+
+
+def test_combined_mode_parses_real_model_output(client, monkeypatch):
+    """Real Typhoon answers to combined images (2026-09-22, cache-defeating variants of sample2 / sample)."""
+    import ocr_model
+    real = {
+        "sample2": "Name: chun\nNationality: Chinese\nHotel Name:\nTreatment: ไทย 90 นาที+หน้า 1 ชม. PLOENCHIT\nTherapist Name: พิพี\nRoom No.: 3",
+        "sample": ("Cynthia De La Cruz-Eikanter\nNationality:\nHotel Name:\n\nSTAFF ONLY 仅前台使用\nPLOENCHIT\n\n"
+                   "Treatment: หน้า 1 ชม.\nTherapist Name: เอี้ยง Room No. 1"),
+    }
+    expected = {
+        "sample2": ("chun", "Chinese", [("นวดไทย", 90), ("นวดหน้า", 60)], "พีพี", "3"),
+        "sample": ("Cynthia De La Cruz-Eikanter", None, [("นวดหน้า", 60)], "เอี้ยง", "1"),
+    }
+    for name, text in real.items():
+        monkeypatch.setattr(ocr_model, "call_ocr", lambda png, prompt, max_tokens=220, text=text: text)
+        body = post(client, png_of(S.filled_form())).json()
+        customer, staff = body["customerInformation"], body["staffOnly"]
+        got = (customer["name"]["value"], customer["nationality"]["value"],
+               [(t["value"], t["durationMinutes"]) for t in staff["treatments"]], staff["therapistName"]["value"], staff["roomNo"]["value"])
+        assert got == expected[name], name
+        assert "PLOENCHIT" not in (staff["treatment"]["raw"] or "") and not customer["name"]["needsReview"]
+
+
+def test_combined_answer_without_staff_labels_falls_back_to_the_v22_staff_call(client, monkeypatch):
+    """Real answer seen once with a looser prompt: bare values, no labels. The STAFF crop is re-read alone."""
+    import ocr_model
+    calls = []
+    def model(png, prompt, max_tokens=220):
+        calls.append(prompt)
+        if "CUSTOMER INFORMATION" in prompt:
+            return "chun\nChinese\nPLOENCHIT\nไทย 90 นาที+หน้า 1 ชม. 2.\nฟิพี\n3"
+        return STAFF_TEXT
+    monkeypatch.setattr(ocr_model, "call_ocr", model)
+    body = post(client, png_of(S.filled_form())).json()
+    assert len(calls) == 2 and "CUSTOMER INFORMATION" in calls[0] and calls[1] == ocr_model.STAFF_PROMPT
+    assert [s["name"] for s in body["timings"]["sections"]] == ["combined", "staffOnlyFallback"]
+    assert body["evidence"]["staffCropRaw"] == STAFF_TEXT and body["evidence"]["combinedRaw"].startswith("chun")
+    assert [t["value"] for t in body["staffOnly"]["treatments"]] == ["นวดไทย", "นวดหน้า"]
+    assert body["timings"]["inferenceWallMs"] >= 0 and body["timings"]["inferenceMs"] == sum(s["ms"] for s in body["timings"]["sections"])

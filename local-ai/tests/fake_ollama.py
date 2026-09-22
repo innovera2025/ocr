@@ -22,6 +22,8 @@ CUSTOMER_TEXT = "Name 姓名 : Chun\nNationality 国籍 : Chinese\nHotel Name �
 
 
 def canned_text(prompt):
+    if "STAFF ONLY" in prompt and "CUSTOMER INFORMATION" in prompt:  # combined call
+        return os.environ.get("FAKE_OLLAMA_CUSTOMER_TEXT", CUSTOMER_TEXT) + "\n\n" + os.environ.get("FAKE_OLLAMA_STAFF_TEXT", STAFF_TEXT)
     if "STAFF ONLY" in prompt:
         return os.environ.get("FAKE_OLLAMA_STAFF_TEXT", STAFF_TEXT)
     if "CUSTOMER INFORMATION" in prompt:

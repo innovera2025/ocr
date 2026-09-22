@@ -23,6 +23,7 @@ def isolated_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("OCR_VERIFIED_FILE", str(tmp_path / "verified_dataset" / "corrections.jsonl"))
     monkeypatch.delenv("OCR_MASTER_DATA", raising=False)
     monkeypatch.delenv("OCR_SECTION_PARALLELISM", raising=False)
+    monkeypatch.delenv("OCR_SECTION_MODE", raising=False)
     return tmp_path
 
 
@@ -55,6 +56,8 @@ class FakeModel:
             time.sleep(self.delay)
         if self.fail:
             raise ConnectionError("model unavailable")
+        if "STAFF ONLY" in prompt and "CUSTOMER INFORMATION" in prompt:  # combined call: customer rows above the staff crop
+            return self.customer + "\n\n" + self.staff
         return self.staff if "STAFF ONLY" in prompt else self.customer
 
 

@@ -159,12 +159,26 @@ def _best(raw, entries, name_key):
 
 # ---------------------------------------------------------------- STAFF ONLY
 
-_NOISE_LINES = re.compile(r"staff\s*only|仅前台|ploenchit|makkha|health\s*&\s*spa", re.I)
+# Printed text of the STAFF ONLY box (heading, its Chinese label, branch, logo). The model sometimes appends it to the
+# handwritten treatment line ("ไทย 90 นาที+หน้า 1 ชม. PLOENCHIT"), so it is removed inline, not by dropping the line.
+_NOISE_TEXT = re.compile(r"staff\s*only|[(（]?\s*仅[^\s)）]*\s*[)）]?|ploenchit|makkha|health\s*&\s*spa", re.I)
+# Where the STAFF ONLY part starts in a combined (customer + staff) transcription.
+_STAFF_START = re.compile(r"staff\s*only|仅[限前]|treatment\s*:?", re.I)
 
 
 def _clean_model_text(text):
     text = re.sub(r"<[^>]+>", "\n", text or "")
     return text.replace("：", ":").replace("**", "").replace("__", "").replace("`", "")
+
+
+def split_combined_text(text):
+    """Combined transcription (customer rows above the STAFF crop) -> (customer part, staff part), each stripped.
+    Without a staff marker the whole text goes to both parsers; their label sets do not overlap."""
+    text = text or ""
+    m = _STAFF_START.search(text)
+    if not m:
+        return text.strip(), text.strip()
+    return text[:m.start()].strip(), text[m.start():].strip()
 
 
 def extract_staff_fields(text):
@@ -173,8 +187,8 @@ def extract_staff_fields(text):
     treatment = therapist = room = None
     m = re.search(r"Treatment\s*:?\s*(.+?)(?=Therapist\s*Name|Room\s*No|$)", text, re.I | re.S)
     if m:
-        lines = [ln.strip(" \t|-") for ln in m.group(1).splitlines()]
-        lines = [ln for ln in lines if ln and not _NOISE_LINES.search(ln)]
+        lines = [_NOISE_TEXT.sub(" ", ln).strip(" \t|-") for ln in m.group(1).splitlines()]
+        lines = [re.sub(r"\s{2,}", " ", ln) for ln in lines if ln]
         treatment = "\n".join(lines) or None
     m = re.search(r"Therapist\s*Name\s*:?\s*(.+?)(?=Room\s*No\.?|$)", text, re.I | re.S)
     if m:
@@ -214,7 +228,7 @@ DURATION_RE = re.compile(
     rf"(?<![\d:])(?P<hh>[0-4]):(?P<mm>[0-5]\d)(?![\d:])"
     rf"|(?P<num>\d+(?:[.,]\d+)?)\s*(?:(?P<hour>{_HOUR})(?:\s*(?P<half>ครึ่ง))?"
     rf"(?:\s*(?P<num2>[1-5]\d|\d(?=\s*{_MIN}))(?![\d.,:])(?!\s*{_HOUR})(?:\s*{_MIN})?)?|(?P<min>{_MIN}))", re.I)
-BARE_NUMBER_RE = re.compile(r"(?<!\d)(?<!\d[.,])(\d+(?:\.\d+)?)(?![\d.])")  # "ชม.2": a dot after a unit is not a decimal point
+BARE_NUMBER_RE = re.compile(r"(?<!\d)(?<!\d[.,])(\d+(?:\.\d+)?)(?!\d|\.\d)")  # "ชม.2": a dot after a unit is not a decimal point
 SEPARATOR_RE = re.compile(r"\s*(?:\+|＋|/|\n|;|、|，|(?<!\d),|,(?!\d)|\s&\s|\sและ\s)\s*")
 
 
@@ -408,6 +422,10 @@ def parse_customer_text(text, expected=CUSTOMER_FIELDS):
         value = _clean_value(text[m.end():end])
         if value and not found.get(key):
             found[key] = value
+    if matches and not found.get("name") and "name" in expected and (matches[0].lastgroup != "name" or _clean_value(text[:matches[0].start()])):
+        # The Name row is the top row of the crop: real output sometimes drops only its label
+        # ("Cynthia De La Cruz-Eikanter\nNationality:\nHotel Name:"), so text before the first label is the name.
+        found["name"] = _clean_value(text[:matches[0].start()])
     if matches:
         return {k: found.get(k) for k in CUSTOMER_FIELDS}, False
     lines = [v for v in (_clean_value(line) for line in text.splitlines()) if v]

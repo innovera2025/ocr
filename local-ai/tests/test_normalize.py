@@ -226,3 +226,44 @@ def test_therapist_vowel_confusion_suggests_master_name_for_review():
     assert (result["value"], result["needsReview"], result["source"]) == ("พีพี", True, "master-fuzzy")
     assert result["confidence"] < N.REVIEW_BELOW
     assert N.normalize_therapist("สมชาย")["value"] is None
+
+
+@pytest.mark.parametrize("text, customer, staff", [
+    ("Name: chun\nNationality: Chinese\nHotel Name:\nTreatment: ไทย 90 นาที\nTherapist Name: พิพี\nRoom No.: 3",
+     "Name: chun\nNationality: Chinese\nHotel Name:", "Treatment: ไทย 90 นาที\nTherapist Name: พิพี\nRoom No.: 3"),
+    ("Name: A\n\nSTAFF ONLY 仅前台使用\nTreatment: หน้า 1 ชม.", "Name: A", "STAFF ONLY 仅前台使用\nTreatment: หน้า 1 ชม."),
+    ("Name: A\n仅限台使用 PLOENCHIT\nTreatment: x", "Name: A", "仅限台使用 PLOENCHIT\nTreatment: x"),
+    ("no markers at all", "no markers at all", "no markers at all"),
+])
+def test_split_combined_text(text, customer, staff):
+    assert N.split_combined_text(text) == (customer, staff)
+
+
+@pytest.mark.parametrize("text", [
+    "Treatment: ไทย 90 นาที+หน้า 1 ชม. PLOENCHIT\nTherapist Name: พิพี\nRoom No.: 3",
+    "STAFF ONLY (仅前台使用) PLOENCHIT\nTreatment: ไทย 90 นาที+หน้า 1 ชม.\nTherapist Name: พิพี Room No.: 3",
+    "Treatment: ไทย 90 นาที+หน้า 1 ชม.\nMAKKHA HEALTH & SPA\nTherapist Name: พิพี\nRoom No.: 3",
+])
+def test_printed_staff_box_text_is_removed_inline_not_the_whole_line(text):
+    treatment, therapist, room = N.extract_staff_fields(text)
+    assert treatment == "ไทย 90 นาที+หน้า 1 ชม." and therapist == "พิพี" and room == "3"
+
+
+def test_customer_name_without_label_is_taken_from_the_top_row():
+    found, fallback = N.parse_customer_text("Cynthia De La Cruz-Eikanter\nNationality:\nHotel Name:")
+    assert found == {"name": "Cynthia De La Cruz-Eikanter", "nationality": None, "hotelName": None} and not fallback
+    found, _ = N.parse_customer_text("Chun\nNationality: Chinese\nHotel Name:", expected=("nationality",))
+    assert found["name"] is None  # no handwriting in the Name box: nothing is invented
+
+
+def test_customer_name_written_before_an_empty_chinese_label():
+    """Real combined answer: 'Cynthia De La Cruz-Eikanter\n姓名\nNationality 国籍\nHotel Name 酒店'."""
+    found, fallback = N.parse_customer_text("Cynthia De La Cruz-Eikanter\n姓名\nNationality 国籍\nHotel Name 酒店")
+    assert found["name"] == "Cynthia De La Cruz-Eikanter" and not fallback
+
+
+def test_trailing_number_with_a_full_stop_is_a_leftover_not_a_treatment():
+    """Real answer for sample2 (v9 variant): "ไทย 90 นาที+หน้า 1 ชม. 2." must not add a treatment named "2"."""
+    items, durations, warnings, _ = N.parse_treatments("ไทย 90 นาที+หน้า 1 ชม. 2.")
+    assert [(i["value"], i["durationMinutes"]) for i in items] == [("นวดไทย", 90), ("นวดหน้า", 60)]
+    assert items[1]["needsReview"] and any("2" in w for w in warnings)

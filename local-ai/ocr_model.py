@@ -43,6 +43,34 @@ Return clean OCR text only.
 """
 CUSTOMER_MAX_TOKENS = 120
 
+# One model call for both sections (customer rows stacked above the unchanged STAFF crop). On the CPU-only Local AI
+# host every image costs the same ~25 s (Ollama resizes each image to ~1,070 tokens whatever its size) and requests
+# run one at a time, so two calls took ~50 s per new document; one combined call keeps v2.2's ~25 s (measured
+# 2026-09-22 on sample/sample2 variants that defeat the prompt cache). Listing every label keeps them in the answer
+# (6/6 parsed); a looser wording sometimes returned bare values without labels. api.py re-reads the STAFF crop with
+# STAFF_PROMPT when the combined answer has no staff label at all.
+COMBINED_PROMPT = """
+Extract all text from this image of a spa intake form, top to bottom.
+Top part: CUSTOMER INFORMATION. Bottom part: STAFF ONLY section.
+
+Copy each printed label exactly, then the handwriting after it, one field per line:
+Name:
+Nationality:
+Hotel Name:
+Treatment:
+Therapist Name:
+Room No.:
+
+Read handwriting directly.
+Do not normalize.
+Do not translate.
+Do not guess.
+Preserve Thai and durations.
+Leave the value empty when a box is empty.
+Return clean OCR text only.
+"""
+COMBINED_MAX_TOKENS = 340
+
 
 def model_name():
     return os.environ.get("OCR_MODEL", DEFAULT_MODEL)

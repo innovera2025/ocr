@@ -36,8 +36,9 @@ def test_fake_ollama_rejects_requests_without_png(fake_server):
     assert error.value.code == 400
 
 
-def test_whole_service_against_fake_ollama(client, fake_server):
+def test_whole_service_against_fake_ollama(client, fake_server, monkeypatch):
     _, log = fake_server
+    monkeypatch.setenv("OCR_SECTION_MODE", "separate")
     response = client.post("/v1/ocr", files={"file": ("form.png", png_of(S.filled_form()), "image/png")})
     assert response.status_code == 200, response.text
     body = response.json()
