@@ -291,9 +291,19 @@ def process_image(image, document_id, source_file, started, extra_warnings=()):
     combined_raw = outputs["combined"][0] if "combined" in outputs else None
     if combined_raw is not None:
         customer_raw, staff_raw = N.split_combined_text(combined_raw)
-        if not any(N.extract_staff_fields(staff_raw)):  # no staff label survived: re-read the STAFF crop with the proven prompt
-            outputs["staffOnlyFallback"] = _timed_call(staff_png, ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS)
-            staff_raw = outputs["staffOnlyFallback"][0]
+        # Re-read a section alone with its proven prompt when the combined answer lost it: no staff label at all, or
+        # written customer boxes with no value parsed (Typhoon occasionally answers with its own training prompt).
+        fallbacks = []
+        if not any(N.extract_staff_fields(staff_raw)):
+            fallbacks.append(("staffOnlyFallback", staff_png, ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS))
+        if not any(N.parse_customer_text(customer_raw, expected)[0].values()):
+            fallbacks.append(("customerInformationFallback", customer_png, ocr_model.CUSTOMER_PROMPT, ocr_model.CUSTOMER_MAX_TOKENS))
+        if fallbacks:
+            with ThreadPoolExecutor(max_workers=min(section_parallelism(), len(fallbacks))) as pool:
+                pending = [(name, pool.submit(_timed_call, png, prompt, tokens)) for name, png, prompt, tokens in fallbacks]
+                outputs.update((name, future.result()) for name, future in pending)
+            staff_raw = outputs["staffOnlyFallback"][0] if "staffOnlyFallback" in outputs else staff_raw
+            customer_raw = outputs["customerInformationFallback"][0] if "customerInformationFallback" in outputs else customer_raw
     else:
         staff_raw = outputs["staffOnly"][0]
         customer_raw = outputs["customerInformation"][0] if "customerInformation" in outputs else None

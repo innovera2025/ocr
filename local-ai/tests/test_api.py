@@ -446,19 +446,46 @@ def test_combined_mode_parses_real_model_output(client, monkeypatch):
         assert "PLOENCHIT" not in (staff["treatment"]["raw"] or "") and not customer["name"]["needsReview"]
 
 
-def test_combined_answer_without_staff_labels_falls_back_to_the_v22_staff_call(client, monkeypatch):
-    """Real answer seen once with a looser prompt: bare values, no labels. The STAFF crop is re-read alone."""
-    import ocr_model
-    calls = []
+def _section_model(combined_answer, calls):
+    """Answers the combined prompt with `combined_answer` and the single-section prompts with the proven texts."""
     def model(png, prompt, max_tokens=220):
         calls.append(prompt)
-        if "CUSTOMER INFORMATION" in prompt:
-            return "chun\nChinese\nPLOENCHIT\nไทย 90 นาที+หน้า 1 ชม. 2.\nฟิพี\n3"
-        return STAFF_TEXT
-    monkeypatch.setattr(ocr_model, "call_ocr", model)
+        if "CUSTOMER INFORMATION" in prompt and "STAFF ONLY" in prompt:
+            return combined_answer
+        return CUSTOMER_TEXT if "CUSTOMER INFORMATION" in prompt else STAFF_TEXT
+    return model
+
+
+def test_combined_answer_without_labels_falls_back_to_both_single_section_calls(client, monkeypatch):
+    """Real answer seen once with a looser prompt: bare values, no labels. Both sections are re-read alone."""
+    import ocr_model
+    calls = []
+    monkeypatch.setattr(ocr_model, "call_ocr", _section_model("chun\nChinese\nPLOENCHIT\nไทย 90 นาที+หน้า 1 ชม. 2.\nฟิพี\n3", calls))
     body = post(client, png_of(S.filled_form())).json()
-    assert len(calls) == 2 and "CUSTOMER INFORMATION" in calls[0] and calls[1] == ocr_model.STAFF_PROMPT
-    assert [s["name"] for s in body["timings"]["sections"]] == ["combined", "staffOnlyFallback"]
+    assert len(calls) == 3 and sorted(calls[1:]) == sorted([ocr_model.STAFF_PROMPT, ocr_model.CUSTOMER_PROMPT])
+    assert [s["name"] for s in body["timings"]["sections"]] == ["combined", "staffOnlyFallback", "customerInformationFallback"]
     assert body["evidence"]["staffCropRaw"] == STAFF_TEXT and body["evidence"]["combinedRaw"].startswith("chun")
     assert [t["value"] for t in body["staffOnly"]["treatments"]] == ["นวดไทย", "นวดหน้า"]
+    assert body["customerInformation"]["name"]["value"] == "Chun" and body["customerInformation"]["nationality"]["value"] == "Chinese"
     assert body["timings"]["inferenceWallMs"] >= 0 and body["timings"]["inferenceMs"] == sum(s["ms"] for s in body["timings"]["sections"])
+
+
+def test_model_answering_with_its_training_prompt_is_recovered_by_fallbacks(client, monkeypatch):
+    """Production 2026-09-22 (1 in 18 fresh documents): the combined call returned Typhoon's own training prompt."""
+    import ocr_model
+    calls = []
+    regurgitated = ("Extract all text from the image.\n\nInstructions:\n- Only return the clean Markdown.\n\nFormatting Rules:\n"
+                    "- Checkboxes: Use ☐ for unchecked and ☑ for checked boxes.")
+    monkeypatch.setattr(ocr_model, "call_ocr", _section_model(regurgitated, calls))
+    body = post(client, png_of(S.filled_form())).json()
+    assert len(calls) == 3
+    assert body["customerInformation"]["name"]["value"] == "Chun" and body["staffOnly"]["therapistName"]["value"] == "พีพี"
+    assert body["evidence"]["combinedRaw"] == regurgitated and body["evidence"]["customerCropRaw"] == CUSTOMER_TEXT
+
+
+def test_good_combined_answer_needs_no_fallback(client, monkeypatch):
+    import ocr_model
+    calls = []
+    monkeypatch.setattr(ocr_model, "call_ocr", _section_model(CUSTOMER_TEXT + "\n\n" + STAFF_TEXT, calls))
+    body = post(client, png_of(S.filled_form())).json()
+    assert len(calls) == 1 and [s["name"] for s in body["timings"]["sections"]] == ["combined"]
