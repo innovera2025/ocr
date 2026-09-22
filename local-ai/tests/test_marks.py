@@ -294,3 +294,49 @@ def test_header_boxes_count_handwriting_beside_them():
     mask, _ = M.ink_mask(image, lum, geo)
     ink = M.text_ink(mask, geo, L.HEADER_TEXT_BOXES, L.HEADER_BESIDE_ZONES)
     assert M.text_state(ink["date"]) == "present" and M.text_state(ink["time"]) == "empty"
+
+
+# ---------------------------------------------------------------- review fixes: covered boxes, ambiguous body marks
+STICKY = (250, 240, 150)  # a yellow sticky note / receipt: not ink, and no printed border shows through
+
+
+def test_covered_boxes_are_unreadable_not_unchecked():
+    image = S.filled_form()
+    S.tick(ImageDraw.Draw(image), "massageOilScrub", "citronella")
+    ImageDraw.Draw(image).rectangle((515, 94, 720, 130), fill=STICKY)  # covers all 5 oil boxes (and the Citronella tick)
+    result = analyse(image)
+    assert result["detection"]["verdict"] == "known", "the rest of the grid still registers"
+    oils = {key: m for key, _, m in result["boxes"]["massageOilScrub"]}
+    assert {m["state"] for m in oils.values()} == {"unreadable"} and all(m["confidence"] <= 0.5 for m in oils.values())
+    assert M.hidden_checkboxes(result["boxes"]) == ["5 massageOilScrub box(es) not visible (covered or cut off?): Jasmine, Rose, Citronella, Orange-Cinnamon, Lavender"]
+    assert result["marked"]["healthConditions.menstruation"] == "checked" and "pressure.standard" in result["marked"], "visible boxes read as before"
+
+
+def test_clean_form_has_no_hidden_box():
+    result = analyse(S.filled_form())
+    assert M.hidden_checkboxes(result["boxes"]) == [] and not any(v == "unreadable" for v in result["marked"].values())
+
+
+def test_a_mark_over_two_labels_of_one_side_needs_review():
+    """Real p89: circles around Calf (front) and Plantar (front) touched, merged into one mark over both label rows and read
+    as a confident mark on Plantar only. A mark whose rows hold two labels of its side is a guess, whatever its shape."""
+    image = S.blank_form()
+    calf, plantar = S.label_box("Calf", "front"), S.label_box("Plantar", "front")
+    ImageDraw.Draw(image).ellipse((plantar[0] - 6, calf[1] - 2, plantar[2] + 6, plantar[3] + 9), outline=S.BLUE_PEN, width=2)
+    marks = list(analyse(image)["body"].values())
+    assert [(m["area"], m["kind"]) for m in marks] == [("Plantar (front)", "circle")] and marks[0]["needsReview"], marks
+    single = S.blank_form()
+    S.circle_label(ImageDraw.Draw(single), "Plantar", "front")
+    assert [(m["area"], m["needsReview"]) for m in analyse(single)["body"].values()] == [("Plantar (front)", False)], "one label circled: confident"
+
+
+def test_body_mark_between_circle_and_cross_needs_review():
+    def points(draw_fn):
+        im = Image.new("L", (40, 40), 0)
+        draw_fn(ImageDraw.Draw(im))
+        return [(x, y) for y in range(40) for x in range(40) if im.getpixel((x, y))]
+    ring = lambda d: d.ellipse((4, 8, 34, 30), outline=255, width=2)  # noqa: E731
+    x = lambda d: (d.line((5, 8, 33, 30), fill=255, width=2), d.line((5, 30, 33, 8), fill=255, width=2))  # noqa: E731
+    assert M.classify_shape(points(ring))[:2] == ("circle", 0.98) and M.classify_shape(points(x))[:2] == ("cross", 0.98)
+    kind, confidence, _ = M.classify_shape(points(lambda d: (ring(d), d.line((8, 11, 30, 27), fill=255, width=2), d.line((8, 27, 30, 11), fill=255, width=2))))
+    assert confidence < M.REVIEW_BELOW, (kind, confidence)  # a circled X: which one the customer meant is a guess

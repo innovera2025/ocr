@@ -229,6 +229,25 @@ def test_pdf_with_renderer_processes_first_page(client, fake_model, monkeypatch)
     assert body["layout"]["warnings"] == ["PDF has 3 pages; only page 1 was processed"] and body["needsReview"]
 
 
+def test_page_image_sent_under_its_pdf_name_is_decoded_as_an_image(client, fake_model, monkeypatch, isolated_paths):
+    """A worker rolled back to before Release 1 sends a split page (PNG bytes, type image/png) as 'intake.pdf': the bytes
+    decide the decoder, so queued page jobs still succeed instead of ending DEAD with a 400."""
+    def no_pdf(data):
+        raise AssertionError("an image must never reach the PDF renderer")
+    monkeypatch.setattr(api, "_pdf_renderer", lambda: no_pdf)
+    for data, content_type in ((png_of(S.filled_form()), "image/png"), (png_of(S.filled_form(), "JPEG", quality=95), "image/jpeg"),
+                               (png_of(S.filled_form(), "WEBP", lossless=True), "image/webp")):
+        response = post(client, data, "intake.pdf", content_type)
+        assert response.status_code == 200, (content_type, response.text)
+        body = response.json()
+        assert body["customerInformation"]["gender"]["value"] == "Female" and body["sourceFile"] == "intake.pdf"
+    assert sorted(path.suffix for path in api.upload_dir().iterdir()) == [".jpg", ".png", ".webp"], "stored under the real type"
+    # Real PDFs (a header, possibly after up to 1 KB of junk) still go to the renderer; other bytes named .pdf stay a PDF (400).
+    assert api._sniff_extension(b"junk" * 10 + b"%PDF-1.7\n", ".pdf") == ".pdf"
+    assert api._sniff_extension(b"not an image", ".pdf") == ".pdf"
+    assert api._sniff_extension(b"\x89PNG\r\n\x1a\n", ".jpg") == ".jpg", "only a .pdf name is second-guessed"
+
+
 def make_pdf(media_box=(0, 0, 595, 842), text=True):
     """Minimal one-page PDF; `text` adds a Helvetica text object (text pages are what crashed concurrent PDFium renders)."""
     content = b"BT /F1 24 Tf 72 720 Td (Makkha intake form) Tj ET" if text else b""
@@ -474,7 +493,9 @@ def test_combined_mode_parses_real_model_output(client, monkeypatch):
         got = (customer["name"]["value"], customer["nationality"]["value"],
                [(t["value"], t["durationMinutes"]) for t in staff["treatments"]], staff["therapistName"]["value"], staff["roomNo"]["value"])
         assert got == expected[name], name
-        assert "PLOENCHIT" not in (staff["treatment"]["raw"] or "") and not customer["name"]["needsReview"]
+        assert "PLOENCHIT" not in (staff["treatment"]["raw"] or "")
+        # "sample" lost its Name label: the name is still read (the top row), but for review, as it was not read under its label.
+        assert customer["name"]["needsReview"] is (name == "sample"), name
 
 
 def _section_model(combined_answer, calls):
@@ -577,9 +598,25 @@ def test_pink_paid_stamp_is_removed_from_the_model_image(client, fake_model):
 
 def test_stamp_removal_keeps_pen_and_print_pixels():
     crops = api._Crops(Image.new("RGB", (4, 1)), R_IDENTITY())
-    image = Image.new("RGB", (5, 1))
-    image.putdata([(40, 45, 150), (85, 85, 90), (224, 159, 84), (236, 118, 170), (200, 40, 50)])  # blue, black, orange, pink, red
-    assert list(crops._stamp_free(image).getdata()) == [(40, 45, 150), (85, 85, 90), (224, 159, 84), (255, 255, 255), (255, 255, 255)]
+    image = Image.new("RGB", (9, 1))
+    kept = [(40, 45, 150), (85, 85, 90), (224, 159, 84), (190, 45, 60), (200, 40, 80), (150, 30, 40), (200, 40, 50)]  # blue, black, orange print, red / crimson / dark red pen
+    stamp = [(236, 118, 170), (244, 150, 175)]  # PAID-stamp pink (its median on the real scans), lighter pink
+    image.putdata(kept + stamp)
+    assert list(crops._stamp_free(image).getdata()) == kept + [(255, 255, 255)] * 2
+
+
+def test_red_pen_handwriting_reaches_the_model_and_the_stamp_does_not(client, fake_model):
+    """A treatment written in red or crimson pen stays in the STAFF crop; the pink PAID stamp over it is whitened."""
+    image = S.filled_form()
+    draw = ImageDraw.Draw(image)
+    for i, colour in enumerate(((190, 45, 60), (200, 40, 80))):  # zig-zags in the STAFF ONLY box, as a written treatment
+        draw.line([(430 + 20 * k, 500 + 14 * i + (6 if k % 2 else 0)) for k in range(8)], fill=colour, width=3)
+    S.pink_stamp(draw, (600, 515, 700, 560))
+    body = post(client, png_of(image)).json()
+    crop = Image.open(io.BytesIO(fake_model.calls[0]["png"])).convert("RGB")
+    pixels = list(crop.getdata())
+    assert sum(1 for p in pixels if p in ((190, 45, 60), (200, 40, 80))) > 100, "red / crimson pen strokes are sent"
+    assert (236, 118, 170) not in pixels and body["evidence"]["stampPixelsRemoved"] > 100
 
 
 def R_IDENTITY():
@@ -662,3 +699,24 @@ def test_separate_mode_does_not_read_the_header(client, fake_model, monkeypatch)
     assert [s["name"] for s in body["timings"]["sections"]] == ["staffOnly", "customerInformation"]
     assert body["header"]["formNumber"] == {"raw": None, "value": None, "confidence": 0.0, "source": "none", "needsReview": False}
     assert body["header"]["date"]["source"] == "ink-mark"
+
+
+def test_covered_oil_row_on_a_known_page_is_a_flagged_not_visible_marker(client, fake_model):
+    """A sticky note over the oil row: no confident empty list; the group says what cannot be seen, the page is flagged."""
+    image = S.filled_form()
+    ImageDraw.Draw(image).rectangle((515, 94, 720, 130), fill=(250, 240, 150))
+    body = post(client, png_of(image)).json()
+    assert body["layout"]["detection"]["verdict"] == "known"
+    assert body["recommendationCard"]["massageOilScrub"] == [
+        {"raw": "not visible: Jasmine, Rose, Citronella, Orange-Cinnamon, Lavender", "value": None, "confidence": 0.3, "source": "checkbox",
+         "needsReview": True, "checked": True}]
+    assert any("massageOilScrub box(es) not visible" in w for w in body["layout"]["warnings"]) and body["needsReview"] is True
+    assert body["evidence"]["checkboxNotes"]["massageOilScrub.rose"] == "border-not-found"
+
+
+def test_covered_single_choice_box_makes_the_visible_choice_doubtful(client, fake_model):
+    image = S.filled_form()  # Female ticked
+    _, _, x, y, s = S.box_of("gender", "other")
+    ImageDraw.Draw(image).rectangle((x - 4, y - 4, x + s + 30, y + s + 4), fill=(255, 255, 255))  # "Other" hidden
+    gender = post(client, png_of(image)).json()["customerInformation"]["gender"]
+    assert gender["value"] == "Female" and gender["needsReview"] is True and gender["confidence"] <= 0.5

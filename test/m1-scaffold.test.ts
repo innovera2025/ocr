@@ -32,4 +32,6 @@ test("the worker image ships poppler-utils for the PDF split", () => {
   const dockerfile = readFileSync(new URL("../deploy/Dockerfile.worker", import.meta.url), "utf8");
   assert.match(dockerfile, /apt-get install -y --no-install-recommends poppler-utils/);
   assert.match(dockerfile, /rm -rf \/var\/lib\/apt\/lists/);
+  // The build fails unless every tool the split uses runs (pdfimages sizes scan pages to their own pixels).
+  assert.match(dockerfile, /pdftoppm -v && pdfinfo -v && pdfimages -v/);
 });

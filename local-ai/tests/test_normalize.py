@@ -124,7 +124,7 @@ def test_therapist_and_room_normalization():
 ])
 def test_customer_text_label_parsing(text, expected):
     parsed, fallback = N.parse_customer_text(text)
-    assert parsed == expected and fallback is False
+    assert parsed == expected and fallback == frozenset()
 
 
 @pytest.mark.parametrize("text, expected", [
@@ -137,12 +137,12 @@ def test_customer_text_label_parsing(text, expected):
     ("Hotel Name 酒店 : 曼谷洲际酒店", {"name": None, "nationality": None, "hotelName": "曼谷洲际酒店"}),
 ])
 def test_label_words_inside_values_do_not_start_a_new_field(text, expected):
-    assert N.parse_customer_text(text) == (expected, False)
+    assert N.parse_customer_text(text) == (expected, frozenset())
 
 
 def test_customer_text_unlabeled_fallback_uses_written_boxes():
     parsed, fallback = N.parse_customer_text("Chun\nChinese", ("name", "nationality"))
-    assert parsed == {"name": "Chun", "nationality": "Chinese", "hotelName": None} and fallback is True
+    assert parsed == {"name": "Chun", "nationality": "Chinese", "hotelName": None} and fallback == {"name", "nationality"}
 
 
 def test_nationality_master_english_thai_chinese_and_fuzzy():
@@ -263,7 +263,7 @@ def test_printed_staff_box_text_is_removed_inline_not_the_whole_line(text):
 
 def test_customer_name_without_label_is_taken_from_the_top_row():
     found, fallback = N.parse_customer_text("Cynthia De La Cruz-Eikanter\nNationality:\nHotel Name:")
-    assert found == {"name": "Cynthia De La Cruz-Eikanter", "nationality": None, "hotelName": None} and not fallback
+    assert found == {"name": "Cynthia De La Cruz-Eikanter", "nationality": None, "hotelName": None} and fallback == {"name"}  # read without its label: review
     found, _ = N.parse_customer_text("Chun\nNationality: Chinese\nHotel Name:", expected=("nationality",))
     assert found["name"] is None  # no handwriting in the Name box: nothing is invented
 
@@ -271,7 +271,7 @@ def test_customer_name_without_label_is_taken_from_the_top_row():
 def test_customer_name_written_before_an_empty_chinese_label():
     """Real combined answer: 'Cynthia De La Cruz-Eikanter\n姓名\nNationality 国籍\nHotel Name 酒店'."""
     found, fallback = N.parse_customer_text("Cynthia De La Cruz-Eikanter\n姓名\nNationality 国籍\nHotel Name 酒店")
-    assert found["name"] == "Cynthia De La Cruz-Eikanter" and not fallback
+    assert found["name"] == "Cynthia De La Cruz-Eikanter" and fallback == {"name"}
 
 
 def test_trailing_number_with_a_full_stop_is_a_leftover_not_a_treatment():
@@ -425,3 +425,59 @@ def test_master_data_rejects_a_bad_therapist_branch_or_seed(tmp_path):
     bad.write_text(json.dumps(master, ensure_ascii=False), encoding="utf-8")
     with pytest.raises(ValueError, match="seed"):
         N._load_master(bad)
+
+
+# ---------------------------------------------------------------- review fixes: header leftovers, TIME durations, trailing guests
+@pytest.mark.parametrize("answer, name", [
+    ("No.:\nName:\nNationality: Thai", None),                              # form number unread, Name empty: nothing invented
+    ("No.: N/A\nNationality: Thai", None),
+    ("No. O7832\nNationality: Thai", None),                                  # misread number, Name label dropped
+    ("No.: 07832\n16 Aug 2026\nName:\nNationality: Thai", None),            # an unlabeled date line
+    ("Time:\n60 mins\nJohn Smith\nNationality: Thai", "John Smith"),        # the TIME box's session length, then the name
+    ("No. 07832\nDate: 16/08/26\nAnna Lee\nNationality: Thai", "Anna Lee"),
+])
+def test_header_text_never_becomes_the_customer_name(answer, name):
+    header, rest = N.extract_header_fields(answer)
+    found, fallback = N.parse_customer_text(rest)
+    assert found["name"] == name, (answer, rest)
+    assert ("name" in fallback) == (name is not None), "a name read without its label is flagged"
+    field = N.normalize_free_text(name, "name" in fallback) if name else None
+    assert field is None or (field["needsReview"] and field["confidence"] == 0.5)
+
+
+def test_every_header_label_line_leaves_the_customer_part():
+    header, rest = N.extract_header_fields("No.: N/A\nName: Chun")
+    assert header["formNumber"] is None and rest == "Name: Chun"
+    header, rest = N.extract_header_fields("No. O7832\nName: Chun")
+    assert header["formNumber"] == "O7832" and rest == "Name: Chun"
+    header, rest = N.extract_header_fields("Date:\n16 Aug 2026\nName: Chun")  # the value written under its empty label
+    assert header["date"] == "16 Aug 2026" and rest == "Name: Chun"
+    header, rest = N.extract_header_fields("Date:\nJohn Smith\nNationality: Thai")  # a name is never taken as a date
+    assert header["date"] is None and rest.startswith("John Smith")
+    assert N.extract_header_fields("No smoking\nName: Chun")[0]["formNumber"] is None  # the word "no" is no label
+    fields = N.header_fields({"formNumber": "O7832", "date": None, "time": None}, {"date": "empty", "time": "empty"})
+    assert fields["formNumber"] == {"raw": "O7832", "value": "07832", "confidence": 0.5, "source": "ocr", "needsReview": True}
+
+
+@pytest.mark.parametrize("raw, value, review", [
+    ("1:30", "01:30", True), ("1.30", "01:30", True), ("1 30", "01:30", True), ("1h30", "01:30", True), ("2.00", "02:00", True),
+    ("2.30", "02:30", True), ("14:30", "14:30", False), ("2.30 pm", "14:30", False), ("10.30", "10:30", False), ("9:15", "09:15", False),
+    ("14.30 น.", "14:30", False),
+])
+def test_time_box_session_lengths_are_never_confident_clock_times(raw, value, review):
+    field = N.header_fields({"formNumber": None, "date": None, "time": raw}, {"date": "empty", "time": "present"})["time"]
+    assert (field["value"], field["needsReview"]) == (value, review)
+    assert field["confidence"] == (0.5 if review else 0.8)
+
+
+@pytest.mark.parametrize("line, guests, minutes", [
+    ("ไทย 90 นาที 2 ท่าน", 2, 90), ("ไทย 1 ชม. 4 ท่าน", 4, 60), ("ไทย 90 นาที 2 คน", 2, 90), ("ไทย 90 นาที (2 ท่าน)", 2, 90),
+    ("ไทย 1 ชม. x 2", 2, 60), ("ไทย 1 ชม. = 2 ท่าน", 2, 60), ("ไทย 1 ชม. × 3", 3, 60),
+])
+def test_trailing_guest_count_is_the_lines_guests_not_a_treatment(line, guests, minutes):
+    items, _, _, total = N.parse_treatments(line)
+    assert [(i["value"], i["durationMinutes"], i["guests"], i["needsReview"]) for i in items] == [("นวดไทย", minutes, guests, False)], line
+    assert total is None
+    # a bare trailing number is still a duration or a flagged leftover, never guests
+    assert all(i["guests"] is None for i in N.parse_treatments("ไทย 90 นาที 15")[0])
+    assert N.parse_treatments("ไทย + เท้า 30 = 90 (2 ท่าน)")[0][0]["guests"] == 2

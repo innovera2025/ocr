@@ -69,8 +69,9 @@ the drawer (and as a table column if it fits).
 
 ## Verification and rollout
 TS + DB integration + pytest green; deterministic real-data targets (A8) met; adversarial review; then (with approval) a
-real-model run of all 95 pages in the isolated eval container, deploy (Local AI first, then web → worker), press Retry on
-the user's 95-page row, and report per-field accuracy and timings.
+real-model run of all 95 pages in the isolated eval container, deploy (Local AI first; stop the old worker; web, which
+applies 0018; then the new worker, which refuses to start before 0018), press Retry on the user's 95-page row, and report
+per-field accuracy and timings. Keep `OCR_PAGE_FORMAT=png`.
 
 ## Integration record (2026-09-22, before the real-model run)
 Deviations accepted at integration (details in the workstream reports and `full-document-batch-spec.md` §1/§9):
@@ -87,5 +88,27 @@ Deviations accepted at integration (details in the workstream reports and `full-
   the row's `minConfidence` (it showed 0 % on every page without a printed branch); the worker logs
   `template_verdict`/`template_score` and counts `ocr_template_verdict_total{verdict}`; `test/fixtures/local-ai-v31-response.json`
   (a real v3.1 response on the synthetic form) pins the Local AI ↔ canonical-view contract.
+- Review fixes (2026-09-22, after the adversarial review; details in `full-document-batch-spec.md` §9 and `local-ai/README.md`):
+  - B1 deviates from design §1.6: 0018 grants the worker no `SELECT` on `extraction_jobs` (its job INSERT has no RETURNING;
+    the column grant only exposed other tenants' job ids); `verify-db-roles.sh` checks it. The worker refuses to start until
+    `schema_migrations` holds 0018 (it would otherwise fail every claimed job with 42703).
+  - B2 deviates from `pdftoppm -png -scale-to 1610`: pages are rendered from the CropBox, a plain scan page pixel for pixel
+    (`-rx/-ry`), other scans at their own density (≤ 1610 px, never upsampled), other pages at 1610 px. A8 on the worker's
+    own renders of a 95-page PDF built from the real page JPEGs: all 95 pages bit-identical to the JPEG decode, so the A8
+    numbers below hold for split pages (at 1610 px the checkbox lists were right on only 84/95 pages, with unflagged false
+    positives). `OCR_PAGE_FORMAT=jpeg` gives 81/95: unvalidated. A split has a 30 min budget; host failures (scratch disk
+    full, renderer missing, source gone) are retryable job failures, never per-page FAILED rows.
+  - A: covered checkboxes (border not found) are `unreadable` with a "not visible: …" marker and a warning, not unchecked;
+    body-map marks over two labels or between circle and cross are flagged; header-label leftovers never become the customer
+    name, and a name read without its label is flagged; a TIME value that may be a session length is flagged; a trailing
+    guest count ("2 ท่าน", "x 2") is `guests`; red/crimson pen is no longer whitened as PAID stamp (luminance floor); a
+    `*.pdf`-named image is decoded by its bytes (a rolled-back worker's page jobs still succeed). The registration limit on
+    real scans is documented as about ±0.55 degrees (deskew stays Release 3).
+  - B7: the batch total comes from the server's new `rowsExpected` (a 95-page PDF is 95 rows while it is split, not 96);
+    the preview drops superseded loads, reloads after a page is re-rendered, and explains a missing original by context.
+  - A8 after the fixes (native JPEGs and the worker's PNG renders, identical): verdict known 95/95; gender 94/95, pressure
+    89/95, 0 wrong and unflagged; checkbox lists exactly right on 87/95 (91.6 %), 0 unflagged false positives; body map
+    0 unflagged false positives; parser names 89/95 strict (95/95 with the labels' hot-oil naming), 0 wrong and unflagged.
+
 Open before deploy: real-model run; STAFF crop cuts totals written past the Treatment box on some pages; `numpy` import in the
 production Local AI image; ClamAV and app-host nginx size limits (design §7).

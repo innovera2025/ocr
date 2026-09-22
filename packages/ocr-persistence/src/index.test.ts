@@ -110,15 +110,18 @@ test("page jobs are queued in page order at the single-upload priority and above
 
 /** A BATCH_SELECT row: files (uploaded/expected) vs rows (status counters). */
 const batchRow = (counts: Partial<Record<string, number | Date | null>>) => ({ id: "b", label: null, created_at: new Date("2026-09-22T01:00:00Z"), expected_total: 1,
-  db_now: new Date("2026-09-22T01:30:00Z"), uploaded: 1, rows: 1, pages: 0, pages_expected: 0, splitting: 0, queued: 0, processing: 0, succeeded: 0, needs_review: 0,
+  db_now: new Date("2026-09-22T01:30:00Z"), uploaded: 1, rows: 1, pages: 0, pages_expected: 0, splitting: 0, splitting_counted: 0, queued: 0, processing: 0, succeeded: 0, needs_review: 0,
   failed: 0, confirmed: 0, last_completed_at: null, last_created_at: new Date("2026-09-22T01:00:05Z"), ...counts });
 
 test("batch summary: a 1-file batch whose PDF became 95 rows is not finished until the last page is read", () => {
   const firstPage = new Date("2026-09-22T01:01:00Z");
   // The PDF is being split (one processing row) and page 1 is already read.
-  let summary = toBatchSummary(batchRow({ rows: 11, pages: 10, pages_expected: 95, splitting: 1, processing: 1, queued: 9, succeeded: 1, last_completed_at: firstPage }));
+  let summary = toBatchSummary(batchRow({ rows: 11, pages: 10, pages_expected: 95, splitting: 1, splitting_counted: 1, processing: 1, queued: 9, succeeded: 1, last_completed_at: firstPage }));
   assert.deepEqual([summary.uploaded, summary.rows, summary.pages, summary.pagesExpected, summary.splitting, summary.completed, summary.finished, summary.finishedAt],
     [1, 11, 10, 95, 1, 1, false, null], "the old rule (completed >= expectedTotal) called this finished");
+  assert.equal(summary.rowsExpected, 95, "95 page rows to come, not 96: the splitting parent (a row now) is not counted on top of its pages");
+  assert.equal(toBatchSummary(batchRow({ rows: 1, pages: 0, pages_expected: 0, splitting: 1, processing: 1 })).rowsExpected, 1, "page count not known yet: the PDF is one row");
+  assert.equal(toBatchSummary(batchRow({ expected_total: 3, rows: 11, pages: 10, pages_expected: 95, splitting: 1, splitting_counted: 1 })).rowsExpected, 97, "+2 files still to come");
   // Split done (parent SPLIT, not a row); 94 pages read, 1 page still processing.
   summary = toBatchSummary(batchRow({ rows: 95, pages: 95, pages_expected: 95, processing: 1, succeeded: 60, needs_review: 34, last_completed_at: firstPage }));
   assert.equal(summary.finished, false);

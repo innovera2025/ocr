@@ -386,11 +386,29 @@ export function startWorkerLoops(dependencies: WorkerDependencies & MaintenanceD
   return { concurrency, done, stop: async () => { control.stop(); await done; } };
 }
 
+/** The newest migration this worker's SQL needs (`getWorkerDocument` reads the 0018 page columns). */
+export const REQUIRED_SCHEMA_VERSION = "0018_multipage_documents";
+
+/**
+ * Refuses to start before the web has applied REQUIRED_SCHEMA_VERSION (it migrates at startup): a worker that claimed
+ * jobs on an older schema would fail every one of them (42703) and burn their attempts. `ocr_worker` can read
+ * schema_migrations (0015). Throws SCHEMA_NOT_READY; the process exits and `restart: unless-stopped` retries it.
+ */
+export async function assertSchemaReady(pool: Readonly<{ query(sql: string, values?: unknown[]): Promise<{ rowCount: number | null }> }>, version = REQUIRED_SCHEMA_VERSION): Promise<void> {
+  const applied = await pool.query("SELECT 1 FROM schema_migrations WHERE version = $1", [version]);
+  if (applied.rowCount !== 1) throw new Error(`SCHEMA_NOT_READY: migration ${version} is not applied yet (deploy the web first; it migrates at startup)`);
+}
+
 export async function startWorkerRuntime(): Promise<() => Promise<void>> {
   const pool = createDatabasePool(process.env.DATABASE_URL_WORKER || process.env.DATABASE_URL);
   const queuePool = createDatabasePool(process.env.DATABASE_URL_QUEUE || process.env.DATABASE_URL_WORKER || process.env.DATABASE_URL);
-  await assertDatabaseReady(pool);
-  await pool.query("SELECT 1 FROM schema_migrations LIMIT 1");
+  try {
+    await assertDatabaseReady(pool);
+    await assertSchemaReady(pool);
+  } catch (error) {
+    await Promise.allSettled([pool.end(), queuePool.end()]);
+    throw error;
+  }
   const queue = new PostgresQueue(queuePool, pool);
   const outbox = new PostgresConfirmOutbox(pool, process.env.OCR_WORKER_ID ?? undefined);
   const store = new PostgresOcrDocumentStore(pool);

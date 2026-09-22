@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
@@ -8,8 +8,9 @@ import type { OcrResponse } from "@innovera/ocr-client";
 import type { PageDocumentInput, WorkerDocument } from "@innovera/ocr-persistence";
 import { parseOriginalKey } from "@innovera/ocr-storage";
 import { inflateSync, crc32 } from "node:zlib";
-import { childPublicId, childStorageKey, isSplitTarget, ocrUploadName, pageFormat, parsePdfInfo, pdfPageLimit, PdfSplitError, pngFromPpm, runWorkerOnce, splitPdf, validatePayload,
-  type FinishOutcome, type PdfInfo, type PdfRenderer } from "./index.js";
+import { limits } from "@innovera/ocr-config";
+import { childPublicId, childStorageKey, createPopplerRenderer, isSplitTarget, ocrUploadName, PAGE_LONG_SIDE_PX, pageFormat, pageRenderPlans, parsePdfInfo, pdfPageLimit, PdfSplitError, pngFromPpm, rendererMissing,
+  runWorkerOnce, SPLIT_TOO_SLOW, splitPdf, validatePayload, type FinishOutcome, type PdfInfo, type PdfRenderer } from "./index.js";
 
 const tenant = "00000000-0000-4000-8000-000000000001";
 const parentId = "00000000-0000-4000-8000-0000000000aa";
@@ -203,6 +204,134 @@ test("split stops before the next chunk once the lease is lost (another worker r
     assert.equal(store.pages.size, 10);
     assert.equal(store.calls.includes("markSplit:25"), false);
   } finally { await rm(tmpRoot, { recursive: true, force: true }); }
+});
+
+test("split: a host failure (scratch disk full, renderer gone) is retryable and never becomes FAILED page rows", async () => {
+  const tmpRoot = await scratch();
+  try {
+    const { renderer, calls } = fakeRenderer();
+    const hostFailing: PdfRenderer = { ...renderer, renderRange: async (pdf, first, last, outDir, options) => {
+      if (first === 11) throw new PdfSplitError("PDF_RENDERER_UNAVAILABLE", "page 11 was written incompletely (scratch space full?)", true);
+      return renderer.renderRange(pdf, first, last, outDir, options);
+    } };
+    const store = memoryStore();
+    await assert.rejects(splitPdf({ store, storage: memoryStorage(), renderer: hostFailing, tmpRoot, maxPages: 300 }, "job-host", parent()),
+      (error: unknown) => error instanceof PdfSplitError && error.code === "PDF_RENDERER_UNAVAILABLE" && error.retryable);
+    assert.deepEqual(calls, ["1-10"], "no page-by-page retry of a host failure");
+    assert.deepEqual(store.chunks, [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]], "the failing chunk wrote no row at all");
+    assert.equal(store.calls.includes("markSplit:25"), false, "the parent stays splittable: the queue retries the job, and a resume renders only pages 11-25");
+  } finally { await rm(tmpRoot, { recursive: true, force: true }); }
+});
+
+test("split time budget: every call gets at most the time left, and a split past its budget fails for good (a Retry resumes it)", async () => {
+  const tmpRoot = await scratch();
+  try {
+    const { renderer } = fakeRenderer();
+    const timeouts: number[] = [];
+    const slow: PdfRenderer = { ...renderer, renderRange: async (pdf, first, last, outDir, options) => {
+      timeouts.push(options?.timeoutMs ?? Number.NaN);
+      await new Promise((resolve) => setTimeout(resolve, 40)); // every page renders, just slowly
+      return renderer.renderRange(pdf, first, last, outDir, options);
+    } };
+    const store = memoryStore();
+    await assert.rejects(splitPdf({ store, storage: memoryStorage(), renderer: slow, tmpRoot, maxPages: 300, budgetMs: 60 }, "job-slow", parent()),
+      (error: unknown) => error instanceof PdfSplitError && error.message === `PDF_RENDER_FAILED: ${SPLIT_TOO_SLOW}` && !error.retryable);
+    assert.ok(timeouts.length >= 1 && timeouts.every((timeout) => timeout > 0 && timeout <= 60), `each call is bounded by what is left of the budget: ${timeouts.join(", ")}`);
+    assert.ok(store.pages.size < 25 && !store.calls.includes("markSplit:25"), "the split stopped; the pages created so far stay and are read");
+    assert.deepEqual(await readdir(tmpRoot), [], "scratch removed");
+  } finally { await rm(tmpRoot, { recursive: true, force: true }); }
+  assert.equal(limits.jobProcessingBudgetMs, 1_800_000, "production default: 30 min per split");
+});
+
+test("renderer missing: ENOENT, or prlimit's 'failed to execute' (exit 127/126); a loader failure (bare 127) is not", () => {
+  assert.equal(rendererMissing({ code: "ENOENT" }), true);
+  assert.equal(rendererMissing({ code: 127, stderr: "prlimit: failed to execute pdfinfo: No such file or directory\n" }), true);
+  assert.equal(rendererMissing({ code: 126, stderr: "prlimit: failed to execute pdftoppm: Permission denied\n" }), true);
+  assert.equal(rendererMissing({ code: 127, stderr: "pdftoppm: error while loading shared libraries: libpoppler.so: failed to map segment from shared object\n" }), false);
+  assert.equal(rendererMissing({ code: 1, stderr: "Syntax Error: Couldn't read xref table\n" }), false);
+});
+
+test("render plans: a plain scan page is rendered pixel for pixel, other scans at their own density (never upsampled, at most 1610 px), other pages at 1610 px", () => {
+  const info = (pages: Array<[number, number, number?]>) => pages.map(([w, h, rot], index) => `Page ${String(index + 1).padStart(4)} size: ${w} x ${h} pts\nPage ${String(index + 1).padStart(4)} rot:  ${rot ?? 0}`).join("\n");
+  const header = "page   num  type   width height color comp bpc  enc interp  object ID x-ppi y-ppi size ratio\n--------------------------------------------------------------------------------------------\n";
+  const image = (page: number, width: number, height: number, ppi: number, type = "image") => `${String(page).padStart(4)} ${String(page - 1).padStart(5)} ${type.padEnd(6)} ${String(width).padStart(6)} ${String(height).padStart(6)}  rgb     3   8  jpeg   no  ${String(10 + page).padStart(9)}  0 ${String(ppi).padStart(5)} ${String(ppi).padStart(5)}  201K 4.9%`;
+  const listing = header + [
+    image(1, 1400, 991, 121),            // the real upload: a 1400×991 px scan on an 833.06×589.69 pt page (ppi rounded by pdfimages)
+    image(2, 3500, 2475, 300),           // a 300 dpi scan: capped at 1610
+    image(3, 200, 100, 150),             // a logo on a vector page
+    image(3, 200, 100, 150, "smask"),
+    image(5, 990, 1400, 121),            // portrait scan, but the page is rotated: native density, uniform scale
+    image(6, 1400, 990, 121),            // a scan whose CropBox shows the left half of the page (990 rows along the long axis)
+    image(7, 990, 1400, 121),            // an image drawn rotated (axes swapped): not recognised, 1610 px
+    image(8, 1400, 991, 121),            // a scan with a second (small) image drawn over it: rendered, at the scan's density
+    image(8, 120, 60, 121),
+    image(9, 1400, 991, 121)             // a scan stretched onto a fixed 832×590 pt page: still pixel for pixel
+  ].join("\n");
+  const plans = pageRenderPlans(info([[833.06, 589.69], [840, 594], [595, 842], [595, 842], [589.09, 833.06, 90], [416, 590], [832, 590], [833.06, 589.69], [832, 590]]), listing, 1, 9);
+  const exact = (page: number) => plans.get(page)!.resolution!.map((dpi) => Math.round(dpi * 1000) / 1000);
+  assert.deepEqual(plans.get(1)?.longSide, 1400);
+  assert.deepEqual(exact(1), [120.988, 120.987], "72·1400/833.06 and 72·991/589.69, a hair under 121 dpi: 1400×991 output pixels, one per image pixel");
+  assert.deepEqual(exact(9), [121.142, 120.923], "per-axis: the scan's own 1400×991 pixels even when the PDF stretched it");
+  assert.deepEqual([2, 3, 4, 5, 6, 7, 8].map((page) => [page, plans.get(page)!.longSide, plans.get(page)!.resolution]),
+    [[2, PAGE_LONG_SIDE_PX, null], [3, PAGE_LONG_SIDE_PX, null], [4, PAGE_LONG_SIDE_PX, null], [5, 1400, null], [6, 990, null], [7, PAGE_LONG_SIDE_PX, null], [8, 1400, null]]);
+  assert.deepEqual([...pageRenderPlans("", "", 3, 4).values()], [{ longSide: PAGE_LONG_SIDE_PX, resolution: null }, { longSide: PAGE_LONG_SIDE_PX, resolution: null }], "no listing: the previous behaviour (1610 px)");
+});
+
+/** The real poppler renderer driven by fake pdfinfo/pdfimages/pdftoppm scripts on PATH (no prlimit): its error handling. */
+async function withFakePoppler(pdftoppm: string, run: (renderer: (format?: "png" | "jpeg") => PdfRenderer, dir: string) => Promise<void>): Promise<void> {
+  const dir = await scratch();
+  const path = process.env.PATH;
+  try {
+    const bin = join(dir, "bin");
+    await mkdir(bin);
+    const script = async (name: string, body: string) => { await writeFile(join(bin, name), `#!/bin/sh\n${body}\n`); await chmod(join(bin, name), 0o755); };
+    await script("pdfinfo", "printf 'Pages:          2\\nPage    1 size: 832 x 590 pts\\nPage    2 size: 832 x 590 pts\\n'");
+    await script("pdfimages", "echo 'page   num  type   width height color comp bpc  enc interp  object ID x-ppi y-ppi size ratio'");
+    await script("pdftoppm", pdftoppm);
+    process.env.PATH = `${bin}:/usr/bin:/bin`;
+    await run((format = "png") => createPopplerRenderer({ usePrlimit: false, format }), dir);
+  } finally {
+    process.env.PATH = path;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+const lastArg = 'for last; do :; done';
+const hostFailure = (error: unknown) => error instanceof PdfSplitError && error.code === "PDF_RENDERER_UNAVAILABLE" && error.retryable;
+
+test("poppler renderer: a render cut short or refused by a full disk is a host failure, not a failed page", async () => {
+  // pdftoppm exits 0 when its write fails (ENOSPC): the PPM is cut short, and later pages of the range are empty.
+  await withFakePoppler(`${lastArg}; printf 'P6\\n4 4\\n255\\n' > "$last-1.ppm"; : > "$last-2.ppm"`, async (renderer, dir) => {
+    await assert.rejects(renderer().renderRange(join(dir, "in.pdf"), 1, 2, join(dir, "out")), hostFailure);
+  });
+  await withFakePoppler(`${lastArg}; : > "$last-1.ppm"`, async (renderer, dir) => {
+    await assert.rejects(renderer().renderRange(join(dir, "in.pdf"), 1, 1, join(dir, "out")), hostFailure, "an empty file");
+  });
+  await withFakePoppler(`${lastArg}; printf '\\377\\330\\377\\340 no end marker' > "$last-1.jpg"`, async (renderer, dir) => {
+    await assert.rejects(renderer("jpeg").renderRange(join(dir, "in.pdf"), 1, 1, join(dir, "out")), hostFailure, "a JPEG without its EOI marker");
+  });
+  await withFakePoppler(`${lastArg}; echo "Could not write image to $last-1.ppm; exiting" >&2; exit 1`, async (renderer, dir) => {
+    await assert.rejects(renderer().renderRange(join(dir, "in.pdf"), 1, 1, join(dir, "out")), hostFailure, "output file not writable");
+  });
+  await withFakePoppler(`echo "I/O Error: Couldn't open file 'in.pdf': No such file or directory." >&2; exit 1`, async (renderer, dir) => {
+    await assert.rejects(renderer().renderRange(join(dir, "in.pdf"), 1, 1, join(dir, "out")), hostFailure, "the staged source vanished");
+  });
+  // A page-specific failure stays a (retryable, swallowed-by-renderPages) PDF_RENDER_FAILED, and a complete render works.
+  await withFakePoppler(`echo "Syntax Error: Bad block header" >&2; exit 99`, async (renderer, dir) => {
+    await assert.rejects(renderer().renderRange(join(dir, "in.pdf"), 1, 1, join(dir, "out")), (error: unknown) => error instanceof PdfSplitError && error.code === "PDF_RENDER_FAILED");
+  });
+  await withFakePoppler(`${lastArg}; printf 'P6\\n1 1\\n255\\n\\001\\002\\003' > "$last-1.ppm"; printf '\\377\\330\\377\\340\\377\\331' > "$last-1.jpg"`, async (renderer, dir) => {
+    assert.deepEqual((await renderer().renderRange(join(dir, "in.pdf"), 1, 1, join(dir, "out"))).map((page) => page.pageNumber), [1]);
+    assert.deepEqual((await renderer("jpeg").renderRange(join(dir, "in.pdf"), 1, 1, join(dir, "out2"))).map((page) => page.pageNumber), [1]);
+  });
+});
+
+test("poppler renderer: pdftoppm renders the CropBox, a page without a scan image at 1610 px", async () => {
+  await withFakePoppler(`echo "$@" > "$(dirname "$0")/args"; ${lastArg}; printf 'P6\\n1 1\\n255\\n\\001\\002\\003' > "$last-1.ppm"`, async (renderer, dir) => {
+    await renderer().renderRange(join(dir, "in.pdf"), 1, 1, join(dir, "out"));
+    const args = (await readFile(join(dir, "bin", "args"), "utf8")).trim().split(" ");
+    assert.ok(args.includes("-cropbox"), "the CropBox, as pdfinfo and pdfium measure it");
+    assert.equal(args[args.indexOf("-scale-to") + 1], String(PAGE_LONG_SIDE_PX), "a page without a scan image: 1610 px");
+  });
 });
 
 test("pngFromPpm keeps the pixels exactly (lossless) and writes valid PNG chunks", async () => {

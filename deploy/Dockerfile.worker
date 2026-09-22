@@ -1,10 +1,10 @@
 FROM node:24.21.0-bookworm-slim
-# poppler-utils: pdfinfo + pdftoppm split multi-page PDFs into page images (services/ocr-worker/src/split.ts).
-# prlimit (util-linux, essential in Debian) caps each renderer process's address space and CPU time.
+# poppler-utils: pdfinfo + pdfimages + pdftoppm split multi-page PDFs into page images (services/ocr-worker/src/split.ts;
+# pdfimages sizes scan pages to their own pixels). prlimit (util-linux, essential in Debian) caps each renderer process.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends poppler-utils \
  && rm -rf /var/lib/apt/lists/* \
- && pdftoppm -v \
+ && pdftoppm -v && pdfinfo -v && pdfimages -v \
  && command -v prlimit
 WORKDIR /app
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml tsconfig.base.json tsconfig.json ./

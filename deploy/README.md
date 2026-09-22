@@ -6,13 +6,13 @@ This stack starts PostgreSQL 17, ClamAV, the authenticated web service, and the 
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-The web health endpoint is available at `http://127.0.0.1:53100/health/live`. PostgreSQL is bound to `127.0.0.1:55432`; ClamAV is internal-only. OCR integration reads `OCR_API_BASE_URL` (default `https://ai.innoveraappcenter.com/ocr`), `OCR_REQUEST_TIMEOUT` (seconds, default `300`) and `OCR_MAX_RETRIES` (default `3`). The worker image includes poppler-utils: a PDF upload is split into one page image and one row per page (`OCR_MAX_PDF_PAGES`, default `300`, at most `1000`; `OCR_PAGE_FORMAT` `png` (default) or `jpeg`), rendered in `${OCR_STORAGE_ROOT}/tmp` and stored next to the originals (about 1–3 MB per PNG page). Deploy the web (it runs migration 0018) before the worker. Stop and remove local containers with:
+The web health endpoint is available at `http://127.0.0.1:53100/health/live`. PostgreSQL is bound to `127.0.0.1:55432`; ClamAV is internal-only. OCR integration reads `OCR_API_BASE_URL` (default `https://ai.innoveraappcenter.com/ocr`), `OCR_REQUEST_TIMEOUT` (seconds, default `300`) and `OCR_MAX_RETRIES` (default `3`). The worker image includes poppler-utils: a PDF upload is split into one page image and one row per page (`OCR_MAX_PDF_PAGES`, default `300`, at most `1000`; `OCR_PAGE_FORMAT` `png` (default; the only format validated against the real scans) or `jpeg`), rendered in `${OCR_STORAGE_ROOT}/tmp` and stored next to the originals (a scanned page keeps its own pixels: about 1.4 MB per PNG page for the 1400 px real scans; at most 1610 px). Deploy order: stop the old worker, deploy the web (it runs migration 0018), then the worker — the new worker refuses to start (`SCHEMA_NOT_READY`) until 0018 is applied. Stop and remove local containers with:
 
 ```sh
 docker compose -f deploy/docker-compose.yml down
 ```
 
-The web entrypoint runs the idempotent, checksum-verified migrations in `prisma/migrations`; the worker verifies database readiness and the presence of `schema_migrations` before accepting work. The compose file does not run destructive migrations outside that runner; the migration role must have permission to apply them.
+The web entrypoint runs the idempotent, checksum-verified migrations in `prisma/migrations`; the worker verifies database readiness and that the newest migration it needs (`0018_multipage_documents`) is recorded in `schema_migrations` before accepting work; otherwise it exits and Docker restarts it. The compose file does not run destructive migrations outside that runner; the migration role must have permission to apply them.
 
 Runtime credentials are injected, never stored in compose: `POSTGRES_MIGRATOR_PASSWORD`, `DATABASE_URL_MIGRATOR`, `DATABASE_URL_APP`, `DATABASE_URL_WORKER`, `DATABASE_URL_QUEUE`, `AUTH_JWT_SECRETS`, `AUTH_JWT_ISSUER`, and `AUTH_JWT_AUDIENCE`. Provision the four login roles (`ocr_migrator`, `ocr_app`, `ocr_worker`, `ocr_queue`) separately before starting the application.
 

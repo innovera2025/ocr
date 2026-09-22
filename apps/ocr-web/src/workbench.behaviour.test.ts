@@ -72,7 +72,8 @@ const inline = /<script\b[^>]*>([\s\S]*?)<\/script>/.exec(workbenchPage({ nonce:
 const EXPOSE = "globalThis.__wb={row,renderBatch,addFiles,loadPreview,save,ERRORS,state,applyDocument,failText,toggleOriginal};";
 
 /** Runs the workbench script without init(). `fetchImpl` answers every fetch; `xhrStatus` answers every upload. */
-function load(fetchImpl: (url: string, init?: Record<string, unknown>) => Promise<FakeResponse>, xhr: { status: number; body: unknown } = { status: 202, body: {} }) {
+function load(fetchImpl: (url: string, init?: Record<string, unknown>) => Promise<FakeResponse>, xhr: { status: number; body: unknown } = { status: 202, body: {} },
+  blobs?: { created: number; revoked: number }) {
   assert.ok(inline.endsWith("init();\n})();\n"), "the script still ends with init()");
   const elements = new Map<string, FakeElement>();
   const fetches: string[] = [];
@@ -90,10 +91,15 @@ function load(fetchImpl: (url: string, init?: Record<string, unknown>) => Promis
     addEventListener(type: string, listener: () => void): void { this.listeners.set(type, listener); }
     send(): void { queueMicrotask(() => { this.status = xhr.status; this.responseText = JSON.stringify(xhr.body); this.listeners.get(xhr.status === 0 ? "error" : "load")?.(); }); }
   }
+  // Counts blob URLs (`blobs`) so a test can see that none is left alive behind the preview.
+  const CountingURL = blobs ? Object.assign(class extends URL {}, {
+    createObjectURL: (blob: Blob) => { blobs.created += 1; return URL.createObjectURL(blob); },
+    revokeObjectURL: (url: string) => { blobs.revoked += 1; URL.revokeObjectURL(url); }
+  }) : URL;
   const context = createContext({
     document, window: { matchMedia: () => ({ matches: true }), addEventListener: () => undefined }, location: { href: "http://127.0.0.1/", search: "" },
     history: { replaceState: () => undefined }, CSS: { escape: (value: string) => value }, crypto: webcrypto, Node: { DOCUMENT_POSITION_PRECEDING: 2 },
-    Option: class { constructor(readonly text: string, readonly value: string) {} }, URL, URLSearchParams, Blob, TextEncoder, AbortController,
+    Option: class { constructor(readonly text: string, readonly value: string) {} }, URL: CountingURL, URLSearchParams, Blob, TextEncoder, AbortController,
     setTimeout: () => 0, clearTimeout: () => undefined, XMLHttpRequest: FakeXhr,
     fetch: (url: string, init?: Record<string, unknown>) => { fetches.push(`${String(init?.method ?? "GET")} ${url}`); return fetchImpl(url, init); }
   });
@@ -214,10 +220,11 @@ test("the batch strip counts files and rows separately and trusts the server's f
   const { wb, $ } = load(() => new Promise(() => undefined));
   const base = { batchId: ID, label: null, createdAt: "2026-09-22T01:00:00.000Z", expectedTotal: 1, uploaded: 1, queued: 9, processing: 1, succeeded: 1, needsReview: 0, failed: 0, confirmed: 0, completed: 1, durationMs: 60_000, throughputPerMinute: 1 };
   wb.state.batchId = ID;
-  wb.state.batch = { ...base, rows: 31, pages: 30, pagesExpected: 95, splitting: 1, finished: false, finishedAt: null };
+  wb.state.batch = { ...base, rows: 31, pages: 30, pagesExpected: 95, splitting: 1, rowsExpected: 95, finished: false, finishedAt: null };
   wb.renderBatch();
   assert.match($("batch-title").textContent, /กำลังแยก PDF เป็นรายหน้า/);
-  assert.match($("batch-meta").textContent, /ไฟล์ 1\/1 · กำลังแยกหน้า 30\/95 · อ่านเสร็จ 1 จาก 96 แถว/);
+  assert.match($("batch-meta").textContent, /ไฟล์ 1\/1 · กำลังแยกหน้า 30\/95 · อ่านเสร็จ 1 จาก 95 แถว/, "a 95-page PDF is 95 rows, also while it is split");
+  assert.match($("batch-stats").textContent, /ทั้งหมด \(แถว\)95/);
   wb.state.batch = { ...base, queued: 0, processing: 0, succeeded: 95, completed: 95, rows: 95, pages: 95, pagesExpected: 95, splitting: 0, finished: true, finishedAt: "2026-09-22T01:40:00.000Z" };
   wb.renderBatch();
   assert.match($("batch-title").textContent, /อ่านครบแล้ว/);
@@ -257,4 +264,59 @@ test("v3.0 results show no empty header group and no branch row; a SPLIT parent 
   assert.match($("editor").textContent, /ไฟล์นี้ถูกแยกเป็น 95 หน้า/);
   assert.match($("d-status").textContent, /แยกเป็นรายหน้าแล้ว/);
   assert.equal(wb.state.editable, false);
+});
+
+test("toggling page ↔ PDF while the big PDF is still downloading: the late PDF is dropped, the label stays right and no blob URL leaks", async () => {
+  let releasePdf: (response: FakeResponse) => void = () => undefined, holdPdf = true;
+  const pdf = (): FakeResponse => ({ ...json(200, {}), blob: async () => ({ type: "application/pdf" }) });
+  const blobs = { created: 0, revoked: 0 };
+  const { wb, $ } = load(async (url, init) => token(url) ?? (url.includes(PARENT)
+    ? holdPdf ? new Promise<FakeResponse>((resolve, reject) => {
+      releasePdf = resolve;
+      (init?.signal as AbortSignal | undefined)?.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+    }) : pdf()
+    : { ...json(200, {}), blob: async () => ({ type: "image/png" }) }), undefined, blobs);
+  wb.applyDocument({ ...page12, structuredResult: { schemaVersion: 3, header: {}, customerInformation: {}, recommendationCard: {}, staffOnly: {} } });
+  const toPdf = wb.toggleOriginal();           // the 44.8 MB parent PDF starts downloading
+  await settle();
+  const back = wb.toggleOriginal();            // the reviewer goes back to the page image before it arrived
+  await back;
+  assert.equal(($("p-content").children[0] as FakeElement).tagName, "IMG");
+  releasePdf(pdf()); // arrives late (or was aborted)
+  holdPdf = false;
+  await toPdf.catch(() => undefined);
+  await settle();
+  assert.equal(($("p-content").children[0] as FakeElement).tagName, "IMG", "the superseded PDF never replaces the image");
+  assert.equal($("p-pdf").textContent, "เปิด PDF ต้นฉบับ (หน้า 12)");
+  assert.equal($("z-tools").hidden, false, "zoom tools belong to the image that is shown");
+  assert.equal(blobs.created - blobs.revoked, 1, "only the URL on screen is alive");
+  await wb.toggleOriginal();                   // now the PDF for real: the zoom tools hide (they cannot zoom an iframe)
+  assert.equal(($("p-content").children[0] as FakeElement).tagName, "IFRAME");
+  assert.equal($("z-tools").hidden, true);
+  assert.equal(blobs.created - blobs.revoked, 1);
+});
+
+test("a missing original is explained by what is open; after a Retry re-renders the page the preview loads again", async () => {
+  let pageImage = false;
+  const { wb, $, fetches } = load(async (url) => token(url) ?? (url.endsWith("/content")
+    ? (pageImage ? { ...json(200, {}), blob: async () => ({ type: "image/png" }) } : json(404, { error: "CONTENT_NOT_FOUND" }))
+    : json(200, {})));
+  const failedPage = { ...page12, status: "FAILED", statusCategory: "failed", errorMessage: "PAGE_RENDER_FAILED", summary: {} };
+  wb.state.current = failedPage;
+  await wb.loadPreview(wb.state.openSeq, ID);
+  assert.match($("p-content").textContent, /แปลงหน้า PDF เป็นภาพไม่สำเร็จ กด "ลองอ่านอีกครั้ง"/);
+  wb.state.current = { documentId: ID, filename: "a.png", mimeType: "image/png", status: "SUCCEEDED", statusCategory: "succeeded" };
+  await wb.loadPreview(wb.state.openSeq, ID);
+  assert.equal($("p-content").textContent, `โหลดต้นฉบับไม่ได้: ${wb.ERRORS.CONTENT_NOT_FOUND}`, "an image upload has no page to re-render and no retry: neutral text");
+  assert.doesNotMatch(wb.ERRORS.CONTENT_NOT_FOUND ?? "", /ลองอีกครั้ง|PDF/);
+  wb.state.current = { ...failedPage, status: "CLEAN", statusCategory: "queued", errorMessage: "" };
+  await wb.loadPreview(wb.state.openSeq, ID);
+  assert.match($("p-content").textContent, /กำลังแปลงหน้านี้เป็นภาพใหม่/, "retried, not re-rendered yet: no button to press");
+  // The re-rendered page was read: the drawer swaps in the result and the preview is fetched again.
+  pageImage = true;
+  const before = fetches.filter((url) => url.endsWith("/content")).length;
+  wb.applyDocument({ ...page12, structuredResult: { schemaVersion: 3, header: {}, customerInformation: {}, recommendationCard: {}, staffOnly: {} } });
+  await settle();
+  assert.equal(fetches.filter((url) => url.endsWith("/content")).length, before + 1);
+  assert.equal(($("p-content").children[0] as FakeElement).tagName, "IMG");
 });

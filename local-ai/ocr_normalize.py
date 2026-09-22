@@ -313,9 +313,21 @@ _MONTHS = {m: i + 1 for i, names in enumerate((
 )) for m in names}
 
 
+def _header_value_line(key, line):
+    """A whole line that is only a value of header field `key` (written under its empty label)."""
+    line = line.strip(" \t|:-*")
+    if not line or _CUSTOMER_LABELS.search(line):
+        return False
+    if key == "formNumber":
+        return bool(re.fullmatch(r"#?\s*[0-9Oo]{4,7}", line.translate(THAI_DIGITS)))
+    return (parse_date if key == "date" else parse_time)(line) is not None
+
+
 def extract_header_fields(text):
     """Header values from the customer part of a combined answer -> ({formNumber, date, time: raw|None}, rest of the text
-    with the header labels and values removed, for the customer parser)."""
+    with the header labels and values removed, for the customer parser). Every header-label line is removed whatever its
+    value (empty, "N/A", a misread number), so none of it can become a customer value; a label with nothing after it
+    takes the next line as its value when that line is exactly such a value ("Date:\n16 Aug 2026")."""
     text = _clean_model_text(text)
     found, spans = {}, []
     matches = [m for m in _HEADER_LABELS.finditer(text) if _is_header_label(text, m)]
@@ -325,6 +337,11 @@ def extract_header_fields(text):
         if i + 1 < len(matches) and matches[i + 1].start() < end:
             end = matches[i + 1].start()
         value = _HEADER_ECHO.sub("", text[m.end():end]).strip(" \t|:-*")
+        if not value and end == line_end:
+            next_end = text.find("\n", end + 1)
+            next_end = len(text) if next_end < 0 else next_end
+            if not (i + 1 < len(matches) and matches[i + 1].start() < next_end) and _header_value_line(m.lastgroup, text[end + 1:next_end]):
+                value, end = text[end + 1:next_end].strip(" \t|:-*"), next_end
         spans.append((m.start(), end))
         if value and value.lower() not in _PLACEHOLDERS and not found.get(m.lastgroup):
             found[m.lastgroup] = value
@@ -338,12 +355,14 @@ def extract_header_fields(text):
 
 def _is_header_label(text, m):
     before, after = text[:m.start()], text[m.end():]
+    line_start = bool(re.search(r"(?:^|[\n|])[^\S\n]*$", before))
     if m.lastgroup == "formNumber" and re.search(r"room\s*$", before, re.I):
         return False
     if m.lastgroup == "formNumber" and not re.match(r"[\s.:]*\d", after.translate(THAI_DIGITS)):
-        return False  # "No." without a number is not the printed form number
-    return bool(re.search(r"(?:^|[\n|])[^\S\n]*$", before) or re.match(r"[^\S\n]*[:：]", after)
-                or m.group(0) in ("日期", "时间", "時間"))
+        # Without a number it is still the printed label when it starts a line as "No." / "No:" / "เลขที่" (its number
+        # unread, "N/A" or misread as "O7832"); a plain word "no" never is.
+        return line_start and (m.group(0).endswith(".") or m.group(0) == "เลขที่" or bool(re.match(r"[^\S\n]*[:：]", after)))
+    return bool(line_start or re.match(r"[^\S\n]*[:：]", after) or m.group(0) in ("日期", "时间", "時間"))
 
 
 def _year(text):
@@ -401,9 +420,11 @@ def header_fields(raw, ink_states, read=True):
     """Header Fields. `raw` from ``extract_header_fields``; `ink_states` = {date, time: empty|uncertain|present} from the
     handwriting boxes; `read` False when no model call read the header (OCR_SECTION_MODE=separate)."""
     number = raw.get("formNumber")
-    digits = re.sub(r"\D", "", number.translate(THAI_DIGITS)) if number else ""
+    core = re.sub(r"^\s*(?:no\b\.?|เลขที่)\s*[.:]?\s*", "", number.translate(THAI_DIGITS), flags=re.I) if number else ""
+    lettered = bool(re.search(r"[^\W\d_]", core))  # "O7832": the printed 0 read as a letter
+    digits = re.sub(r"\D", "", core.translate(str.maketrans("Oo", "00")))
     if 4 <= len(digits) <= 7:
-        out = {"formNumber": field(number, digits, 0.9, "ocr", False)}
+        out = {"formNumber": field(number, digits, 0.5 if lettered else 0.9, "ocr", lettered)}
     else:
         out = {"formNumber": field(number, None, 0.0, "ocr" if number else "none", read)}
     for key, parse in (("date", parse_date), ("time", parse_time)):
@@ -414,8 +435,17 @@ def header_fields(raw, ink_states, read=True):
             out[key] = field(None, None, 0.0, "none", read or state == "present")
         else:
             parsed = parse(value)
-            out[key] = field(value, parsed, 0.8 if parsed else 0.4, "ocr", parsed is None)
+            doubtful = parsed is not None and key == "time" and _time_looks_like_duration(value, parsed)
+            out[key] = field(value, parsed, 0.5 if doubtful else 0.8 if parsed else 0.4, "ocr", parsed is None or doubtful)
     return out
+
+
+def _time_looks_like_duration(raw, parsed):
+    """The real TIME boxes hold session lengths ('60', '1ช', '60 mins'): a parsed time with no am/pm/น. before 09:00 ('1:30',
+    '2.00', or 14:30 written '2.30') or written with an hour unit ('1h30') is as likely a duration: review it."""
+    text = raw.translate(THAI_DIGITS).lower().strip()
+    suffixed = re.search(r"(?:am|pm|a\.m\.|p\.m\.|น\.?|นาฬิกา)\s*\.?$", text)
+    return (not suffixed and int(parsed[:2]) < 9) or bool(re.search(r"\d\s*(?:h(?![a-z])|hrs?\b|hours?\b|ชม|ชั่วโมง)", text))
 
 
 # ---------------------------------------------------------------- treatments
@@ -436,6 +466,9 @@ SEPARATOR_RE = re.compile(r"\s*(?:\+|＋|/|\n|;|、|，|(?<!\d),|,(?!\d)|\s&\s|\
 TOTAL_MARK_RE = re.compile(r"\s*(?:=+>?|＝|->|→|>|รวม|\btotal\b)\s*", re.I)
 # Leading guest count: "4 ไทย 1 ชม." (4 guests, one hour each), "2 คน ออย 90 นาที".
 GUESTS_RE = re.compile(r"^\s*(?P<n>[1-9]|1\d|20)\s*(?:คน|ท่าน|pax|persons?|guests?|x|×)?\s+(?=[^\W\d_])", re.I)
+# Trailing guest count: "ไทย 90 นาที 2 ท่าน", "(2 คน)", "= 2 ท่าน", "x 2" / "× 2". A bare trailing number stays a duration.
+TRAILING_GUESTS_RE = re.compile(r"\s*(?:(?:[=x×]\s*)?[(（]?\s*(?P<n>[1-9]|1\d|20)\s*(?:คน|ท่าน|pax|persons?|guests?)\s*[)）]?"
+                                r"|(?<![a-z])[x×]\s*(?P<m>[1-9]|1\d|20))\s*$", re.I)
 
 
 def _minutes(match):
@@ -560,12 +593,17 @@ def parse_treatments(raw):
     duration of its own, its duration is derived from the total ("ไทย + เท้า 30 = 90" -> ไทย 60); a total that does not
     add up flags every item. Without a total marker, a trailing duration equal to the sum is the total, and a duration
     written only after the last of several treatments ("ออย + หน้า 2 ชม") is read as their total. A leading guest count
-    ("4 ไทย 1 ชม.") goes to ``guests`` of every item."""
+    ("4 ไทย 1 ชม.") or a trailing one ("ไทย 90 นาที 2 ท่าน", "x 2") goes to ``guests`` of every item."""
     if not raw:
         return [], [], [], None
     text = raw.translate(THAI_DIGITS)
+    trailing = TRAILING_GUESTS_RE.search(text)
+    trailing_guests = None
+    if trailing and re.search(r"[^\W\d_]", text[:trailing.start()]):
+        text, trailing_guests = text[:trailing.start()], int(trailing.group("n") or trailing.group("m"))
     text, written_total, total_text, total_unit = _split_total(text)
     text, guests = _split_guests(text, written_total is not None)
+    guests = guests if guests is not None else trailing_guests
     groups = []
     for segment in SEPARATOR_RE.split(text):
         if segment.strip():
@@ -694,8 +732,17 @@ def _clean_value(text):
     return None
 
 
+def _not_a_name(line):
+    """A line before the first customer label that is not the name: a date, clock time or session length (header / TIME
+    box leftovers), a number, a header label, or no letters at all."""
+    return (parse_date(line) is not None or parse_time(line) is not None or DURATION_RE.search(line.translate(THAI_DIGITS)) is not None
+            or len(re.findall(r"\d", line.translate(THAI_DIGITS))) >= 3 or bool(_HEADER_LABELS.match(line))
+            or not re.search(r"[^\W\d_]", line))
+
+
 def parse_customer_text(text, expected=CUSTOMER_FIELDS):
-    """Customer transcription -> ({field: value|None}, used_fallback). `expected` = fields that have handwriting."""
+    """Customer transcription -> ({field: value|None}, fallback fields). `expected` = fields that have handwriting; the
+    fallback fields (a frozenset) were not read under their own label and need review."""
     text = _LIST_MARKER.sub("", _ECHOED_LABEL.sub(" ", _clean_model_text(text)))
     found, matches = {}, [m for m in _CUSTOMER_LABELS.finditer(text) if _is_label(text, m)]
     for i, m in enumerate(matches):
@@ -704,16 +751,21 @@ def parse_customer_text(text, expected=CUSTOMER_FIELDS):
         value = _clean_value(text[m.end():end])
         if value and not found.get(key):
             found[key] = value
-    if matches and not found.get("name") and "name" in expected and (matches[0].lastgroup != "name" or _clean_value(text[:matches[0].start()])):
-        # The Name row is the top row of the crop: real output sometimes drops only its label
-        # ("Cynthia De La Cruz-Eikanter\nNationality:\nHotel Name:"), so text before the first label is the name.
-        found["name"] = _clean_value(text[:matches[0].start()])
+    fallback = set()
+    if matches and not found.get("name") and "name" in expected:
+        # The Name row is the top row of the crop and sits right above Nationality: real output sometimes drops only its
+        # label ("Cynthia De La Cruz-Eikanter\nNationality:\nHotel Name:"), so the last real line before the first label is
+        # the name -- flagged, as it was not read under its label.
+        lines = [v for v in (_clean_value(line) for line in text[:matches[0].start()].replace("|", "\n").splitlines()) if v and not _not_a_name(v)]
+        if lines:
+            found["name"] = lines[-1]
+            fallback.add("name")
     if matches:
-        return {k: found.get(k) for k in CUSTOMER_FIELDS}, False
+        return {k: found.get(k) for k in CUSTOMER_FIELDS}, frozenset(fallback)
     lines = [v for v in (_clean_value(line) for line in text.splitlines()) if v]
     if lines and len(lines) == len(expected):  # unlabeled answer: one line per written field, in form order
-        return {k: (lines[expected.index(k)] if k in expected else None) for k in CUSTOMER_FIELDS}, True
-    return {k: None for k in CUSTOMER_FIELDS}, bool(lines)
+        return {k: (lines[expected.index(k)] if k in expected else None) for k in CUSTOMER_FIELDS}, frozenset(expected)
+    return {k: None for k in CUSTOMER_FIELDS}, frozenset(CUSTOMER_FIELDS if lines else ())
 
 
 def normalize_free_text(raw, fallback):

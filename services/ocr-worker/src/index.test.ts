@@ -7,7 +7,7 @@ import { OcrClient, OcrClientError, type OcrResponse } from "@innovera/ocr-clien
 import { metrics } from "@innovera/ocr-observability";
 import type { OcrResultPatch } from "@innovera/ocr-persistence";
 import { createLocalStorage } from "@innovera/ocr-storage/local";
-import { confirmSender, isOcrUnavailable, processOcrJob, runMaintenanceOnce, runWorkerOnce, startWorkerLoops, workerConcurrency, type FinishOutcome, type FinishResult } from "./index.js";
+import { assertSchemaReady, confirmSender, isOcrUnavailable, processOcrJob, REQUIRED_SCHEMA_VERSION, runMaintenanceOnce, runWorkerOnce, startWorkerLoops, workerConcurrency, type FinishOutcome, type FinishResult } from "./index.js";
 
 const organizationId = "00000000-0000-0000-0000-000000000001";
 const documentId = "00000000-0000-0000-0000-000000000002";
@@ -200,6 +200,19 @@ test("heartbeat runs during OCR and its timer is cleared on success and on failu
     await delay(40);
     assert.equal(h.heartbeats(), afterRun, `heartbeat interval must be cleared (fails=${String(fails)})`);
   }
+});
+
+test("the worker refuses to start until the web applied 0018 (on an older schema every claimed job would fail with 42703)", async () => {
+  const seen: Array<{ sql: string; values: unknown[] | undefined }> = [];
+  const pool = (applied: string[]) => ({ query: async (sql: string, values?: unknown[]) => {
+    seen.push({ sql, values });
+    return { rowCount: applied.includes(String(values?.[0])) ? 1 : 0 };
+  } });
+  assert.equal(REQUIRED_SCHEMA_VERSION, "0018_multipage_documents");
+  await assert.rejects(assertSchemaReady(pool(["0016_fair_queue", "0017_batch_processing"])), /^Error: SCHEMA_NOT_READY: migration 0018_multipage_documents is not applied yet/);
+  await assertSchemaReady(pool(["0017_batch_processing", "0018_multipage_documents"]));
+  assert.deepEqual(seen.at(-1), { sql: "SELECT 1 FROM schema_migrations WHERE version = $1", values: ["0018_multipage_documents"] });
+  assert.match(readFileSync(new URL("./index.ts", import.meta.url), "utf8"), /await assertDatabaseReady\(pool\);\s*await assertSchemaReady\(pool\);/, "startWorkerRuntime checks the schema before any loop claims a job");
 });
 
 test("OCR_WORKER_CONCURRENCY is clamped to 1..8 with default 2", () => {

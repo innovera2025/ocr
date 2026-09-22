@@ -22,6 +22,7 @@ check_sql "worker:no-migration-table" "$DATABASE_URL_WORKER" "SELECT has_table_p
 check_sql "worker:insert-documents" "$DATABASE_URL_WORKER" "SELECT has_table_privilege(current_user,'public.documents','INSERT')::int" 1
 check_sql "worker:insert-extraction-jobs" "$DATABASE_URL_WORKER" "SELECT has_table_privilege(current_user,'public.extraction_jobs','INSERT')::int" 1
 check_sql "worker:no-update-extraction-jobs" "$DATABASE_URL_WORKER" "SELECT has_table_privilege(current_user,'public.extraction_jobs','UPDATE')::int" 0
+check_sql "worker:no-select-extraction-jobs" "$DATABASE_URL_WORKER" "SELECT has_any_column_privilege(current_user,'public.extraction_jobs','SELECT')::int" 0
 check_sql "worker:no-delete-documents" "$DATABASE_URL_WORKER" "SELECT has_table_privilege(current_user,'public.documents','DELETE')::int" 0
 printf 'SUMMARY PASS=%s FAIL=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

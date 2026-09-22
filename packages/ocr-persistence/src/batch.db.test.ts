@@ -165,7 +165,7 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     const created = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3, label: " Morning intake " });
     batchA = created.batchId;
     const { batchId: _id, createdAt: _created, ...counters } = created;
-    assert.deepEqual(counters, { label: "Morning intake", expectedTotal: 3, uploaded: 0, rows: 0, pages: 0, pagesExpected: 0, splitting: 0, queued: 0, processing: 0,
+    assert.deepEqual(counters, { label: "Morning intake", expectedTotal: 3, uploaded: 0, rows: 0, pages: 0, pagesExpected: 0, splitting: 0, rowsExpected: 3, queued: 0, processing: 0,
       succeeded: 0, needsReview: 0, failed: 0, confirmed: 0, completed: 0, finished: false, finishedAt: null, durationMs: null, throughputPerMinute: null });
     assert.ok(Date.parse(created.createdAt) > 0);
     batchB = (await app.createBatch(TENANT_B, { createdBy: "user-b", expectedTotal: 1 })).batchId;
@@ -646,6 +646,8 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
 
   test("0018 applies after 0017: SPLIT status, page columns, same-tenant FK, shape CHECK, and exactly the new worker rights", async () => {
     assert.deepEqual(applied.slice(-2), ["0017_batch_processing", "0018_multipage_documents"]);
+    // The worker's startup gate (services/ocr-worker assertSchemaReady) runs exactly this query as ocr_worker.
+    assert.equal((await workerPool.query("SELECT 1 FROM schema_migrations WHERE version = $1", ["0018_multipage_documents"])).rowCount, 1);
     assert.equal((await superDb.query("SELECT 'SPLIT'::document_status AS s")).rows[0].s, "SPLIT");
     const table = async (role: string, name: string, privilege: string) => (await superDb.query<{ ok: boolean }>("SELECT has_table_privilege($1, $2, $3) AS ok", [role, name, privilege])).rows[0]!.ok;
     const column = async (role: string, name: string, col: string) => (await superDb.query<{ ok: boolean }>("SELECT has_column_privilege($1, $2, $3, 'SELECT') AS ok", [role, name, col])).rows[0]!.ok;
@@ -653,7 +655,9 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     assert.deepEqual(await Promise.all([table("ocr_worker", "extraction_jobs", "UPDATE"), table("ocr_worker", "extraction_jobs", "DELETE"), table("ocr_worker", "extraction_jobs", "SELECT"),
       table("ocr_worker", "documents", "DELETE"), table("ocr_app", "extraction_jobs", "UPDATE"), table("ocr_queue", "extraction_jobs", "SELECT"), table("ocr_queue", "documents", "INSERT")]),
       [false, false, false, false, false, false, false]);
-    assert.deepEqual(await Promise.all(["id", "organization_id", "run_id", "status", "priority", "lease_token_hash"].map((col) => column("ocr_worker", "extraction_jobs", col))), [true, true, true, false, false, false]);
+    // No column of extraction_jobs is readable by the worker (its job INSERT has no RETURNING / ON CONFLICT).
+    assert.deepEqual(await Promise.all(["id", "organization_id", "run_id", "status", "priority", "lease_token_hash"].map((col) => column("ocr_worker", "extraction_jobs", col))), [false, false, false, false, false, false]);
+    assert.equal((await superDb.query<{ ok: boolean }>("SELECT has_any_column_privilege('ocr_worker', 'extraction_jobs', 'SELECT') AS ok")).rows[0]!.ok, false);
     const functions = await superDb.query<{ proname: string }>("SELECT proname FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND prokind = 'f' AND proname LIKE 'ocr%' ORDER BY proname");
     assert.deepEqual(functions.rows.map((row) => row.proname), ["ocr_claim_confirm_outbox_v1", "ocr_claim_v1", "ocr_finish_confirm_outbox_v1", "ocr_finish_retry_v1", "ocr_finish_v1",
       "ocr_heartbeat_v1", "ocr_recover_confirm_outbox_v1", "ocr_recover_expired_v1"], "0018 created no function");
@@ -711,11 +715,13 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     let summary = (await app.getBatch(TENANT_A, batchId))!;
     assert.deepEqual([summary.uploaded, summary.rows, summary.pages, summary.pagesExpected, summary.splitting, summary.processing, summary.queued, summary.failed, summary.finished],
       [1, 6, 5, 5, 1, 1, 4, 1, false], "the splitting parent is one processing row; 4 queued pages; the failed page is a finished row");
+    assert.equal(summary.rowsExpected, 6, "5 pages + 1 promised file: the splitting parent (page count known) is not counted on top of its pages");
     const image = await uploadFile(TENANT_A, "late-image.png", "image/png", batchId);
     await assert.rejects(uploadFile(TENANT_A, "third.png", "image/png", batchId), { message: "BATCH_FULL" }, "2 files promised: pages never fill the batch");
     await worker.markSplit(TENANT_A, parent.documentId, 5);
     summary = (await app.getBatch(TENANT_A, batchId))!;
     assert.deepEqual([summary.uploaded, summary.rows, summary.pages, summary.splitting, summary.queued, summary.processing, summary.finished], [2, 6, 5, 0, 5, 0, false]);
+    assert.equal(summary.rowsExpected, 6);
     const listed = await app.listDocuments(TENANT_A, { batchId });
     assert.deepEqual(listed.documents.map((item) => [item.filename, item.pageNumber, item.pageCount]),
       [["late-image.png", null, null], ["intake-12.pdf", 1, 5], ["intake-12.pdf", 2, 5], ["intake-12.pdf", 3, 5], ["intake-12.pdf", 4, 5], ["intake-12.pdf", 5, 5]],

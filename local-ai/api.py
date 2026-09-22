@@ -34,6 +34,9 @@ app = FastAPI(title="INNOVERA OCR API", version=VERSION)
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 MIME_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf"}
 STAMP_RED_MIN = 40  # red minus max(green, blue) of a pink/red stamp pixel (PAID stamps), removed from model crops
+# ...only at a stamp's luminance: real PAID-stamp ink sits at 150-200 (1 % of it below 117), red or crimson ballpoint at
+# 65-95, and pen strokes must reach the model.
+STAMP_LUM_MIN = 110
 MAX_PDF_PAGE_PT = 14400  # PDF page-size limit (200 in); bigger MediaBoxes are refused before anything is rendered
 MAX_RASTER_PIXELS = 89_478_485  # Pillow's decompression-bomb warning threshold, enforced as an error (after JPEG draft)
 JPEG_DRAFT_SIDE = 4096  # a bigger JPEG (e.g. a 108 MP phone photo) is decoded at 1/2..1/8 scale, still >= this on both sides
@@ -154,6 +157,21 @@ def _decode(data, ext):
     return image.convert("RGB"), warnings
 
 
+def _sniff_extension(data, ext):
+    """The decoder follows the bytes when the name says PDF but the bytes are an image: a worker from before Release 1
+    (a rollback) sends a PDF page image under its parent's name 'x.pdf'. Anything else keeps the name's extension (a PDF
+    may put up to 1 KB before its '%PDF-' header)."""
+    if ext != ".pdf" or b"%PDF-" in data[:1024]:
+        return ext
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ext
+
+
 class _Crops:
     """Model crops cut from the original image through the fitted geometry. Template boxes are in reference px; the image
     has width/805 x height/569 pixels per reference px. Above ROTATE_CROPS_ABOVE_DEG of fitted rotation a crop is
@@ -189,12 +207,13 @@ class _Crops:
 
     def _stamp_free(self, crop):
         """Pink/red stamp pixels (a PAID stamp) become paper white before the crop is sent to the model (release1 A7).
-        Blue and black pen, gray print and the orange form print are kept: orange has blue far below green."""
+        Blue and black pen, gray print and the orange form print are kept (orange has blue far below green), and so is red
+        or crimson pen: it is much darker than stamp ink (STAMP_LUM_MIN)."""
         arr = np.asarray(crop)
         if arr.ndim != 3 or not arr.size:
             return crop
-        r, g, b = (arr[..., i].astype(np.int16) for i in range(3))
-        stamp = (r - np.maximum(g, b) >= STAMP_RED_MIN) & (b >= g - 5) & (r >= 120)
+        r, g, b = (arr[..., i].astype(np.int32) for i in range(3))
+        stamp = (r - np.maximum(g, b) >= STAMP_RED_MIN) & (b >= g - 5) & (r >= 120) & (299 * r + 587 * g + 114 * b >= STAMP_LUM_MIN * 1000)
         found = int(stamp.sum())
         if not found:
             return crop
@@ -250,19 +269,26 @@ def _struck_field(results):
     return {**N.field("struck out: " + ", ".join(struck), None, 0.35, "checkbox", True), "checked": True} if struck else None
 
 
+def _hidden_field(results):
+    """One marker for boxes that are not visible (covered): their choice is unknown, value null, needsReview."""
+    hidden = [label for _, label, m in results if m["state"] == "unreadable"]
+    return {**N.field("not visible: " + ", ".join(hidden), None, 0.3, "checkbox", True), "checked": True} if hidden else None
+
+
 def _check_fields(results):
     fields = [_check_field(label, m) for _, label, m in results if m["state"] in ("checked", "ambiguous")]
-    marker = _struck_field(results)
-    return fields + [marker] if marker else fields
+    return fields + [marker for marker in (_struck_field(results), _hidden_field(results)) if marker]
 
 
 def _single_choice(results):
     checked = [(label, m) for _, label, m in results if m["state"] == "checked"]
     ambiguous = [(label, m) for _, label, m in results if m["state"] == "ambiguous"]
     struck = _struck_field(results)
+    hidden = any(m["state"] == "unreadable" for _, _, m in results)  # a box nobody can see may hold the real choice
     if len(checked) == 1 and not ambiguous:
         label, m = checked[0]
-        return N.field(label, label, m["confidence"], "checkbox", m["confidence"] < M.REVIEW_BELOW or struck is not None)
+        return N.field(label, label, min(m["confidence"], 0.5) if hidden else m["confidence"], "checkbox",
+                       m["confidence"] < M.REVIEW_BELOW or struck is not None or hidden)
     if len(checked) + len(ambiguous) == 1 or len(checked) == 1:  # one ambiguous mark, or one tick plus stray marks
         label, m = (checked or ambiguous)[0]
         return N.field(label, label, min(m["confidence"], 0.6), "checkbox", True)
@@ -279,7 +305,7 @@ def _body_fields(marks, kind):
 
 
 def _customer_text_fields(text_px, states, customer_raw, expected):
-    parsed, fallback = N.parse_customer_text(customer_raw, expected) if customer_raw is not None else ({}, False)
+    parsed, fallback = N.parse_customer_text(customer_raw, expected) if customer_raw is not None else ({}, frozenset())
     out = {}
     for key in N.CUSTOMER_FIELDS:
         state, value = states[key], parsed.get(key)
@@ -289,9 +315,9 @@ def _customer_text_fields(text_px, states, customer_raw, expected):
         elif not value:
             out[key] = N.field(None, None, 0.6, "ink-mark", True) if state == "uncertain" else N.field(None, None, 0.0, "none", True)
         elif key == "nationality":
-            out[key] = N.normalize_nationality(value, fallback)
+            out[key] = N.normalize_nationality(value, key in fallback)
         else:
-            out[key] = N.normalize_free_text(value, fallback)
+            out[key] = N.normalize_free_text(value, key in fallback)
     return out
 
 
@@ -410,6 +436,7 @@ def process_image(image, document_id, source_file, started, extra_warnings=()):
         customer_raw = outputs["customerInformation"][0] if "customerInformation" in outputs else None
     inference_wall_ms = _ms(t_inference)
     layout["warnings"].extend(M.implausible_checkboxes(checkboxes))
+    layout["warnings"].extend(M.hidden_checkboxes(checkboxes))
 
     t_normalize = time.perf_counter()
     branch = N.detect_branch(staff_raw)
@@ -465,12 +492,13 @@ def ocr(file: UploadFile = File(...)):
     ext = Path(filename).suffix.lower() or MIME_EXTENSIONS.get((file.content_type or "").split(";")[0].strip().lower(), "")
     if ext not in IMAGE_EXTENSIONS and ext != ".pdf":
         raise HTTPException(400, "Only PNG/JPG/JPEG/WebP (and PDF when a renderer is installed) are supported")
-    if ext == ".pdf" and _pdf_renderer() is None:
-        raise HTTPException(415, "PDF input needs pypdfium2 or PyMuPDF in the Local AI image; upload PNG/JPG/WebP instead")
     limit = max_upload_bytes()
     data = file.file.read(limit + 1)
     if len(data) > limit:
         raise HTTPException(413, f"File larger than {limit} bytes")
+    ext = _sniff_extension(data, ext)
+    if ext == ".pdf" and _pdf_renderer() is None:
+        raise HTTPException(415, "PDF input needs pypdfium2 or PyMuPDF in the Local AI image; upload PNG/JPG/WebP instead")
     document_id = str(uuid.uuid4())
     try:
         directory = upload_dir()

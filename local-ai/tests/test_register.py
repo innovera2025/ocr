@@ -74,3 +74,36 @@ def test_other_images_are_unknown(page):
              "mirror": form.transpose(Image.Transpose.FLIP_LEFT_RIGHT)}[page]
     _, detection = register(image)
     assert detection["verdict"] != "known" and detection["score"] < 28
+
+
+def test_boxes_whose_border_is_not_found_are_reported_missing():
+    geo, detection = register(S.filled_form())
+    assert geo.missing == frozenset() and R.IDENTITY.missing == frozenset()
+    covered = S.filled_form()
+    from PIL import ImageDraw
+    ImageDraw.Draw(covered).rectangle((188, 358, 420, 480), fill=(255, 255, 255))  # the right health column under a white receipt
+    geo, detection = register(covered)
+    assert detection["verdict"] == "known" and detection["foundRatio"] < 1.0
+    assert geo.missing == {("healthConditions", key) for key in ("pregnancy", "menstruation", "infectiousSkinDisease", "haveACold",
+                                                                  "claustrophobia", "anyAllergies", "sle")}
+
+
+def _text_bearing_form():
+    """The synthetic form with printed-label stand-ins (dark gray bars) right of every checkbox, as on the real form."""
+    image = S.filled_form()
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(image)
+    for boxes in L.CHECKBOXES.values():
+        for _, _, x, y, s in boxes:
+            draw.rectangle((x + s + 4, y + 2, x + s + 44, y + s - 3), fill=(110, 110, 110))
+    return image
+
+
+@pytest.mark.parametrize("rotation", [-1.0, -0.8, 0.8, 1.0])
+def test_skewed_text_bearing_page_is_never_known_with_a_wrong_fit(rotation):
+    """Real scans register exactly only up to about +-0.55 degrees (printed text next to the boxes pulls the shift-only
+    coarse search off; deskew is Release 3). Beyond that the page may fall to uncertain / unknown -- every field flagged --
+    but a 'known' verdict must always come with a correct fit."""
+    geo, detection = register(S.transformed(_text_bearing_form(), 1.0, rotation))
+    if detection["verdict"] == "known":
+        assert abs(detection["rotationDeg"] - rotation) < 0.1 and detection["rmsPx"] <= 1.0

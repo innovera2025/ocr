@@ -7,7 +7,9 @@ ring minus the 2 px band around it (low-chroma pixels only, see ``ocr_marks.bord
 2. per-box local search +-3 px around the coarse prediction;
 3. weighted least-squares affine fit (scale x/y, rotation, shift; shear is fitted too and is ~0 on real scans), boxes
    more than 1.5 px off dropped and the fit repeated; one more local-search + fit pass from the fitted positions so
-   rotations up to ~1 degree converge.
+   rotations up to ~1 degree converge on the text-free synthetic form. On real scans (printed text beside the boxes) the
+   shift-only coarse search holds only up to about +-0.55 degrees of skew; beyond it the verdict falls to uncertain /
+   unknown (visible, never silently wrong). A rotation step in the coarse search (deskew) is Release 3.
 
 The result maps template (reference 805x569) coordinates to coordinates of the scan resized to 805x569. Every other
 geometry (checkbox windows, handwriting boxes, body map, model crops) is placed through it (``Geometry``).
@@ -33,10 +35,13 @@ ROTATE_CROPS_ABOVE_DEG = 0.3  # model crops are cut from a de-rotated page above
 
 
 class Geometry:
-    """Affine map template -> scan (reference px): q = A (p - C) + C + t, C = page centre."""
+    """Affine map template -> scan (reference px): q = A (p - C) + C + t, C = page centre. `missing` (set by ``register``):
+    the (group, key) checkboxes whose printed border was not found at their fitted position (covered, torn off): whatever
+    they hold is not visible, so they must never read as confidently unchecked."""
 
     def __init__(self, a=1.0, b=0.0, c=0.0, d=1.0, tx=0.0, ty=0.0):
         self.a, self.b, self.c, self.d, self.tx, self.ty = float(a), float(b), float(c), float(d), float(tx), float(ty)
+        self.missing = frozenset()
 
     @classmethod
     def shift(cls, dx, dy):
@@ -210,6 +215,7 @@ def register(dark):
     score = float(surf.at(offsets).mean())
     near = surf.local(fitted, 1)[1]
     found = float((near >= FOUND_CONTRAST).mean())
+    geo.missing = frozenset((group, box[0]) for (group, box), contrast in zip(BOXES, near, strict=True) if contrast < FOUND_CONTRAST)
     rms = float(np.sqrt(np.mean(residual ** 2)))
     scale_x, scale_y = geo.scale
     rotation = geo.rotation_deg

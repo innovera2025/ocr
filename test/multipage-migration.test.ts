@@ -15,13 +15,13 @@ test("0018 defines no function and redefines no queue/outbox SECURITY DEFINER fu
   assert.doesNotMatch(statements, /\bCONCURRENTLY\b/i);
 });
 
-test("0018 grants exactly the worker's INSERT rights (documents, runs, jobs) plus the RETURNING/RLS columns", () => {
+test("0018 grants exactly the worker's INSERT rights (documents, runs, jobs) and no read right on jobs", () => {
   const grants = statements.match(/GRANT[^;]*;/g) ?? [];
   assert.deepEqual(grants, [
     "GRANT INSERT ON documents, document_runs TO ocr_worker;",
-    "GRANT INSERT ON extraction_jobs TO ocr_worker;",
-    "GRANT SELECT (id, organization_id, run_id) ON extraction_jobs TO ocr_worker;"
+    "GRANT INSERT ON extraction_jobs TO ocr_worker;"
   ]);
+  assert.doesNotMatch(statements, /GRANT\s+SELECT/i, "the worker's job INSERT has no RETURNING / ON CONFLICT: it needs no SELECT on extraction_jobs");
   assert.doesNotMatch(statements, /GRANT\s+(ALL|UPDATE|DELETE|TRUNCATE)/i);
   assert.doesNotMatch(statements, /\b(BYPASSRLS|SUPERUSER|DISABLE ROW LEVEL SECURITY|NO FORCE ROW LEVEL SECURITY)\b/i);
   assert.doesNotMatch(statements, /\bALTER\s+(ROLE|DEFAULT PRIVILEGES)\b/i);
@@ -55,4 +55,6 @@ test("verify-db-roles.sh checks the new worker rights and what the worker still 
     assert.match(script, new RegExp(`check_sql "${name}" "\\$DATABASE_URL_WORKER" "SELECT has_table_privilege\\(current_user,'public\\.${table}','${privilege}'\\)::int" ${expected}`), name);
   }
   assert.match(script, /check_sql "queue:no-table-select" "\$DATABASE_URL_QUEUE"/);
+  // has_table_privilege is false when only column grants exist: the column-level check is has_any_column_privilege.
+  assert.match(script, /check_sql "worker:no-select-extraction-jobs" "\$DATABASE_URL_WORKER" "SELECT has_any_column_privilege\(current_user,'public\.extraction_jobs','SELECT'\)::int" 0/);
 });

@@ -19,6 +19,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS documents_parent_page_uidx
   ON documents(organization_id, parent_document_id, page_number) WHERE parent_document_id IS NOT NULL;
 
 -- The worker creates page documents, their runs and their OCR jobs under the same tenant RLS as ocr_app (mirrors 0016).
+-- No SELECT on extraction_jobs: its job INSERT has no RETURNING / ON CONFLICT, and RLS WITH CHECK needs no column grant.
 GRANT INSERT ON documents, document_runs TO ocr_worker;
 GRANT INSERT ON extraction_jobs TO ocr_worker;
-GRANT SELECT (id, organization_id, run_id) ON extraction_jobs TO ocr_worker;   -- INSERT … RETURNING id + RLS column

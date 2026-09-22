@@ -43,6 +43,8 @@ BESIDE_MAX_EXTENT, BESIDE_MIN_HEIGHT = 64, 8       # ...a compact stroke with so
 BESIDE_TEXT_INK = 30                   # ink px further right that make the "mark" the start of a handwritten note
 OTHERS_LINE_INK = 40                   # handwriting on the referral "Others" line counts as an (unsure) Others choice
 REVIEW_BELOW = 0.7                     # confidence below this => needsReview
+SHAPE_MARGIN = 0.4                     # body map: circle and cross scores this close are a guess (needs review)
+LABEL_RATIO = 1.5                      # body map: a mark whose second-nearest label is this close to the nearest is ambiguous
 
 # Handwriting box emptiness (ink pixel counts inside a text box).
 TEXT_EMPTY_MAX, TEXT_PRESENT_MIN = 12, 40
@@ -372,15 +374,21 @@ def _measure(mask, strokes, group, x, y, s):
 
 def detect_checkboxes(mask, geo=IDENTITY):
     """All template checkboxes -> {group: [(key, label, measurement)]}; measurement = dict(state, score, confidence, note)
-    with state checked | ambiguous | struck | unchecked. ``struck``: a stroke through the box (one stroke through >= 3
-    boxes = row struck out, a stroke longer than a tick, a flat line, or a flat stroke passing both opposite sides) --
-    never a selection. In a group with a struck box, faint marks and marks beside a box are taken as parts of the strike
-    and dropped, and the remaining ticks need review. A tick drawn next to a box (ring or printed label) is ``ambiguous``."""
+    with state checked | ambiguous | struck | unchecked | unreadable. ``struck``: a stroke through the box (one stroke
+    through >= 3 boxes = row struck out, a stroke longer than a tick, a flat line, or a flat stroke passing both opposite
+    sides) -- never a selection. In a group with a struck box, faint marks and marks beside a box are taken as parts of
+    the strike and dropped, and the remaining ticks need review. A tick drawn next to a box (ring or printed label) is
+    ``ambiguous``. ``unreadable``: an empty box whose printed border registration did not find (``geo.missing``: covered
+    by a sticky note, a receipt, a fold) -- not visible, so never "unchecked"."""
     placed = {(group, box[0]): (*checkbox_position(geo, box), box[4]) for group, boxes in L.CHECKBOXES.items() for box in boxes}
     strokes = _Strokes(mask, placed)
+    missing = getattr(geo, "missing", frozenset())
     out = {}
     for group, boxes in L.CHECKBOXES.items():
         items = [(key, label, _measure(mask, strokes, group, *placed[(group, key)])) for key, label, *_ in boxes]
+        for key, _, m in items:
+            if (group, key) in missing and m["state"] == "unchecked":
+                m.update(state="unreadable", confidence=0.3, note="border-not-found")
         if any(m["state"] == "struck" for _, _, m in items):
             for _, _, m in items:
                 if m["note"] in ("faint", "light"):
@@ -397,6 +405,16 @@ def detect_checkboxes(mask, geo=IDENTITY):
                 others.update(state="ambiguous", confidence=0.5, note="text-on-others-line")
         out[group] = items
     return out
+
+
+def hidden_checkboxes(checkboxes):
+    """Warnings for groups with boxes that are not visible (state ``unreadable``); the caller flags the page."""
+    warnings = []
+    for group, items in checkboxes.items():
+        hidden = [label for _, label, m in items if m["state"] == "unreadable"]
+        if hidden:
+            warnings.append(f"{len(hidden)} {group} box(es) not visible (covered or cut off?): {', '.join(hidden)}")
+    return warnings
 
 
 def implausible_checkboxes(checkboxes, min_boxes=8):
@@ -510,6 +528,8 @@ def classify_shape(points):
     cross = diag_score * (0.6 + 0.4 * min(1.0, center_frac * 5)) * (len(quads) / 4) ** 2
     kind = "circle" if circle >= cross else "cross"
     confidence = max(0.3, min(0.98, 0.5 + (max(circle, cross) - min(circle, cross)) * 0.6))
+    if max(circle, cross) - min(circle, cross) < SHAPE_MARGIN:  # an X-like scribble read as a circle, or the reverse
+        confidence = min(confidence, round(REVIEW_BELOW - 0.01, 3))
     if n < 40:  # too little ink to be sure of the shape
         confidence = min(confidence, 0.6)
     return kind, round(confidence, 3), {"coverage": round(coverage, 2), "center": round(center_frac, 2), "diagonal": round(diag_frac, 2)}
@@ -540,7 +560,11 @@ def detect_body_marks(mask, lum, geo=IDENTITY, min_pixels=15):
         grp = groups.setdefault(key, {"points": [], "onLabel": best[1], "ambiguous": False})
         grp["points"].extend(comp)
         grp["onLabel"] = grp["onLabel"] and best[1]
-        if second[0] - best[0] < 4:
+        # Two labels of one side inside the mark's rows (e.g. two touching circles merged into one mark over Calf and
+        # Plantar), or a second label about as near as the nearest: which area it means is a guess.
+        rows = [lab for lab in labels if lab[1] == best[3] and min(xs) <= lab[4] and max(xs) >= lab[2]
+                and min(max(ys), lab[5]) - max(min(ys), lab[3]) + 1 >= 0.5 * (lab[5] - lab[3] + 1)]
+        if second[0] - best[0] < 4 or (best[0] > 0 and second[0] < LABEL_RATIO * best[0]) or len(rows) >= 2:
             grp["ambiguous"] = True
     marks = []
     for (area, side), grp in groups.items():

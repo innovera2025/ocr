@@ -96,7 +96,8 @@ and counts `ocr_template_verdict_total{verdict}` (`readLayoutDetection` in `@inn
 `formNumber` and `branch`; an unread field (`source:"none"`, raw and value null, not flagged — e.g. a branch that was not
 found, confidence 0) is left out of `minConfidence`. A struck-out checkbox row arrives as one check-list item with
 `value: null`, `raw: "struck out: …"`, `needsReview: true`; it is kept through normalisation and a review save (accepted as
-read it stays a no-selection marker). `test/fixtures/local-ai-v31-response.json` is a real v3.1 response (synthetic form)
+read it stays a no-selection marker). Boxes the page does not show (covered: their printed border was not found) arrive
+the same way as `raw: "not visible: …"` (plus a layout warning), never as an empty list. `test/fixtures/local-ai-v31-response.json` is a real v3.1 response (synthetic form)
 used by the contract tests in `document-view.test.ts` and the worker tests.
 
 Legacy rows already in production are flat v2.2 staff results
@@ -360,9 +361,15 @@ Binding plan: `docs/operations/real-data/release1-plan.md` (workstream B); desig
 **Data model — migration `0018_multipage_documents`** (runs as `ocr_migrator`, defines no function): document status
 `SPLIT`; `documents.parent_document_id`, `page_number`, `page_count` (page shape CHECK, page 1..1000, composite FK
 `(parent_document_id, organization_id)` so a page and its PDF share a tenant, unique `(organization_id,
-parent_document_id, page_number)` for pages); `ocr_worker` gains `INSERT` on `documents`, `document_runs`,
-`extraction_jobs` and `SELECT (id, organization_id, run_id)` on `extraction_jobs` (still no UPDATE/DELETE on jobs, no DELETE
-on documents; `deploy/verify-db-roles.sh` checks both). Deploy order: web (migrates at startup) → worker.
+parent_document_id, page_number)` for pages); `ocr_worker` gains `INSERT` on `documents`, `document_runs` and
+`extraction_jobs` — and no read right on `extraction_jobs` (its job INSERT has no RETURNING / ON CONFLICT), no UPDATE/DELETE
+on jobs, no DELETE on documents; `deploy/verify-db-roles.sh` checks all of them (`worker:no-select-extraction-jobs` with
+`has_any_column_privilege`). Deploy order: Local AI v3.1, then **stop the old worker** (a multi-page PDF it read while the
+new web is live would be read page 1 only and could never be split), web (migrates at startup), worker. The worker refuses
+to start (`SCHEMA_NOT_READY`, exit 1, Docker restarts it) until `schema_migrations` holds `0018_multipage_documents`
+(`REQUIRED_SCHEMA_VERSION`): on an older schema every claimed job would fail with 42703. A worker rollback with page jobs
+still queued is safe because the Local AI decodes a `*.pdf`-named image by its bytes (older workers send page images under
+the parent's name).
 
 **Worker split** (`services/ocr-worker/src/split.ts`). A job whose document is a top-level PDF in status CLEAN or
 PROCESSING is split instead of sent to the OCR API (decided from the document, not a job kind, so an old web works and
@@ -370,16 +377,26 @@ retrying a FAILED PDF re-splits it). `pdfinfo` first: a PDF that needs a passwor
 `OCR_MAX_PDF_PAGES` pages (default 300, 1..1000) → `PDF_TOO_MANY_PAGES`, a page side over 14,400 pt →
 `PDF_PAGE_TOO_LARGE`, unreadable or without pages → `PDF_RENDER_FAILED` (all: job DEAD, parent FAILED with `CODE: detail`,
 Retry allowed). A permissions-only encrypted PDF (empty user password) opens without a password and is rendered. Then
-`page_count` is set, and pages are rendered in chunks of 10 (`pdftoppm -scale-to 1610`, PNG — or JPEG q95 with
-`OCR_PAGE_FORMAT=jpeg`) into `${OCR_STORAGE_ROOT}/tmp/split-<jobId>/` (removed afterwards; the retention job also cleans
-`tmp`). Each page is stored under the deterministic key `mintOriginalKey(tenant, sha256("page:"+parentId+":"+n).slice(0,32))`
+`page_count` is set, and pages are rendered in chunks of 10 into `${OCR_STORAGE_ROOT}/tmp/split-<jobId>/` (removed
+afterwards; the retention job also cleans `tmp`) with `pdftoppm -cropbox` (the CropBox, as pdfinfo measures it and the
+Local AI's pdfium renders it) and a per-page size from `pdfinfo` + `pdfimages -list` (`pageRenderPlans`): a plain scan page
+(its only image spans the page within 2 %, no /Rotate, ≤ 1610 px) pixel for pixel (`-rx/-ry` a hair under the image's own
+resolution: the page image is the scan's own pixels — all 95 real pages bit-identical to their JPEG decode, so the A8
+numbers of the native JPEGs hold for the split pages); another scan at its own density (`-scale-to`, never upsampled,
+≤ 1610 px); any other page, or all pages when the listing fails, at `-scale-to 1610`. PNG by default (JPEG q95 with
+`OCR_PAGE_FORMAT=jpeg`: unvalidated — 81/95 checkbox-list pages on the real scans against 87/95 for PNG). Each page is stored under the deterministic key `mintOriginalKey(tenant, sha256("page:"+parentId+":"+n).slice(0,32))`
 and each chunk's page documents (status CLEAN, parent's filename, batch and created_at, `mime_type` image/png), runs and OCR
 jobs (priority `100 + (page - 1)`) are inserted in ONE transaction under `pg_advisory_xact_lock(hashtext('innovera_ocr:split'),
 hashtext(parentId))` with `ON CONFLICT DO NOTHING`, so a resumed split (lost lease, crash, retry) creates only missing pages.
 A page that does not render (the chunk call is retried page by page) gets a FAILED row (`PAGE_RENDER_FAILED`, no object, no
-job) so every page 1..N has a row. Last: parent `SPLIT` (refused as `SPLIT_INCOMPLETE` unless all N pages exist). pdfinfo
-and pdftoppm run through `execFile` (no shell) with a minimal environment, a wall-clock timeout (30 s / 120 s) and, via
-`prlimit`, 1 GiB address space and 120 s CPU per process. Pages are not re-scanned by ClamAV (renders of a scanned upload).
+job) so every page 1..N has a row. A failure of the host, not the PDF — renderer missing (ENOENT, or prlimit's exit 127/126
+"failed to execute"), scratch disk full (pdftoppm exits 0 with an empty or cut-off file; a JPEG without its EOI), a write /
+file-table / permission error, the staged source gone — is a retryable `PDF_RENDERER_UNAVAILABLE` for the whole job and
+writes no row of the failing chunk (the queue retries; a Retry of the parent resumes). Last: parent `SPLIT` (refused as
+`SPLIT_INCOMPLETE` unless all N pages exist). pdfinfo, pdfimages and pdftoppm run through `execFile` (no shell) with a
+minimal environment, a wall-clock timeout (30 s / 120 s per render call) and, via `prlimit`, 1 GiB address space and 120 s
+CPU per process; a whole split has a budget of `limits.jobProcessingBudgetMs` (30 min): every call gets at most the time
+left, and past it the split fails as non-retryable `PDF_RENDER_FAILED` (pages created so far stay; a Retry resumes). Pages are not re-scanned by ClamAV (renders of a scanned upload).
 A page job sends `page-0012.png` (`ocrUploadName`: the extension always matches the MIME type); a page whose object is
 missing is re-rendered from its PDF by its own OCR job before the OCR call. A job for an already SPLIT parent just finishes.
 
@@ -393,18 +410,20 @@ retry `100`, PDF page p `100 + (p - 1)`. `OCR_REQUEST_TIMEOUT` defaults to 300 s
 | Route | Change |
 |---|---|
 | `GET /api/documents` | items gain `parentDocumentId, pageNumber, pageCount, parentFilename` (null for non-pages); new query `parentId` (UUID, else 404 `DOCUMENT_NOT_FOUND`) lists the pages of one PDF; `SPLIT` parents are never rows; order `created_at DESC`, then the pages of one PDF together in page order; `q` also matches `header.formNumber.value` |
-| `GET /api/batches[/:id]` | gains `rows` (visible rows), `pages` (page rows so far), `pagesExpected` (sum of the PDFs' page counts), `splitting` (PDFs not split yet), `finished` (boolean). `expectedTotal`/`uploaded` count **files**, all status counters count **rows**. `finished = uploaded >= expectedTotal && queued + processing == 0 && a row completed`; `finishedAt` is set once finished. Capacity (`BATCH_FULL`) counts files only |
+| `GET /api/batches[/:id]` | gains `rows` (visible rows), `pages` (page rows so far), `pagesExpected` (sum of the PDFs' page counts), `splitting` (PDFs not split yet), `rowsExpected` (rows once every promised file arrived and every PDF is split: `rows` − PDFs still splitting whose page count is known + missing pages + missing files, so a 95-page PDF is 95 rows, also while it is split), `finished` (boolean). `expectedTotal`/`uploaded` count **files**, all status counters count **rows**. `finished = uploaded >= expectedTotal && queued + processing == 0 && a row completed`; `finishedAt` is set once finished. Capacity (`BATCH_FULL`) counts files only |
 | `GET /api/documents/:id/ocr` | gains `parentDocumentId, pageNumber, pageCount, parentFilename`; `status` may be `SPLIT` (a parent) |
-| `GET /api/documents/:id/content` | also serves a `SPLIT` parent's PDF (the UI opens `blob#page=N`); a page without an object → 404 `CONTENT_NOT_FOUND` |
+| `GET /api/documents/:id/content` | also serves a `SPLIT` parent's PDF (the UI opens `blob#page=N`); a page without an object → 404 `CONTENT_NOT_FOUND` (the UI says "render failed, press Retry" only for a FAILED `PAGE_RENDER_FAILED` page, "being re-rendered" for a queued page, else a neutral "original not found") |
 | `POST /api/documents/:id/retry` | a FAILED page is retryable even without a job (its render failed; the new job re-renders it); a FAILED PDF parent is split again (existing pages kept) |
 | `POST /api/documents` | 415 for DOCX/XLSX; the job's priority follows the batch position |
 
 `statusCategoryOf('SPLIT') = "split"` (never a list filter value). Summaries add `formNumber` and `branch`.
 
 **UI.** Page rows show "หน้า 12/95" (plus form number and branch) under the file name; a PDF being split shows
-"กำลังแยก PDF เป็นรายหน้า"; the batch strip shows files and rows separately ("ไฟล์ 1/1 · กำลังแยกหน้า 30/95 · อ่านเสร็จ 1 จาก 96
-แถว") and uses the server's `finished`; the drawer title is "file.pdf · หน้า 12/95" with "เปิด PDF ต้นฉบับ (หน้า 12)" (the
-parent's PDF at `#page=12` in the preview) and "ดูทุกหน้าของไฟล์นี้" (list filtered by `parentId`); a SPLIT parent opened
+"กำลังแยก PDF เป็นรายหน้า"; the batch strip shows files and rows separately ("ไฟล์ 1/1 · กำลังแยกหน้า 30/95 · อ่านเสร็จ 1 จาก 95
+แถว", the total from `rowsExpected`) and uses the server's `finished`; the drawer title is "file.pdf · หน้า 12/95" with "เปิด PDF ต้นฉบับ (หน้า 12)" (the
+parent's PDF at `#page=12` in the preview; every toggle, reopen or close aborts the previous preview load, so a slow PDF
+never replaces the preview shown after it and no blob URL leaks; a preview that found no file is loaded again once a Retry
+has re-rendered and read the page) and "ดูทุกหน้าของไฟล์นี้" (list filtered by `parentId`); a SPLIT parent opened
 by link says "ไฟล์นี้ถูกแยกเป็น N หน้า"; the editor shows the header section (form number, date, time) and the branch when
 the result has them; split error codes are shown in Thai.
 

@@ -85,10 +85,11 @@ export type ReviewStore = DocumentStore & Readonly<{
  * `expectedTotal` and `uploaded` count FILES (top-level documents: what the client promised and sent). Every other counter
  * counts visible ROWS: an image is one row, a PDF becomes one row per page once split (the SPLIT parent is no row; while it
  * is being split it is one queued/processing row). `pages` = page rows created so far, `pagesExpected` = sum of the PDFs'
- * page counts, `splitting` = PDFs not split yet.
+ * page counts, `splitting` = PDFs not split yet. `rowsExpected` = the rows the batch will have once every promised file
+ * arrived and every PDF is split: a PDF whose page count is known counts as its pages, not also as its own row.
  */
 export type BatchSummary = { batchId: string; label: string | null; createdAt: string; expectedTotal: number;
-  uploaded: number; rows: number; pages: number; pagesExpected: number; splitting: number;
+  uploaded: number; rows: number; pages: number; pagesExpected: number; splitting: number; rowsExpected: number;
   queued: number; processing: number; succeeded: number; needsReview: number;
   failed: number; confirmed: number; completed: number /* succeeded+needsReview+failed */;
   /** Every promised file arrived and no row is queued or processing (so every page exists and was read). */
@@ -202,6 +203,7 @@ const BATCH_SELECT = `SELECT b.id, b.label, b.created_at, b.expected_total, now(
   count(d.id) FILTER (WHERE d.parent_document_id IS NOT NULL)::int AS pages,
   COALESCE(sum(d.page_count) FILTER (WHERE d.parent_document_id IS NULL), 0)::int AS pages_expected,
   count(d.id) FILTER (WHERE d.parent_document_id IS NULL AND d.mime_type = 'application/pdf' AND d.status IN ('VALIDATING','SCANNING','CLEAN','PROCESSING'))::int AS splitting,
+  count(d.id) FILTER (WHERE d.parent_document_id IS NULL AND d.page_count IS NOT NULL AND d.status IN ('VALIDATING','SCANNING','CLEAN','PROCESSING'))::int AS splitting_counted,
   count(d.id) FILTER (WHERE d.status IN ('VALIDATING','SCANNING','CLEAN'))::int AS queued,
   count(d.id) FILTER (WHERE d.status = 'PROCESSING')::int AS processing,
   count(d.id) FILTER (WHERE d.status = 'SUCCEEDED')::int AS succeeded,
@@ -243,6 +245,9 @@ export function toBatchSummary(row: Row): BatchSummary {
   const uploaded = num(row.uploaded), succeeded = num(row.succeeded), needsReview = num(row.needs_review), failed = num(row.failed);
   const queued = num(row.queued), processing = num(row.processing);
   const completed = succeeded + needsReview + failed;
+  const rows = num(row.rows), pages = num(row.pages), pagesExpected = num(row.pages_expected);
+  // A PDF being split is a row now and becomes its pages: once its page count is known it is counted as those pages only.
+  const rowsExpected = rows - num(row.splitting_counted) + Math.max(0, pagesExpected - pages) + Math.max(0, expectedTotal - uploaded);
   const lastCompleted = ms(row.last_completed_at);
   const now = ms(row.db_now) ?? Date.now();
   const finished = uploaded >= expectedTotal && queued + processing === 0 && lastCompleted !== null;
@@ -255,7 +260,7 @@ export function toBatchSummary(row: Row): BatchSummary {
   const durationMs = uploaded > 0 ? Math.max(0, end - createdAt) : null;
   const throughputPerMinute = completed > 0 && durationMs !== null && durationMs > 0 ? Math.round((completed / (durationMs / 60_000)) * 100) / 100 : null;
   return { batchId: String(row.id), label: str(row.label), createdAt: iso(row.created_at) ?? "", expectedTotal, uploaded,
-    rows: num(row.rows), pages: num(row.pages), pagesExpected: num(row.pages_expected), splitting: num(row.splitting),
+    rows, pages, pagesExpected, splitting: num(row.splitting), rowsExpected,
     queued, processing, succeeded, needsReview, failed, confirmed: num(row.confirmed), completed,
     finished, finishedAt: finished ? iso(row.last_completed_at) : null, durationMs, throughputPerMinute };
 }
