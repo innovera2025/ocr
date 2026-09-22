@@ -1,5 +1,7 @@
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { limits } from "@innovera/ocr-config";
-import { OcrClient, OcrClientError, readOcrTimings, type OcrResponse } from "@innovera/ocr-client";
+import { OcrClient, OcrClientError, readLayoutDetection, readOcrTimings, type OcrResponse } from "@innovera/ocr-client";
 import { hasReviewFields, toStructuredResult, type DocumentStore, type WorkerDocument } from "@innovera/ocr-persistence";
 import type { LocalStorage } from "@innovera/ocr-storage/local";
 import { PostgresQueue, type ClaimedJob, type FinishOutcome, type FinishResult } from "@innovera/ocr-queue/postgres";
@@ -8,6 +10,9 @@ import { assertDatabaseReady, createDatabasePool } from "@innovera/ocr-db-runtim
 import { PostgresOcrDocumentStore } from "@innovera/ocr-persistence";
 import { createLocalStorage } from "@innovera/ocr-storage/local";
 import { logEvent, metrics } from "@innovera/ocr-observability";
+import { childStorageKey, createPopplerRenderer, isSplitTarget, ocrUploadName, PdfSplitError, readOrRenderPage, splitPdf, type PageFormat, type PdfRenderer, type SplitStore } from "./split.js";
+
+export * from "./split.js";
 
 export type ExtractionPayloadV1 = Readonly<{
   schemaVersion: 1;
@@ -21,6 +26,8 @@ export type ExtractionPayloadV1 = Readonly<{
 export type WorkerResult = Readonly<{ status: "disabled"; reason: "ocr-runtime-not-installed" }>;
 
 export type OcrJobResult = Readonly<{ status: "SUCCEEDED" | "NEEDS_REVIEW"; ocrDocumentId: string }>;
+/** What a job did: read by the OCR API, or split into page documents (a PDF). */
+type JobOutcome = Readonly<{ status: "SUCCEEDED" | "NEEDS_REVIEW" | "SPLIT"; pages?: number }>;
 
 export type { FinishOutcome, FinishResult };
 /** Structural view of PostgresQueue used by the job loops (fakes in tests). */
@@ -29,8 +36,9 @@ export type WorkerQueue = Readonly<{
   heartbeat(jobId: string, leaseToken: string): Promise<boolean>;
   finishDetailed(jobId: string, leaseToken: string, outcome: FinishOutcome, error?: string): Promise<FinishResult>;
 }>;
-/** Structural view of PostgresOcrDocumentStore used by the job loops. */
-export type WorkerStore = DocumentStore & Readonly<{
+/** Structural view of PostgresOcrDocumentStore used by the job loops (incl. the PDF split, see split.ts). */
+export type WorkerStore = DocumentStore & SplitStore & Readonly<{
+  setPageObject(tenantId: string, documentId: string, storageKey: string, sizeBytes: number, contentHash: string): Promise<void>;
   getWorkerDocument(runId: string, tenantId: string): Promise<WorkerDocument | null>;
   markProcessing(tenantId: string, documentId: string): Promise<void>;
   markFailure(tenantId: string, documentId: string, message: string): Promise<void>;
@@ -41,7 +49,12 @@ export type WorkerStore = DocumentStore & Readonly<{
 export type WorkerOutbox = Readonly<{ recoverExpired(): Promise<number>; dispatchOnce(sender: ConfirmSender): Promise<OutboxDispatchResult> }>;
 /** `healthCheck` (GET /health) is probed before claiming again after the OCR API was unreachable. */
 export type WorkerOcrClient = Pick<OcrClient, "processDocument"> & Partial<Pick<OcrClient, "healthCheck">>;
-export type WorkerDependencies = Readonly<{ queue: WorkerQueue; store: WorkerStore; storage: LocalStorage; ocrClient: WorkerOcrClient; heartbeatMs?: number }>;
+/**
+ * `renderer` splits PDFs (poppler in production); `tmpRoot` is the scratch directory for renders (default: the OS temp
+ * directory); `maxPdfPages` the page limit of one PDF (default `limits.maxOcrPagesPerDocument`).
+ */
+export type WorkerDependencies = Readonly<{ queue: WorkerQueue; store: WorkerStore; storage: LocalStorage; ocrClient: WorkerOcrClient; heartbeatMs?: number;
+  renderer?: PdfRenderer; tmpRoot?: string; maxPdfPages?: number }>;
 export type MaintenanceDependencies = Readonly<{ queue: Readonly<{ recoverExpired(): Promise<number> }>; outbox: WorkerOutbox; sendConfirmation: ConfirmSender }>;
 export type WorkerLoopOptions = Readonly<{ concurrency?: number; idleMs?: number; maintenanceMs?: number; maxBackoffMs?: number; outboxBatch?: number }>;
 export type WorkerLoops = Readonly<{ concurrency: number; done: Promise<void>; stop(): Promise<void> }>;
@@ -66,6 +79,17 @@ export function runDeterministicOcr(_payload: ExtractionPayloadV1): WorkerResult
   return { status: "disabled", reason: "ocr-runtime-not-installed" };
 }
 
+/** OCR_MAX_PDF_PAGES: pages allowed in one PDF, integer clamped to 1..1000 (the 0018 CHECK); anything else → 300. */
+export function pdfPageLimit(value: string | undefined = process.env.OCR_MAX_PDF_PAGES): number {
+  const parsed = value === undefined || value.trim() === "" ? Number.NaN : Number(value);
+  return Number.isInteger(parsed) ? Math.min(1000, Math.max(1, parsed)) : limits.maxOcrPagesPerDocument;
+}
+
+/** OCR_PAGE_FORMAT: `png` (default, lossless like the validated path) or `jpeg` (q95, about a third of the disk). */
+export function pageFormat(value: string | undefined = process.env.OCR_PAGE_FORMAT): PageFormat {
+  return value?.trim().toLowerCase() === "jpeg" ? "jpeg" : "png";
+}
+
 /** OCR_WORKER_CONCURRENCY: integer job loops, clamped to 1..8; anything else → 2. */
 export function workerConcurrency(value: string | undefined = process.env.OCR_WORKER_CONCURRENCY): number {
   const parsed = value === undefined || value.trim() === "" ? Number.NaN : Number(value);
@@ -76,12 +100,13 @@ function errorText(error: unknown, fallback: string): string {
   return (error instanceof Error && error.message ? error.message : fallback).slice(0, 1000);
 }
 
+/** `loadFile` replaces the plain storage read (a page whose object is missing is re-rendered from its PDF first). */
 export async function processOcrJob(
   payload: ExtractionPayloadV1,
-  dependencies: Readonly<{ storage: LocalStorage; ocrClient: Pick<OcrClient, "processDocument">; documentStore: DocumentStore }>
+  dependencies: Readonly<{ storage: LocalStorage; ocrClient: Pick<OcrClient, "processDocument">; documentStore: DocumentStore; loadFile?: () => Promise<Uint8Array> }>
 ): Promise<OcrJobResult> {
   validatePayload(payload);
-  const file = await dependencies.storage.get(payload.sourceKey);
+  const file = dependencies.loadFile ? await dependencies.loadFile() : await dependencies.storage.get(payload.sourceKey);
   const startedAt = Date.now();
   let result: OcrResponse;
   try {
@@ -106,15 +131,20 @@ export async function processOcrJob(
   const status = needsReview ? "NEEDS_REVIEW" : "SUCCEEDED";
   const timings = readOcrTimings(result);
   if (timings.inferenceMs !== undefined) metrics.increment("ocr_inference_ms_sum", {}, timings.inferenceMs);
-  logEvent("ocr_completed", { document_id: payload.documentId, tenant_id: payload.organizationId, status, ocr_ms: ocrMs, inference_ms: timings.inferenceMs, inference_wall_ms: timings.inferenceWallMs, engine_total_ms: timings.totalMs });
+  // v3.1 template verdict (fitted registration): monitored so pages that are not the known form show up (design §2.6).
+  const detection = readLayoutDetection(result);
+  if (detection) metrics.increment("ocr_template_verdict_total", { verdict: detection.verdict });
+  logEvent("ocr_completed", { document_id: payload.documentId, tenant_id: payload.organizationId, status, ocr_ms: ocrMs, inference_ms: timings.inferenceMs, inference_wall_ms: timings.inferenceWallMs, engine_total_ms: timings.totalMs,
+    template_verdict: detection?.verdict, template_score: detection?.score });
   return { status, ocrDocumentId: result.documentId };
 }
 
 async function failJob(dependencies: WorkerDependencies, claimed: ClaimedJob, document: WorkerDocument | null, error: unknown, startedAt: number, forceDead = false): Promise<void> {
   const message = errorText(error, "OCR_WORKER_FAILED");
-  // A non-retryable 4xx from the OCR API (bad input) will not heal on retry. "malformed" stays retryable:
-  // a body cut off mid-stream surfaces the same way.
-  const outcome: FinishOutcome = forceDead || (error instanceof OcrClientError && error.code === "http" && !error.retryable) ? "DEAD" : "FAILED";
+  // A non-retryable 4xx from the OCR API (bad input) will not heal on retry, nor will a PDF that cannot be split
+  // (encrypted, too many pages, unreadable). "malformed" stays retryable: a body cut off mid-stream surfaces the same way.
+  const outcome: FinishOutcome = forceDead || (error instanceof OcrClientError && error.code === "http" && !error.retryable)
+    || (error instanceof PdfSplitError && !error.retryable) ? "DEAD" : "FAILED";
   metrics.increment("jobs_failed");
   const finished = await dependencies.queue.finishDetailed(claimed.jobId, claimed.leaseToken, outcome, message);
   const fields = { job_id: claimed.jobId, tenant_id: claimed.organizationId, document_id: document?.documentId, error: message.slice(0, 200) };
@@ -161,17 +191,40 @@ export async function runWorkerOnce(dependencies: WorkerDependencies): Promise<b
     await failJob(dependencies, claimed, null, new Error("DOCUMENT_NOT_FOUND"), startedAt, true);
     return true;
   }
+  if (document.status === "SPLIT" && document.parentDocumentId === null) {
+    // Already split (the job of a split that finished just before its lease was lost): nothing is left to do.
+    const finished = await queue.finishDetailed(claimed.jobId, claimed.leaseToken, "SUCCEEDED");
+    logEvent("pdf_split_already_done", { job_id: claimed.jobId, tenant_id: document.organizationId, document_id: document.documentId, accepted: finished.accepted });
+    return true;
+  }
+  const split = isSplitTarget(document);
+  const tmpRoot = dependencies.tmpRoot ?? join(tmpdir(), "innovera-ocr");
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
-  let result: OcrJobResult;
+  let leaseLost = false;
+  let result: JobOutcome;
   try {
     await store.markProcessing(document.organizationId, document.documentId);
     heartbeatTimer = setInterval(() => {
-      void queue.heartbeat(claimed.jobId, claimed.leaseToken).catch(() => undefined);
+      void queue.heartbeat(claimed.jobId, claimed.leaseToken).then((alive) => { if (!alive) leaseLost = true; }).catch(() => undefined);
     }, dependencies.heartbeatMs ?? HEARTBEAT_MS);
-    result = await processOcrJob(
-      { schemaVersion: 1, documentId: document.documentId, organizationId: document.organizationId, sourceKey: document.sourceKey, filename: document.filename, mimeType: document.mimeType },
-      { storage: dependencies.storage, ocrClient: dependencies.ocrClient, documentStore: store }
-    );
+    if (split) {
+      if (!dependencies.renderer) throw new PdfSplitError("PDF_RENDERER_UNAVAILABLE", "no renderer configured", true);
+      const pages = await splitPdf({ store, storage: dependencies.storage, renderer: dependencies.renderer, tmpRoot, maxPages: dependencies.maxPdfPages ?? limits.maxOcrPagesPerDocument, leaseLost: () => leaseLost },
+        claimed.jobId, document);
+      metrics.increment("pdf_pages_created_total", {}, pages.created);
+      if (pages.failedPages.length > 0) metrics.increment("pdf_page_render_failures_total", {}, pages.failedPages.length);
+      logEvent("pdf_split_completed", { job_id: claimed.jobId, tenant_id: document.organizationId, document_id: document.documentId, pages: pages.pageCount,
+        created: pages.created, existing: pages.existing, failed_pages: pages.failedPages.length, split_ms: pages.renderMs,
+        ms_per_page: pages.created > 0 ? Math.round(pages.renderMs / pages.created) : 0 });
+      result = { status: "SPLIT", pages: pages.pageCount };
+    } else {
+      const sourceKey = document.sourceKey ?? (document.parentDocumentId && document.pageNumber ? childStorageKey(document.organizationId, document.parentDocumentId, document.pageNumber) : "");
+      result = await processOcrJob(
+        { schemaVersion: 1, documentId: document.documentId, organizationId: document.organizationId, sourceKey, filename: ocrUploadName(document), mimeType: document.mimeType },
+        { storage: dependencies.storage, ocrClient: dependencies.ocrClient, documentStore: store,
+          loadFile: () => readOrRenderPage({ storage: dependencies.storage, renderer: dependencies.renderer, tmpRoot, store }, claimed.jobId, document) }
+      );
+    }
   } catch (error) {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     await failJob(dependencies, claimed, document, error, startedAt);
@@ -341,10 +394,14 @@ export async function startWorkerRuntime(): Promise<() => Promise<void>> {
   const queue = new PostgresQueue(queuePool, pool);
   const outbox = new PostgresConfirmOutbox(pool, process.env.OCR_WORKER_ID ?? undefined);
   const store = new PostgresOcrDocumentStore(pool);
-  const storage = createLocalStorage(process.env.OCR_STORAGE_ROOT ?? "/var/lib/ocr");
   const ocrClient = OcrClient.fromConfig();
-  const loops = startWorkerLoops({ queue, store, storage, ocrClient, outbox, sendConfirmation: confirmSender(ocrClient) }, { concurrency: workerConcurrency() });
-  logEvent("worker_started", { concurrency: loops.concurrency });
+  const storageRoot = process.env.OCR_STORAGE_ROOT ?? "/var/lib/ocr";
+  const storage = createLocalStorage(storageRoot);
+  const renderer = createPopplerRenderer({ format: pageFormat() });
+  const maxPdfPages = pdfPageLimit();
+  const loops = startWorkerLoops({ queue, store, storage, ocrClient, outbox, sendConfirmation: confirmSender(ocrClient), renderer, tmpRoot: join(storageRoot, "tmp"), maxPdfPages },
+    { concurrency: workerConcurrency() });
+  logEvent("worker_started", { concurrency: loops.concurrency, max_pdf_pages: maxPdfPages, page_format: renderer.format });
   let stopping: Promise<void> | undefined;
   return () => stopping ??= (async () => {
     // Let in-flight jobs finish briefly; an unfinished lease expires and is recovered by another worker.

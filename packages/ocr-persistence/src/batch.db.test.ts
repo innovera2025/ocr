@@ -8,16 +8,16 @@
  * deploy/sql/queue-definer.sql as superuser, exercises the app/worker/queue roles and drops the database.
  */
 import assert from "node:assert/strict";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { Pool } from "pg";
-import { hasReviewFields, PostgresOcrDocumentStore, toStructuredResult, type DocumentView } from "./index.js";
+import { hasReviewFields, PostgresOcrDocumentStore, toStructuredResult, type DocumentView, type PageDocumentInput } from "./index.js";
 
 type Claimed = { jobId: string; organizationId: string; runId: string; kind: string; leaseToken: string };
 type Queue = {
-  enqueue(input: { organizationId: string; runId: string }): Promise<string>;
+  enqueue(input: { organizationId: string; runId: string; priority?: number }): Promise<string>;
   claim(now?: Date): Promise<Claimed | null>;
   heartbeat(jobId: string, leaseToken: string, now?: Date): Promise<boolean>;
   finishDetailed(jobId: string, leaseToken: string, outcome: "SUCCEEDED" | "FAILED" | "DEAD", error?: string): Promise<{ accepted: boolean; finalStatus: string | null }>;
@@ -165,8 +165,8 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     const created = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3, label: " Morning intake " });
     batchA = created.batchId;
     const { batchId: _id, createdAt: _created, ...counters } = created;
-    assert.deepEqual(counters, { label: "Morning intake", expectedTotal: 3, uploaded: 0, queued: 0, processing: 0,
-      succeeded: 0, needsReview: 0, failed: 0, confirmed: 0, completed: 0, finishedAt: null, durationMs: null, throughputPerMinute: null });
+    assert.deepEqual(counters, { label: "Morning intake", expectedTotal: 3, uploaded: 0, rows: 0, pages: 0, pagesExpected: 0, splitting: 0, queued: 0, processing: 0,
+      succeeded: 0, needsReview: 0, failed: 0, confirmed: 0, completed: 0, finished: false, finishedAt: null, durationMs: null, throughputPerMinute: null });
     assert.ok(Date.parse(created.createdAt) > 0);
     batchB = (await app.createBatch(TENANT_B, { createdBy: "user-b", expectedTotal: 1 })).batchId;
     assert.deepEqual(await app.getBatch(TENANT_A, batchA), created);
@@ -258,7 +258,7 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     const review = await app.listDocuments(TENANT_A, { status: "review" });
     assert.deepEqual(review.documents.map((item) => item.documentId), [docs.d2!.documentId]);
     assert.deepEqual(review.documents[0]!.summary, { customerName: "Chun Li", gender: "Female", nationality: null,
-      treatments: [{ name: "นวดไทย", duration: "90 นาที" }, { name: null, duration: "60 นาที" }], therapist: null, room: "12", minConfidence: 0.41, reviewFieldCount: 2 });
+      treatments: [{ name: "นวดไทย", duration: "90 นาที" }, { name: null, duration: "60 นาที" }], therapist: null, room: "12", formNumber: null, branch: null, minConfidence: 0.41, reviewFieldCount: 2 });
     assert.deepEqual([review.documents[0]!.batchId, review.documents[0]!.needsReview, review.documents[0]!.deliveryStatus, review.documents[0]!.mimeType], [batchA, true, "NONE", "image/png"]);
     assert.deepEqual((await app.listDocuments(TENANT_A, { q: "chun LI" })).documents.map((item) => item.documentId), [docs.d2!.documentId]);
     assert.deepEqual((await app.listDocuments(TENANT_A, { q: "anna" })).documents.map((item) => item.documentId), [docs.d1!.documentId]);
@@ -607,5 +607,189 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     for (const value of ["Som\u0000chai", "Som\ud800chai"]) {
       await assert.rejects(app.saveReview(TENANT_A, docs.d2!.documentId, { structuredResult: { customerInformation: { name: { value } } }, reviewedBy: "user-a" }), { message: "REVIEW_INVALID" });
     }
+  });
+  // ---- multi-page PDFs (migration 0018, release 1 B1–B4) ------------------------------------------------------------
+
+  const pageKey = (tenantId: string, publicId: string) => `org/${tenantId}/original/${publicId.slice(0, 2)}/${publicId}`;
+  const publicIdOf = (parentId: string, page: number) => createHash("sha256").update(`page:${parentId}:${page}`).digest("hex").slice(0, 32);
+  /** Inputs of pages `numbers` of `parentId`; pages in `failed` did not render (no object). */
+  const pageInputs = (tenantId: string, parentId: string, numbers: number[], failed: number[] = []): PageDocumentInput[] => numbers.map((pageNumber) => {
+    const publicId = publicIdOf(parentId, pageNumber);
+    return failed.includes(pageNumber) ? { pageNumber, publicId, storageKey: null, mimeType: "image/png", sizeBytes: null, contentHash: null }
+      : { pageNumber, publicId, storageKey: pageKey(tenantId, publicId), mimeType: "image/png", sizeBytes: 1000 + pageNumber, contentHash: "c".repeat(64) };
+  });
+  async function uploadFile(tenantId: string, filename: string, mimeType: string, batchId?: string) {
+    const doc = await app.createUploadedDocument({ tenantId, filename, mimeType, sizeBytes: 4242, contentHash: "p".repeat(64), storageKey: `org/${tenantId}/original/cd/${randomBytes(16).toString("hex")}`, ...(batchId ? { batchId } : {}) });
+    await app.updateScanStatus(tenantId, doc.documentId, "CLEAN");
+    return doc;
+  }
+  async function asWorker<T>(tenantId: string, sql: string, values: unknown[] = []): Promise<T[]> {
+    const client = await workerPool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT set_config('app.current_org', $1, true)", [tenantId]);
+      const result = await client.query(sql, values);
+      await client.query("COMMIT");
+      return result.rows as T[];
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+  async function pagesOf(parentId: string) {
+    return (await superDb.query<{ page_number: number; status: string; storage_key: string | null; filename: string; batch_id: string | null; created_at: Date; page_count: number;
+      size_bytes: string; content_hash: string; error_message: string | null; runs: number; jobs: number; priorities: number[] | null }>(
+      `SELECT d.page_number, d.status::text AS status, d.storage_key, d.filename, d.batch_id, d.created_at, d.page_count, d.size_bytes, d.content_hash, d.error_message,
+              (SELECT count(*)::int FROM document_runs r WHERE r.document_id = d.id) AS runs,
+              (SELECT count(*)::int FROM extraction_jobs j JOIN document_runs r ON r.id = j.run_id WHERE r.document_id = d.id) AS jobs,
+              (SELECT array_agg(j.priority ORDER BY j.created_at) FROM extraction_jobs j JOIN document_runs r ON r.id = j.run_id WHERE r.document_id = d.id) AS priorities
+       FROM documents d WHERE d.parent_document_id = $1 ORDER BY d.page_number`, [parentId])).rows;
+  }
+  const split: Record<string, { documentId: string; runId: string }> = {};
+
+  test("0018 applies after 0017: SPLIT status, page columns, same-tenant FK, shape CHECK, and exactly the new worker rights", async () => {
+    assert.deepEqual(applied.slice(-2), ["0017_batch_processing", "0018_multipage_documents"]);
+    assert.equal((await superDb.query("SELECT 'SPLIT'::document_status AS s")).rows[0].s, "SPLIT");
+    const table = async (role: string, name: string, privilege: string) => (await superDb.query<{ ok: boolean }>("SELECT has_table_privilege($1, $2, $3) AS ok", [role, name, privilege])).rows[0]!.ok;
+    const column = async (role: string, name: string, col: string) => (await superDb.query<{ ok: boolean }>("SELECT has_column_privilege($1, $2, $3, 'SELECT') AS ok", [role, name, col])).rows[0]!.ok;
+    assert.deepEqual(await Promise.all([table("ocr_worker", "documents", "INSERT"), table("ocr_worker", "document_runs", "INSERT"), table("ocr_worker", "extraction_jobs", "INSERT")]), [true, true, true]);
+    assert.deepEqual(await Promise.all([table("ocr_worker", "extraction_jobs", "UPDATE"), table("ocr_worker", "extraction_jobs", "DELETE"), table("ocr_worker", "extraction_jobs", "SELECT"),
+      table("ocr_worker", "documents", "DELETE"), table("ocr_app", "extraction_jobs", "UPDATE"), table("ocr_queue", "extraction_jobs", "SELECT"), table("ocr_queue", "documents", "INSERT")]),
+      [false, false, false, false, false, false, false]);
+    assert.deepEqual(await Promise.all(["id", "organization_id", "run_id", "status", "priority", "lease_token_hash"].map((col) => column("ocr_worker", "extraction_jobs", col))), [true, true, true, false, false, false]);
+    const functions = await superDb.query<{ proname: string }>("SELECT proname FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND prokind = 'f' AND proname LIKE 'ocr%' ORDER BY proname");
+    assert.deepEqual(functions.rows.map((row) => row.proname), ["ocr_claim_confirm_outbox_v1", "ocr_claim_v1", "ocr_finish_confirm_outbox_v1", "ocr_finish_retry_v1", "ocr_finish_v1",
+      "ocr_heartbeat_v1", "ocr_recover_confirm_outbox_v1", "ocr_recover_expired_v1"], "0018 created no function");
+    // CHECK: a page number needs a parent and vice versa; bounds 1..1000.
+    const parent = await uploadFile(TENANT_A, "shape.pdf", "application/pdf");
+    for (const [parentId, page, count] of [[null, 1, null], [parent.documentId, null, 3], [parent.documentId, 0, 3], [parent.documentId, 1, 1001]] as const) {
+      await assert.rejects(superDb.query(`INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, parent_document_id, page_number, page_count)
+        VALUES (gen_random_uuid(), $1, $2, 'CLEAN', 'x.png', 'image/png', 1, 'h', $3, $4, $5)`, [TENANT_A, randomBytes(16).toString("hex"), parentId, page, count]), { code: "23514" });
+    }
+  });
+
+  test("the worker creates pages, runs and jobs for tenant A; tenant B is refused (parent lookup, RLS, composite FK); nothing else is writable", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 2 });
+    const parent = await uploadFile(TENANT_A, "intake-12.pdf", "application/pdf", batch.batchId);
+    split.parent = parent;
+    await worker.markProcessing(TENANT_A, parent.documentId);
+    await worker.setPageCount(TENANT_A, parent.documentId, 5);
+    assert.deepEqual(await worker.createPageDocuments(TENANT_A, parent.documentId, 5, pageInputs(TENANT_A, parent.documentId, [1, 2, 3])), { created: [1, 2, 3], existing: [] });
+    const parentRow = (await superDb.query("SELECT created_at, batch_id FROM documents WHERE id = $1", [parent.documentId])).rows[0];
+    const pages = await pagesOf(parent.documentId);
+    assert.deepEqual(pages.map((page) => [page.page_number, page.status, page.filename, page.batch_id, page.page_count, page.runs, page.jobs, page.priorities]),
+      [[1, "CLEAN", "intake-12.pdf", batch.batchId, 5, 1, 1, [100]], [2, "CLEAN", "intake-12.pdf", batch.batchId, 5, 1, 1, [101]], [3, "CLEAN", "intake-12.pdf", batch.batchId, 5, 1, 1, [102]]]);
+    assert.ok(pages.every((page) => page.created_at.getTime() === parentRow.created_at.getTime()), "pages carry the parent's created_at (they list where the upload was)");
+    assert.equal(pages[1]!.storage_key, pageKey(TENANT_A, publicIdOf(parent.documentId, 2)));
+    await assert.rejects(worker.createPageDocuments(TENANT_B, parent.documentId, 5, pageInputs(TENANT_B, parent.documentId, [4])), { message: "DOCUMENT_NOT_FOUND" });
+    const insert = (org: string, parentId: string | null) => `INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, parent_document_id, page_number, page_count)
+      VALUES (gen_random_uuid(), '${org}', '${randomBytes(16).toString("hex")}', 'CLEAN', 'x.png', 'image/png', 1, 'h', ${parentId ? `'${parentId}'` : "NULL"}, ${parentId ? 4 : "NULL"}, ${parentId ? 5 : "NULL"})`;
+    await assert.rejects(asWorker(TENANT_B, insert(TENANT_A, parent.documentId)), /row-level security/, "RLS: a row for another tenant is rejected");
+    await assert.rejects(asWorker(TENANT_B, insert(TENANT_B, parent.documentId)), { code: "23503" }, "composite FK: a page never points at another tenant's parent");
+    const runId = (await asWorker<{ id: string }>(TENANT_A, "SELECT id FROM document_runs WHERE document_id = $1", [parent.documentId]))[0]!.id;
+    await assert.rejects(asWorker(TENANT_B, "INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status) VALUES (gen_random_uuid(), $1, $2, 'OCR', 'PENDING')", [TENANT_A, runId]), /row-level security/);
+    await assert.rejects(asWorker(TENANT_A, "UPDATE extraction_jobs SET priority = 1"), { code: "42501" });
+    await assert.rejects(asWorker(TENANT_A, "SELECT status FROM extraction_jobs"), { code: "42501" });
+    await assert.rejects(asWorker(TENANT_A, "DELETE FROM documents WHERE id = $1", [parent.documentId]), { code: "42501" });
+    assert.equal((await asWorker(TENANT_B, "SELECT id FROM documents WHERE parent_document_id = $1", [parent.documentId])).length, 0);
+  });
+
+  test("a repeated or concurrent split creates no duplicate page, run or job; a page that did not render gets a FAILED row without a job", async () => {
+    const parentId = split.parent!.documentId;
+    assert.deepEqual(await worker.createPageDocuments(TENANT_A, parentId, 5, pageInputs(TENANT_A, parentId, [2, 3, 4, 5], [4])), { created: [4, 5], existing: [2, 3] });
+    const pages = await pagesOf(parentId);
+    assert.deepEqual(pages.map((page) => [page.page_number, page.status, page.runs, page.jobs]), [[1, "CLEAN", 1, 1], [2, "CLEAN", 1, 1], [3, "CLEAN", 1, 1], [4, "FAILED", 1, 0], [5, "CLEAN", 1, 1]]);
+    assert.deepEqual([pages[3]!.storage_key, pages[3]!.error_message, pages[3]!.size_bytes, pages[3]!.content_hash], [null, "PAGE_RENDER_FAILED", "4242", "p".repeat(64)], "a failed page carries its source's size and hash");
+    assert.deepEqual(await worker.existingPages(TENANT_A, parentId), [1, 2, 3, 4, 5]);
+    const other = await uploadFile(TENANT_A, "race.pdf", "application/pdf");
+    const results = await Promise.all([1, 2, 3].map(() => worker.createPageDocuments(TENANT_A, other.documentId, 4, pageInputs(TENANT_A, other.documentId, [1, 2, 3, 4]))));
+    assert.deepEqual(results.map((result) => result.created.length).sort(), [0, 0, 4], "the advisory lock + unique index let exactly one run create the pages");
+    assert.deepEqual((await pagesOf(other.documentId)).map((page) => [page.runs, page.jobs]), [[1, 1], [1, 1], [1, 1], [1, 1]]);
+    await assert.rejects(worker.markSplit(TENANT_A, parentId, 6), { message: "SPLIT_INCOMPLETE" });
+  });
+
+  test("batch counters: 1 file → N rows, capacity counts files, finished only after the last page; pages list in order; SPLIT hidden but served", async () => {
+    const parent = split.parent!;
+    const batchId = (await app.getReviewDocument(TENANT_A, parent.documentId))!.batchId!;
+    let summary = (await app.getBatch(TENANT_A, batchId))!;
+    assert.deepEqual([summary.uploaded, summary.rows, summary.pages, summary.pagesExpected, summary.splitting, summary.processing, summary.queued, summary.failed, summary.finished],
+      [1, 6, 5, 5, 1, 1, 4, 1, false], "the splitting parent is one processing row; 4 queued pages; the failed page is a finished row");
+    const image = await uploadFile(TENANT_A, "late-image.png", "image/png", batchId);
+    await assert.rejects(uploadFile(TENANT_A, "third.png", "image/png", batchId), { message: "BATCH_FULL" }, "2 files promised: pages never fill the batch");
+    await worker.markSplit(TENANT_A, parent.documentId, 5);
+    summary = (await app.getBatch(TENANT_A, batchId))!;
+    assert.deepEqual([summary.uploaded, summary.rows, summary.pages, summary.splitting, summary.queued, summary.processing, summary.finished], [2, 6, 5, 0, 5, 0, false]);
+    const listed = await app.listDocuments(TENANT_A, { batchId });
+    assert.deepEqual(listed.documents.map((item) => [item.filename, item.pageNumber, item.pageCount]),
+      [["late-image.png", null, null], ["intake-12.pdf", 1, 5], ["intake-12.pdf", 2, 5], ["intake-12.pdf", 3, 5], ["intake-12.pdf", 4, 5], ["intake-12.pdf", 5, 5]],
+      "the SPLIT parent is not a row; its pages sit together in page order where the upload was");
+    assert.equal(listed.total, 6);
+    assert.deepEqual([listed.documents[2]!.parentDocumentId, listed.documents[2]!.parentFilename, listed.documents[4]!.statusCategory, listed.documents[4]!.errorMessage], [parent.documentId, "intake-12.pdf", "failed", "PAGE_RENDER_FAILED"]);
+    const pagesOnly = await app.listDocuments(TENANT_A, { parentId: parent.documentId, limit: 2, offset: 2 });
+    assert.deepEqual([pagesOnly.total, pagesOnly.documents.map((item) => item.pageNumber)], [5, [3, 4]], "parentId filter + pagination");
+    assert.equal((await app.listDocuments(TENANT_B, { parentId: parent.documentId })).total, 0);
+    const parentView = (await app.getReviewDocument(TENANT_A, parent.documentId))!;
+    assert.deepEqual([parentView.status, parentView.pageCount, parentView.parentDocumentId], ["SPLIT", 5, null]);
+    assert.deepEqual(await app.getOriginal(TENANT_A, parent.documentId).then((original) => original && [original.status, original.mimeType, original.storageKey?.startsWith(`org/${TENANT_A}/original/`)]),
+      ["SPLIT", "application/pdf", true], "hidden from the list, still served (the original-PDF-page link)");
+    const page2Id = listed.documents[2]!.documentId;
+    const page2 = (await app.getReviewDocument(TENANT_A, page2Id))!;
+    assert.deepEqual([page2.parentDocumentId, page2.pageNumber, page2.pageCount, page2.parentFilename], [parent.documentId, 2, 5, "intake-12.pdf"]);
+    const page2Run = (await superDb.query<{ id: string }>("SELECT id FROM document_runs WHERE document_id = $1", [page2Id])).rows[0]!.id;
+    const workerView = (await worker.getWorkerDocument(page2Run, TENANT_A))!;
+    assert.deepEqual([workerView.status, workerView.mimeType, workerView.parentDocumentId, workerView.pageNumber, workerView.pageCount, workerView.batchId, workerView.sourceKey?.endsWith(publicIdOf(parent.documentId, 2))],
+      ["CLEAN", "image/png", parent.documentId, 2, 5, batchId, true]);
+    assert.equal(workerView.parentSourceKey, (await app.getOriginal(TENANT_A, parent.documentId))!.storageKey);
+    const failedRun = (await superDb.query<{ id: string }>("SELECT r.id FROM document_runs r JOIN documents d ON d.id = r.document_id WHERE d.parent_document_id = $1 AND d.page_number = 4", [parent.documentId])).rows[0]!.id;
+    assert.equal((await worker.getWorkerDocument(failedRun, TENANT_A))?.sourceKey, null, "a page without an object is still loadable (its job re-renders it)");
+    // Read every row (pages + image): only then is the batch finished.
+    const rows = listed.documents.filter((item) => item.status === "CLEAN");
+    for (const [index, item] of rows.entries()) {
+      await worker.markProcessing(TENANT_A, item.documentId);
+      await saveResult(TENANT_A, item.documentId, { ...cleanResponse, documentId: `local-${randomUUID()}` });
+      summary = (await app.getBatch(TENANT_A, batchId))!;
+      assert.equal(summary.finished, index === rows.length - 1, `finished after row ${index + 1} of ${rows.length}`);
+    }
+    assert.deepEqual([summary.completed, summary.succeeded, summary.failed, summary.rows], [6, 5, 1, 6]);
+    assert.ok(summary.finishedAt);
+    void image;
+  });
+
+  test("retry: a page whose render failed gets a job (re-rendered by it); a FAILED PDF parent re-splits; the new jobs have priority 100", async () => {
+    const parentId = split.parent!.documentId;
+    const failedPage = (await superDb.query<{ id: string }>("SELECT id FROM documents WHERE parent_document_id = $1 AND page_number = 4", [parentId])).rows[0]!.id;
+    const { jobId } = await app.retryDocument(TENANT_A, failedPage);
+    assert.deepEqual((await pagesOf(parentId))[3]!.priorities, [100]);
+    assert.deepEqual(await app.getReviewDocument(TENANT_A, failedPage).then((doc) => [doc?.status, doc?.errorMessage]), ["CLEAN", null]);
+    assert.ok(jobId);
+    await assert.rejects(app.retryDocument(TENANT_A, failedPage), { message: "DOCUMENT_NOT_RETRYABLE" });
+    await worker.setPageObject(TENANT_A, failedPage, pageKey(TENANT_A, publicIdOf(parentId, 4)), 777, "d".repeat(64));
+    assert.deepEqual(await superDb.query("SELECT storage_key, size_bytes::int AS size FROM documents WHERE id = $1", [failedPage]).then((result) => result.rows[0]), { storage_key: pageKey(TENANT_A, publicIdOf(parentId, 4)), size: 777 });
+    // A PDF whose split failed (job ended, parent FAILED) is retried like any failed document: its new job splits it again.
+    const pdf = await uploadFile(TENANT_A, "retry-me.pdf", "application/pdf");
+    await appQueue.enqueue({ organizationId: TENANT_A, runId: pdf.runId });
+    await worker.markFailure(TENANT_A, pdf.documentId, "PDF_RENDER_FAILED: pages 1-10 timed out");
+    await app.retryDocument(TENANT_A, pdf.documentId);
+    const view = (await worker.getWorkerDocument(pdf.runId, TENANT_A))!;
+    assert.deepEqual([view.status, view.mimeType, view.parentDocumentId, view.pageCount], ["CLEAN", "application/pdf", null, null], "a split target for the worker");
+    const scanFailed = await app.createUploadedDocument({ tenantId: TENANT_A, filename: "unscanned.pdf", mimeType: "application/pdf", sizeBytes: 1, contentHash: "h", storageKey: `org/${TENANT_A}/original/ef/${randomBytes(16).toString("hex")}` });
+    await app.updateScanStatus(TENANT_A, scanFailed.documentId, "FAILED", "SCAN_FAILED");
+    await assert.rejects(app.retryDocument(TENANT_A, scanFailed.documentId), { message: "DOCUMENT_NOT_RETRYABLE" }, "an unscanned upload is still never retried");
+  });
+
+  test("fair priority: ocr_claim_v1 claims pages in page order and a single upload ahead of the remaining pages", async () => {
+    const pdf = await uploadFile(TENANT_B, "priority.pdf", "application/pdf");
+    await worker.createPageDocuments(TENANT_B, pdf.documentId, 3, pageInputs(TENANT_B, pdf.documentId, [1, 2, 3]));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const single = await uploadFile(TENANT_B, "urgent.png", "image/png");
+    const singleJob = await appQueue.enqueue({ organizationId: TENANT_B, runId: single.runId });
+    const batched = await uploadFile(TENANT_B, "batch-file-1.png", "image/png");
+    const batchedJob = await appQueue.enqueue({ organizationId: TENANT_B, runId: batched.runId, priority: 101 });
+    const names = new Map<string, string>([[singleJob, "single"], [batchedJob, "batch#1"]]);
+    for (const row of (await superDb.query<{ id: string; page_number: number }>("SELECT j.id, d.page_number FROM extraction_jobs j JOIN document_runs r ON r.id = j.run_id JOIN documents d ON d.id = r.document_id WHERE d.parent_document_id = $1", [pdf.documentId])).rows) {
+      names.set(row.id, `page${row.page_number}`);
+    }
+    const order: string[] = [];
+    for (let claimed = await queue.claim(new Date(Date.now() + 60_000)); claimed; claimed = await queue.claim(new Date(Date.now() + 60_000))) {
+      if (names.has(claimed.jobId)) order.push(names.get(claimed.jobId)!);
+    }
+    assert.deepEqual(order, ["page1", "single", "page2", "batch#1", "page3"]);
   });
 });

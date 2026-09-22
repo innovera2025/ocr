@@ -15,7 +15,7 @@ import { clamAvHealthCheck } from "@innovera/ocr-ingest/clamav";
 import type { LocalStorage } from "@innovera/ocr-storage/local";
 import { createLocalStorage } from "@innovera/ocr-storage/local";
 
-export type DocumentListQuery = { limit: number; offset: number; status?: DocumentStatusCategory; q?: string; batchId?: string };
+export type DocumentListQuery = { limit: number; offset: number; status?: DocumentStatusCategory; q?: string; batchId?: string; parentId?: string };
 
 /** Structural subset of the store methods behind the workbench routes (spec §4), so tests can pass fakes. PostgresOcrDocumentStore implements it; results are passed through as JSON. */
 export type WorkbenchStore = Readonly<{
@@ -183,7 +183,7 @@ function intParam(value: string | null, fallback: number, min: number, max: numb
   return parsed;
 }
 
-/** Strict `GET /api/documents` query parsing; empty parameters count as absent. */
+/** Strict `GET /api/documents` query parsing; empty parameters count as absent. `parentId` lists the pages of one PDF. */
 export function parseDocumentListQuery(params: URLSearchParams): DocumentListQuery {
   const limit = intParam(params.get("limit"), 50, 1, 200, "INVALID_LIMIT");
   const offset = intParam(params.get("offset"), 0, 0, 1_000_000, "INVALID_OFFSET");
@@ -192,11 +192,13 @@ export function parseDocumentListQuery(params: URLSearchParams): DocumentListQue
   const q = params.get("q")?.trim() || undefined;
   if (q !== undefined && (q.length > 100 || q.includes("\u0000"))) throw new Error("INVALID_QUERY");
   const batchId = params.get("batchId") || undefined;
+  const parentId = params.get("parentId") || undefined;
   return {
     limit, offset,
     ...(status !== undefined ? { status: status as DocumentStatusCategory } : {}),
     ...(q !== undefined ? { q } : {}),
-    ...(batchId !== undefined ? { batchId: uuidOr404(batchId, "BATCH_NOT_FOUND") } : {})
+    ...(batchId !== undefined ? { batchId: uuidOr404(batchId, "BATCH_NOT_FOUND") } : {}),
+    ...(parentId !== undefined ? { parentId: uuidOr404(parentId, "DOCUMENT_NOT_FOUND") } : {})
   };
 }
 
@@ -306,6 +308,9 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
       if (!original) throw new Error("DOCUMENT_NOT_FOUND");
       const refused = UNSERVED_CONTENT.get(original.status);
       if (refused) throw new Error(refused);
+      // A SPLIT PDF is hidden from the list but its original is still served (the "open the original PDF page" link).
+      // A page whose render failed has no object yet.
+      if (typeof original.storageKey !== "string" || !original.storageKey) throw new Error("CONTENT_NOT_FOUND");
       let bytes: Uint8Array;
       try { bytes = await app.storage.get(original.storageKey); } catch { throw new Error("CONTENT_NOT_FOUND"); }
       response.writeHead(200, { "content-type": original.mimeType, "cache-control": "private, no-store", "x-content-type-options": "nosniff" });

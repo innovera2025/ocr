@@ -1,23 +1,27 @@
 import type { OcrResponse } from "@innovera/ocr-client";
 
-/** Canonical `documents.structured_result` (schema v3). Evidence/timings stay in `raw_response`. */
-export type DocumentView = { schemaVersion: 3; customerInformation: Record<string, unknown>;
+/**
+ * Canonical `documents.structured_result` (schema v3). Evidence/timings/layout stay in `raw_response`. v3.1 (Local AI
+ * `typhoon-sections` 3.1) adds the form `header` (formNumber/date/time Fields), `staffOnly.branch` (Field),
+ * `staffOnly.totalMinutes` (number|null) and `guests` (number|null) on treatment items; `header` is `{}` for older rows.
+ */
+export type DocumentView = { schemaVersion: 3; header: Record<string, unknown>; customerInformation: Record<string, unknown>;
   recommendationCard: Record<string, unknown>; staffOnly: Record<string, unknown> };
 export type DocumentSummary = { customerName: string | null; gender: string | null; nationality: string | null;
   treatments: Array<{ name: string | null; duration: string | null }>; therapist: string | null; room: string | null;
-  minConfidence: number | null; reviewFieldCount: number };
+  formNumber: string | null; branch: string | null; minConfidence: number | null; reviewFieldCount: number };
 export type ReviewChange = { path: string; oldRaw: string | null; oldValue: string | null; newValue: string | null;
   provider?: { field: "treatment" | "therapist"; raw: string; verifiedValue: string } };
 
-type Section = "customerInformation" | "recommendationCard" | "staffOnly";
+type Section = "header" | "customerInformation" | "recommendationCard" | "staffOnly";
 type Json = Record<string, unknown>;
 
-export const DOCUMENT_SECTIONS: readonly Section[] = ["customerInformation", "recommendationCard", "staffOnly"];
+export const DOCUMENT_SECTIONS: readonly Section[] = ["header", "customerInformation", "recommendationCard", "staffOnly"];
 export const REVIEW_ARRAY_FIELDS: Readonly<Record<Section, readonly string[]>> = {
-  customerInformation: ["referralSources", "healthConditions"], recommendationCard: ["massageOilScrub", "preferredAreas", "avoidAreas"], staffOnly: ["treatments"]
+  header: [], customerInformation: ["referralSources", "healthConditions"], recommendationCard: ["massageOilScrub", "preferredAreas", "avoidAreas"], staffOnly: ["treatments"]
 };
 export const REVIEW_SCALAR_FIELDS: Readonly<Record<Section, readonly string[]>> = {
-  customerInformation: ["name", "gender", "nationality", "hotelName"], recommendationCard: ["pressure"], staffOnly: ["therapistName", "roomNo"]
+  header: ["formNumber", "date", "time"], customerInformation: ["name", "gender", "nationality", "hotelName"], recommendationCard: ["pressure"], staffOnly: ["therapistName", "roomNo", "branch"]
 };
 export const MAX_REVIEW_VALUE_LENGTH = 500;
 export const MAX_REVIEW_ARRAY_ITEMS = 50;
@@ -29,7 +33,9 @@ function text(value: unknown): string | null { return typeof value === "string" 
 function nonEmpty(value: string | null): value is string { return value !== null && value.trim().length > 0; }
 function isFieldLike(value: unknown): value is Json { return isRecord(value) && ("value" in value || "raw" in value); }
 function reviewInvalid(): Error { return new Error("REVIEW_INVALID"); }
-function emptyView(): DocumentView { return { schemaVersion: 3, customerInformation: {}, recommendationCard: {}, staffOnly: {} }; }
+function emptyView(): DocumentView { return { schemaVersion: 3, header: {}, customerInformation: {}, recommendationCard: {}, staffOnly: {} }; }
+/** v3.1 numeric leaves (`staffOnly.totalMinutes`, treatment `guests`): a finite number or null. */
+function numberOrNull(value: unknown): number | null { return typeof value === "number" && Number.isFinite(value) ? value : null; }
 
 /** Deep copy of JSON-like data: drops functions/undefined/`__proto__` keys, non-finite numbers become null, depth-limited. */
 function cloneJson(value: unknown, depth = 0): unknown {
@@ -108,6 +114,7 @@ function normalizeTreatment(item: unknown): Json | null {
   out.nameRaw = "nameRaw" in item ? text(item.nameRaw) : out.raw;
   out.duration = text(source.duration);
   out.durationMinutes = typeof item.durationMinutes === "number" && Number.isFinite(item.durationMinutes) ? item.durationMinutes : parseDurationMinutes(out.duration);
+  if ("guests" in item) out.guests = numberOrNull(item.guests);
   return out;
 }
 
@@ -147,6 +154,7 @@ function normalizeSection(section: Section, value: unknown): Json {
     if (section === "staffOnly" && key === "treatment") continue;
     if (REVIEW_ARRAY_FIELDS[section].includes(key)) out[key] = normalizeArray(key, item);
     else if (REVIEW_SCALAR_FIELDS[section].includes(key)) out[key] = normalizeField(item);
+    else if (section === "staffOnly" && key === "totalMinutes") out[key] = numberOrNull(item);
     else out[key] = item;
   }
   if (section === "staffOnly" && "treatment" in value) {
@@ -164,7 +172,7 @@ function normalizeUnsafe(value: unknown): DocumentView {
   const source = cloneJson(value);
   if (!isRecord(source)) return emptyView();
   if (DOCUMENT_SECTIONS.some((section) => section in source) || source.schemaVersion === 3) {
-    return { schemaVersion: 3, customerInformation: normalizeSection("customerInformation", source.customerInformation),
+    return { schemaVersion: 3, header: normalizeSection("header", source.header), customerInformation: normalizeSection("customerInformation", source.customerInformation),
       recommendationCard: normalizeSection("recommendationCard", source.recommendationCard), staffOnly: normalizeSection("staffOnly", source.staffOnly) };
   }
   if (LEGACY_STAFF_KEYS.some((key) => key in source)) return { ...emptyView(), staffOnly: normalizeSection("staffOnly", source) };
@@ -172,15 +180,15 @@ function normalizeUnsafe(value: unknown): DocumentView {
 }
 
 /**
- * Converts any stored structured result to the canonical v3 view: canonical v3, legacy flat v2.2 staff results
- * (`{treatment, therapistName, roomNo}`) and whole v2.2/v3 responses (`{documentId, staffOnly, evidence…}`).
- * Returns a fresh deep copy and never throws.
+ * Converts any stored structured result to the canonical v3 view: canonical v3 (incl. the v3.1 header/branch additions),
+ * legacy flat v2.2 staff results (`{treatment, therapistName, roomNo}`) and whole v2.2/v3/v3.1 responses
+ * (`{documentId, staffOnly, evidence…}`). Returns a fresh deep copy and never throws.
  */
 export function normalizeStructuredResult(value: unknown): DocumentView {
   try { return normalizeUnsafe(value); } catch { return emptyView(); }
 }
 
-/** Canonical view of a Local AI response (sections only; evidence, timings and layout are not stored here). */
+/** Canonical view of a Local AI response (sections incl. the v3.1 `header`; evidence, timings and layout are not stored here). */
 export function toStructuredResult(response: OcrResponse): DocumentView {
   const sections: Json = {};
   for (const section of DOCUMENT_SECTIONS) if (response[section] !== undefined) sections[section] = response[section];
@@ -204,9 +212,18 @@ function valueOf(section: unknown, key: string): string | null {
   return isRecord(section) && isRecord(section[key]) ? text(section[key].value) : null;
 }
 
-const EMPTY_SUMMARY: DocumentSummary = { customerName: null, gender: null, nationality: null, treatments: [], therapist: null, room: null, minConfidence: null, reviewFieldCount: 0 };
+const EMPTY_SUMMARY: DocumentSummary = { customerName: null, gender: null, nationality: null, treatments: [], therapist: null, room: null, formNumber: null, branch: null, minConfidence: null, reviewFieldCount: 0 };
 
-/** Table row summary of a canonical view. Human-sourced fields count as confidence 1. Never throws. */
+/**
+ * A field that carries no reading and asks for nothing: nothing was found (`source:"none"`, raw and value null) and it is
+ * not flagged — e.g. v3.1 `staffOnly.branch` when no printed branch was read (confidence 0). It says nothing about how
+ * well the page was read, so it must not pull the row's confidence down to 0 %.
+ */
+function isUnread(field: Json): boolean {
+  return field.source === "none" && field.needsReview !== true && text(field.raw) === null && text(field.value) === null;
+}
+
+/** Table row summary of a canonical view. Human-sourced fields count as confidence 1; unread fields (isUnread) are skipped. Never throws. */
 export function summarizeDocument(view: DocumentView): DocumentSummary {
   try {
     const staff = view.staffOnly;
@@ -217,11 +234,13 @@ export function summarizeDocument(view: DocumentView): DocumentSummary {
     let reviewFieldCount = 0;
     for (const field of fieldsOf(view)) {
       if (field.needsReview === true) reviewFieldCount += 1;
+      if (isUnread(field)) continue;
       const confidence = field.source === "human" ? 1 : field.confidence;
       if (typeof confidence === "number" && Number.isFinite(confidence)) minConfidence = minConfidence === null ? confidence : Math.min(minConfidence, confidence);
     }
     return { customerName: valueOf(view.customerInformation, "name"), gender: valueOf(view.customerInformation, "gender"), nationality: valueOf(view.customerInformation, "nationality"),
-      treatments, therapist: valueOf(staff, "therapistName"), room: valueOf(staff, "roomNo"), minConfidence, reviewFieldCount };
+      treatments, therapist: valueOf(staff, "therapistName"), room: valueOf(staff, "roomNo"), formNumber: valueOf(view.header, "formNumber"), branch: valueOf(staff, "branch"),
+      minConfidence, reviewFieldCount };
   } catch { return { ...EMPTY_SUMMARY, treatments: [] }; }
 }
 

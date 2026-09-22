@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Pool } from "pg";
-import { PostgresQueue } from "./postgres.js";
+import { jobPriority, PostgresQueue } from "./postgres.js";
 
 function fakeQueue(rows: Array<Record<string, unknown>>) {
   const calls: Array<{ sql: string; values: unknown[] }> = [];
@@ -40,4 +40,19 @@ test("finish keeps its boolean contract on top of finishDetailed", async () => {
   const lost = fakeQueue([{ accepted: false, final_status: null }]);
   assert.equal(await lost.queue.finish("job", "token", "FAILED", "x"), false);
   await lost.pool.end();
+});
+
+test("enqueue sets the job priority at insert time (default 100, clamped to 0..10000)", async () => {
+  const calls: Array<{ sql: string; values: unknown[] }> = [];
+  const pool = new Pool();
+  const client = { query: async (sql: string, values: unknown[] = []) => { calls.push({ sql, values }); return { rows: [{ id: "job-1" }] }; }, release: () => undefined };
+  Object.assign(pool, { connect: async () => client });
+  const queue = new PostgresQueue(pool);
+  assert.equal(await queue.enqueue({ organizationId: "t", runId: "r", priority: 103 }), "job-1");
+  await queue.enqueue({ organizationId: "t", runId: "r" });
+  const inserts = calls.filter((call) => call.sql.includes("INSERT INTO extraction_jobs"));
+  assert.match(inserts[0]!.sql, /priority\)\s+VALUES \(gen_random_uuid\(\), \$1::uuid, \$2::uuid, \$3, 'PENDING', COALESCE\(\$4, now\(\)\), \$5\)/);
+  assert.deepEqual(inserts.map((call) => call.values[4]), [103, 100]);
+  assert.deepEqual([jobPriority(undefined), jobPriority(Number.NaN), jobPriority(-5), jobPriority(99.7), jobPriority(1e9)], [100, 100, 0, 99, 10_000]);
+  await pool.end();
 });

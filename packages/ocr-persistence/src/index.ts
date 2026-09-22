@@ -8,8 +8,20 @@ export type OcrDocumentStatus = "PROCESSING" | "SUCCEEDED" | "NEEDS_REVIEW" | "F
 export type ConfirmStatus = "PENDING" | "SUCCEEDED" | "RETRY";
 export type CorrectionAudit = Readonly<{ raw: string; verifiedBy: string }>;
 
-export type UploadedDocument = Readonly<{ documentId: string; runId: string; tenantId: string; reused?: boolean; batchId?: string }>;
-export type WorkerDocument = Readonly<{ documentId: string; organizationId: string; sourceKey: string; filename: string; mimeType: string }>;
+/** `batchPosition`: 1-based position of a new upload among the batch's files (counted under the batch lock; fair priority). */
+export type UploadedDocument = Readonly<{ documentId: string; runId: string; tenantId: string; reused?: boolean; batchId?: string; batchPosition?: number }>;
+/**
+ * What the worker needs to process a job. `sourceKey` is null only for a page whose render failed (it has no object yet;
+ * the OCR job re-renders it from `parentSourceKey`). `status` lets the worker dispatch: a top-level PDF that is CLEAN or
+ * PROCESSING is split into pages, everything else is read by the OCR API.
+ */
+export type WorkerDocument = Readonly<{ documentId: string; organizationId: string; sourceKey: string | null; filename: string; mimeType: string;
+  status: string; batchId: string | null; parentDocumentId: string | null; pageNumber: number | null; pageCount: number | null; createdAt: string;
+  parentSourceKey: string | null }>;
+/** One page of a split PDF. A page whose render failed has no object (`storageKey: null`) and gets no OCR job. */
+export type PageDocumentInput = Readonly<{ pageNumber: number; publicId: string; storageKey: string | null; mimeType: string;
+  sizeBytes: number | null; contentHash: string | null }>;
+export type PageDocumentsResult = { created: number[]; existing: number[] };
 
 export type OcrResultPatch = Readonly<{
   ocrDocumentId: string;
@@ -27,8 +39,12 @@ export type DocumentStore = Readonly<{
 
 /** Derived from the document's `ocr_confirm_outbox` rows (latest correction per field). */
 export type DeliveryStatus = "NONE" | "PENDING" | "DELIVERED" | "RETRYING" | "FAILED";
+/** Categories of visible rows (the list filter). A `SPLIT` PDF parent is never a row: its category is "split". */
 export type DocumentStatusCategory = "queued" | "processing" | "review" | "succeeded" | "confirmed" | "failed";
 export const DOCUMENT_STATUS_CATEGORIES: readonly DocumentStatusCategory[] = ["queued", "processing", "review", "succeeded", "confirmed", "failed"];
+/** Page documents of a split PDF are created with this queue priority: page order, and fair against other uploads. */
+export function pageJobPriority(pageNumber: number): number { return Math.min(10_000, 100 + Math.max(0, Math.trunc(pageNumber) - 1)); }
+export const MAX_PDF_PAGES = 1000;
 
 export type ReviewDocument = Readonly<{
   documentId: string;
@@ -52,26 +68,43 @@ export type ReviewDocument = Readonly<{
   createdAt: string;
   processedAt: string | null;
   deliveryStatus: DeliveryStatus;
+  /** Pages of a split PDF: the parent (original PDF), 1-based page number and page count (also set on the parent). */
+  parentDocumentId: string | null;
+  pageNumber: number | null;
+  pageCount: number | null;
+  parentFilename: string | null;
 }>;
 
 export type ReviewStore = DocumentStore & Readonly<{
   getReviewDocument(tenantId: string, documentId: string): Promise<ReviewDocument | null>;
-  /** `status` lets the content route refuse quarantined / not yet scanned originals. */
-  getOriginal?: (tenantId: string, documentId: string) => Promise<{ storageKey: string; mimeType: string; status: string } | null>;
+  /** `status` lets the content route refuse quarantined / not yet scanned originals; `storageKey` is null for a page whose render failed. */
+  getOriginal?: (tenantId: string, documentId: string) => Promise<{ storageKey: string | null; mimeType: string; status: string } | null>;
 }>;
 
+/**
+ * `expectedTotal` and `uploaded` count FILES (top-level documents: what the client promised and sent). Every other counter
+ * counts visible ROWS: an image is one row, a PDF becomes one row per page once split (the SPLIT parent is no row; while it
+ * is being split it is one queued/processing row). `pages` = page rows created so far, `pagesExpected` = sum of the PDFs'
+ * page counts, `splitting` = PDFs not split yet.
+ */
 export type BatchSummary = { batchId: string; label: string | null; createdAt: string; expectedTotal: number;
-  uploaded: number; queued: number; processing: number; succeeded: number; needsReview: number;
+  uploaded: number; rows: number; pages: number; pagesExpected: number; splitting: number;
+  queued: number; processing: number; succeeded: number; needsReview: number;
   failed: number; confirmed: number; completed: number /* succeeded+needsReview+failed */;
-  finishedAt: string | null /* last completion, once completed === expectedTotal */;
+  /** Every promised file arrived and no row is queued or processing (so every page exists and was read). */
+  finished: boolean;
+  finishedAt: string | null /* last completion, once finished */;
   durationMs: number | null /* createdAt → last completion once finished, or once nothing is queued or processing and
     nothing arrived or completed for 5 minutes (fewer files than expected arrived), else → now; null before the first upload */;
   throughputPerMinute: number | null /* completed per minute of durationMs */ };
 export type CreateBatchInput = { createdBy: string; expectedTotal: number; label?: string | null | undefined };
 export type DocumentListItem = { documentId: string; batchId: string | null; filename: string; mimeType: string;
   status: string; statusCategory: DocumentStatusCategory; needsReview: boolean; errorMessage: string | null; createdAt: string;
-  processedAt: string | null; reviewedAt: string | null; deliveryStatus: DeliveryStatus; summary: DocumentSummary };
-export type ListDocumentsQuery = { limit?: number | undefined; offset?: number | undefined; status?: DocumentStatusCategory | undefined; q?: string | undefined; batchId?: string | undefined };
+  processedAt: string | null; reviewedAt: string | null; deliveryStatus: DeliveryStatus; summary: DocumentSummary;
+  parentDocumentId: string | null; pageNumber: number | null; pageCount: number | null; parentFilename: string | null };
+/** `parentId`: only the pages of that (split) PDF. */
+export type ListDocumentsQuery = { limit?: number | undefined; offset?: number | undefined; status?: DocumentStatusCategory | undefined; q?: string | undefined;
+  batchId?: string | undefined; parentId?: string | undefined };
 export type SaveReviewInput = { structuredResult: unknown; reviewedBy: string; expectedUpdatedAt?: string | undefined };
 export type SaveReviewResult = { corrections: number; delivery: "PENDING" | "NOT_REQUIRED"; document: ReviewDocument };
 
@@ -101,9 +134,10 @@ export function structuredDocumentResult(response: OcrResponse): Readonly<Record
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function isUuid(value: unknown): value is string { return typeof value === "string" && UUID.test(value); }
 
-/** Document row → UI category; `null` for rows the list never shows (DELETED). */
-export function statusCategoryOf(status: string, reviewedAt: unknown): DocumentStatusCategory | null {
+/** Document row → UI category; "split" for a PDF parent split into page rows (never listed), `null` for DELETED. */
+export function statusCategoryOf(status: string, reviewedAt: unknown): DocumentStatusCategory | "split" | null {
   switch (status) {
+    case "SPLIT": return "split";
     case "VALIDATING": case "SCANNING": case "CLEAN": return "queued";
     case "PROCESSING": return "processing";
     case "NEEDS_REVIEW": return "review";
@@ -147,14 +181,27 @@ const DELIVERY_SQL = `(SELECT CASE WHEN count(x.status) = 0 THEN 'NONE'
         LEFT JOIN ocr_confirm_outbox o ON o.correction_id = c.id AND o.organization_id = c.organization_id
         WHERE c.organization_id = d.organization_id AND c.document_id = d.id ORDER BY c.field, c.verified_at DESC, (o.id IS NOT NULL) DESC, c.id) x)`;
 
+/** Rows of the document list: not deleted, and not a PDF parent that was split into page rows (its pages are the rows). */
+const VISIBLE_SQL = "d.deleted_at IS NULL AND d.status NOT IN ('DELETED','SPLIT')";
+/** The parent (original PDF) of a page row `d`, same tenant. */
+const PARENT_JOIN = "LEFT JOIN documents p ON p.id = d.parent_document_id AND p.organization_id = d.organization_id";
+const PAGE_COLUMNS = "d.parent_document_id, d.page_number, d.page_count, p.filename AS parent_filename";
+
 const REVIEW_SELECT = `SELECT d.id, d.organization_id, d.batch_id, d.filename, d.mime_type, d.status::text AS status, d.ocr_document_id, d.ocr_engine, d.ocr_version,
   d.raw_response, d.structured_result, d.needs_review, d.confirm_status, ${REVIEWED_AT_SQL} AS reviewed_at, d.reviewed_by, d.updated_at, d.error_message,
-  d.created_at, d.processed_at, ${DELIVERY_SQL} AS delivery_status
-FROM documents d WHERE d.id = $1::uuid AND d.organization_id = $2::uuid AND d.deleted_at IS NULL`;
+  d.created_at, d.processed_at, ${DELIVERY_SQL} AS delivery_status, ${PAGE_COLUMNS}
+FROM documents d ${PARENT_JOIN} WHERE d.id = $1::uuid AND d.organization_id = $2::uuid AND d.deleted_at IS NULL`;
 
-/** Counters are derived from document rows on every read (nothing stored, nothing to drift). */
+/**
+ * Counters are derived from document rows on every read (nothing stored, nothing to drift). `uploaded` counts files
+ * (top-level documents), the status counters count visible rows (SPLIT parents match none of them).
+ */
 const BATCH_SELECT = `SELECT b.id, b.label, b.created_at, b.expected_total, now() AS db_now,
-  count(d.id)::int AS uploaded,
+  count(d.id) FILTER (WHERE d.parent_document_id IS NULL)::int AS uploaded,
+  count(d.id) FILTER (WHERE d.status <> 'SPLIT')::int AS rows,
+  count(d.id) FILTER (WHERE d.parent_document_id IS NOT NULL)::int AS pages,
+  COALESCE(sum(d.page_count) FILTER (WHERE d.parent_document_id IS NULL), 0)::int AS pages_expected,
+  count(d.id) FILTER (WHERE d.parent_document_id IS NULL AND d.mime_type = 'application/pdf' AND d.status IN ('VALIDATING','SCANNING','CLEAN','PROCESSING'))::int AS splitting,
   count(d.id) FILTER (WHERE d.status IN ('VALIDATING','SCANNING','CLEAN'))::int AS queued,
   count(d.id) FILTER (WHERE d.status = 'PROCESSING')::int AS processing,
   count(d.id) FILTER (WHERE d.status = 'SUCCEEDED')::int AS succeeded,
@@ -185,25 +232,32 @@ function clampInt(value: unknown, fallback: number, min: number, max: number): n
   return Number.isFinite(parsed) ? Math.min(max, Math.max(min, Math.trunc(parsed))) : fallback;
 }
 
-function toBatchSummary(row: Row): BatchSummary {
+/**
+ * BATCH_SELECT row → summary. Finished once every promised file arrived and no row is queued or processing: a PDF is one
+ * processing row while it is split and its pages are queued rows after, so a 1-file batch is not finished after its first
+ * page (the old rule `completed >= expectedTotal` counted rows against files).
+ */
+export function toBatchSummary(row: Row): BatchSummary {
   const createdAt = ms(row.created_at) ?? 0;
   const expectedTotal = num(row.expected_total);
   const uploaded = num(row.uploaded), succeeded = num(row.succeeded), needsReview = num(row.needs_review), failed = num(row.failed);
+  const queued = num(row.queued), processing = num(row.processing);
   const completed = succeeded + needsReview + failed;
   const lastCompleted = ms(row.last_completed_at);
   const now = ms(row.db_now) ?? Date.now();
-  const finished = completed >= expectedTotal && lastCompleted !== null;
+  const finished = uploaded >= expectedTotal && queued + processing === 0 && lastCompleted !== null;
   // Uploads rejected before persistence (or abandoned) never become documents, so a batch can stay below expectedTotal
   // for good: the clock also stops at the last completion once nothing is queued or processing and nothing new has
   // arrived or completed for BATCH_IDLE_AFTER_MS (before that, OCR may just be ahead of a file still uploading).
   const lastActivity = Math.max(lastCompleted ?? 0, ms(row.last_created_at) ?? 0);
-  const idle = uploaded > 0 && num(row.queued) + num(row.processing) === 0 && lastCompleted !== null && now - lastActivity >= BATCH_IDLE_AFTER_MS;
+  const idle = uploaded > 0 && queued + processing === 0 && lastCompleted !== null && now - lastActivity >= BATCH_IDLE_AFTER_MS;
   const end = finished || idle ? lastCompleted! : now;
   const durationMs = uploaded > 0 ? Math.max(0, end - createdAt) : null;
   const throughputPerMinute = completed > 0 && durationMs !== null && durationMs > 0 ? Math.round((completed / (durationMs / 60_000)) * 100) / 100 : null;
   return { batchId: String(row.id), label: str(row.label), createdAt: iso(row.created_at) ?? "", expectedTotal, uploaded,
-    queued: num(row.queued), processing: num(row.processing), succeeded, needsReview, failed, confirmed: num(row.confirmed), completed,
-    finishedAt: finished ? iso(row.last_completed_at) : null, durationMs, throughputPerMinute };
+    rows: num(row.rows), pages: num(row.pages), pagesExpected: num(row.pages_expected), splitting: num(row.splitting),
+    queued, processing, succeeded, needsReview, failed, confirmed: num(row.confirmed), completed,
+    finished, finishedAt: finished ? iso(row.last_completed_at) : null, durationMs, throughputPerMinute };
 }
 
 /** Canonical view of a row; a confirmed row (see REVIEWED_AT_SQL) has nothing left to review. */
@@ -219,16 +273,22 @@ function toReviewDocument(row: Row): ReviewDocument {
     rawResponse: row.raw_response ?? null, structuredResult: viewOf(row),
     needsReview: row.needs_review === true, confirmStatus: str(row.confirm_status), reviewedAt: iso(row.reviewed_at), reviewedBy: str(row.reviewed_by),
     updatedAt: iso(row.updated_at) ?? "", errorMessage: str(row.error_message), createdAt: iso(row.created_at) ?? "", processedAt: iso(row.processed_at),
-    deliveryStatus: delivery(row.delivery_status)
+    deliveryStatus: delivery(row.delivery_status), ...pageFields(row)
   };
+}
+
+function intOrNull(value: unknown): number | null { const parsed = value === null || value === undefined ? Number.NaN : Number(value); return Number.isInteger(parsed) ? parsed : null; }
+function pageFields(row: Row): { parentDocumentId: string | null; pageNumber: number | null; pageCount: number | null; parentFilename: string | null } {
+  return { parentDocumentId: str(row.parent_document_id), pageNumber: intOrNull(row.page_number), pageCount: intOrNull(row.page_count), parentFilename: str(row.parent_filename) };
 }
 
 function toListItem(row: Row): DocumentListItem {
   const status = String(row.status);
+  const category = statusCategoryOf(status, row.reviewed_at);
   return { documentId: String(row.id), batchId: str(row.batch_id), filename: String(row.filename), mimeType: String(row.mime_type), status,
-    statusCategory: statusCategoryOf(status, row.reviewed_at) ?? "failed", needsReview: row.needs_review === true, errorMessage: str(row.error_message),
+    statusCategory: category === null || category === "split" ? "failed" : category, needsReview: row.needs_review === true, errorMessage: str(row.error_message),
     createdAt: iso(row.created_at) ?? "", processedAt: iso(row.processed_at), reviewedAt: iso(row.reviewed_at), deliveryStatus: delivery(row.delivery_status),
-    summary: summarizeDocument(viewOf(row)) };
+    summary: summarizeDocument(viewOf(row)), ...pageFields(row) };
 }
 
 function isRow(value: unknown): value is Row { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -304,11 +364,14 @@ export class PostgresOcrDocumentStore implements ReviewStore {
 
   /**
    * `batchId` attaches the upload to a batch of the same tenant: BATCH_NOT_FOUND when it is not the tenant's (or not a
-   * UUID), BATCH_FULL once uploaded >= expected_total. Uploads into one batch are serialised with a transaction-scoped
-   * advisory lock (ocr_app has no UPDATE on ocr_batches, so the batch row cannot be locked FOR UPDATE), so there is no overshoot.
+   * UUID), BATCH_FULL once the batch holds expected_total files. Only top-level documents count: the page rows a PDF is
+   * split into never fill a batch. Uploads into one batch are serialised with a transaction-scoped advisory lock (ocr_app
+   * has no UPDATE on ocr_batches, so the batch row cannot be locked FOR UPDATE), so there is no overshoot, and the new
+   * file's 1-based position in its batch (`batchPosition`, for the fair queue priority) is exact.
    */
   async createUploadedDocument(input: { tenantId: string; filename: string; mimeType: string; sizeBytes: number; contentHash: string; storageKey: string; idempotencyKey?: string; requestFingerprint?: string; batchId?: string | undefined }): Promise<UploadedDocument> {
     if (input.batchId !== undefined && !isUuid(input.batchId)) throw new Error("BATCH_NOT_FOUND");
+    let batchPosition: number | undefined;
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -319,7 +382,8 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       if (input.batchId) {
         await client.query("SELECT pg_advisory_xact_lock(hashtext('innovera_ocr:batch'), hashtext($1))", [input.batchId]);
         const batch = await client.query<{ expected_total: number; uploaded: number }>(
-          `SELECT b.expected_total, (SELECT count(*)::int FROM documents d WHERE d.organization_id=b.organization_id AND d.batch_id=b.id AND d.deleted_at IS NULL AND d.status <> 'DELETED') AS uploaded
+          `SELECT b.expected_total, (SELECT count(*)::int FROM documents d WHERE d.organization_id=b.organization_id AND d.batch_id=b.id AND d.parent_document_id IS NULL
+             AND d.deleted_at IS NULL AND d.status <> 'DELETED') AS uploaded
            FROM ocr_batches b WHERE b.id=$1::uuid AND b.organization_id=$2::uuid`, [input.batchId, input.tenantId]);
         const capacity = batch.rows[0];
         if (!capacity) throw new Error("BATCH_NOT_FOUND");
@@ -329,6 +393,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
           await client.query("COMMIT");
           return reused;
         }
+        batchPosition = capacity.uploaded + 1;
       }
       const document = await client.query<{ id: string; public_id: string }>(
         `INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, storage_key, batch_id)
@@ -358,7 +423,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
         }
       }
       await client.query("COMMIT");
-      return { documentId: row.id, runId: run.rows[0]!.id, tenantId: input.tenantId, ...(input.batchId ? { batchId: input.batchId } : {}) };
+      return { documentId: row.id, runId: run.rows[0]!.id, tenantId: input.tenantId, ...(input.batchId ? { batchId: input.batchId } : {}), ...(batchPosition ? { batchPosition } : {}) };
     } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; }
     finally { client.release(); }
   }
@@ -449,18 +514,107 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     });
   }
 
+  /** The document of a job's run; null when it is gone, or a top-level document without an original. */
   async getWorkerDocument(runId: string, tenantId: string): Promise<WorkerDocument | null> {
-    const client = await this.pool.connect();
-    try { await client.query("BEGIN"); await client.query("SELECT set_config('app.current_org', $1, true)", [tenantId]); const result = await client.query(
-      `SELECT d.id, d.organization_id, d.storage_key, d.filename, d.mime_type
-       FROM documents d JOIN document_runs r ON r.document_id=d.id AND r.organization_id=d.organization_id
-       WHERE r.id=$1::uuid AND r.organization_id=$2::uuid AND d.deleted_at IS NULL`,
-      [runId, tenantId]
-    );
-    const row = result.rows[0] as Record<string, unknown> | undefined;
-    if (!row || typeof row.storage_key !== "string") { await client.query("COMMIT"); return null; }
-    await client.query("COMMIT"); return { documentId: String(row.id), organizationId: String(row.organization_id), sourceKey: row.storage_key, filename: String(row.filename), mimeType: String(row.mime_type) };
-    } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; } finally { client.release(); }
+    return this.tenantTransaction(tenantId, async (client) => {
+      const result = await client.query<Row>(
+        `SELECT d.id, d.organization_id, d.storage_key, d.filename, d.mime_type, d.status::text AS status, d.batch_id, d.created_at,
+                d.parent_document_id, d.page_number, d.page_count, p.storage_key AS parent_storage_key
+         FROM documents d JOIN document_runs r ON r.document_id=d.id AND r.organization_id=d.organization_id ${PARENT_JOIN}
+         WHERE r.id=$1::uuid AND r.organization_id=$2::uuid AND d.deleted_at IS NULL`,
+        [runId, tenantId]);
+      const row = result.rows[0];
+      if (!row) return null;
+      const page = pageFields(row);
+      if (typeof row.storage_key !== "string" && page.parentDocumentId === null) return null;
+      return { documentId: String(row.id), organizationId: String(row.organization_id), sourceKey: str(row.storage_key), filename: String(row.filename),
+        mimeType: String(row.mime_type), status: String(row.status), batchId: str(row.batch_id), createdAt: iso(row.created_at) ?? "",
+        parentDocumentId: page.parentDocumentId, pageNumber: page.pageNumber, pageCount: page.pageCount, parentSourceKey: str(row.parent_storage_key) };
+    });
+  }
+
+  /** Page count of a PDF, recorded as soon as it is known (before its pages exist), so the UI can show "page x/N". */
+  async setPageCount(tenantId: string, documentId: string, pageCount: number): Promise<void> {
+    if (!Number.isInteger(pageCount) || pageCount < 1 || pageCount > MAX_PDF_PAGES) throw new Error("PAGE_COUNT_INVALID");
+    await this.tenantTransaction(tenantId, async (client) => {
+      const result = await client.query("UPDATE documents SET page_count=$1, updated_at=now() WHERE id=$2::uuid AND organization_id=$3::uuid AND parent_document_id IS NULL AND deleted_at IS NULL", [pageCount, documentId, tenantId]);
+      if (result.rowCount !== 1) throw new Error("DOCUMENT_NOT_FOUND_OR_FORBIDDEN");
+    });
+  }
+
+  /** Page numbers of `parentId` that already have a row (a resumed split renders only the others). */
+  async existingPages(tenantId: string, parentId: string): Promise<number[]> {
+    return this.tenantTransaction(tenantId, async (client) => {
+      const result = await client.query<{ page_number: number }>("SELECT page_number FROM documents WHERE organization_id=$1::uuid AND parent_document_id=$2::uuid ORDER BY page_number", [tenantId, parentId]);
+      return result.rows.map((row) => Number(row.page_number));
+    });
+  }
+
+  /**
+   * Creates the page documents of one rendered chunk of `parentId` in ONE transaction: per new page its document (status
+   * CLEAN, or FAILED `PAGE_RENDER_FAILED` without an object when its render failed), its run and — for rendered pages —
+   * its OCR job with priority `pageJobPriority(page)`. Pages copy the parent's filename, batch and created_at (so they
+   * list together, in page order, where the upload was). Serialised per parent with an advisory lock; a page that already
+   * exists is left alone (partial unique index + ON CONFLICT DO NOTHING), so a resumed or repeated split never
+   * duplicates a page, run or job. Runs as the worker under the tenant's RLS: another tenant's parent is not found, and
+   * the composite FK keeps parent and page in one tenant. A failed page carries its source's size and hash
+   * (size_bytes must be > 0) until its OCR job re-renders it (`setPageObject`).
+   */
+  async createPageDocuments(tenantId: string, parentId: string, pageCount: number, pages: readonly PageDocumentInput[]): Promise<PageDocumentsResult> {
+    if (!isUuid(parentId)) throw new Error("DOCUMENT_NOT_FOUND");
+    if (!Number.isInteger(pageCount) || pageCount < 1 || pageCount > MAX_PDF_PAGES) throw new Error("PAGE_COUNT_INVALID");
+    for (const page of pages) {
+      if (!Number.isInteger(page.pageNumber) || page.pageNumber < 1 || page.pageNumber > pageCount || !/^[a-z0-9]{32}$/.test(page.publicId)) throw new Error("PAGE_INVALID");
+      if (page.storageKey !== null && (!Number.isSafeInteger(page.sizeBytes) || (page.sizeBytes ?? 0) < 1 || typeof page.contentHash !== "string")) throw new Error("PAGE_INVALID");
+    }
+    return this.tenantTransaction(tenantId, async (client) => {
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('innovera_ocr:split'), hashtext($1))", [parentId]);
+      const parent = await client.query("SELECT 1 FROM documents WHERE id=$1::uuid AND organization_id=$2::uuid AND parent_document_id IS NULL AND deleted_at IS NULL", [parentId, tenantId]);
+      if (parent.rowCount !== 1) throw new Error("DOCUMENT_NOT_FOUND");
+      const result: PageDocumentsResult = { created: [], existing: [] };
+      for (const page of pages) {
+        const rendered = page.storageKey !== null;
+        const inserted = await client.query<{ id: string }>(
+          `INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, storage_key, batch_id, created_at,
+                                 parent_document_id, page_number, page_count, error_message)
+           SELECT gen_random_uuid(), p.organization_id, $3::varchar, $4::document_status, p.filename, $5::varchar, COALESCE($6::bigint, p.size_bytes),
+                  COALESCE($7::varchar, p.content_hash), $8::varchar, p.batch_id, p.created_at, p.id, $9::int, $10::int, $11::text
+           FROM documents p WHERE p.id=$1::uuid AND p.organization_id=$2::uuid
+           ON CONFLICT (organization_id, parent_document_id, page_number) WHERE parent_document_id IS NOT NULL DO NOTHING
+           RETURNING id`,
+          [parentId, tenantId, page.publicId, rendered ? "CLEAN" : "FAILED", page.mimeType, rendered ? page.sizeBytes : null, rendered ? page.contentHash : null,
+            page.storageKey, page.pageNumber, pageCount, rendered ? null : "PAGE_RENDER_FAILED"]);
+        const documentId = inserted.rows[0]?.id;
+        if (!documentId) { result.existing.push(page.pageNumber); continue; }
+        const run = await client.query<{ id: string }>("INSERT INTO document_runs(id, organization_id, document_id, outcome) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'RUNNING') RETURNING id", [tenantId, documentId]);
+        if (rendered) {
+          await client.query("INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, priority, available_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'OCR', 'PENDING', $3, now())",
+            [tenantId, run.rows[0]!.id, pageJobPriority(page.pageNumber)]);
+        }
+        result.created.push(page.pageNumber);
+      }
+      return result;
+    });
+  }
+
+  /** The split of `documentId` is complete: SPLIT (hidden from the list, still a file of its batch). SPLIT_INCOMPLETE unless all `pageCount` pages exist. */
+  async markSplit(tenantId: string, documentId: string, pageCount: number): Promise<void> {
+    await this.tenantTransaction(tenantId, async (client) => {
+      const result = await client.query(
+        `UPDATE documents d SET status='SPLIT', page_count=$1, error_message=NULL, processed_at=now(), updated_at=now()
+         WHERE d.id=$2::uuid AND d.organization_id=$3::uuid AND d.parent_document_id IS NULL AND d.deleted_at IS NULL
+           AND (SELECT count(*) FROM documents c WHERE c.organization_id=d.organization_id AND c.parent_document_id=d.id) >= $1`, [pageCount, documentId, tenantId]);
+      if (result.rowCount !== 1) throw new Error("SPLIT_INCOMPLETE");
+    });
+  }
+
+  /** A page was (re-)rendered by its OCR job: record its object. */
+  async setPageObject(tenantId: string, documentId: string, storageKey: string, sizeBytes: number, contentHash: string): Promise<void> {
+    await this.tenantTransaction(tenantId, async (client) => {
+      const result = await client.query("UPDATE documents SET storage_key=$1, size_bytes=$2, content_hash=$3, updated_at=now() WHERE id=$4::uuid AND organization_id=$5::uuid AND parent_document_id IS NOT NULL AND deleted_at IS NULL",
+        [storageKey, sizeBytes, contentHash, documentId, tenantId]);
+      if (result.rowCount !== 1) throw new Error("DOCUMENT_NOT_FOUND_OR_FORBIDDEN");
+    });
   }
 
   async saveOcrResult(tenantId: string, documentId: string, result: OcrResultPatch): Promise<void> {
@@ -564,7 +718,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     });
   }
 
-  async getOriginal(tenantId: string, documentId: string): Promise<{ storageKey: string; mimeType: string; status: string } | null> {
+  async getOriginal(tenantId: string, documentId: string): Promise<{ storageKey: string | null; mimeType: string; status: string } | null> {
     if (!isUuid(documentId)) return null;
     const client = await this.pool.connect();
     try {
@@ -606,32 +760,39 @@ export class PostgresOcrDocumentStore implements ReviewStore {
   }
 
   /**
-   * Newest first. limit 1..200 (default 50) and offset ≥ 0 are clamped. `q` matches filename, customer name and therapist
-   * (case-insensitive, LIKE wildcards escaped). Unknown status → INVALID_QUERY; malformed batchId → BATCH_NOT_FOUND.
+   * Visible rows (VISIBLE_SQL), newest upload first; the pages of one PDF stay together in page order at the position of
+   * their upload (they share its created_at). limit 1..200 (default 50) and offset ≥ 0 are clamped. `q` matches filename,
+   * customer name, therapist and form number (case-insensitive, LIKE wildcards escaped); `parentId` lists the pages of one
+   * PDF. Unknown status → INVALID_QUERY; malformed batchId → BATCH_NOT_FOUND; malformed parentId → DOCUMENT_NOT_FOUND.
    */
   async listDocuments(tenantId: string, query: ListDocumentsQuery = {}): Promise<{ total: number; documents: DocumentListItem[] }> {
     const limit = clampInt(query.limit, 50, 1, 200);
     const offset = clampInt(query.offset, 0, 0, 1_000_000);
     if (query.status !== undefined && !DOCUMENT_STATUS_CATEGORIES.includes(query.status)) throw new Error("INVALID_QUERY");
     if (query.batchId !== undefined && !isUuid(query.batchId)) throw new Error("BATCH_NOT_FOUND");
+    if (query.parentId !== undefined && !isUuid(query.parentId)) throw new Error("DOCUMENT_NOT_FOUND");
     const params: unknown[] = [tenantId];
-    const where = ["d.organization_id = $1::uuid", "d.deleted_at IS NULL", "d.status <> 'DELETED'"];
+    const where = ["d.organization_id = $1::uuid", VISIBLE_SQL];
     if (query.status) where.push(CATEGORY_SQL[query.status]);
     if (query.batchId) { params.push(query.batchId); where.push(`d.batch_id = $${params.length}::uuid`); }
+    if (query.parentId) { params.push(query.parentId); where.push(`d.parent_document_id = $${params.length}::uuid`); }
     const q = typeof query.q === "string" ? query.q.trim().slice(0, 200) : "";
     if (q) {
       params.push(`%${escapeLike(q)}%`);
       const p = `$${params.length}`;
       where.push(`(d.filename ILIKE ${p} ESCAPE '\\' OR (d.structured_result #>> '{customerInformation,name,value}') ILIKE ${p} ESCAPE '\\'
-        OR (d.structured_result #>> '{staffOnly,therapistName,value}') ILIKE ${p} ESCAPE '\\' OR (d.structured_result #>> '{therapistName,value}') ILIKE ${p} ESCAPE '\\')`);
+        OR (d.structured_result #>> '{staffOnly,therapistName,value}') ILIKE ${p} ESCAPE '\\' OR (d.structured_result #>> '{therapistName,value}') ILIKE ${p} ESCAPE '\\'
+        OR (d.structured_result #>> '{header,formNumber,value}') ILIKE ${p} ESCAPE '\\')`);
     }
     const condition = where.join(" AND ");
     return this.tenantTransaction(tenantId, async (client) => {
       const total = await client.query<{ total: number }>(`SELECT count(*)::int AS total FROM documents d WHERE ${condition}`, params);
       const rows = await client.query<Row>(
         `SELECT d.id, d.batch_id, d.filename, d.mime_type, d.status::text AS status, d.needs_review, d.error_message, d.created_at, d.processed_at,
-                ${REVIEWED_AT_SQL} AS reviewed_at, d.structured_result, ${DELIVERY_SQL} AS delivery_status
-         FROM documents d WHERE ${condition} ORDER BY d.created_at DESC, d.id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+                ${REVIEWED_AT_SQL} AS reviewed_at, d.structured_result, ${DELIVERY_SQL} AS delivery_status, ${PAGE_COLUMNS}
+         FROM documents d ${PARENT_JOIN} WHERE ${condition}
+         ORDER BY d.created_at DESC, COALESCE(d.parent_document_id, d.id) DESC, d.page_number ASC NULLS FIRST, d.id DESC
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]);
       return { total: total.rows[0]?.total ?? 0, documents: rows.rows.map(toListItem) };
     });
@@ -640,12 +801,15 @@ export class PostgresOcrDocumentStore implements ReviewStore {
   /**
    * Re-queues a FAILED document: status CLEAN, error cleared, one new PENDING job on the latest run (the run stays
    * RUNNING; never a second run). A document that never reached the queue (scan failure → no job) is not retryable,
-   * because a retry would skip the malware scan. DOCUMENT_NOT_FOUND / DOCUMENT_NOT_RETRYABLE.
+   * because a retry would skip the malware scan — except a page of a split PDF: it is our own render of an original that
+   * passed the scan, and a page whose render failed never got a job (its new job re-renders it). A FAILED PDF parent is
+   * split again by its new job (the worker decides from the document; existing pages are kept). The job has the default
+   * priority 100. DOCUMENT_NOT_FOUND / DOCUMENT_NOT_RETRYABLE.
    */
   async retryDocument(tenantId: string, documentId: string): Promise<{ jobId: string }> {
     if (!isUuid(documentId)) throw new Error("DOCUMENT_NOT_FOUND");
     return this.tenantTransaction(tenantId, async (client) => {
-      const document = await client.query<{ status: string }>("SELECT status::text AS status FROM documents WHERE id=$1::uuid AND organization_id=$2::uuid AND deleted_at IS NULL FOR UPDATE", [documentId, tenantId]);
+      const document = await client.query<{ status: string; is_page: boolean }>("SELECT status::text AS status, parent_document_id IS NOT NULL AS is_page FROM documents WHERE id=$1::uuid AND organization_id=$2::uuid AND deleted_at IS NULL FOR UPDATE", [documentId, tenantId]);
       if (!document.rows[0]) throw new Error("DOCUMENT_NOT_FOUND");
       if (document.rows[0].status !== "FAILED") throw new Error("DOCUMENT_NOT_RETRYABLE");
       const run = await client.query<{ id: string; queued: boolean }>(
@@ -653,7 +817,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
                                WHERE rr.organization_id=r.organization_id AND rr.document_id=r.document_id) AS queued
          FROM document_runs r WHERE r.organization_id=$1::uuid AND r.document_id=$2::uuid ORDER BY r.created_at DESC LIMIT 1`, [tenantId, documentId]);
       const latest = run.rows[0];
-      if (!latest?.queued) throw new Error("DOCUMENT_NOT_RETRYABLE");
+      if (!latest || (!latest.queued && document.rows[0].is_page !== true)) throw new Error("DOCUMENT_NOT_RETRYABLE");
       await client.query("UPDATE documents SET status='CLEAN', error_message=NULL, updated_at=now() WHERE id=$1::uuid AND organization_id=$2::uuid", [documentId, tenantId]);
       const job = await client.query<{ id: string }>(
         "INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, available_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'OCR', 'PENDING', now()) RETURNING id",

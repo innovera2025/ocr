@@ -1,10 +1,10 @@
 import { limits } from "@innovera/ocr-config";
 
-export const supportedMimeTypes = Object.freeze([
-  "application/pdf", "image/jpeg", "image/png", "image/webp",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-] as const);
+/**
+ * What the OCR pipeline can read. DOCX/XLSX are refused at upload (415 UNSUPPORTED_MEDIA_TYPE) until they are supported:
+ * the Local AI answers them with 400, so they used to be accepted here and then lost (job DEAD).
+ */
+export const supportedMimeTypes = Object.freeze(["application/pdf", "image/jpeg", "image/png", "image/webp"] as const);
 export type SupportedMimeType = typeof supportedMimeTypes[number];
 
 export type IngestState = "STAGED" | "SCANNING" | "CLEAN" | "QUARANTINED";
@@ -44,20 +44,23 @@ export type IngestDependencies = Readonly<{
   lookupUpload?: (input: { filename: string; mimeType: SupportedMimeType; bytes: Uint8Array }) => Promise<{ tenantId: string; documentId: string; runId: string; jobId?: string; status?: string; storageKey?: string; stale?: boolean } | null>;
   /** Atomically takes over a stale upload before it is resumed; false when a concurrent replay already took it. */
   claimResume?: (input: { tenantId: string; documentId: string }) => Promise<boolean>;
-  persistUpload?: (input: { filename: string; mimeType: SupportedMimeType; bytes: Uint8Array; stagedKey: string }) => Promise<{ tenantId: string; documentId: string; runId: string; reused?: boolean }>;
+  /** `priority`: queue priority of the upload's OCR job (fair share inside a batch, see enqueuePersistent). */
+  persistUpload?: (input: { filename: string; mimeType: SupportedMimeType; bytes: Uint8Array; stagedKey: string }) => Promise<{ tenantId: string; documentId: string; runId: string; reused?: boolean; priority?: number }>;
   updateStatus?: (input: { tenantId: string; documentId: string; status: "CLEAN" | "QUARANTINED" | "FAILED"; errorMessage?: string }) => Promise<void>;
-  enqueuePersistent?: (input: { tenantId: string; documentId: string; runId: string; stagedKey: string }) => Promise<string>;
+  /** `priority` comes from persistUpload (absent for a resumed upload: the default 100). */
+  enqueuePersistent?: (input: { tenantId: string; documentId: string; runId: string; stagedKey: string; priority?: number }) => Promise<string>;
   /** Deletes a staged original that no document references (persistUpload refused it with a known pre-insert error or reused another upload). */
   discard?: (stagedKey: string) => Promise<void>;
 }>;
 
-type Persisted = { tenantId: string; documentId: string; runId: string };
+type Persisted = { tenantId: string; documentId: string; runId: string; priority?: number };
 /** persistUpload rejections after which no document references the staged original. */
 const UNREFERENCED_UPLOAD_ERRORS: ReadonlySet<string> = new Set(["BATCH_FULL", "BATCH_NOT_FOUND", "IDEMPOTENCY_CONFLICT"]);
 export type IngestResult = Readonly<{ status: "CLEAN" | "QUARANTINED"; stagedKey: string; jobId?: string; tenantId?: string; documentId?: string; runId?: string; reused?: boolean }>;
 
 /** Scan → status → enqueue for a persisted upload (fresh, or resumed after its request died). */
-async function scanAndEnqueue(persisted: Persisted, stagedKey: string, deps: IngestDependencies, scanned?: "CLEAN"): Promise<IngestResult> {
+async function scanAndEnqueue(input: Persisted, stagedKey: string, deps: IngestDependencies, scanned?: "CLEAN"): Promise<IngestResult> {
+  const { priority, ...persisted } = input;
   let verdict: "CLEAN" | "QUARANTINED";
   try {
     verdict = scanned ?? await deps.scan(stagedKey);
@@ -71,7 +74,7 @@ async function scanAndEnqueue(persisted: Persisted, stagedKey: string, deps: Ing
   }
   if (deps.updateStatus && !scanned) await deps.updateStatus({ tenantId: persisted.tenantId, documentId: persisted.documentId, status: "CLEAN" });
   const jobId = deps.enqueuePersistent
-    ? await deps.enqueuePersistent({ tenantId: persisted.tenantId, documentId: persisted.documentId, runId: persisted.runId, stagedKey })
+    ? await deps.enqueuePersistent({ tenantId: persisted.tenantId, documentId: persisted.documentId, runId: persisted.runId, stagedKey, ...(priority !== undefined ? { priority } : {}) })
     : await deps.enqueue(stagedKey);
   return { status: "CLEAN" as const, stagedKey, jobId, ...persisted };
 }
@@ -107,7 +110,8 @@ export async function ingestDocument(input: { filename: string; bytes: Uint8Arra
   // Reuse the winner and stop before scanning/enqueuing a second job.
   if (persisted?.reused) {
     await deps.discard?.(stagedKey).catch(() => undefined);
-    return { status: "CLEAN" as const, stagedKey: "", jobId: "", ...persisted };
+    const { priority: _unused, ...winner } = persisted;
+    return { status: "CLEAN" as const, stagedKey: "", jobId: "", ...winner };
   }
   if (persisted) return scanAndEnqueue(persisted, stagedKey, deps);
   const verdict = await deps.scan(stagedKey);

@@ -13,7 +13,8 @@ const batchId = "10000000-0000-4000-8000-000000000001";
 const failedDocumentId = "20000000-0000-4000-8000-000000000002";
 const unknownId = "30000000-0000-4000-8000-000000000003";
 const auth = { authorization: "Bearer test-token" };
-const reviewExtras = { batchId: null, reviewedAt: null, reviewedBy: null, updatedAt: "2026-09-21T01:00:00.000Z", errorMessage: null, createdAt: "2026-09-21T00:59:00.000Z", processedAt: "2026-09-21T01:00:00.000Z", deliveryStatus: "NONE" } as const;
+const reviewExtras = { batchId: null, reviewedAt: null, reviewedBy: null, updatedAt: "2026-09-21T01:00:00.000Z", errorMessage: null, createdAt: "2026-09-21T00:59:00.000Z", processedAt: "2026-09-21T01:00:00.000Z", deliveryStatus: "NONE",
+  parentDocumentId: null, pageNumber: null, pageCount: null, parentFilename: null } as const;
 /** Stored views are canonical; tests may still hand the server a legacy flat shape to prove it normalizes defensively. */
 const asView = (value: unknown) => value as ReviewDocument["structuredResult"];
 const jsonAuth = { ...auth, "content-type": "application/json" };
@@ -80,7 +81,7 @@ const canonical = (needsReview: { therapist?: boolean; name?: boolean } = {}) =>
   staffOnly: { treatments: [], therapistName: { raw: "พิพิ", value: "พิพิ", confidence: 0.4, source: "ocr", needsReview: needsReview.therapist ?? true }, roomNo: { raw: "1", value: "1", confidence: 0.9, source: "ocr", needsReview: false } }
 });
 
-function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; storeError?: Error; readiness?: () => Promise<boolean>; structuredResult?: unknown; originalStatus?: string } = {}) {
+function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; storeError?: Error; readiness?: () => Promise<boolean>; structuredResult?: unknown; originalStatus?: string; originalKey?: string | null } = {}) {
   const calls: Call[] = [];
   let contentReads = 0;
   const confirmCalls: unknown[] = [];
@@ -118,7 +119,7 @@ function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; store
         rawResponse: {}, structuredResult: asView(options.structuredResult ?? canonical()), needsReview: true, confirmStatus: null, ...reviewExtras
       } : null;
     },
-    getOriginal: async (tenantId: string, id: string) => { record("getOriginal", tenantId, id); return id === documentId ? { storageKey: "org/x/original/ab/key", mimeType: "image/png", status: options.originalStatus ?? "NEEDS_REVIEW" } : null; },
+    getOriginal: async (tenantId: string, id: string) => { record("getOriginal", tenantId, id); return id === documentId ? { storageKey: options.originalKey === undefined ? "org/x/original/ab/key" : options.originalKey, mimeType: "image/png", status: options.originalStatus ?? "NEEDS_REVIEW" } : null; },
     saveCorrection: async (...args: unknown[]) => { corrections.push(args); }
   };
   const ingest = (tenantId: string, idempotencyKey?: string, batch?: string): IngestDependencies => {
@@ -274,12 +275,15 @@ test("documents list parses query parameters strictly", async () => {
     const full = await fetch(`${base}/api/documents?limit=200&offset=400&status=review&q=${encodeURIComponent("  อันนา  ")}&batchId=${batchId.toUpperCase()}`, { headers: auth });
     assert.equal(full.status, 200);
     assert.deepEqual(h.calls.at(-1)?.args, [{ limit: 200, offset: 400, status: "review", q: "อันนา", batchId }]);
+    assert.equal((await fetch(`${base}/api/documents?parentId=${failedDocumentId.toUpperCase()}`, { headers: auth })).status, 200);
+    assert.deepEqual(h.calls.at(-1)?.args, [{ limit: 50, offset: 0, parentId: failedDocumentId }], "the pages of one PDF");
     const count = h.calls.length;
     for (const [query, status, code] of [
       ["limit=0", 400, "INVALID_LIMIT"], ["limit=201", 400, "INVALID_LIMIT"], ["limit=abc", 400, "INVALID_LIMIT"], ["limit=1.5", 400, "INVALID_LIMIT"], ["limit=-1", 400, "INVALID_LIMIT"],
       ["offset=-1", 400, "INVALID_OFFSET"], ["offset=1e3", 400, "INVALID_OFFSET"], ["offset=1000001", 400, "INVALID_OFFSET"],
       ["status=SUCCEEDED", 400, "INVALID_STATUS"], ["status=bogus", 400, "INVALID_STATUS"],
-      [`q=${"a".repeat(101)}`, 400, "INVALID_QUERY"], ["batchId=nope", 404, "BATCH_NOT_FOUND"], ["batchId=1%27%20OR%201%3D1", 404, "BATCH_NOT_FOUND"]
+      [`q=${"a".repeat(101)}`, 400, "INVALID_QUERY"], ["batchId=nope", 404, "BATCH_NOT_FOUND"], ["batchId=1%27%20OR%201%3D1", 404, "BATCH_NOT_FOUND"],
+      ["parentId=nope", 404, "DOCUMENT_NOT_FOUND"], ["status=split", 400, "INVALID_STATUS"]
     ] as const) {
       await expectError(await fetch(`${base}/api/documents?${query}`, { headers: auth }), status, code);
     }
@@ -390,6 +394,9 @@ test("upload threads the batch id and decodes URI-encoded filenames", async () =
     await expectError(await upload({ "x-batch-id": "batch-1" }), 400, "INVALID_BATCH_ID");
     await expectError(await upload({ "x-upload-filename": "bad%E0%A4%A.png" }), 400, "INVALID_UPLOAD_HEADERS");
     await expectError(await upload({ "content-type": "text/html" }), 415, "UNSUPPORTED_MEDIA_TYPE");
+    for (const office of ["application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]) {
+      await expectError(await upload({ "content-type": office }), 415, "UNSUPPORTED_MEDIA_TYPE");
+    }
   });
   for (const [error, status] of [["BATCH_FULL", 409], ["BATCH_NOT_FOUND", 404], ["IDEMPOTENCY_CONFLICT", 409]] as const) {
     const failing = workbenchHarness({ ingest: { persistUpload: async () => { throw new Error(error); } } });
@@ -458,12 +465,17 @@ test("originals are never served before a clean scan: quarantined and unscanned 
       assert.equal(h.contentReads(), 0, `${status}: the stored bytes are not even read`);
     });
   }
-  for (const status of ["CLEAN", "FAILED", "SUCCEEDED"]) {
+  for (const status of ["CLEAN", "FAILED", "SUCCEEDED", "SPLIT"]) {
     const h = workbenchHarness({ originalStatus: status });
     await withServer(h, async (base) => {
-      assert.equal((await fetch(`${base}/api/documents/${documentId}/content`, { headers: auth })).status, 200, status);
+      assert.equal((await fetch(`${base}/api/documents/${documentId}/content`, { headers: auth })).status, 200, `${status} (a SPLIT PDF is hidden from the list, its original is still served)`);
     });
   }
+  const unrendered = workbenchHarness({ originalStatus: "FAILED", originalKey: null });
+  await withServer(unrendered, async (base) => {
+    await expectError(await fetch(`${base}/api/documents/${documentId}/content`, { headers: auth }), 404, "CONTENT_NOT_FOUND");
+    assert.equal(unrendered.contentReads(), 0, "a page whose render failed has no object");
+  });
 });
 
 test("NUL characters are client errors, not database 500s", async () => {

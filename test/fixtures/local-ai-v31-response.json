@@ -1,0 +1,315 @@
+{
+ "documentId": "00000000-0000-4000-8000-000000000031",
+ "sourceFile": "page-0001.png",
+ "engine": "typhoon-sections",
+ "version": "3.1",
+ "schemaVersion": 3,
+ "layout": {
+  "template": "makkha-intake-v1",
+  "imageWidth": 805,
+  "imageHeight": 569,
+  "scaleX": 1.0,
+  "scaleY": 1.0,
+  "aspectMatch": true,
+  "warnings": [],
+  "detection": {
+   "verdict": "known",
+   "score": 104.0,
+   "foundRatio": 1.0,
+   "rmsPx": 0.0,
+   "scaleX": 1.0,
+   "scaleY": 1.0,
+   "rotationDeg": 0.0,
+   "dx": 0.0,
+   "dy": 0.0
+  }
+ },
+ "header": {
+  "formNumber": {
+   "raw": "012345",
+   "value": "012345",
+   "confidence": 0.9,
+   "source": "ocr",
+   "needsReview": false
+  },
+  "date": {
+   "raw": "21/9/69",
+   "value": "2026-09-21",
+   "confidence": 0.8,
+   "source": "ocr",
+   "needsReview": false
+  },
+  "time": {
+   "raw": "14.30 น.",
+   "value": "14:30",
+   "confidence": 0.8,
+   "source": "ocr",
+   "needsReview": false
+  }
+ },
+ "customerInformation": {
+  "name": {
+   "raw": "Chun",
+   "value": "Chun",
+   "confidence": 0.8,
+   "source": "ocr",
+   "needsReview": false
+  },
+  "gender": {
+   "raw": "Female",
+   "value": "Female",
+   "confidence": 0.99,
+   "source": "checkbox",
+   "needsReview": false
+  },
+  "nationality": {
+   "raw": "Chinese",
+   "value": "Chinese",
+   "confidence": 1.0,
+   "source": "master-fuzzy",
+   "needsReview": false
+  },
+  "hotelName": {
+   "raw": null,
+   "value": null,
+   "confidence": 0.983,
+   "source": "ink-mark",
+   "needsReview": false
+  },
+  "referralSources": [],
+  "healthConditions": [
+   {
+    "raw": "Menstruation",
+    "value": "Menstruation",
+    "confidence": 0.99,
+    "source": "checkbox",
+    "needsReview": false,
+    "checked": true
+   }
+  ]
+ },
+ "recommendationCard": {
+  "pressure": {
+   "raw": "Standard",
+   "value": "Standard",
+   "confidence": 0.99,
+   "source": "checkbox",
+   "needsReview": false
+  },
+  "massageOilScrub": [
+   {
+    "raw": "struck out: Jasmine, Rose, Citronella",
+    "value": null,
+    "confidence": 0.35,
+    "source": "checkbox",
+    "needsReview": true,
+    "checked": true
+   }
+  ],
+  "preferredAreas": [
+   {
+    "raw": "Shoulder (front)",
+    "value": "Shoulder (front)",
+    "confidence": 0.98,
+    "source": "ink-mark",
+    "needsReview": false,
+    "checked": true
+   }
+  ],
+  "avoidAreas": [
+   {
+    "raw": "Calf (back)",
+    "value": "Calf (back)",
+    "confidence": 0.98,
+    "source": "ink-mark",
+    "needsReview": false,
+    "checked": true
+   }
+  ]
+ },
+ "staffOnly": {
+  "treatments": [
+   {
+    "raw": "ไทย",
+    "value": "นวดไทย",
+    "confidence": 0.95,
+    "source": "rule",
+    "needsReview": false,
+    "nameRaw": "ไทย",
+    "duration": "60 นาที",
+    "durationMinutes": 60,
+    "guests": 2
+   },
+   {
+    "raw": "เท้า 30",
+    "value": "นวดเท้า",
+    "confidence": 0.95,
+    "source": "rule",
+    "needsReview": false,
+    "nameRaw": "เท้า",
+    "duration": "30",
+    "durationMinutes": 30,
+    "guests": 2
+   }
+  ],
+  "treatment": {
+   "raw": "2 ไทย + เท้า 30 = 90 นาที",
+   "durations": [
+    "90 นาที"
+   ],
+   "items": [
+    {
+     "raw": "ไทย",
+     "value": "นวดไทย",
+     "confidence": 0.95,
+     "source": "rule",
+     "needsReview": false,
+     "nameRaw": "ไทย",
+     "duration": "60 นาที",
+     "durationMinutes": 60,
+     "guests": 2
+    },
+    {
+     "raw": "เท้า 30",
+     "value": "นวดเท้า",
+     "confidence": 0.95,
+     "source": "rule",
+     "needsReview": false,
+     "nameRaw": "เท้า",
+     "duration": "30",
+     "durationMinutes": 30,
+     "guests": 2
+    }
+   ],
+   "needsReview": false
+  },
+  "therapistName": {
+   "raw": "พีพี / Anna",
+   "value": "พีพี / Anna",
+   "confidence": 0.0,
+   "source": "master-fuzzy",
+   "needsReview": true
+  },
+  "roomNo": {
+   "raw": "3",
+   "value": "3",
+   "confidence": 0.95,
+   "source": "ocr",
+   "needsReview": false
+  },
+  "branch": {
+   "raw": "SUKHUMVIT 33",
+   "value": "SUKHUMVIT 33",
+   "confidence": 1.0,
+   "source": "rule",
+   "needsReview": false
+  },
+  "totalMinutes": 90
+ },
+ "evidence": {
+  "staffCropRaw": "STAFF ONLY\nTreatment : 2 ไทย + เท้า 30 = 90 นาที\nTherapist Name : พีพี / Anna\nRoom No. : 3\nSUKHUMVIT 33",
+  "customerCropRaw": "Name 姓名 : Chun\nNationality 国籍 : Chinese\nHotel Name 酒店 :",
+  "combinedRaw": "No. 012345\nDate 日期 : 21/9/69\nTime 时间 : 14.30 น.\nName 姓名 : Chun\nNationality 国籍 : Chinese\nHotel Name 酒店 :\n\nSTAFF ONLY\nTreatment : 2 ไทย + เท้า 30 = 90 นาที\nTherapist Name : พีพี / Anna\nRoom No. : 3\nSUKHUMVIT 33",
+  "checkboxScores": {
+   "gender.male": 0.0,
+   "gender.female": 0.333,
+   "gender.other": 0.0,
+   "referralSources.google": 0.0,
+   "referralSources.klook": 0.0,
+   "referralSources.redBook": 0.0,
+   "referralSources.daZhongDianPing": 0.0,
+   "referralSources.signage": 0.0,
+   "referralSources.kkday": 0.0,
+   "referralSources.totoBookingMonkeyTravel": 0.0,
+   "referralSources.tripadvisor": 0.0,
+   "referralSources.hotelStaff": 0.0,
+   "referralSources.tourGuide": 0.0,
+   "referralSources.brochures": 0.0,
+   "referralSources.others": 0.0,
+   "healthConditions.heartDisease": 0.0,
+   "healthConditions.pregnancy": 0.0,
+   "healthConditions.cancer": 0.0,
+   "healthConditions.menstruation": 0.391,
+   "healthConditions.highBloodPressure": 0.0,
+   "healthConditions.infectiousSkinDisease": 0.0,
+   "healthConditions.diabetes": 0.0,
+   "healthConditions.haveACold": 0.0,
+   "healthConditions.shoulderOrBackPain": 0.0,
+   "healthConditions.claustrophobia": 0.0,
+   "healthConditions.jointOrBoneDisorder": 0.0,
+   "healthConditions.anyAllergies": 0.0,
+   "healthConditions.asthma": 0.0,
+   "healthConditions.sle": 0.0,
+   "healthConditions.healingInjuriesOrRecentSurgery": 0.0,
+   "healthConditions.others": 0.0,
+   "pressure.strong": 0.0,
+   "pressure.standard": 0.266,
+   "pressure.soft": 0.0,
+   "massageOilScrub.jasmine": 0.125,
+   "massageOilScrub.rose": 0.125,
+   "massageOilScrub.citronella": 0.125,
+   "massageOilScrub.orangeCinnamon": 0.0,
+   "massageOilScrub.lavender": 0.0
+  },
+  "checkboxNotes": {
+   "massageOilScrub.jasmine": "row-struck-out",
+   "massageOilScrub.rose": "row-struck-out",
+   "massageOilScrub.citronella": "row-struck-out"
+  },
+  "bodyMap": [
+   {
+    "area": "Shoulder (front)",
+    "kind": "circle",
+    "confidence": 0.98,
+    "pixels": 316,
+    "onLabel": true,
+    "coverage": 1.0,
+    "center": 0.0,
+    "diagonal": 0.32
+   },
+   {
+    "area": "Calf (back)",
+    "kind": "cross",
+    "confidence": 0.98,
+    "pixels": 119,
+    "onLabel": true,
+    "coverage": 0.33,
+    "center": 0.24,
+    "diagonal": 1.0
+   }
+  ],
+  "textInk": {
+   "name": 277,
+   "nationality": 253,
+   "hotelName": 1,
+   "date": 163,
+   "time": 139
+  },
+  "layoutOffset": {
+   "dx": 0,
+   "dy": 0,
+   "contrast": 104.0
+  },
+  "stampPixelsRemoved": 0,
+  "treatmentWarnings": [
+   "เท้า: duration '30' has no unit; read as 30 min",
+   "ไทย: 60 min derived from the written total (90 min)"
+  ],
+  "treatmentTotalMinutes": 90
+ },
+ "timings": {
+  "preprocessMs": 0,
+  "checkboxMs": 0,
+  "inferenceMs": 0,
+  "inferenceWallMs": 0,
+  "normalizeMs": 0,
+  "totalMs": 0,
+  "sections": [
+   {
+    "name": "combined",
+    "ms": 0
+   }
+  ]
+ },
+ "needsReview": true
+}

@@ -132,3 +132,20 @@ test("a persistence error of unknown outcome keeps the staged original (the row 
   }), /Connection terminated/);
   assert.deepEqual(discarded, []);
 });
+
+test("the queue priority chosen at persistence reaches enqueuePersistent and never leaks into the result", async () => {
+  const enqueued: unknown[] = [];
+  const result = await ingestDocument(upload, {
+    stage: async () => "staged", scan: async () => "CLEAN" as const, enqueue: async () => "never",
+    persistUpload: async () => ({ tenantId: "t", documentId: "d", runId: "r", priority: 103 }),
+    updateStatus: async () => undefined,
+    enqueuePersistent: async (input) => { enqueued.push(input); return "job-1"; }
+  });
+  assert.deepEqual(enqueued, [{ tenantId: "t", documentId: "d", runId: "r", stagedKey: "staged", priority: 103 }]);
+  assert.equal("priority" in result, false);
+  const plain: unknown[] = [];
+  await ingestDocument(upload, { stage: async () => "staged", scan: async () => "CLEAN" as const, enqueue: async () => "never",
+    persistUpload: async () => ({ tenantId: "t", documentId: "d", runId: "r" }), updateStatus: async () => undefined,
+    enqueuePersistent: async (input) => { plain.push(input); return "job-2"; } });
+  assert.deepEqual(plain, [{ tenantId: "t", documentId: "d", runId: "r", stagedKey: "staged" }], "no priority: the column default (100)");
+});

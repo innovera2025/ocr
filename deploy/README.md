@@ -6,7 +6,7 @@ This stack starts PostgreSQL 17, ClamAV, the authenticated web service, and the 
 docker compose -f deploy/docker-compose.yml up --build
 ```
 
-The web health endpoint is available at `http://127.0.0.1:53100/health/live`. PostgreSQL is bound to `127.0.0.1:55432`; ClamAV is internal-only. OCR integration reads `OCR_API_BASE_URL` (default `https://ai.innoveraappcenter.com/ocr`), `OCR_REQUEST_TIMEOUT` (seconds, default `120`) and `OCR_MAX_RETRIES` (default `3`). Stop and remove local containers with:
+The web health endpoint is available at `http://127.0.0.1:53100/health/live`. PostgreSQL is bound to `127.0.0.1:55432`; ClamAV is internal-only. OCR integration reads `OCR_API_BASE_URL` (default `https://ai.innoveraappcenter.com/ocr`), `OCR_REQUEST_TIMEOUT` (seconds, default `300`) and `OCR_MAX_RETRIES` (default `3`). The worker image includes poppler-utils: a PDF upload is split into one page image and one row per page (`OCR_MAX_PDF_PAGES`, default `300`, at most `1000`; `OCR_PAGE_FORMAT` `png` (default) or `jpeg`), rendered in `${OCR_STORAGE_ROOT}/tmp` and stored next to the originals (about 1–3 MB per PNG page). Deploy the web (it runs migration 0018) before the worker. Stop and remove local containers with:
 
 ```sh
 docker compose -f deploy/docker-compose.yml down

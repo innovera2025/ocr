@@ -33,7 +33,8 @@ const v3Response = {
 
 test("normalizes a v3 response to the canonical view without evidence, timings or the legacy treatment block", () => {
   const view = normalizeStructuredResult(v3Response);
-  assert.deepEqual(Object.keys(view).sort(), ["customerInformation", "recommendationCard", "schemaVersion", "staffOnly"]);
+  assert.deepEqual(Object.keys(view).sort(), ["customerInformation", "header", "recommendationCard", "schemaVersion", "staffOnly"]);
+  assert.deepEqual(view.header, {}, "a v3.0 response has no header: {} like any absent section");
   assert.equal(view.schemaVersion, 3);
   assert.deepEqual(view.customerInformation.name, v3Response.customerInformation.name);
   assert.deepEqual(view.recommendationCard.avoidAreas, [check("Neck", true)]);
@@ -125,9 +126,9 @@ test("summarizeDocument extracts table columns, min confidence and review count"
   assert.deepEqual(summary, {
     customerName: "Chun Li", gender: "Female", nationality: "Thai",
     treatments: [{ name: "นวดไทย", duration: "90 นาที" }, { name: null, duration: "60 นาที" }],
-    therapist: "พิพิม", room: "12", minConfidence: 0.41, reviewFieldCount: 3
+    therapist: "พิพิม", room: "12", formNumber: null, branch: null, minConfidence: 0.41, reviewFieldCount: 3
   });
-  assert.deepEqual(summarizeDocument(normalizeStructuredResult(null)), { customerName: null, gender: null, nationality: null, treatments: [], therapist: null, room: null, minConfidence: null, reviewFieldCount: 0 });
+  assert.deepEqual(summarizeDocument(normalizeStructuredResult(null)), { customerName: null, gender: null, nationality: null, treatments: [], therapist: null, room: null, formNumber: null, branch: null, minConfidence: null, reviewFieldCount: 0 });
   const human = normalizeStructuredResult({ staffOnly: { roomNo: { raw: "1", value: "2", confidence: 0.2, source: "human", needsReview: false } } });
   assert.equal(summarizeDocument(human).minConfidence, 1);
 });
@@ -306,4 +307,124 @@ test("review removals never share a correction path with the item edited at that
   assert.deepEqual(changes.map((change) => change.path), ["staffOnly.treatments[0]", "staffOnly.treatments[0].removed"]);
   assert.equal(changes[0]!.provider?.verifiedValue, "นวดเท้า");
   assert.equal(thai!.value, "นวดไทย");
+});
+
+/** Local AI v3.1 (release1-plan "v3.1 response additions"): header section, staffOnly.branch/totalMinutes, treatment guests. */
+const v31Response = {
+  ...v3Response, version: "3.1",
+  header: { formNumber: field("012345", "012345", 0.93), date: field("21/9/69", "21/9/69", 0.7, true), time: field("14:30", "14:30", 0.8) },
+  layout: { ...v3Response.layout, detection: { verdict: "known", score: 45.3, foundRatio: 1, rmsPx: 0.5, scaleX: 0.993, scaleY: 0.993, rotationDeg: -0.15, dx: 1.2, dy: -2 } },
+  staffOnly: {
+    ...v3Response.staffOnly,
+    treatments: [{ ...treatment("4 ไทย 1 ชม.", "ไทย", "นวดไทย", "1 ชม.", 0.9), durationMinutes: 60, guests: 4 }, { ...treatment("ประคบ 30", "ประคบ", "ประคบ", "30", 0.8), guests: null }],
+    branch: field("SUKHUMVIT 33", "SUKHUMVIT 33", 0.95, false, "master-fuzzy"), totalMinutes: 90
+  }
+};
+
+test("v3.1: the canonical view keeps header, staffOnly.branch, totalMinutes and treatment guests (layout stays out)", () => {
+  const view = toStructuredResult(v31Response);
+  assert.deepEqual(view.header, v31Response.header);
+  assert.deepEqual(view.staffOnly.branch, v31Response.staffOnly.branch);
+  assert.equal(view.staffOnly.totalMinutes, 90);
+  assert.deepEqual((view.staffOnly.treatments as Array<Record<string, unknown>>).map((item) => [item.value, item.durationMinutes, item.guests]), [["นวดไทย", 60, 4], ["ประคบ", 30, null]]);
+  assert.equal("layout" in view, false);
+  assert.deepEqual(normalizeStructuredResult(view), view, "idempotent");
+  assert.deepEqual(summarizeDocument(view), { customerName: "Chun Li", gender: "Female", nationality: "Thai", treatments: [{ name: "นวดไทย", duration: "1 ชม." }, { name: "ประคบ", duration: "30" }],
+    therapist: "พิพิม", room: "12", formNumber: "012345", branch: "SUKHUMVIT 33", minConfidence: 0.7, reviewFieldCount: 3 });
+  assert.equal(hasReviewFields(normalizeStructuredResult({ header: { date: field("x", null, 0.2, true) } })), true, "a flagged header field sends the document to review");
+});
+
+test("v3.1: malformed numeric additions become null, and v3.0 / legacy rows get an empty header", () => {
+  const view = normalizeStructuredResult({ schemaVersion: 3, header: { formNumber: 12345 }, staffOnly: { totalMinutes: "90", treatments: [{ raw: "ไทย", value: "นวดไทย", guests: "4" }] } });
+  assert.equal(view.staffOnly.totalMinutes, null);
+  assert.equal((view.staffOnly.treatments as Array<Record<string, unknown>>)[0]!.guests, null);
+  assert.deepEqual(view.header.formNumber, { raw: "12345", value: "12345", needsReview: false });
+  assert.deepEqual(normalizeStructuredResult(v2Staff).header, {});
+  assert.deepEqual(normalizeStructuredResult(null).header, {});
+  assert.equal("guests" in (normalizeStructuredResult(v3Response).staffOnly.treatments as Array<Record<string, unknown>>)[0]!, false, "v3.0 items do not grow a guests key");
+});
+
+test("v3.1: the review editor edits header values and the branch; totalMinutes and guests survive a save", () => {
+  const current = toStructuredResult(v31Response);
+  const edited = structuredClone(current);
+  (edited.header.formNumber as Record<string, unknown>).value = "012346";
+  (edited.staffOnly.branch as Record<string, unknown>).value = "PLOENCHIT";
+  edited.staffOnly.totalMinutes = 999;
+  ((edited.staffOnly.treatments as Array<Record<string, unknown>>)[0]!).guests = 9;
+  const { merged, changes } = applyReviewEdits(current, edited);
+  assert.deepEqual(merged.header.formNumber, { raw: "012345", value: "012346", confidence: 0.93, source: "human", needsReview: false });
+  assert.deepEqual(merged.header.date, { ...v31Response.header.date, needsReview: false }, "accepted as read");
+  assert.deepEqual(merged.staffOnly.branch, { raw: "SUKHUMVIT 33", value: "PLOENCHIT", confidence: 0.95, source: "human", needsReview: false });
+  assert.equal(merged.staffOnly.totalMinutes, 90, "not an editable leaf");
+  assert.equal((merged.staffOnly.treatments as Array<Record<string, unknown>>)[0]!.guests, 4, "not an editable leaf");
+  const paths = changes.map((change) => change.path);
+  assert.ok(paths.includes("header.formNumber") && paths.includes("staffOnly.branch"));
+  assert.equal(changes.find((change) => change.path === "staffOnly.branch")?.provider, undefined, "the branch is not sent to verified memory");
+  assert.equal(hasReviewFields(merged), false);
+  const filled = applyReviewEdits(normalizeStructuredResult(v3Response), { header: { formNumber: { value: "777" } } });
+  assert.deepEqual(filled.merged.header, { formNumber: { raw: null, value: "777", confidence: 1, source: "human", needsReview: false } }, "a v3.0 row can get a form number");
+  assert.throws(() => applyReviewEdits(current, { header: "x" }), { message: "REVIEW_INVALID" });
+});
+
+/**
+ * Contract with the Local AI: a REAL v3.1 response (test/fixtures/local-ai-v31-response.json, made by local-ai api.process_image
+ * on the synthetic form with a canned model answer: header, a struck-out oil row, guests, a written total, two therapists, the
+ * printed branch). Field by field, what the Local AI emits is what the canonical view, the summary and the review save keep.
+ */
+type Sections = Record<"header" | "customerInformation" | "recommendationCard" | "staffOnly", Record<string, unknown>>;
+const v31Real = JSON.parse(readFileSync(new URL("../../../test/fixtures/local-ai-v31-response.json", import.meta.url), "utf8")) as Sections & { version: string };
+const struckMarker = (v31Real.recommendationCard.massageOilScrub as Array<Record<string, unknown>>)[0]!;
+
+test("v3.1 contract: a real Local AI response maps field by field onto the canonical view and the summary", () => {
+  assert.equal(v31Real.version, "3.1");
+  const view = toStructuredResult({ documentId: "local-31", ...v31Real });
+  assert.deepEqual(Object.keys(view).sort(), ["customerInformation", "header", "recommendationCard", "schemaVersion", "staffOnly"], "layout/evidence/timings stay in raw_response");
+  for (const key of ["formNumber", "date", "time"]) assert.deepEqual(view.header[key], v31Real.header[key], `header.${key}`);
+  assert.deepEqual([view.header.date, view.header.time].map((f) => (f as Record<string, unknown>).value), ["2026-09-21", "14:30"], "ISO date, HH:MM time");
+  assert.deepEqual(view.staffOnly.branch, v31Real.staffOnly.branch);
+  assert.equal(view.staffOnly.totalMinutes, 90);
+  assert.equal(view.staffOnly.totalMinutes, v31Real.staffOnly.totalMinutes);
+  assert.deepEqual(view.staffOnly.treatments, v31Real.staffOnly.treatments, "treatments incl. guests and a derived duration, unchanged");
+  assert.deepEqual((view.staffOnly.treatments as Array<Record<string, unknown>>).map((t) => [t.value, t.durationMinutes, t.guests]), [["นวดไทย", 60, 2], ["นวดเท้า", 30, 2]]);
+  assert.equal("treatment" in view.staffOnly, false, "the legacy v2.2 block is folded into treatments");
+  assert.deepEqual(view.staffOnly.therapistName, v31Real.staffOnly.therapistName, "two therapists joined with ' / '");
+  const marker = (view.recommendationCard.massageOilScrub as Array<Record<string, unknown>>)[0]!;
+  assert.deepEqual(marker, struckMarker, "struck-out row marker kept (value null, flagged)");
+  assert.equal(marker.value, null);
+  assert.deepEqual(view.customerInformation, v31Real.customerInformation);
+  assert.deepEqual(view.recommendationCard, v31Real.recommendationCard);
+  assert.equal(hasReviewFields(view), true);
+  assert.deepEqual(normalizeStructuredResult(view), view, "idempotent");
+  const summary = summarizeDocument(view);
+  assert.equal(summary.formNumber, "012345");
+  assert.equal(summary.branch, "SUKHUMVIT 33");
+  assert.deepEqual(summary.treatments, [{ name: "นวดไทย", duration: "60 นาที" }, { name: "นวดเท้า", duration: "30" }]);
+  assert.equal(summary.reviewFieldCount, 2, "the struck-out marker and the two-therapist field");
+});
+
+test("v3.1 contract: the review editor's round trip keeps the struck-out marker and the numeric additions", () => {
+  const current = toStructuredResult({ documentId: "local-31", ...v31Real });
+  const draft = structuredClone(current); // what the UI sends back when the reviewer changes nothing
+  const { merged, changes } = applyReviewEdits(current, draft);
+  const marker = (merged.recommendationCard.massageOilScrub as Array<Record<string, unknown>>)[0]!;
+  assert.deepEqual(marker, { ...struckMarker, needsReview: false }, "accepted as read: still no selection");
+  assert.equal(merged.staffOnly.totalMinutes, 90);
+  assert.deepEqual((merged.staffOnly.treatments as Array<Record<string, unknown>>).map((t) => t.guests), [2, 2]);
+  assert.deepEqual(merged.header.date, { ...(v31Real.header.date as Record<string, unknown>), needsReview: false });
+  assert.deepEqual(changes.map((c) => c.path), ["staffOnly.therapistName"], "only the flagged therapist is confirmed (verified memory); header and branch are not");
+  assert.equal(hasReviewFields(merged), false);
+});
+
+test("v3.1: an unread field (branch not found: source none, confidence 0) does not pull the row's confidence to 0", () => {
+  const response = structuredClone(v31Real);
+  response.staffOnly.branch = { raw: null, value: null, confidence: 0, source: "none", needsReview: false };
+  response.staffOnly.therapistName = { raw: "พีพี", value: "พีพี", confidence: 1, source: "master-fuzzy", needsReview: false };
+  response.recommendationCard.massageOilScrub = [];
+  const summary = summarizeDocument(toStructuredResult({ documentId: "local-31", ...response }));
+  assert.equal(summary.branch, null);
+  assert.equal(summary.minConfidence, 0.8, "the weakest reading (name 0.8), not the absent branch");
+  const flagged = summarizeDocument(normalizeStructuredResult({ staffOnly: { branch: { raw: null, value: null, confidence: 0, source: "none", needsReview: true } } }));
+  assert.equal(flagged.minConfidence, 0, "a flagged empty field still counts");
+  const read = summarizeDocument(normalizeStructuredResult({ staffOnly: { roomNo: { raw: "x", value: null, confidence: 0, source: "none", needsReview: false } } }));
+  assert.equal(read.minConfidence, 0, "raw text without a value is a reading and counts");
 });

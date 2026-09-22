@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { OcrClient, OcrClientError, readOcrTimings, type OcrResponse, type TreatmentField } from "./index.js";
+import { OcrClient, OcrClientError, readLayoutDetection, readOcrTimings, type OcrResponse, type TreatmentField } from "./index.js";
 
 const response = (status: number, body: unknown): Response => new Response(JSON.stringify(body), {
   status,
@@ -75,6 +75,15 @@ test("OCR timings reader ignores missing and malformed values", () => {
   assert.deepEqual(readOcrTimings({}), {});
   assert.deepEqual(readOcrTimings({ timings: "fast" }), {});
   assert.deepEqual(readOcrTimings({ timings: { inferenceMs: "2900", totalMs: -1, checkboxMs: Number.NaN, preprocessMs: 12, sections: [{ name: 1, ms: 2 }, null] } }), { preprocessMs: 12 });
+});
+
+test("v3.1 layout.detection reader: the verdict and fit values, null before 3.1 or when malformed", () => {
+  const detection = { verdict: "known", score: 45.3, foundRatio: 1, rmsPx: 0.5, scaleX: 0.993, scaleY: 0.993, rotationDeg: -0.15, dx: 1.2, dy: -2 };
+  assert.deepEqual(readLayoutDetection({ layout: { template: "makkha-intake-v1", detection: { ...detection, extra: "ignored" } } }), detection);
+  assert.equal(readLayoutDetection({ layout: { template: "makkha-intake-v1", warnings: [] } }), null, "v3.0 has no detection");
+  assert.equal(readLayoutDetection({}), null);
+  assert.equal(readLayoutDetection({ layout: { detection: { ...detection, verdict: "maybe" } } }), null);
+  assert.equal(readLayoutDetection({ layout: { detection: { ...detection, score: "45" } } }), null);
 });
 
 test("OCR client marks client errors non-retryable and server errors retryable", async () => {

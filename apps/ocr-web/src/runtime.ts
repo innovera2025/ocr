@@ -3,9 +3,16 @@ import { createClamAvStorageScanner } from "@innovera/ocr-ingest/clamav";
 import type { IngestDependencies } from "@innovera/ocr-ingest";
 import { mintOriginalKey } from "@innovera/ocr-storage";
 import { createLocalStorage } from "@innovera/ocr-storage/local";
-import { PostgresQueue } from "@innovera/ocr-queue/postgres";
+import { DEFAULT_JOB_PRIORITY, jobPriority, PostgresQueue } from "@innovera/ocr-queue/postgres";
 import { PostgresOcrDocumentStore } from "@innovera/ocr-persistence";
 import type { Pool } from "pg";
+
+/**
+ * Fair queue priority (design §4.1): the k-th file of a batch gets 100 + k, a single upload (no batch) and a retry keep the
+ * default 100, the pages of a PDF 100 + (page - 1). `ocr_claim_v1` claims by priority, so batches interleave and a single
+ * urgent upload goes ahead of a large batch without touching the queue functions.
+ */
+export function batchJobPriority(position: number): number { return jobPriority(DEFAULT_JOB_PRIORITY + position); }
 
 export function createRuntimeIngest(pool: Pool, tenantId: string, idempotencyKey?: string, batchId?: string): IngestDependencies {
   const storage = createLocalStorage(process.env.OCR_STORAGE_ROOT ?? "/var/lib/ocr");
@@ -30,13 +37,16 @@ export function createRuntimeIngest(pool: Pool, tenantId: string, idempotencyKey
     },
     scan: scanner,
     enqueue: async () => { throw new Error("PERSISTENT_QUEUE_REQUIRED"); },
-    persistUpload: async ({ filename, mimeType, bytes, stagedKey }) => store.createUploadedDocument({
-      tenantId, filename, mimeType, sizeBytes: bytes.byteLength,
-      contentHash: createHash("sha256").update(bytes).digest("hex"), storageKey: stagedKey,
-      ...idempotency, ...(batchId ? { batchId } : {}), requestFingerprint: fingerprint(filename, mimeType, bytes)
-    }),
+    persistUpload: async ({ filename, mimeType, bytes, stagedKey }) => {
+      const { batchPosition, ...uploaded } = await store.createUploadedDocument({
+        tenantId, filename, mimeType, sizeBytes: bytes.byteLength,
+        contentHash: createHash("sha256").update(bytes).digest("hex"), storageKey: stagedKey,
+        ...idempotency, ...(batchId ? { batchId } : {}), requestFingerprint: fingerprint(filename, mimeType, bytes)
+      });
+      return { ...uploaded, ...(batchPosition !== undefined ? { priority: batchJobPriority(batchPosition) } : {}) };
+    },
     updateStatus: async ({ documentId, status, errorMessage }) => store.updateScanStatus(tenantId, documentId, status, errorMessage),
-    enqueuePersistent: async ({ runId }) => queue.enqueue({ organizationId: tenantId, runId }),
+    enqueuePersistent: async ({ runId, priority }) => queue.enqueue({ organizationId: tenantId, runId, ...(priority !== undefined ? { priority } : {}) }),
     discard: async (stagedKey) => storage.remove(stagedKey)
   };
 }

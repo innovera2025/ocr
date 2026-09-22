@@ -7,6 +7,14 @@ export type FinalJobStatus = "PENDING" | "SUCCEEDED" | "FAILED" | "DEAD";
 export type FinishResult = Readonly<{ accepted: boolean; finalStatus: FinalJobStatus | null }>;
 const FINAL_STATUSES: readonly FinalJobStatus[] = ["PENDING", "SUCCEEDED", "FAILED", "DEAD"];
 
+/** `ocr_claim_v1` claims by `priority ASC, available_at ASC`; 100 is the column default (a single upload or a retry). */
+export const DEFAULT_JOB_PRIORITY = 100;
+export const MAX_JOB_PRIORITY = 10_000;
+/** Integer priority clamped to 0..MAX_JOB_PRIORITY; anything else → the default. */
+export function jobPriority(value: number | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) ? Math.min(MAX_JOB_PRIORITY, Math.max(0, Math.trunc(value))) : DEFAULT_JOB_PRIORITY;
+}
+
 export class PostgresQueue {
   readonly pool: Pool;
   readonly workerPool: Pool;
@@ -15,16 +23,17 @@ export class PostgresQueue {
     this.workerPool = workerConfig instanceof Pool ? workerConfig : workerConfig ? new Pool(typeof workerConfig === "string" ? { connectionString: workerConfig } : workerConfig) : this.pool;
   }
 
-  async enqueue(input: { organizationId: string; runId: string; kind?: string; availableAt?: Date }): Promise<string> {
+  /** `priority` (lower = earlier) is set at insert time only: fair share between batches without touching the queue functions. */
+  async enqueue(input: { organizationId: string; runId: string; kind?: string; availableAt?: Date; priority?: number }): Promise<string> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
       await client.query("SELECT set_config('app.current_org', $1, true)", [input.organizationId]);
 
       const result = await client.query<{ id: string }>(
-        `INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, available_at)
-         VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3, 'PENDING', COALESCE($4, now())) RETURNING id`,
-        [input.organizationId, input.runId, input.kind ?? "OCR", input.availableAt ?? null]
+        `INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, available_at, priority)
+         VALUES (gen_random_uuid(), $1::uuid, $2::uuid, $3, 'PENDING', COALESCE($4, now()), $5) RETURNING id`,
+        [input.organizationId, input.runId, input.kind ?? "OCR", input.availableAt ?? null, jobPriority(input.priority)]
       );
 
       await client.query("COMMIT");

@@ -81,10 +81,23 @@ The app never stores evidence/timings in `structured_result` (they stay in `raw_
 
 ```jsonc
 { "schemaVersion": 3,
+  "header": { "formNumber": Field, "date": Field, "time": Field },   // v3.1; {} when absent (every older row)
   "customerInformation": { ... as above ... },     // {} when absent
   "recommendationCard":  { ... },                   // {} when absent
-  "staffOnly": { "treatments": [TreatmentField], "therapistName": Field, "roomNo": Field } }
+  "staffOnly": { "treatments": [TreatmentField], "therapistName": Field, "roomNo": Field,
+                 "branch": Field, "totalMinutes": number|null } }   // branch/totalMinutes: v3.1, absent before
 ```
+
+Release 1 (Local AI v3.1, `docs/operations/real-data/release1-plan.md`) additions are kept by `normalizeStructuredResult`
+and `toStructuredResult`: the `header` section, `staffOnly.branch` (a Field, editable in review, never sent to verified
+memory), `staffOnly.totalMinutes` and a treatment item's `guests` (finite number or null; not editable, preserved by a
+review save). `layout.detection` stays in `raw_response` only; the worker logs its `verdict`/`score` with `ocr_completed`
+and counts `ocr_template_verdict_total{verdict}` (`readLayoutDetection` in `@innovera/ocr-client`). `summarizeDocument` adds
+`formNumber` and `branch`; an unread field (`source:"none"`, raw and value null, not flagged — e.g. a branch that was not
+found, confidence 0) is left out of `minConfidence`. A struck-out checkbox row arrives as one check-list item with
+`value: null`, `raw: "struck out: …"`, `needsReview: true`; it is kept through normalisation and a review save (accepted as
+read it stays a no-selection marker). `test/fixtures/local-ai-v31-response.json` is a real v3.1 response (synthetic form)
+used by the contract tests in `document-view.test.ts` and the worker tests.
 
 Legacy rows already in production are flat v2.2 staff results
 (`{treatment:{raw,durations,items,needsReview}, therapistName, roomNo}`) or whole v2.2 responses
@@ -338,3 +351,60 @@ retry, review save + outbox rows, queue claim/heartbeat/recovery.
 Python (pytest, python:3.11-slim container): full-document response shape, checkbox detection on
 `sample2.png` (Female, Menstruation, Standard pressure), multiple treatments + duration matching,
 therapist verified-memory correction, legacy fields present, confirm field validation.
+
+## 9. Release 1 — multi-page PDFs, fair priority, v3.1 fields (2026-09-22)
+
+Binding plan: `docs/operations/real-data/release1-plan.md` (workstream B); design: `docs/operations/real-data/design-2026-09-22.md`
+§1, §4.1, §4.4. Everything below is additive; v3.0 responses and legacy rows read as before.
+
+**Data model — migration `0018_multipage_documents`** (runs as `ocr_migrator`, defines no function): document status
+`SPLIT`; `documents.parent_document_id`, `page_number`, `page_count` (page shape CHECK, page 1..1000, composite FK
+`(parent_document_id, organization_id)` so a page and its PDF share a tenant, unique `(organization_id,
+parent_document_id, page_number)` for pages); `ocr_worker` gains `INSERT` on `documents`, `document_runs`,
+`extraction_jobs` and `SELECT (id, organization_id, run_id)` on `extraction_jobs` (still no UPDATE/DELETE on jobs, no DELETE
+on documents; `deploy/verify-db-roles.sh` checks both). Deploy order: web (migrates at startup) → worker.
+
+**Worker split** (`services/ocr-worker/src/split.ts`). A job whose document is a top-level PDF in status CLEAN or
+PROCESSING is split instead of sent to the OCR API (decided from the document, not a job kind, so an old web works and
+retrying a FAILED PDF re-splits it). `pdfinfo` first: a PDF that needs a password → `PDF_ENCRYPTED`, more than
+`OCR_MAX_PDF_PAGES` pages (default 300, 1..1000) → `PDF_TOO_MANY_PAGES`, a page side over 14,400 pt →
+`PDF_PAGE_TOO_LARGE`, unreadable or without pages → `PDF_RENDER_FAILED` (all: job DEAD, parent FAILED with `CODE: detail`,
+Retry allowed). A permissions-only encrypted PDF (empty user password) opens without a password and is rendered. Then
+`page_count` is set, and pages are rendered in chunks of 10 (`pdftoppm -scale-to 1610`, PNG — or JPEG q95 with
+`OCR_PAGE_FORMAT=jpeg`) into `${OCR_STORAGE_ROOT}/tmp/split-<jobId>/` (removed afterwards; the retention job also cleans
+`tmp`). Each page is stored under the deterministic key `mintOriginalKey(tenant, sha256("page:"+parentId+":"+n).slice(0,32))`
+and each chunk's page documents (status CLEAN, parent's filename, batch and created_at, `mime_type` image/png), runs and OCR
+jobs (priority `100 + (page - 1)`) are inserted in ONE transaction under `pg_advisory_xact_lock(hashtext('innovera_ocr:split'),
+hashtext(parentId))` with `ON CONFLICT DO NOTHING`, so a resumed split (lost lease, crash, retry) creates only missing pages.
+A page that does not render (the chunk call is retried page by page) gets a FAILED row (`PAGE_RENDER_FAILED`, no object, no
+job) so every page 1..N has a row. Last: parent `SPLIT` (refused as `SPLIT_INCOMPLETE` unless all N pages exist). pdfinfo
+and pdftoppm run through `execFile` (no shell) with a minimal environment, a wall-clock timeout (30 s / 120 s) and, via
+`prlimit`, 1 GiB address space and 120 s CPU per process. Pages are not re-scanned by ClamAV (renders of a scanned upload).
+A page job sends `page-0012.png` (`ocrUploadName`: the extension always matches the MIME type); a page whose object is
+missing is re-rendered from its PDF by its own OCR job before the OCR call. A job for an already SPLIT parent just finishes.
+
+**Queue priority** (set at insert; `ocr_claim_v1` unchanged): the k-th file of a batch `100 + k`, a single upload and a
+retry `100`, PDF page p `100 + (p - 1)`. `OCR_REQUEST_TIMEOUT` defaults to 300 s (config + compose).
+
+**Upload.** DOCX/XLSX are refused with 415 `UNSUPPORTED_MEDIA_TYPE` (accepted types: PDF, JPEG, PNG, WebP).
+
+**API changes**
+
+| Route | Change |
+|---|---|
+| `GET /api/documents` | items gain `parentDocumentId, pageNumber, pageCount, parentFilename` (null for non-pages); new query `parentId` (UUID, else 404 `DOCUMENT_NOT_FOUND`) lists the pages of one PDF; `SPLIT` parents are never rows; order `created_at DESC`, then the pages of one PDF together in page order; `q` also matches `header.formNumber.value` |
+| `GET /api/batches[/:id]` | gains `rows` (visible rows), `pages` (page rows so far), `pagesExpected` (sum of the PDFs' page counts), `splitting` (PDFs not split yet), `finished` (boolean). `expectedTotal`/`uploaded` count **files**, all status counters count **rows**. `finished = uploaded >= expectedTotal && queued + processing == 0 && a row completed`; `finishedAt` is set once finished. Capacity (`BATCH_FULL`) counts files only |
+| `GET /api/documents/:id/ocr` | gains `parentDocumentId, pageNumber, pageCount, parentFilename`; `status` may be `SPLIT` (a parent) |
+| `GET /api/documents/:id/content` | also serves a `SPLIT` parent's PDF (the UI opens `blob#page=N`); a page without an object → 404 `CONTENT_NOT_FOUND` |
+| `POST /api/documents/:id/retry` | a FAILED page is retryable even without a job (its render failed; the new job re-renders it); a FAILED PDF parent is split again (existing pages kept) |
+| `POST /api/documents` | 415 for DOCX/XLSX; the job's priority follows the batch position |
+
+`statusCategoryOf('SPLIT') = "split"` (never a list filter value). Summaries add `formNumber` and `branch`.
+
+**UI.** Page rows show "หน้า 12/95" (plus form number and branch) under the file name; a PDF being split shows
+"กำลังแยก PDF เป็นรายหน้า"; the batch strip shows files and rows separately ("ไฟล์ 1/1 · กำลังแยกหน้า 30/95 · อ่านเสร็จ 1 จาก 96
+แถว") and uses the server's `finished`; the drawer title is "file.pdf · หน้า 12/95" with "เปิด PDF ต้นฉบับ (หน้า 12)" (the
+parent's PDF at `#page=12` in the preview) and "ดูทุกหน้าของไฟล์นี้" (list filtered by `parentId`); a SPLIT parent opened
+by link says "ไฟล์นี้ถูกแยกเป็น N หน้า"; the editor shows the header section (form number, date, time) and the branch when
+the result has them; split error codes are shown in Thai.
+

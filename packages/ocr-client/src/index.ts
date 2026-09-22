@@ -11,11 +11,14 @@ export type OcrField = Readonly<{
 
 export type OcrTreatment = Readonly<OcrField & { name?: string; duration?: string }>;
 
-/** Schema v3 (engine `typhoon-sections` 3.0) shapes. Responses are NOT validated against them — read defensively. */
+/** Schema v3 (engine `typhoon-sections` 3.0 / 3.1) shapes. Responses are NOT validated against them — read defensively. */
 export type Source = "ocr" | "checkbox" | "ink-mark" | "rule" | "master-fuzzy" | "verified-memory" | "none" | "human";
 export type Field = Readonly<{ raw: string | null; value: string | null; confidence: number; source: Source; needsReview: boolean }>;
 export type CheckField = Readonly<Field & { checked: true }>;
-export type TreatmentField = Readonly<Field & { nameRaw: string | null; duration: string | null; durationMinutes: number | null }>;
+/** `guests` (v3.1): a leading guest count ("4 ไทย 1 ชม." → 4), never a duration. */
+export type TreatmentField = Readonly<Field & { nameRaw: string | null; duration: string | null; durationMinutes: number | null; guests?: number | null }>;
+/** v3.1 form header: the printed form number and the handwritten date and time. */
+export type HeaderSection = Readonly<{ formNumber?: Field; date?: Field; time?: Field }>;
 export type OcrSectionTiming = Readonly<{ name: string; ms: number }>;
 export type OcrTimings = Readonly<{
   preprocessMs?: number; checkboxMs?: number; inferenceMs?: number; inferenceWallMs?: number;
@@ -29,6 +32,9 @@ export type OcrResponse = Readonly<{
   version?: string;
   schemaVersion?: number;
   layout?: Readonly<Record<string, unknown>>;
+  /** v3.1 `HeaderSection`; absent before 3.1. */
+  header?: Readonly<Record<string, unknown>>;
+  /** v3.1 adds `branch: Field` and `totalMinutes: number|null`. */
   staffOnly?: Readonly<Record<string, unknown>>;
   customerInformation?: Readonly<Record<string, unknown>>;
   recommendationCard?: Readonly<Record<string, unknown>>;
@@ -49,6 +55,23 @@ export function readOcrTimings(response: Readonly<{ timings?: unknown }>): OcrTi
   }
   const sections = Array.isArray(timings.sections) ? timings.sections.filter((entry): entry is OcrSectionTiming => isRecord(entry) && typeof entry.name === "string" && typeof entry.ms === "number" && Number.isFinite(entry.ms) && entry.ms >= 0) : [];
   return sections.length > 0 ? { ...timing, sections } : timing;
+}
+
+/**
+ * v3.1 `layout.detection`: the template verdict of the fitted registration (release1-plan A1/A3). `known` pages are read as
+ * the form; `uncertain` pages are read with every field flagged; `unknown` pages come back with empty sections.
+ */
+export type TemplateVerdict = "known" | "uncertain" | "unknown";
+export type LayoutDetection = Readonly<{ verdict: TemplateVerdict; score: number; foundRatio: number; rmsPx: number; scaleX: number; scaleY: number;
+  rotationDeg: number; dx: number; dy: number }>;
+const DETECTION_NUMBERS = ["score", "foundRatio", "rmsPx", "scaleX", "scaleY", "rotationDeg", "dx", "dy"] as const;
+
+/** `layout.detection` of a v3.1 response; null before 3.1 or when malformed (never throws). */
+export function readLayoutDetection(response: Readonly<{ layout?: unknown }>): LayoutDetection | null {
+  const detection = isRecord(response.layout) && isRecord(response.layout.detection) ? response.layout.detection : null;
+  if (!detection || !["known", "uncertain", "unknown"].includes(detection.verdict as string)) return null;
+  if (!DETECTION_NUMBERS.every((key) => typeof detection[key] === "number" && Number.isFinite(detection[key]))) return null;
+  return Object.freeze(Object.fromEntries([["verdict", detection.verdict], ...DETECTION_NUMBERS.map((key) => [key, detection[key]])])) as LayoutDetection;
 }
 
 export type ConfirmPayload = Readonly<{

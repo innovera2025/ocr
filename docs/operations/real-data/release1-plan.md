@@ -71,3 +71,21 @@ the drawer (and as a table column if it fits).
 TS + DB integration + pytest green; deterministic real-data targets (A8) met; adversarial review; then (with approval) a
 real-model run of all 95 pages in the isolated eval container, deploy (Local AI first, then web → worker), press Retry on
 the user's 95-page row, and report per-field accuracy and timings.
+
+## Integration record (2026-09-22, before the real-model run)
+Deviations accepted at integration (details in the workstream reports and `full-document-batch-spec.md` §1/§9):
+- A: the fit is a 6-parameter affine (shear ≈ 0; only scale/rotation/shift are reported); `uncertain` whenever S ≥ 20 but
+  any `known` criterion fails; `unknown` pages return every section with its keys and empty fields (not `{}`); the header
+  crop is always part of the combined image (`COMBINED_MAX_TOKENS` 380; `OCR_SECTION_MODE=separate` does not read the
+  header); extra calibrated checkbox rules and aliases; a struck-out row is one check-list item with `value: null`.
+- B: PNG pages are rendered as PPM and encoded losslessly in Node (poppler's PNG writer ≈ 5 s/page); a permissions-only
+  encrypted PDF (empty user password) is rendered, a password-protected one is `PDF_ENCRYPTED`; extra codes
+  `PDF_PAGE_TOO_LARGE` and `PDF_RENDERER_UNAVAILABLE` (retryable); a page whose render failed carries its parent's
+  size/hash (0001 CHECK) and is retryable without a job; `header` is `{}` on older rows; form number and branch are shown
+  under the file name (no new table column).
+- Integration: an unread field (`source:"none"`, no raw/value, not flagged — e.g. a branch that was not found) is left out of
+  the row's `minConfidence` (it showed 0 % on every page without a printed branch); the worker logs
+  `template_verdict`/`template_score` and counts `ocr_template_verdict_total{verdict}`; `test/fixtures/local-ai-v31-response.json`
+  (a real v3.1 response on the synthetic form) pins the Local AI ↔ canonical-view contract.
+Open before deploy: real-model run; STAFF crop cuts totals written past the Treatment box on some pages; `numpy` import in the
+production Local AI image; ClamAV and app-host nginx size limits (design §7).

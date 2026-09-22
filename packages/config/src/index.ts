@@ -5,7 +5,7 @@ const envSchema = z.object({
   OCR_PORT: z.coerce.number().int().min(1).max(65535).default(3100),
   OCR_TRUSTED_PROXY_HOPS: z.coerce.number().int().min(0).default(0),
   OCR_API_BASE_URL: z.string().url().default("https://ai.innoveraappcenter.com/ocr"),
-  OCR_REQUEST_TIMEOUT: z.coerce.number().int().min(1).max(900).default(120),
+  OCR_REQUEST_TIMEOUT: z.coerce.number().int().min(1).max(900).default(300),
   OCR_MAX_RETRIES: z.coerce.number().int().min(0).max(10).default(3)
   ,AUTH_JWT_SECRET: z.string().default("")
   ,AUTH_JWT_SECRETS: z.string().default("")
@@ -16,7 +16,8 @@ const envSchema = z.object({
 export const limits = Object.freeze({
   maxUploadBytes: 209_715_200,
   maxPagesPerDocument: 500,
-  maxOcrPagesPerDocument: 50,
+  /** Default page limit of one PDF (`OCR_MAX_PDF_PAGES`, 1..1000 — the 0018 CHECK allows 1000). */
+  maxOcrPagesPerDocument: 300,
   jobProcessingBudgetMs: 1_800_000,
   pageOcrTimeoutSeconds: 45
 });

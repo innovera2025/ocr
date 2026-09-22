@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -48,14 +49,20 @@ function harness(options: { process?: () => Promise<OcrResponse>; finalStatus?: 
   const store = {
     getWorkerDocument: async () => {
       if (options.documentError) throw options.documentError;
-      return options.documentMissing ? null : { documentId, organizationId, sourceKey, filename: "a.png", mimeType: "image/png" };
+      return options.documentMissing ? null : { documentId, organizationId, sourceKey, filename: "a.png", mimeType: "image/png", status: "CLEAN", batchId: null,
+        parentDocumentId: null, pageNumber: null, pageCount: null, createdAt: "2026-09-22T01:00:00.000Z", parentSourceKey: null };
     },
     markProcessing: async () => { calls.push("markProcessing"); },
     markFailure: async (_tenant: string, _id: string, message: string) => { calls.push(`markFailure:${message}`); },
     markRetrying: async (_tenant: string, _id: string, message: string) => { calls.push(`markRetrying:${message}`); },
     markRunFailure: async (_tenant: string, runId: string, message: string) => { calls.push(`markRunFailure:${runId}:${message}`); return true; },
     saveOcrResult: async (tenant: string, _id: string, patch: OcrResultPatch) => { assert.equal(tenant, organizationId); saved.push(patch); calls.push("saveOcrResult"); },
-    saveCorrection: async () => undefined
+    saveCorrection: async () => undefined,
+    setPageCount: async () => { throw new Error("images are never split"); },
+    existingPages: async () => [],
+    createPageDocuments: async () => ({ created: [], existing: [] }),
+    markSplit: async () => undefined,
+    setPageObject: async () => undefined
   };
   const dependencies = {
     queue, store,
@@ -103,6 +110,21 @@ test("full-document result is stored canonically and marked NEEDS_REVIEW", async
   assert.match(metrics.snapshot(), /ocr_inference_ms_sum \d+/);
   assert.match(metrics.snapshot(), /document_processing_ms_sum \d+/);
   assert.match(metrics.snapshot(), /documents_processed_total\{status="NEEDS_REVIEW"\} \d+/);
+});
+
+test("a Local AI v3.1 response (fixture) is stored with its header/branch and its template verdict is counted", async () => {
+  const v31 = JSON.parse(readFileSync(new URL("../../../test/fixtures/local-ai-v31-response.json", import.meta.url), "utf8")) as OcrResponse;
+  const h = harness({ process: async () => v31 });
+  await run(h);
+  const patch = h.saved[0]!;
+  assert.equal(patch.version, "3.1");
+  assert.equal(patch.needsReview, true);
+  const view = patch.structuredResult as Record<string, Record<string, { value?: unknown } | unknown>>;
+  assert.equal((view.header?.formNumber as { value?: string }).value, "012345");
+  assert.equal((view.staffOnly?.branch as { value?: string }).value, "SUKHUMVIT 33");
+  assert.equal(view.staffOnly?.totalMinutes, 90);
+  assert.equal("layout" in view, false);
+  assert.match(metrics.snapshot(), /ocr_template_verdict_total\{verdict="known"\} \d+/);
 });
 
 test("review flags are judged on the canonical view, not on evidence", async () => {

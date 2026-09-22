@@ -57,6 +57,9 @@ const json = (status: number, body: unknown): FakeResponse => ({ ok: status >= 2
 type Upload = { status: string; retryable: boolean; error: string; group: { batchId: string | null; total: number } | null; file: { name: string } };
 type Workbench = {
   row(document: Record<string, unknown>): FakeElement;
+  applyDocument(document: Record<string, unknown>): void;
+  failText(document: Record<string, unknown>): string;
+  toggleOriginal(): Promise<void>;
   renderBatch(): void;
   addFiles(files: unknown[]): void;
   loadPreview(seq: number, id: string): Promise<void>;
@@ -66,7 +69,7 @@ type Workbench = {
 };
 
 const inline = /<script\b[^>]*>([\s\S]*?)<\/script>/.exec(workbenchPage({ nonce: "n" }))?.[1] ?? "";
-const EXPOSE = "globalThis.__wb={row,renderBatch,addFiles,loadPreview,save,ERRORS,state};";
+const EXPOSE = "globalThis.__wb={row,renderBatch,addFiles,loadPreview,save,ERRORS,state,applyDocument,failText,toggleOriginal};";
 
 /** Runs the workbench script without init(). `fetchImpl` answers every fetch; `xhrStatus` answers every upload. */
 function load(fetchImpl: (url: string, init?: Record<string, unknown>) => Promise<FakeResponse>, xhr: { status: number; body: unknown } = { status: 202, body: {} }) {
@@ -179,4 +182,79 @@ test("the editor is inert while a save is in flight, so no keystroke is silently
   answer(json(200, { status: "confirmed", delivery: "NOT_REQUIRED", corrections: 0, document: saved }));
   await saving;
   assert.equal($("d-body").hasAttribute("inert"), false);
+});
+
+// ---- multi-page PDFs (release 1, B7) ---------------------------------------------------------------------------------
+
+const PARENT = "10000000-0000-4000-8000-0000000000aa";
+const page12 = { documentId: ID, filename: "intake.pdf", parentFilename: "intake.pdf", mimeType: "image/png", status: "NEEDS_REVIEW", statusCategory: "review",
+  parentDocumentId: PARENT, pageNumber: 12, pageCount: 95, summary: { formNumber: "012345", branch: "SUKHUMVIT 33", treatments: [] } };
+
+test("a page row shows 'หน้า 12/95' under the file name, with the form number and branch", () => {
+  const { wb } = load(() => new Promise(() => undefined));
+  const text = wb.row(page12).textContent;
+  assert.match(text, /intake\.pdf/);
+  assert.match(text, /หน้า 12\/95/);
+  assert.match(text, /เลขที่ 012345 · SUKHUMVIT 33/);
+  assert.doesNotMatch(wb.row({ documentId: ID, filename: "a.png", status: "SUCCEEDED", statusCategory: "succeeded", summary: {} }).textContent, /หน้า \d/, "a plain image has no page label");
+});
+
+test("a PDF being split says so; split failures are explained in Thai", () => {
+  const { wb } = load(() => new Promise(() => undefined));
+  const splitting = wb.row({ documentId: ID, filename: "intake.pdf", mimeType: "application/pdf", parentDocumentId: null, status: "PROCESSING", statusCategory: "processing", pageCount: 95, summary: {} });
+  assert.match(splitting.textContent, /กำลังแยก PDF เป็นรายหน้า \(95 หน้า\)/);
+  assert.match(wb.row({ documentId: ID, filename: "intake.pdf", mimeType: "application/pdf", parentDocumentId: null, status: "CLEAN", statusCategory: "queued", summary: {} }).textContent, /รอแยก PDF เป็นรายหน้า/);
+  assert.match(wb.failText({ status: "FAILED", errorMessage: "PDF_ENCRYPTED: a password is required to open it" }), /รหัสผ่าน/);
+  assert.equal(wb.failText({ status: "FAILED", errorMessage: "PDF_TOO_MANY_PAGES: 412 pages (limit 300)" }), "PDF มี 412 หน้า เกินที่ระบบรองรับ (สูงสุด 300 หน้า) กรุณาแบ่งไฟล์แล้วอัปโหลดใหม่");
+  assert.match(wb.failText({ status: "FAILED", errorMessage: "PAGE_RENDER_FAILED" }), /ลองอีกครั้ง/);
+  assert.equal(wb.failText({ status: "FAILED", errorMessage: "OCR API returned HTTP 413" }), "สาเหตุ: OCR API returned HTTP 413", "other errors unchanged");
+});
+
+test("the batch strip counts files and rows separately and trusts the server's finished flag", () => {
+  const { wb, $ } = load(() => new Promise(() => undefined));
+  const base = { batchId: ID, label: null, createdAt: "2026-09-22T01:00:00.000Z", expectedTotal: 1, uploaded: 1, queued: 9, processing: 1, succeeded: 1, needsReview: 0, failed: 0, confirmed: 0, completed: 1, durationMs: 60_000, throughputPerMinute: 1 };
+  wb.state.batchId = ID;
+  wb.state.batch = { ...base, rows: 31, pages: 30, pagesExpected: 95, splitting: 1, finished: false, finishedAt: null };
+  wb.renderBatch();
+  assert.match($("batch-title").textContent, /กำลังแยก PDF เป็นรายหน้า/);
+  assert.match($("batch-meta").textContent, /ไฟล์ 1\/1 · กำลังแยกหน้า 30\/95 · อ่านเสร็จ 1 จาก 96 แถว/);
+  wb.state.batch = { ...base, queued: 0, processing: 0, succeeded: 95, completed: 95, rows: 95, pages: 95, pagesExpected: 95, splitting: 0, finished: true, finishedAt: "2026-09-22T01:40:00.000Z" };
+  wb.renderBatch();
+  assert.match($("batch-title").textContent, /อ่านครบแล้ว/);
+  assert.match($("batch-meta").textContent, /หน้า PDF 95\/95 · อ่านเสร็จ 95 จาก 95 แถว/);
+  wb.state.batch = { ...base, queued: 5, processing: 0, succeeded: 1, completed: 1, rows: 6, pages: 5, pagesExpected: 5, splitting: 0, finished: false, finishedAt: null };
+  wb.renderBatch();
+  assert.doesNotMatch($("batch-title").textContent, /อ่านครบแล้ว/, "1 file, 1 of 6 rows read: not finished (the old files-vs-rows rule said it was)");
+});
+
+test("the drawer of a page is titled 'file.pdf · หน้า 12/95' and opens the original PDF at that page", async () => {
+  const { wb, $, fetches } = load(async (url) => token(url) ?? json(200, {}));
+  wb.applyDocument({ ...page12, structuredResult: { schemaVersion: 3, header: { formNumber: { raw: "012345", value: "012345", confidence: 0.9, source: "ocr", needsReview: false } }, customerInformation: {}, recommendationCard: {},
+    staffOnly: { branch: { raw: "SUKHUMVIT 33", value: "SUKHUMVIT 33", confidence: 0.9, source: "master-fuzzy", needsReview: false }, totalMinutes: 90, treatments: [] } } });
+  assert.equal($("d-title").textContent, "intake.pdf · หน้า 12/95");
+  assert.equal($("p-pdf").hidden, false);
+  assert.equal($("p-pdf").textContent, "เปิด PDF ต้นฉบับ (หน้า 12)");
+  assert.match($("d-status").textContent, /เลขที่ 012345 · SUKHUMVIT 33/);
+  const editor = $("editor").textContent;
+  for (const text of ["หัวแบบฟอร์ม", "เลขที่ฟอร์ม", "สาขา", "เวลารวมที่เขียนไว้ในฟอร์ม 90 นาที", "ดูทุกหน้าของไฟล์นี้"]) assert.ok(editor.includes(text), text);
+  await wb.toggleOriginal();
+  assert.deepEqual(fetches.slice(-1), [`GET /api/documents/${PARENT}/content`]);
+  const frame = $("p-content").children[0] as FakeElement & { src?: string };
+  assert.equal(frame.tagName, "IFRAME");
+  assert.match(String(frame.src), /#page=12$/);
+  assert.match(String($("p-open").href), /#page=12$/);
+  assert.equal($("p-pdf").textContent, "กลับไปดูภาพหน้านี้");
+});
+
+test("v3.0 results show no empty header group and no branch row; a SPLIT parent points to its pages", () => {
+  const { wb, $ } = load(() => new Promise(() => undefined));
+  wb.applyDocument({ documentId: ID, filename: "a.png", mimeType: "image/png", status: "NEEDS_REVIEW", statusCategory: "review",
+    structuredResult: { schemaVersion: 3, header: {}, customerInformation: {}, recommendationCard: {}, staffOnly: { treatments: [], roomNo: { raw: "1", value: "1", needsReview: false } } } });
+  assert.doesNotMatch($("editor").textContent, /หัวแบบฟอร์ม|สาขา/);
+  assert.equal($("p-pdf").hidden, true);
+  wb.applyDocument({ documentId: PARENT, filename: "intake.pdf", mimeType: "application/pdf", status: "SPLIT", pageCount: 95, parentDocumentId: null,
+    structuredResult: { schemaVersion: 3, header: {}, customerInformation: {}, recommendationCard: {}, staffOnly: {} } });
+  assert.match($("editor").textContent, /ไฟล์นี้ถูกแยกเป็น 95 หน้า/);
+  assert.match($("d-status").textContent, /แยกเป็นรายหน้าแล้ว/);
+  assert.equal(wb.state.editable, false);
 });
