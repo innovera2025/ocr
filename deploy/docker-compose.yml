@@ -69,7 +69,9 @@ services:
       OCR_REQUEST_TIMEOUT: ${OCR_REQUEST_TIMEOUT:-300}
       OCR_MAX_RETRIES: ${OCR_MAX_RETRIES:-3}
       OCR_WORKER_ID: ${OCR_WORKER_ID:-worker-1}
-      OCR_WORKER_CONCURRENCY: ${OCR_WORKER_CONCURRENCY:-2}
+      # 1 on the CPU-only Local AI host: Ollama serves one request at a time and Local AI v3.2 makes two model calls per
+      # page (~50-55 s), so a second loop adds no throughput and doubles the wait inside OCR_REQUEST_TIMEOUT.
+      OCR_WORKER_CONCURRENCY: ${OCR_WORKER_CONCURRENCY:-1}
       OCR_MAX_PDF_PAGES: ${OCR_MAX_PDF_PAGES:-300}
       OCR_PAGE_FORMAT: ${OCR_PAGE_FORMAT:-png}
       AUTH_JWT_SECRETS: ${AUTH_JWT_SECRETS:?set AUTH_JWT_SECRETS}
