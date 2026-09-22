@@ -104,7 +104,7 @@ def test_staff_fields_v22_format_and_hardened_variants():
 def test_therapist_and_room_normalization():
     assert N.normalize_therapist("พีพี") == {"raw": "พีพี", "value": "พีพี", "confidence": 1.0, "source": "master-fuzzy", "needsReview": False}
     misread = N.normalize_therapist("พิพิ")
-    assert misread["value"] is None and misread["needsReview"]
+    assert misread["value"] == "พีพี" and misread["needsReview"] and misread["confidence"] < N.REVIEW_BELOW
     assert N.normalize_therapist(None)["source"] == "none"
     assert N.normalize_room("๓")["value"] == "3" and N.normalize_room("A")["needsReview"]
 
@@ -205,3 +205,24 @@ def test_default_master_data_covers_v22_treatments_and_therapists():
     known = {n for t in master["treatments"] for n in [t["name"], *t["aliases"]]}
     assert {"คอ บ่า ไหล่", "นวดไทย", "นวดน้ำมัน", "อโรมา", "นวดเท้า", "Thai Massage", "Oil Massage", "Foot Massage", "นวดหน้า", "Face"} <= known
     assert {t["name"] for t in master["therapists"]} == {"ฟ้า", "พีพี", "เอี้ยง"}
+
+
+def test_real_model_staff_text_keeps_hour_and_flags_trailing_digit():
+    """Real Typhoon output for sample2 (2026-09-22): "1 ชม.2" is one hour plus an unread "2", never 62 min."""
+    items, durations, warnings, _ = N.parse_treatments("ไทย 90 นาที+หน้า 1 ชม.2")
+    assert [(i["value"], i["durationMinutes"], i["needsReview"]) for i in items] == [("นวดไทย", 90, False), ("นวดหน้า", 60, True)]
+    assert durations == ["90 นาที", "1 ชม."] and any("2" in w for w in warnings)
+
+
+@pytest.mark.parametrize("text", ["ไทย 1 ชม. 5", "ไทย 2 ชม. 3"])
+def test_single_unlabelled_digit_after_hours_is_not_minutes(text):
+    items, _, warnings, _ = N.parse_treatments(text)
+    assert items[0]["durationMinutes"] in (60, 120) and items[0]["needsReview"] and warnings
+
+
+def test_therapist_vowel_confusion_suggests_master_name_for_review():
+    """Handwriting OCR swaps Thai vowel marks (พิพี for พีพี): suggest the master name, but always for review."""
+    result = N.normalize_therapist("พิพี")
+    assert (result["value"], result["needsReview"], result["source"]) == ("พีพี", True, "master-fuzzy")
+    assert result["confidence"] < N.REVIEW_BELOW
+    assert N.normalize_therapist("สมชาย")["value"] is None

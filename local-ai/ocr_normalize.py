@@ -131,14 +131,27 @@ def similarity(a, b):
     return difflib.SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
 
 
+# Thai above/below vowels and tone marks: handwriting OCR confuses them (พิพี for พีพี) far more than consonants.
+_THAI_MARKS = re.compile(r"[ัิ-ฺ็-๎]")
+SKELETON_WEIGHT = 0.8  # a consonant-only match is a suggestion, always below REVIEW_BELOW
+
+
+def _skeleton(text):
+    return _THAI_MARKS.sub("", _key(text))
+
+
 def _best(raw, entries, name_key):
     """Best master entry for raw among each entry's name and aliases -> (entry, score, exact)."""
     raw_key, best = _key(raw), (None, 0.0, False)
+    raw_skeleton = _skeleton(raw)
     for entry in entries:
         for candidate in [entry[name_key], *entry.get("aliases", [])]:
             if _key(candidate) == raw_key and raw_key:
                 return entry, 1.0, candidate != entry[name_key]
             score = similarity(raw, candidate)
+            candidate_skeleton = _skeleton(candidate)
+            if raw_skeleton and candidate_skeleton and raw_skeleton != raw_key:
+                score = max(score, SKELETON_WEIGHT * difflib.SequenceMatcher(None, raw_skeleton, candidate_skeleton).ratio())
             if score > best[1]:
                 best = (entry, score, False)
     return best
@@ -195,12 +208,13 @@ def normalize_room(raw):
 _HOUR = r"(?:ชั่วโมง|ชัวโมง|ช\.ม\.|ชม\.?|ซม\.?|hours?|hrs?\.?|h(?![a-z]))"
 _MIN = r"(?:นาที|นท\.?|น\.|minutes?|mins?\.?|m(?![a-z]))"
 # "1:30" (hours:minutes), or a number with an hour unit (+ "ครึ่ง" and/or minutes, whose unit may be left out:
-# "1 ชม. 30", "1h30"), or a number with a minute unit.
+# "1 ชม. 30", "1h30"), or a number with a minute unit. Unlabelled minutes after an hour unit need two digits
+# (10-59): the real model reads "1 ชม. 2.5 ชม." as "1 ชม.2", which must stay 60 min plus a flagged leftover "2".
 DURATION_RE = re.compile(
     rf"(?<![\d:])(?P<hh>[0-4]):(?P<mm>[0-5]\d)(?![\d:])"
     rf"|(?P<num>\d+(?:[.,]\d+)?)\s*(?:(?P<hour>{_HOUR})(?:\s*(?P<half>ครึ่ง))?"
-    rf"(?:\s*(?P<num2>[0-5]?\d)(?![\d.,:])(?!\s*{_HOUR})(?:\s*{_MIN})?)?|(?P<min>{_MIN}))", re.I)
-BARE_NUMBER_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)(?![\d.])")
+    rf"(?:\s*(?P<num2>[1-5]\d|\d(?=\s*{_MIN}))(?![\d.,:])(?!\s*{_HOUR})(?:\s*{_MIN})?)?|(?P<min>{_MIN}))", re.I)
+BARE_NUMBER_RE = re.compile(r"(?<!\d)(?<!\d[.,])(\d+(?:\.\d+)?)(?![\d.])")  # "ชม.2": a dot after a unit is not a decimal point
 SEPARATOR_RE = re.compile(r"\s*(?:\+|＋|/|\n|;|、|，|(?<!\d),|,(?!\d)|\s&\s|\sและ\s)\s*")
 
 

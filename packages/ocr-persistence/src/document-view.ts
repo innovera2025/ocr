@@ -49,7 +49,7 @@ function cloneJson(value: unknown, depth = 0): unknown {
 const HOUR_UNIT = "(?:ชั่วโมง|ชัวโมง|ช\\.ม\\.|ชม\\.?|ซม\\.?|hours?|hrs?\\.?|h(?![a-z]))";
 const MINUTE_UNIT = "(?:นาที|นท\\.?|น\\.|minutes?|mins?\\.?|m(?![a-z]))";
 /** The Local AI duration grammar (local-ai/ocr_normalize.py `DURATION_RE` + bare numbers), anchored: one whole duration. */
-const DURATION = new RegExp(`^(?:([0-4]):([0-5]\\d)|(\\d+(?:[.,]\\d+)?)\\s*(?:(${HOUR_UNIT})(?:\\s*(ครึ่ง))?(?:\\s*([0-5]?\\d)(?:\\s*${MINUTE_UNIT})?)?|(${MINUTE_UNIT}))?)\\.?$`, "i");
+const DURATION = new RegExp(`^(?:([0-4]):([0-5]\\d)|(\\d+(?:[.,]\\d+)?)\\s*(?:(${HOUR_UNIT})(?:\\s*(ครึ่ง))?(?:\\s*([1-5]\\d|\\d(?=\\s*${MINUTE_UNIT}))(?:\\s*${MINUTE_UNIT})?)?|(${MINUTE_UNIT}))?)\\.?$`, "i");
 const THAI_DIGITS = "๐๑๒๓๔๕๖๗๘๙";
 
 /**

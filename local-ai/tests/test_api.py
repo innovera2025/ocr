@@ -163,7 +163,8 @@ def test_therapist_verified_memory_round_trip(client, monkeypatch):
     monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(staff="Treatment : ไทย 90 นาที\nTherapist Name : พิพิ\nRoom No. : 3"))
     first = post(client, png_of(S.filled_form())).json()
     therapist = first["staffOnly"]["therapistName"]
-    assert therapist["raw"] == "พิพิ" and therapist["value"] is None and therapist["needsReview"]
+    # vowel-mark confusion: the master name is suggested, but only human memory makes it confident
+    assert therapist["raw"] == "พิพิ" and therapist["value"] == "พีพี" and therapist["needsReview"] and therapist["source"] == "master-fuzzy"
     confirm = client.post("/v1/ocr/confirm", json={"documentId": first["documentId"], "field": "therapist", "raw": "พิพิ", "verifiedValue": "พีพี"})
     assert confirm.status_code == 200 and confirm.json()["status"] == "saved"
     assert confirm.json()["record"]["verifiedByHuman"] is True

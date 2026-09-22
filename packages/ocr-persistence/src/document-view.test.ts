@@ -117,7 +117,7 @@ test("parseDurationMinutes reads durations exactly like the Local AI (shared tab
   const shared = JSON.parse(readFileSync(new URL("../../../local-ai/tests/duration_cases.json", import.meta.url), "utf8")) as { cases: Array<[string, number]> };
   assert.ok(shared.cases.length >= 15);
   for (const [duration, minutes] of shared.cases) assert.equal(parseDurationMinutes(duration), minutes, duration);
-  for (const duration of ["90 นาที + 1 ชม.", "1 ชม. 2.5 ชม.", "ไทย 90 นาที", "10:30", "90 นาที ประมาณ", ""]) assert.equal(parseDurationMinutes(duration), null, duration);
+  for (const duration of ["90 นาที + 1 ชม.", "1 ชม. 2.5 ชม.", "ไทย 90 นาที", "10:30", "90 นาที ประมาณ", "", "1 ชม.2", "1 ชม. 5"]) assert.equal(parseDurationMinutes(duration), null, duration);
 });
 
 test("summarizeDocument extracts table columns, min confidence and review count", () => {
