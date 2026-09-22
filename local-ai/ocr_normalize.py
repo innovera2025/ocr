@@ -132,7 +132,7 @@ def similarity(a, b):
 
 
 # Thai above/below vowels and tone marks: handwriting OCR confuses them (พิพี for พีพี) far more than consonants.
-_THAI_MARKS = re.compile(r"[ัิ-ฺ็-๎]")
+_THAI_MARKS = re.compile(r"[\u0e31\u0e34-\u0e3a\u0e47-\u0e4e]")
 SKELETON_WEIGHT = 0.8  # a consonant-only match is a suggestion, always below REVIEW_BELOW
 
 
