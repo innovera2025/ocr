@@ -1,8 +1,10 @@
-"""INNOVERA Local AI OCR service — schema v3, version 3.1 ("typhoon-sections").
+"""INNOVERA Local AI OCR service — schema v3, version 3.2 ("typhoon-sections").
 
 Full-document extraction for the Makkha intake form: fitted registration and template verdict, deterministic checkbox /
-body-map / empty-box detection, and one Typhoon OCR call on the header, customer rows and STAFF ONLY crop stacked in one
-image (OCR_SECTION_MODE=separate keeps two calls).
+body-map / empty-box detection, and two concurrent Typhoon OCR calls (OCR_SECTION_MODE=staff-separate, the default): the
+STAFF ONLY crop alone with a Thai vocabulary prompt, and the header stacked above the customer rows. Field confidence is
+capped by the model's own token probabilities; a call that fails after one retry degrades only its own section.
+OCR_SECTION_MODE=combined keeps v3.1's single call, OCR_SECTION_MODE=separate v3.0's two calls without the header.
 """
 
 import functools
@@ -12,6 +14,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,13 +25,14 @@ from pydantic import BaseModel
 
 import numpy as np
 
+import ocr_confidence as C
 import ocr_layout as L
 import ocr_marks as M
 import ocr_model
 import ocr_normalize as N
 import ocr_register as R
 
-VERSION, ENGINE, SCHEMA_VERSION = "3.1", "typhoon-sections", 3
+VERSION, ENGINE, SCHEMA_VERSION = "3.2", "typhoon-sections", 3
 app = FastAPI(title="INNOVERA OCR API", version=VERSION)
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
@@ -68,9 +72,15 @@ def customer_crop_scale():
     return _env_number("OCR_CUSTOMER_CROP_SCALE", 1.0, 0.5, 4.0)
 
 
+SECTION_MODES = ("staff-separate", "combined", "separate")
+
+
 def section_mode():
-    """"combined" (default): one model call on the customer rows stacked above the STAFF crop; "separate": v3.0's two calls."""
-    return "separate" if os.environ.get("OCR_SECTION_MODE", "combined").strip().lower() == "separate" else "combined"
+    """"staff-separate" (default, v3.2): the STAFF crop alone (Thai vocabulary prompt) and the header + customer rows, two
+    concurrent calls; "combined": v3.1's one call on header + customer rows + STAFF crop; "separate": v3.0's two calls
+    (STAFF, customer rows; no header). Unknown values fall back to the default."""
+    mode = os.environ.get("OCR_SECTION_MODE", "staff-separate").strip().lower()
+    return mode if mode in SECTION_MODES else "staff-separate"
 
 
 def _ms(start, end=None):
@@ -252,10 +262,37 @@ def _stack(parts, gap=12):
     return canvas
 
 
+@dataclass
+class _Call:
+    """One model call: its answer (ModelText, or a plain str from a stub; None when it failed), wall time over all its
+    attempts, the number of attempts and the error of a call that failed (after its retry, or at once on a timeout)."""
+    text: object
+    ms: int
+    attempts: int = 1
+    error: str | None = None
+
+
 def _timed_call(png, prompt, max_tokens):
+    """One model call, retried once after a transient Ollama error (HTTP 5xx, dropped / refused connection). A timed-out
+    call is not retried (it already waited OCR_MODEL_TIMEOUT). A call that still fails returns `error` set (the caller
+    degrades that section only); any other error propagates (HTTP 500)."""
     start = time.perf_counter()
-    text = ocr_model.call_ocr(png, prompt, max_tokens)
-    return text, _ms(start)
+    for attempt in (1, 2):
+        try:
+            return _Call(ocr_model.call_ocr(png, prompt, max_tokens), _ms(start), attempt)
+        except Exception as error:
+            if not ocr_model.is_transient(error):
+                raise
+            if attempt == 2 or ocr_model.is_timeout(error):
+                return _Call(None, _ms(start), attempt, f"{type(error).__name__}: {error}")
+        time.sleep(ocr_model.RETRY_DELAY_S)
+
+
+def _run_calls(calls):
+    """[(name, png, prompt, max tokens)] -> {name: _Call}, run concurrently (OCR_SECTION_PARALLELISM)."""
+    with ThreadPoolExecutor(max_workers=min(section_parallelism(), len(calls))) as pool:
+        futures = [(name, pool.submit(_timed_call, png, prompt, tokens)) for name, png, prompt, tokens in calls]
+        return {name: future.result() for name, future in futures}
 
 
 def _check_field(label, measurement, source="checkbox"):
@@ -365,8 +402,49 @@ def _response(document_id, source_file, layout, sections, evidence, timings):
     return result
 
 
+def _plain(text):
+    return None if text is None else str(text)
+
+
+def _model_calls(mode, crops, staff_img, customer_img):
+    """The page's model calls for `mode` -> [(timings name, png, prompt, max tokens)]."""
+    png = ocr_model.png_bytes
+    if mode == "separate":  # v3.0: STAFF crop, customer rows (when written); no header
+        return [("staffOnly", png(staff_img), ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS)] + (
+            [("customerInformation", png(customer_img), ocr_model.CUSTOMER_PROMPT, ocr_model.CUSTOMER_MAX_TOKENS)] if customer_img else [])
+    top = [crops.side_by_side(L.HEADER_CROP_PARTS), *([customer_img] if customer_img else [])]  # header, customer rows when written
+    if mode == "combined":  # v3.1: one image, the STAFF crop at the bottom
+        return [("combined", png(_stack([*top, staff_img])), ocr_model.COMBINED_PROMPT, ocr_model.COMBINED_MAX_TOKENS)]
+    return [("staffOnly", png(staff_img), ocr_model.STAFF_VOCAB_PROMPT, ocr_model.STAFF_MAX_TOKENS),
+            ("headerCustomer", png(_stack(top)), ocr_model.HEADER_CUSTOMER_PROMPT, ocr_model.HEADER_CUSTOMER_MAX_TOKENS)]
+
+
+def _read_answers(mode, outputs):
+    """The calls' answers -> {staff, header, customer: the answer each section is read from (None: not read or its call
+    failed), staffRaw, headerRaw, customerRaw: the parsers' inputs, combinedRaw: the combined / header+customer answer}."""
+    ok = {name: call.text for name, call in outputs.items() if call.error is None}
+    read = {"staff": None, "header": None, "customer": None, "staffRaw": None, "headerRaw": dict.fromkeys(N.HEADER_FIELDS),
+            "customerRaw": None, "combinedRaw": None}
+    if mode == "combined" and "combined" in ok:
+        answer = ok["combined"]
+        customer_part, staff_part = N.split_combined_text(answer)
+        header_raw, customer_raw = N.extract_header_fields(customer_part)
+        read.update(staff=answer, header=answer, customer=answer, staffRaw=staff_part, headerRaw=header_raw, customerRaw=customer_raw,
+                    combinedRaw=answer)
+    elif mode == "staff-separate":
+        read.update(staff=ok.get("staffOnly"), staffRaw=ok.get("staffOnly"))
+        if "headerCustomer" in ok:
+            answer = ok["headerCustomer"]
+            header_raw, customer_raw = N.extract_header_fields(answer)
+            read.update(header=answer, customer=answer, headerRaw=header_raw, customerRaw=customer_raw, combinedRaw=answer)
+    elif mode == "separate":
+        read.update(staff=ok.get("staffOnly"), staffRaw=ok.get("staffOnly"), customer=ok.get("customerInformation"),
+                    customerRaw=ok.get("customerInformation"))
+    return read
+
+
 def process_image(image, document_id, source_file, started, extra_warnings=()):
-    """Full-document OCR of one decoded RGB page -> schema v3 (version 3.1) response dict."""
+    """Full-document OCR of one decoded RGB page -> schema v3 (version 3.2) response dict."""
     t_pre = time.perf_counter()
     width, height = image.size
     layout = L.describe_layout(width, height)
@@ -392,75 +470,78 @@ def process_image(image, document_id, source_file, started, extra_warnings=()):
     header_states = {key: M.text_state(px) for key, px in header_px.items()}
     expected = tuple(key for key in N.CUSTOMER_FIELDS if text_states[key] != "empty")
     crops = _Crops(image, geo)
+    mode = section_mode()
     staff_img = crops.rows([L.STAFF_CROP], clamp=False)
     customer_img = crops.rows(L.CUSTOMER_CROP_ROWS, customer_crop_scale()) if expected else None
-    if section_mode() == "combined":  # one call: header, customer rows (when written) and the STAFF crop in one image
-        parts = [crops.side_by_side(L.HEADER_CROP_PARTS), *([customer_img] if customer_img else []), staff_img]
-        sections = [("combined", ocr_model.png_bytes(_stack(parts)), ocr_model.COMBINED_PROMPT, ocr_model.COMBINED_MAX_TOKENS)]
-    else:
-        sections = [("staffOnly", ocr_model.png_bytes(staff_img), ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS)]
-        if expected:
-            sections.append(("customerInformation", ocr_model.png_bytes(customer_img), ocr_model.CUSTOMER_PROMPT, ocr_model.CUSTOMER_MAX_TOKENS))
+    calls = _model_calls(mode, crops, staff_img, customer_img)
     preprocess_ms = _ms(t_pre)
 
     t_inference = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=min(section_parallelism(), len(sections))) as pool:
-        futures = [(name, pool.submit(_timed_call, png, prompt, tokens)) for name, png, prompt, tokens in sections]
+    with ThreadPoolExecutor(max_workers=min(section_parallelism(), len(calls))) as pool:
+        futures = [(name, pool.submit(_timed_call, png, prompt, tokens)) for name, png, prompt, tokens in calls]
         t_checkbox = time.perf_counter()  # deterministic analysis overlaps the model calls
         checkboxes = M.detect_checkboxes(mask, geo)
         body_marks = M.detect_body_marks(mask, lum, geo)
         checkbox_ms = _ms(t_checkbox)
         outputs = {name: future.result() for name, future in futures}
-    combined_raw = outputs["combined"][0] if "combined" in outputs else None
-    header_raw = {key: None for key in N.HEADER_FIELDS}
-    if combined_raw is not None:
-        customer_part, staff_raw = N.split_combined_text(combined_raw)
-        header_raw, customer_raw = N.extract_header_fields(customer_part)
-        # Re-read a section alone with its proven prompt when the combined answer lost it: no staff label at all, or
-        # written customer boxes with no value parsed (Typhoon occasionally answers with its own training prompt).
-        fallbacks = []
-        if not any(N.extract_staff_fields(staff_raw)):
-            fallbacks.append(("staffOnlyFallback", staff_img, ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS))
-        if expected and not any(N.parse_customer_text(customer_raw, expected)[0].values()):
-            fallbacks.append(("customerInformationFallback", customer_img, ocr_model.CUSTOMER_PROMPT, ocr_model.CUSTOMER_MAX_TOKENS))
-        if fallbacks:
-            with ThreadPoolExecutor(max_workers=min(section_parallelism(), len(fallbacks))) as pool:
-                pending = [(name, pool.submit(_timed_call, ocr_model.png_bytes(img), prompt, tokens)) for name, img, prompt, tokens in fallbacks]
-                outputs.update((name, future.result()) for name, future in pending)
-            staff_raw = outputs["staffOnlyFallback"][0] if "staffOnlyFallback" in outputs else staff_raw
-            customer_raw = outputs["customerInformationFallback"][0] if "customerInformationFallback" in outputs else customer_raw
-        if not expected:
-            customer_raw = None
-    else:
-        staff_raw = outputs["staffOnly"][0]
-        customer_raw = outputs["customerInformation"][0] if "customerInformation" in outputs else None
+    if all(call.error for call in outputs.values()):  # only a page with no answer at all fails (HTTP 500, the worker retries)
+        raise RuntimeError("every model call failed: " + "; ".join(f"{name}: {call.error}" for name, call in outputs.items()))
+    read = _read_answers(mode, outputs)
+    # Re-read a section alone with its proven prompt when its answer lost it: no staff label at all, or written customer
+    # boxes with no value parsed (Typhoon occasionally answers with its own training prompt).
+    fallbacks = []
+    if mode != "separate" and read["staff"] is not None and not any(N.extract_staff_fields(read["staffRaw"])):
+        fallbacks.append(("staffOnlyFallback", ocr_model.png_bytes(staff_img), ocr_model.STAFF_PROMPT, ocr_model.STAFF_MAX_TOKENS))
+    if mode != "separate" and expected and read["customer"] is not None and not any(N.parse_customer_text(read["customerRaw"], expected)[0].values()):
+        fallbacks.append(("customerInformationFallback", ocr_model.png_bytes(customer_img), ocr_model.CUSTOMER_PROMPT, ocr_model.CUSTOMER_MAX_TOKENS))
+    if fallbacks:
+        outputs.update(_run_calls(fallbacks))
+        for name, key in (("staffOnlyFallback", "staff"), ("customerInformationFallback", "customer")):
+            if name in outputs and outputs[name].error is None:
+                read.update({key: outputs[name].text, f"{key}Raw": outputs[name].text})
+    if not expected:
+        read.update(customer=None, customerRaw=None)
+    failed = [name for name, call in outputs.items() if call.error]
     inference_wall_ms = _ms(t_inference)
     layout["warnings"].extend(M.implausible_checkboxes(checkboxes))
     layout["warnings"].extend(M.hidden_checkboxes(checkboxes))
 
     t_normalize = time.perf_counter()
+    staff_raw, customer_raw = read["staffRaw"], read["customerRaw"]
     branch = N.detect_branch(staff_raw)
     treatment_raw, therapist_raw, room_raw = N.extract_staff_fields(staff_raw)
     treatments, durations, treatment_warnings, total_minutes = N.parse_treatments(treatment_raw)
     text_fields = _customer_text_fields(text_px, text_states, customer_raw, expected)
-    header = N.header_fields(header_raw, header_states, read=combined_raw is not None)
+    header = N.header_fields(read["headerRaw"], header_states, read=mode != "separate")
     customer = {"name": text_fields["name"], "gender": _single_choice(checkboxes["gender"]), "nationality": text_fields["nationality"],
                 "hotelName": text_fields["hotelName"], "referralSources": _check_fields(checkboxes["referralSources"]),
                 "healthConditions": _check_fields(checkboxes["healthConditions"])}
     recommendation = {"pressure": _single_choice(checkboxes["pressure"]), "massageOilScrub": _check_fields(checkboxes["massageOilScrub"]),
                       "preferredAreas": _body_fields(body_marks, "circle"), "avoidAreas": _body_fields(body_marks, "cross")}
-    staff = {"treatments": treatments, "treatment": N.legacy_treatment(treatment_raw, treatments, durations),
-             "therapistName": N.normalize_therapist(therapist_raw, branch["value"]), "roomNo": N.normalize_room(room_raw),
-             "branch": branch, "totalMinutes": total_minutes}
+    staff = {"treatments": treatments, "treatment": None, "therapistName": N.normalize_therapist(therapist_raw, branch["value"]),
+             "roomNo": N.normalize_room(room_raw), "branch": branch, "totalMinutes": total_minutes}
     sections_out = {"header": header, "customerInformation": customer, "recommendationCard": recommendation, "staffOnly": staff}
+    token_confidence = C.apply(sections_out, {key: read[key] for key in ("header", "customer", "staff")})
+    staff["treatment"] = N.legacy_treatment(treatment_raw, treatments, durations)  # after the items' model confidence
     if detection["verdict"] == "uncertain":
         for section in sections_out.values():
             _flag(section)
     elif layout["warnings"]:
         for section in (header, customer, recommendation):
             _flag(section, ("checkbox", "ink-mark"))
+    for name in failed:  # the fields of a section whose call failed after its retry: nothing read, all for review
+        if name.startswith("staffOnly"):
+            _flag(staff)
+        if name in ("headerCustomer", "combined"):
+            _flag(header)
+        if name in ("headerCustomer", "combined") or name.startswith("customerInformation"):
+            for key in N.CUSTOMER_FIELDS:
+                customer[key]["needsReview"] = True
+        layout["warnings"].append(f"model call {name} failed after {outputs[name].attempts} attempt(s) ({outputs[name].error}); "
+                                  "its fields need review")
     evidence = {
-        "staffCropRaw": staff_raw, "customerCropRaw": customer_raw, "combinedRaw": combined_raw,
+        "staffCropRaw": _plain(staff_raw), "customerCropRaw": _plain(customer_raw if mode == "combined" else read["customer"]),
+        "combinedRaw": _plain(read["combinedRaw"]),
         "checkboxScores": {f"{group}.{key}": round(m["score"], 3) for group, items in checkboxes.items() for key, _, m in items},
         "checkboxNotes": {f"{group}.{key}": m["note"] for group, items in checkboxes.items() for key, _, m in items if m["note"]},
         "bodyMap": [{k: m[k] for k in ("area", "kind", "confidence", "pixels", "onLabel", "coverage", "center", "diagonal") if k in m}
@@ -468,9 +549,12 @@ def process_image(image, document_id, source_file, started, extra_warnings=()):
         "textInk": {**text_px, **header_px},
         "layoutOffset": {"dx": round(detection["dx"]), "dy": round(detection["dy"]), "contrast": detection["score"]},
         "stampPixelsRemoved": crops.stamp_pixels, "treatmentWarnings": treatment_warnings, "treatmentTotalMinutes": total_minutes,
+        "tokenConfidence": token_confidence,
+        "modelErrors": [{"call": name, "attempts": outputs[name].attempts, "error": outputs[name].error} for name in failed],
     }
     normalize_ms = _ms(t_normalize)
-    section_timings = [{"name": name, "ms": ms} for name, (_, ms) in outputs.items()]
+    section_timings = [{"name": name, "ms": call.ms, **({"attempts": call.attempts} if call.attempts > 1 else {}),
+                        **({"failed": True} if call.error else {})} for name, call in outputs.items()]
     timings = {"preprocessMs": preprocess_ms, "checkboxMs": checkbox_ms, "inferenceMs": sum(t["ms"] for t in section_timings),
                "inferenceWallMs": inference_wall_ms, "normalizeMs": normalize_ms, "totalMs": _ms(started), "sections": section_timings}
     return _response(document_id, source_file, layout, sections_out, evidence, timings)

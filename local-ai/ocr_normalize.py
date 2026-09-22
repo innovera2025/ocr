@@ -1,8 +1,10 @@
-"""Text normalization: master data (master_data.json), verified memory (corrections.jsonl), parsing of the model's
-STAFF ONLY / CUSTOMER INFORMATION transcriptions into schema-v3 fields."""
+"""Text normalization: master data (master_data.json), verified memory (corrections.jsonl), cleanup of the model's
+answers, parsing of the STAFF ONLY / CUSTOMER INFORMATION / header transcriptions into schema-v3 fields, and the
+visual-confusion aliases for misread Thai handwriting."""
 
 import datetime
 import difflib
+import html
 import json
 import os
 import re
@@ -12,6 +14,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 REVIEW_BELOW = 0.85  # fuzzy master matches below this similarity need review (v2.2 rule)
+VISUAL_ALIAS_CONFIDENCE = 0.6  # a value read through a visual alias is at most this confident and always needs review
 
 
 def field(raw, value, confidence, source, needs_review):
@@ -91,7 +94,24 @@ def _load_master(path):
     for entry in data["therapists"]:  # optional "branch" (null = every branch) and "seed" (a suggestion, never confident)
         if not isinstance(entry.get("branch"), (str, type(None))) or not isinstance(entry.get("seed", False), bool):
             raise ValueError(f"master data {path}: therapist '{entry['name']}' needs a string or null 'branch' and a boolean 'seed'")
+    data["visualAliases"] = _load_visual_aliases(data.get("visualAliases"), path)
     return data
+
+
+def _load_visual_aliases(section, path):
+    """Optional "visualAliases": {"treatments": [{"reading", "lookalikes"}], "hourUnit": [...], "digitOne": [...]}."""
+    section = {} if section is None else section
+    if not isinstance(section, dict):
+        raise ValueError(f"master data {path}: 'visualAliases' must be an object")
+    out = {"treatments": section.get("treatments") or [], "hourUnit": section.get("hourUnit") or [], "digitOne": section.get("digitOne") or []}
+    if not isinstance(out["treatments"], list) or not all(
+            isinstance(e, dict) and isinstance(e.get("reading"), str) and e["reading"].strip() and isinstance(e.get("lookalikes"), list)
+            and all(isinstance(a, str) for a in e["lookalikes"]) for e in out["treatments"]):
+        raise ValueError(f"master data {path}: visualAliases.treatments must be a list of objects with a string 'reading' and string 'lookalikes'")
+    for key in ("hourUnit", "digitOne"):
+        if not isinstance(out[key], list) or not all(isinstance(a, str) for a in out[key]):
+            raise ValueError(f"master data {path}: visualAliases.{key} must be a list of strings")
+    return out
 
 
 _verified_cache, _master_cache = _FileCache(_load_verified), _FileCache(_load_master)
@@ -206,23 +226,52 @@ def detect_branch(staff_text):
     return field(None, None, 0.0, "none", False)
 
 
-def _clean_model_text(text):
-    text = re.sub(r"<[^>]+>", "\n", text or "")
+# Real Typhoon answers (probe on 16 real pages, 2026-09-22) wrap the fields in HTML tables
+# (<table><tr><td>Treatment</td><td>X</td>...), escape "&" as "&amp;", add notes such as "(handwritten)", "(Treatments)",
+# "(circled)" and echo the printed Chinese labels (治療 / 疗法 / 理疗师名称 / 房号 ...).
+_TABLE_CELL_JOIN = re.compile(r"</t[dh]\s*>\s*<t[dh](?:\s[^>]*)?>", re.I)
+_BLOCK_TAG = re.compile(r"</?(?:table|thead|tbody|tfoot|tr|p|div|li|ul|ol|h[1-6])(?:\s[^>]*)?/?>|<br\s*/?>", re.I)
+_INLINE_TAG = re.compile(r"</?(?:b|i|u|s|em|strong|span|sup|sub|font|mark|small|del|ins|code)(?:\s[^>]*)?>", re.I)
+_ANY_TAG = re.compile(r"</?[A-Za-z][^<>]*>")
+# A bracketed note that starts with a note word; "(5)" (a circled room number) or "(2 คน)" (guests) are values, not notes.
+# Doubt notes ("(unclear)", "(illegible)", "(crossed out)") stay: they are the model's own doubt about the reading next to
+# them, and left in the text they keep that reading from matching a master confidently (it is flagged, as in v3.1).
+_MODEL_NOTE = re.compile(r"[(（\[](?![^()（）\[\]\n]*(?:unclear|illegible|crossed[\s-]*out))"
+                         r"[^\S\n]*(?:(?:hand[\s-]*written|handwriting|treatments?|therapists?|circled|signature)(?![A-Za-z])"
+                         r"|ลายมือ|เขียนด้วยลายมือ)[^()（）\[\]\n]*[)）\]]", re.I)
+_CJK_LABEL_ECHO = re.compile(r"治療師名稱|治疗师名称|理疗师名称|理療師名稱|理疗师名|治療師|治疗师|理疗师|理療師|房間號|房间号|房號|房号|治療|治疗|疗法|療法")
+
+
+def clean_model_text(text):
+    """A model answer -> plain text for the parsers: HTML entities decoded, table cells as "Label: value" lines, tags
+    removed, parenthetical model notes ("(handwritten)", "(hand-written)", "(Treatments)", "(ลายมือ)" ...) and echoed Chinese
+    label words (治療 治疗 疗法 療法, therapist / room labels) dropped, full-width colons and Markdown emphasis normalised.
+    Idempotent in practice; the raw answer stays in the response evidence."""
+    text = html.unescape(text or "")
+    text = _TABLE_CELL_JOIN.sub(": ", text)
+    text = _BLOCK_TAG.sub("\n", text)
+    text = _INLINE_TAG.sub("", text)
+    text = _ANY_TAG.sub("\n", text)
+    text = _MODEL_NOTE.sub(" ", text)
+    text = _CJK_LABEL_ECHO.sub(" ", text)
     return text.replace("：", ":").replace("**", "").replace("__", "").replace("`", "")
 
 
+_clean_model_text = clean_model_text
+
+
 def split_combined_text(text):
-    """Combined transcription (header + customer rows above the STAFF crop) -> (customer part, staff part), each stripped.
-    Without a staff marker the whole text goes to both parsers; their label sets do not overlap. The header lines stay
-    in the customer part (see ``extract_header_fields``)."""
-    text = text or ""
+    """Combined transcription (header + customer rows above the STAFF crop) -> (customer part, staff part), each cleaned and
+    stripped. Without a staff marker the whole text goes to both parsers; their label sets do not overlap. The header lines
+    stay in the customer part (see ``extract_header_fields``)."""
+    text = clean_model_text(text)
     m = _STAFF_START.search(text)
     if not m:
         return text.strip(), text.strip()
     return text[:m.start()].strip(), text[m.start():].strip()
 
 
-_LABEL_LINE = re.compile(r"^(?:treatment|therapist\s*name|room\s*no\.?)\b", re.I)
+_LABEL_LINE = re.compile(r"^(?:treatments?|therapist\s*name|room\s*no\.?)\b", re.I)
 
 
 def extract_staff_fields(text):
@@ -232,7 +281,7 @@ def extract_staff_fields(text):
     text = _noise_text().sub(" ", _clean_model_text(text))
     treatment = therapist = room = None
     # values may be empty: capture up to the next label, never into it ("Treatment\nRoom No. 5" has no treatment)
-    m = re.search(r"Treatment\s*:?((?:(?!Therapist\s*Name|Room\s*No).)*)", text, re.I | re.S)
+    m = re.search(r"Treatments?\s*:?((?:(?!Therapist\s*Name|Room\s*No).)*)", text, re.I | re.S)
     if m:
         lines = [re.sub(r"\s{2,}", " ", ln.strip(" \t|-")) for ln in m.group(1).splitlines()]
         lines = [ln for ln in lines if ln and not re.fullmatch(r"[\s|:\-]*", ln)]
@@ -245,7 +294,9 @@ def extract_staff_fields(text):
     if m:
         lines = [ln.strip(" \t|:-") for ln in m.group(1).splitlines() if ln.strip(" \t|:-")]
         therapist = lines[0] if lines else None
-    m = re.search(r"Room\s*No\.?\s*:?\s*([A-Za-z0-9ก-๙]+)", text, re.I)
+    # "(5)": a circled room number. The value may be on the next line ("Room No.\n11"), but a label is never the value
+    # ("Room No. 房号\nTreatment ...": its echoed Chinese label was dropped): the search moves on to the next "Room No.".
+    m = re.search(r"Room\s*No\.?\s*:?\s*[(（\[]?\s*(?!(?:treatments?|therapist|room|staff|no|name|date|time)\b)([A-Za-z0-9ก-๙]+)", text, re.I)
     if m:
         room = m.group(1).strip()
     return treatment, therapist, room
@@ -471,6 +522,120 @@ TRAILING_GUESTS_RE = re.compile(r"\s*(?:(?:[=x×]\s*)?[(（]?\s*(?P<n>[1-9]|1\d|
                                 r"|(?<![a-z])[x×]\s*(?P<m>[1-9]|1\d|20))\s*$", re.I)
 
 
+# ---------------------------------------------------------------- visual-confusion aliases (v3.2)
+#
+# The model misreads the cursive Thai STAFF handwriting as look-alike Latin letters / digits: "ออย" -> "004" / "002" /
+# "OOW", "ชม." after a number -> "6M" / "2M" / "T2" / "62" / "5ม", "1" -> "I" / "/". master_data.json "visualAliases":
+#   treatments: [{reading, lookalikes}]  a whole look-alike token (also one glued to digits, "004162", or one whose glued
+#                                        Thai word makes an exact master name, "อยู่ร้อน" -> "ออยร้อน") is read as `reading`;
+#   hourUnit:   [...]                    a look-alike after an hour count 1-4 (or 1.5) and a space or "-" (an all-digit
+#                                        look-alike also glued on: "162." = "1 62.") is read as "ชม.";
+#   digitOne:   [...]                    a look-alike standing alone right before an hour unit is read as "1".
+# Everything read through an alias is source "visual-alias", confidence <= VISUAL_ALIAS_CONFIDENCE and needs review.
+
+_HOUR_TH = r"(?:ชั่วโมง|ชัวโมง|ช\.ม\.|ชม\.?)"
+_alias_cache = [None, None]  # (visualAliases object, compiled rules)
+
+
+def _visual_alias_data():
+    try:
+        return master().get("visualAliases") or {}
+    except Exception:  # broken masters: parse without aliases
+        return {}
+
+
+def _exact_treatment(word):
+    key = _key(word)
+    return bool(key) and any(_key(c) == key for e in master().get("treatments", []) for c in (e["name"], *e.get("aliases", [])))
+
+
+def _treatment_rule(readings):
+    alternatives = "|".join(re.escape(k) for k in sorted(readings, key=len, reverse=True))
+    pattern = re.compile(rf"(?<![A-Za-z0-9\u0e01-\u0e59])(?:{alternatives})")
+
+    def replace(m, text):
+        reading, after = readings[m.group(0)], text[m.end():]
+        if re.match(r"[A-Za-z]", after):
+            return None
+        rest = re.match(r"[\u0e01-\u0e4e]+", after)  # a Thai word glued on: only when it makes an exact master name
+        if rest:
+            return reading if _exact_treatment(reading + rest.group(0)) else None
+        return reading + " " if after[:1].isdigit() else reading  # "004162" -> "ออย 162"
+    return pattern, replace
+
+
+def _alias_rules():
+    data = _visual_alias_data()
+    if _alias_cache[0] is data:
+        return _alias_cache[1]
+    rules, readings = [], {}
+    for entry in data.get("treatments", []):
+        for lookalike in entry["lookalikes"]:
+            if lookalike.strip():
+                readings.setdefault(lookalike.strip(), entry["reading"].strip())
+    if readings:
+        rules.append(_treatment_rule(readings))
+    hours = "|".join(re.escape(h) for h in sorted({h.strip() for h in data.get("hourUnit", []) if h.strip()}, key=len, reverse=True))
+    ones = "|".join(re.escape(o) for o in sorted({o.strip() for o in data.get("digitOne", []) if o.strip()}, key=len, reverse=True))
+    if ones:
+        unit = rf"(?:{hours}|{_HOUR_TH})" if hours else _HOUR_TH
+        # alone (after a space, a Thai letter or the start; never inside a word such as "Oil") right before an hour unit
+        rules.append((re.compile(rf"(?:(?<=[\s\u0e01-\u0e4e])|^)[^\S\n]*(?:{ones})[^\S\n]*(?={unit})"), lambda m, text: " 1 "))
+    if hours:
+        # Glued to the number only when the look-alike is all digits ("162." = "1 62."): "12M" / "16M" stay minutes.
+        glued = "|".join(re.escape(h) for h in sorted({h.strip() for h in data.get("hourUnit", []) if h.strip().isdigit()}, key=len, reverse=True))
+        unit = rf"(?:[^\S\n]+-?[^\S\n]*|[^\S\n]*-[^\S\n]*)(?:{hours})" + (rf"|(?:{glued})" if glued else "")
+        # ...and never when a real unit follows: then it is a number ("ออย 162 นาที")
+        pattern = re.compile(rf"(?<![\d.,:])(?P<n>[1-4](?:[.,]5)?)(?:{unit})\.?(?![A-Za-z0-9\u0e01-\u0e59])(?!\s*(?i:{_MIN}|{_HOUR}))")
+        rules.append((pattern, lambda m, text: f"{m.group('n')} ชม."))
+    _alias_cache[:] = [data, rules]
+    return rules
+
+
+def _sub_tracked(pattern, replace, text):
+    """re.sub whose callback may decline (None) -> (new text, [(old start, old end, new start, new end, written, reading)])."""
+    out, edits, pos, shift = [], [], 0, 0
+    for m in pattern.finditer(text):
+        new = replace(m, text)
+        if new is None:
+            continue
+        out += [text[pos:m.start()], new]
+        start = m.start() + shift
+        edits.append((m.start(), m.end(), start, start + len(new), m.group(0).strip(), new.strip()))
+        shift += len(new) - (m.end() - m.start())
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out), edits
+
+
+def _move(position, edits, end):
+    """A position in the text before `edits` -> the same position after them; inside a replaced range: its new start (a span
+    start) or new end (a span end)."""
+    for old_start, old_end, new_start, new_end, *_ in reversed(edits):
+        if old_end <= position:
+            return position + (new_end - old_end)
+        if old_start < position:
+            return new_end if end else new_start
+    return position
+
+
+def apply_visual_aliases(text):
+    """Treatment text -> (text with the masters' look-alikes replaced, spans of the replacements in the new text,
+    [(written, reading)]). The rules run in order: treatment look-alikes, a lone "1" look-alike before an hour unit, hour
+    unit look-alikes after a number ("002 / 6M" -> "ออย / 6M" -> "ออย 1 6M" -> "ออย 1 ชม.")."""
+    spans, notes = [], []
+    for pattern, replace in _alias_rules():
+        text, edits = _sub_tracked(pattern, replace, text)
+        if edits:
+            spans = [(_move(s, edits, False), _move(e, edits, True)) for s, e in spans] + [(e[2], e[3]) for e in edits]
+            notes += [(e[4], e[5]) for e in edits]
+    return text, spans, notes
+
+
+def _overlaps(span, spans):
+    return span is not None and any(start < span[1] and span[0] < end for start, end in spans)
+
+
 def _minutes(match):
     if match.group("hh"):
         return int(match.group("hh")) * 60 + int(match.group("mm"))
@@ -489,8 +654,9 @@ def _clean_name(text):
 
 
 def _segment_groups(segment):
-    """Split one segment into (name, raw, [(duration_text, minutes, bare)], leftover numbers) groups. Leftover numbers are
-    numbers that no duration (and no bare-number fallback) used: they are reported instead of silently dropped."""
+    """Split one segment into (name, raw, [(duration_text, minutes, bare)], leftover numbers, (start, end) in the segment)
+    groups. Leftover numbers are numbers that no duration (and no bare-number fallback) used: they are reported instead of
+    silently dropped."""
     groups, pos, used = [], 0, []
     for m in DURATION_RE.finditer(segment):
         name = _clean_name(segment[pos:m.start()])
@@ -526,7 +692,7 @@ def _segment_groups(segment):
             merged[-1] = group
         else:
             merged.append(group)
-    return [(g[0], segment[g[1]:g[2]].strip(), g[3], g[4]) for g in merged]
+    return [(g[0], segment[g[1]:g[2]].strip(), g[3], g[4], (g[1], g[2])) for g in merged]
 
 
 def _match_treatment(name_raw, raw):
@@ -586,32 +752,42 @@ def _split_guests(text, has_total=False):
     return text[m.end():], int(m.group("n"))
 
 
-def parse_treatments(raw):
+def parse_treatments(raw, visual_aliases=True):
     """Treatment transcription -> (items: [TreatmentField], all duration strings, warnings, total minutes|None).
 
     Totals: a written total ("= 90", "> 2 ชม", "รวม 2 ชม.") becomes the total; when exactly one treatment has no
     duration of its own, its duration is derived from the total ("ไทย + เท้า 30 = 90" -> ไทย 60); a total that does not
     add up flags every item. Without a total marker, a trailing duration equal to the sum is the total, and a duration
     written only after the last of several treatments ("ออย + หน้า 2 ชม") is read as their total. A leading guest count
-    ("4 ไทย 1 ชม.") or a trailing one ("ไทย 90 นาที 2 ท่าน", "x 2") goes to ``guests`` of every item."""
+    ("4 ไทย 1 ชม.") or a trailing one ("ไทย 90 นาที 2 ท่าน", "x 2") goes to ``guests`` of every item.
+
+    Visual aliases (``apply_visual_aliases``, unless `visual_aliases` is False) are applied first; an item whose text or
+    whose total went through one is source "visual-alias" (when it has a value or duration), at most
+    VISUAL_ALIAS_CONFIDENCE and always needsReview; each replacement is reported in the warnings."""
     if not raw:
         return [], [], [], None
     text = raw.translate(THAI_DIGITS)
+    text, alias_spans, alias_notes = apply_visual_aliases(text) if visual_aliases else (text, [], [])
     trailing = TRAILING_GUESTS_RE.search(text)
     trailing_guests = None
     if trailing and re.search(r"[^\W\d_]", text[:trailing.start()]):
         text, trailing_guests = text[:trailing.start()], int(trailing.group("n") or trailing.group("m"))
+    before_total = len(text)
     text, written_total, total_text, total_unit = _split_total(text)
-    text, guests = _split_guests(text, written_total is not None)
+    total_span = (len(text), before_total) if written_total is not None else None  # every split keeps a prefix...
+    body, guests = _split_guests(text, written_total is not None)
+    base = len(text) - len(body)  # ...except the leading guest count: positions below are offset by it
     guests = guests if guests is not None else trailing_guests
-    groups = []
-    for segment in SEPARATOR_RE.split(text):
+    groups, pos = [], 0
+    for separator in [*SEPARATOR_RE.finditer(body), None]:
+        segment = body[pos:separator.start() if separator else len(body)]
         if segment.strip():
-            groups.extend(_segment_groups(segment))
-    durations_all = [d[0] for _, _, ds, _ in groups for d in ds if not d[2]] + ([total_text] if total_unit else [])
-    total, warnings, items, review_next = None, [], [], False
-    named_minutes = [ds[0][1] for name, _, ds, _ in groups if name and ds]
-    for index, (name, seg_raw, durs, leftover) in enumerate(groups):
+            groups.extend((*group[:4], (base + pos + group[4][0], base + pos + group[4][1])) for group in _segment_groups(segment))
+        pos = separator.end() if separator else pos
+    durations_all = [d[0] for _, _, ds, _, _ in groups for d in ds if not d[2]] + ([total_text] if total_unit else [])
+    total, warnings, items, review_next = None, [f"visual alias: '{w}' read as '{r}'" for w, r in alias_notes], [], False
+    named_minutes = [ds[0][1] for name, _, ds, _, _ in groups if name and ds]
+    for index, (name, seg_raw, durs, leftover, span) in enumerate(groups):
         last = index == len(groups) - 1
         if leftover:
             warnings.append(f"{name or seg_raw}: number(s) {', '.join(leftover)} not read as a duration")
@@ -623,11 +799,11 @@ def parse_treatments(raw):
             continue
         if name is None:
             if written_total is None and last and len(durs) == 1 and len(named_minutes) >= 2 and durs[0][1] == sum(named_minutes):
-                total = durs[0][1]
+                total, total_span = durs[0][1], span
                 continue
             if items and items[-1]["duration"] is None:
                 items[-1].update(duration=durs[0][0], durationMinutes=durs[0][1], raw=f"{items[-1]['raw']} {seg_raw}".strip(),
-                                 _bare=durs[0][2])
+                                 _bare=durs[0][2], _span=(items[-1]["_span"][0], span[1]))
                 if leftover:
                     items[-1]["_review"].add("leftover")
                 continue
@@ -637,7 +813,7 @@ def parse_treatments(raw):
         value, confidence, source = _match_treatment(name, seg_raw) if name else (None, 0.0, "none")
         item = {"raw": seg_raw or None, "nameRaw": name, "value": value, "duration": durs[0][0] if durs else None,
                 "durationMinutes": durs[0][1] if durs else None, "confidence": confidence, "source": source,
-                "guests": guests, "_bare": bool(durs and durs[0][2]), "_review": set()}
+                "guests": guests, "_bare": bool(durs and durs[0][2]), "_review": set(), "_span": span}
         if leftover:
             item["_review"].add("leftover")
         if review_next:
@@ -674,9 +850,10 @@ def parse_treatments(raw):
     elif total is None and len(named) >= 2 and named[-1]["durationMinutes"] is not None and not named[-1]["_bare"] \
             and all(item["durationMinutes"] is None for item in named[:-1]):
         last_item = named[-1]
-        total = last_item["durationMinutes"]
+        total, total_span = last_item["durationMinutes"], last_item["_span"]
         last_item.update(duration=None, durationMinutes=None)
         warnings.append(f"{total} min written after the last of {len(named)} treatments is read as their total")
+    total_aliased = _overlaps(total_span, alias_spans)  # a total read through an alias shapes every item's reading
     for item in items:
         reasons = item.pop("_review")
         item.pop("_bare")
@@ -686,6 +863,11 @@ def parse_treatments(raw):
             reasons.add("duration")
             item["confidence"] = min(item["confidence"], 0.6)
             warnings.append(f"{value}: {item['durationMinutes']} min is not an allowed duration ({', '.join(str(a) for a in allowed)})")
+        if _overlaps(item.pop("_span"), alias_spans) or (total_aliased and item["nameRaw"]):
+            reasons.add("visual-alias")
+            item["confidence"] = min(item["confidence"], VISUAL_ALIAS_CONFIDENCE)
+            if value or item["durationMinutes"] is not None:
+                item["source"] = "visual-alias"
         review = bool(reasons) or value is None or item["confidence"] < REVIEW_BELOW or item["durationMinutes"] is None
         item["confidence"], item["needsReview"] = round(float(item["confidence"]), 3), review
     ordered = [{k: item[k] for k in ("raw", "value", "confidence", "source", "needsReview", "nameRaw", "duration", "durationMinutes", "guests")}

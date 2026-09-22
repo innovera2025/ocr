@@ -1,6 +1,7 @@
 """Text normalization: treatments + durations, staff/customer transcription parsing, masters, verified memory."""
 
 import json
+import re
 import os
 from pathlib import Path
 
@@ -481,3 +482,135 @@ def test_trailing_guest_count_is_the_lines_guests_not_a_treatment(line, guests, 
     # a bare trailing number is still a duration or a flagged leftover, never guests
     assert all(i["guests"] is None for i in N.parse_treatments("ไทย 90 นาที 15")[0])
     assert N.parse_treatments("ไทย + เท้า 30 = 90 (2 ท่าน)")[0][0]["guests"] == 2
+
+
+# ---------------------------------------------------------------- v3.2: model text cleanup
+
+@pytest.mark.parametrize("text, expected", [
+    ("<table><tr><td>Treatment</td><td>เท้า 90</td></tr><tr><td>Room No.</td><td>11</td></tr></table>", "Treatment: เท้า 90\nRoom No.: 11"),
+    ('<table><tr><td>Treatment</td><th colspan="2">ไทย 1 ชม.</th></tr></table>', "Treatment: ไทย 1 ชม."),
+    ("มิลค์ &amp; ออย = 2 ชม. &gt; 90", "มิลค์ & ออย = 2 ชม. > 90"),
+    ("ไทย 1 ชม. (handwritten)", "ไทย 1 ชม."), ("เอี้ยง (hand-written signature)", "เอี้ยง"), ("ไทย (Treatments)", "ไทย"),
+    ("พีพี (Therapists)", "พีพี"), ("2 (circled)", "2"), ("ออย (ลายมือ) 1 ชม.", "ออย 1 ชม."), ("(handwritten mark)", ""),
+    ("Treatment 治療 : ไทย", "Treatment : ไทย"), ("Treatment 疗法: ไทย", "Treatment : ไทย"), ("Room No. 房号: 11", "Room No. : 11"),
+    ("<b>ไทย</b> 90", "ไทย 90"), ("Name：Chun", "Name:Chun"),
+    # values in brackets stay: a circled room number, a guest count
+    ("Room No. (5)", "Room No. (5)"), ("ไทย 90 นาที (2 คน)", "ไทย 90 นาที (2 คน)"), ("ไทย + เท้า 30 = 90", "ไทย + เท้า 30 = 90"),
+])
+def test_clean_model_text(text, expected):
+    assert re.sub(r"\s*\n\s*", "\n", re.sub(r"[^\S\n]+", " ", N.clean_model_text(text))).strip() == expected
+    assert N.clean_model_text(N.clean_model_text(text)) == N.clean_model_text(text)
+
+
+def test_staff_fields_from_real_answer_shapes():
+    """Shapes of the real-model probe answers (2026-09-22): tables (also with a plain copy after them), notes, echoes."""
+    table = ("STAFF ONLY 仅前台使用\nSUKHUMVIT 33\n\n<table><tr><td>Treatment</td><td>เท้า 90</td></tr><tr><td>Therapist Name</td>"
+             "<td>ฟ้า</td></tr><tr><td>Room No.</td><td>11</td></tr></table>\n\nTreatment\nเท้า 90\n\nTherapist Name\nฟ้า\n\nRoom No.\n11")
+    assert N.extract_staff_fields(table) == ("เท้า 90", "ฟ้า", "11")
+    assert N.extract_staff_fields("Treatment: มิลค์ &amp; ออย = 200 (handwritten)\nTherapist Name: เอี้ยง (handwritten)\nRoom No.: 2 (circled)") == \
+        ("มิลค์ & ออย = 200", "เอี้ยง", "2")
+    assert N.extract_staff_fields("Treatment 治療 : ไทย (Treatments)\nTherapist Name 理疗师名称: พีพี (Therapists)\nRoom No. 房号: 15") == \
+        ("ไทย", "พีพี", "15")
+    assert N.extract_staff_fields("Treatment: (handwritten mark)\nTherapist Name: (handwritten signature)\nRoom No.: 11") == (None, None, "11")
+    assert N.extract_staff_fields("Treatments: ออย 1 ชม.\nTherapist Name: ฟ้า\nRoom No. (5)") == ("ออย 1 ชม.", "ฟ้า", "5")
+    # an echoed label dropped from an empty "Room No." never makes the next label the room: the next "Room No." is used
+    assert N.extract_staff_fields("Treatment\nTherapist Name\nRoom No. 房号\nTreatment ไทย 1 ชม.\nTherapist Name เอี้ยง Room No. 2")[2] == "2"
+    assert N.extract_staff_fields("Treatment: ไทย\nRoom No. 房間號\n<table><tr><td>Treatment</td><td>x</td></tr></table>")[2] is None
+
+
+def test_customer_and_header_fields_from_an_html_table():
+    text = ("<table><tr><td>No.</td><td>07832</td></tr><tr><td>Date</td><td>16/08/26</td></tr><tr><td>Time</td><td></td></tr>"
+            "<tr><td>Name</td><td>Chun (handwritten)</td></tr><tr><td>Nationality</td><td>Chinese</td></tr><tr><td>Hotel Name</td><td></td></tr></table>")
+    header, rest = N.extract_header_fields(text)
+    assert header == {"formNumber": "07832", "date": "16/08/26", "time": None}
+    assert N.parse_customer_text(rest) == ({"name": "Chun", "nationality": "Chinese", "hotelName": None}, frozenset())
+
+
+# ---------------------------------------------------------------- v3.2: visual-confusion aliases
+
+def aliased(text):
+    items, _, warnings, total = N.parse_treatments(text)
+    return [(i["value"], i["durationMinutes"], i["source"], i["needsReview"]) for i in items], total
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("002 / 6M", [("นวดน้ำมัน", 60)]),            # ออย read as 002, "1" as "/", ชม. as 6M
+    ("004 / T2", [("นวดน้ำมัน", 60)]),
+    ("OOW I 6M", [("นวดน้ำมัน", 60)]),
+    ("OOW I ชม.", [("นวดน้ำมัน", 60)]),
+    ("004162.", [("นวดน้ำมัน", 60)]),             # "ออย 1 ชม." with no spaces: 004 | 1 | 62.
+    ("004 1 ชม.", [("นวดน้ำมัน", 60)]),
+    ("00Y + หน้า 2 6M.", [("นวดน้ำมัน", None), ("นวดหน้า", None)]),
+    ("oo 90 นาที", [("นวดน้ำมัน", 90)]),
+    ("อยู่ร้อน 90 นาที", [("ออยร้อน", 90)]),        # a glued Thai word only when it makes an exact master name
+    ("คอยร้อน 1 ชม.", [("ออยร้อน", 60)]),
+    ("ออย 1 5ม.", [("นวดน้ำมัน", 60)]),
+    ("ยาหม่อง + หน้า 2 5ม.", [("ยาหม่อง", None), ("นวดหน้า", None)]),
+    ("Inw 90", [("นวดไทย", 90)]),
+])
+def test_visual_aliases_are_read_capped_and_flagged(text, expected):
+    got, _ = aliased(text)
+    assert [(value, minutes) for value, minutes, _, _ in got] == expected
+    assert all(review for *_, review in got)  # ALWAYS needsReview
+    items = N.parse_treatments(text)[0]
+    assert all(i["confidence"] <= N.VISUAL_ALIAS_CONFIDENCE for i in items) and any(i["source"] == "visual-alias" for i in items)
+    assert any(w.startswith("visual alias: ") for w in N.parse_treatments(text)[2])
+
+
+def test_a_total_read_through_an_alias_flags_every_item():
+    items, _, _, total = N.parse_treatments("สครับ + ออย = 2 6M")
+    assert total == 120 and all(i["needsReview"] and i["confidence"] <= 0.6 for i in items)
+    assert [i["source"] for i in items] == ["visual-alias", "visual-alias"]
+
+
+@pytest.mark.parametrize("text", [
+    # correct readings must never change: typical staff lines (the 95 labelled real lines were checked offline: no alias fires)
+    "ออย 1 ชม.", "ไทย 1 ชม.", "ออยร้อน 90 นาที", "ออย 90", "สครับ + ออย = 2 ชม.", "ยาหม่อง 1 ชม.", "คอ บ่า 1 ชม.", "4 ไทย 1 ชม.",
+    "ไทย + เท้า 30 = 90", "ออย + หน้า 2 ชม.", "ออย + ประคบ = 2 ช", "ไทย + ประคบ > 2 ชม", "เท้า + ออย 1 30. = 90", "ออยวอม + ไทย = 2 ชม.",
+    "หัวอินเดีย + บ่าไหล่ 30 = 90", "ออย, 90 นาที", "ขาน่อง + เท้า30 = 90", "เท้า 1 ชม. + ออย 1ท30 = 90 นาที", "ไทย 90 นาที + หน้า 1 ชม.",
+    "Oil 1 hr", "Oil hr", "Thai 1h30", "Foot 45min", "ไทย 1 ชม. 30 นาที", "Room 62", "ไทย 90 นาที 2 ท่าน", "x 2 ไทย 60", "12M", "ไทย 16M",
+    "ไทย 30M", "ไทย 1 2", "ออย 162 นาที", "ไทย 2 62 นาที",
+])
+def test_visual_aliases_never_change_a_correct_reading(text):
+    assert N.parse_treatments(text) == N.parse_treatments(text, visual_aliases=False)
+    assert N.apply_visual_aliases(text)[2] == []
+
+
+def test_visual_alias_spans_follow_the_replacements():
+    text, spans, notes = N.apply_visual_aliases("ไทย + 002 / 6M")
+    assert text == "ไทย + ออย 1 ชม." and notes == [("002", "ออย"), ("/", "1"), ("1 6M", "1 ชม.")]
+    assert [text[s:e].strip() for s, e in spans] == ["ออย", "1 ชม.", "1 ชม."]  # the "1" then became part of "1 6M" -> "1 ชม."
+    items = N.parse_treatments("ไทย 1 ชม. + 002 / 6M")[0]
+    assert [(i["value"], i["source"], i["needsReview"]) for i in items] == [("นวดไทย", "rule", False), ("นวดน้ำมัน", "visual-alias", True)]
+
+
+def test_visual_aliases_come_from_the_masters(tmp_path, monkeypatch):
+    data = json.loads((N.HERE / "master_data.json").read_text(encoding="utf-8"))
+    del data["visualAliases"]
+    custom = tmp_path / "master.json"
+    custom.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv("OCR_MASTER_DATA", str(custom))
+    assert N.master_state() == "ok" and N.parse_treatments("002 / 6M")[0][0]["source"] != "visual-alias"
+    data["visualAliases"] = {"treatments": [{"reading": "หน้า", "lookalikes": ["NHA"]}], "hourUnit": [], "digitOne": []}
+    custom.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    assert [(i["value"], i["source"]) for i in N.parse_treatments("NHA 60")[0]] == [("นวดหน้า", "visual-alias")]
+    data["visualAliases"] = {"treatments": [{"reading": "ออย", "lookalikes": "004"}]}  # not a list: refused, last good masters kept
+    custom.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    assert N.master_state().startswith("stale: ") and "visualAliases" in N.master_state()
+    assert N.parse_treatments("NHA 60")[0][0]["source"] == "visual-alias"
+
+
+@pytest.mark.parametrize("text", [
+    "Treatment: ไทย 60 (crossed out) + หน้า 30\nTherapist Name: พีพี\nRoom No.: 3",
+    "Treatment: ไทย (unclear) 1 ชม.\nTherapist Name: พีพี\nRoom No.: 3",
+    "Treatment: ไทย (illegible) 90 นาที\nTherapist Name: พีพี\nRoom No.: 3",
+    "Treatment: ไทย (handwritten, unclear) 1 ชม.\nTherapist Name: พีพี\nRoom No.: 3",
+])
+def test_doubt_notes_are_not_cleaned_away(text):
+    """"(unclear)", "(illegible)", "(crossed out)" are the model's own doubt about the reading next to them: v3.1 kept them
+    (the item did not match a master and was flagged); dropping them made the reading confident and unflagged."""
+    assert re.search(r"crossed out|unclear|illegible", N.clean_model_text(text))
+    items = N.parse_treatments(N.extract_staff_fields(text)[0])[0]
+    assert items[0]["needsReview"] is True
+    therapist = N.normalize_therapist(N.extract_staff_fields(text.replace("พีพี", "พีพี (illegible)"))[1])
+    assert therapist["needsReview"] is True

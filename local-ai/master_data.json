@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "_comment": "Editable masters for Local AI normalization. Reloaded automatically when the file changes (mtime/size). Treatment 'durations' are the allowed minutes; an empty list disables the duration check. Placeholder durations: confirm them against the spa menu. Therapists: optional 'branch' (null = every branch) and 'seed' (true = a frequent name read from real scans, a suggestion only: a match never clears needsReview; the client's official lists replace seeds). 'branches' are the branch names printed in the STAFF ONLY box.",
+  "_comment": "Editable masters for Local AI normalization. Reloaded automatically when the file changes (mtime/size). Treatment 'durations' are the allowed minutes; an empty list disables the duration check. Placeholder durations: confirm them against the spa menu. Therapists: optional 'branch' (null = every branch) and 'seed' (true = a frequent name read from real scans, a suggestion only: a match never clears needsReview; the client's official lists replace seeds). 'branches' are the branch names printed in the STAFF ONLY box. 'visualAliases': see its own _comment.",
   "treatments": [
     { "name": "นวดไทย", "aliases": ["ไทย", "นวดแผนไทย", "แผนไทย", "Thai Massage", "Thai"], "durations": [60, 90, 120, 180] },
     { "name": "นวดน้ำมัน", "aliases": ["น้ำมัน", "ออย", "ออยล์", "Oil Massage", "Oil"], "durations": [60, 90, 120] },
@@ -30,6 +30,15 @@
     { "name": "นก", "aliases": [], "branch": "SUKHUMVIT 33", "seed": true },
     { "name": "ติ", "aliases": [], "branch": "SUKHUMVIT 33", "seed": true }
   ],
+  "visualAliases": {
+    "_comment": "Look-alikes the model writes for cursive Thai STAFF handwriting (real-model probe, 2026-09-22). treatments: a whole look-alike token is read as 'reading' (then matched to the treatment masters). hourUnit: a look-alike right after an hour count 1-4 is read as 'ชม.'. digitOne: a look-alike alone right before an hour unit is read as '1'. Matching is case-sensitive. Values read through an alias are source 'visual-alias', confidence <= 0.6 and always needsReview.",
+    "treatments": [
+      { "reading": "ออย", "lookalikes": ["004", "002", "00ย", "00Y", "OOW", "oow", "oo", "อยู่", "คอย"] },
+      { "reading": "ไทย", "lookalikes": ["Inw", "lnw", "Thw"] }
+    ],
+    "hourUnit": ["6M", "2M", "T2", "62", "5ม", "Ø2"],
+    "digitOne": ["I", "l", "|", "/"]
+  },
   "branches": [
     { "name": "SUKHUMVIT 33", "aliases": ["สุขุมวิท 33", "Sukhumvit Soi 33"] },
     { "name": "PLOENCHIT", "aliases": ["เพลินจิต"] }

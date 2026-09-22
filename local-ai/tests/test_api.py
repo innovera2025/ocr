@@ -17,7 +17,7 @@ from conftest import CUSTOMER_TEXT, HEADER_TEXT, STAFF_TEXT, FakeModel, png_of
 
 FIELD_KEYS = {"raw", "value", "confidence", "source", "needsReview"}
 L_CHECKBOXES = ocr_layout.CHECKBOXES
-SOURCES = {"ocr", "checkbox", "ink-mark", "rule", "master-fuzzy", "verified-memory", "none", "human"}
+SOURCES = {"ocr", "checkbox", "ink-mark", "rule", "master-fuzzy", "verified-memory", "none", "human", "visual-alias"}
 
 
 def ocr_model_module():
@@ -39,7 +39,7 @@ def assert_field(value, extra=()):
 def assert_v3_shape(body, checkboxes=39):
     assert list(body) == ["documentId", "sourceFile", "engine", "version", "schemaVersion", "layout", "header", "customerInformation",
                           "recommendationCard", "staffOnly", "evidence", "timings", "needsReview"]
-    assert body["engine"] == "typhoon-sections" and body["version"] == "3.1" and body["schemaVersion"] == 3
+    assert body["engine"] == "typhoon-sections" and body["version"] == "3.2" and body["schemaVersion"] == 3
     assert set(body["layout"]) == {"template", "imageWidth", "imageHeight", "scaleX", "scaleY", "aspectMatch", "warnings", "detection"}
     detection = body["layout"]["detection"]
     assert list(detection) == ["verdict", "score", "foundRatio", "rmsPx", "scaleX", "scaleY", "rotationDeg", "dx", "dy"]
@@ -70,6 +70,8 @@ def assert_v3_shape(body, checkboxes=39):
     assert_field(staff["branch"])
     assert staff["totalMinutes"] is None or isinstance(staff["totalMinutes"], int)
     assert {"staffCropRaw", "customerCropRaw", "checkboxScores"} <= set(body["evidence"])
+    if body["layout"]["detection"]["verdict"] != "unknown":
+        assert isinstance(body["evidence"]["tokenConfidence"], dict) and isinstance(body["evidence"]["modelErrors"], list)
     assert all(isinstance(v, float) for v in body["evidence"]["checkboxScores"].values())
     assert len(body["evidence"]["checkboxScores"]) == checkboxes
     timings = body["timings"]
@@ -108,14 +110,16 @@ def test_full_document_response_on_sample2(client, fake_model, sample_png):
     assert [(t["nameRaw"], t["value"], t["duration"], t["durationMinutes"]) for t in staff["treatments"]] == \
         [("ไทย", "นวดไทย", "90 นาที", 90), ("หน้า", "นวดหน้า", "1 ชม.", 60)]
     assert staff["therapistName"]["value"] == "พีพี" and staff["roomNo"]["value"] == "3"
-    assert body["evidence"]["staffCropRaw"] == STAFF_TEXT and body["evidence"]["customerCropRaw"] == CUSTOMER_TEXT
-    assert body["evidence"]["combinedRaw"] == HEADER_TEXT + "\n" + CUSTOMER_TEXT + "\n\n" + STAFF_TEXT
+    # v3.2 default (staff-separate): staffCropRaw = the STAFF call's text, customerCropRaw / combinedRaw = the header + customer call's
+    assert body["evidence"]["staffCropRaw"] == STAFF_TEXT
+    assert body["evidence"]["customerCropRaw"] == body["evidence"]["combinedRaw"] == HEADER_TEXT + "\n" + CUSTOMER_TEXT
     assert body["header"]["formNumber"]["value"] == "01234" and body["layout"]["detection"]["verdict"] == "known"
     assert 0.2 < body["evidence"]["checkboxScores"]["gender.female"] < 0.5
     assert body["evidence"]["checkboxScores"]["gender.male"] == 0.0
     assert body["needsReview"] is True  # the scribbled massage-oil row must be reviewed
-    assert [s["name"] for s in body["timings"]["sections"]] == ["combined"]
-    assert len(fake_model.calls) == 1
+    assert [s["name"] for s in body["timings"]["sections"]] == ["staffOnly", "headerCustomer"]
+    assert sorted(fake_model.kinds()) == ["headerCustomer", "staff"]
+    assert body["evidence"]["tokenConfidence"] == {} and body["evidence"]["modelErrors"] == []  # the fake sends no logprobs
 
 
 def test_legacy_v22_fields_keep_their_shape(client, fake_model):
@@ -139,16 +143,25 @@ def test_synthetic_form_full_shape_without_fixture(client, fake_model):
     assert body["needsReview"] is False
 
 
-def test_empty_handwriting_boxes_skip_the_customer_rows(client, fake_model):
+@pytest.mark.parametrize("mode", ["staff-separate", "combined"])
+def test_empty_handwriting_boxes_skip_the_customer_rows(client, fake_model, monkeypatch, mode):
+    monkeypatch.setenv("OCR_SECTION_MODE", mode)
     body = post(client, png_of(S.blank_form())).json()
-    assert len(fake_model.calls) == 1 and fake_model.calls[0]["prompt"] == ocr_model_module().COMBINED_PROMPT
-    image = Image.open(io.BytesIO(fake_model.calls[0]["png"]))
-    assert image.height < 200  # header + STAFF crop only: the customer rows are not sent
+    ocr_model = ocr_model_module()
+    if mode == "combined":
+        assert len(fake_model.calls) == 1 and fake_model.calls[0]["prompt"] == ocr_model.COMBINED_PROMPT
+        assert Image.open(io.BytesIO(fake_model.calls[0]["png"])).height < 200  # header + STAFF crop only: no customer rows
+    else:
+        assert sorted(fake_model.kinds()) == ["headerCustomer", "staff"]
+        header_call = fake_model.call("headerCustomer")
+        assert header_call["prompt"] == ocr_model.HEADER_CUSTOMER_PROMPT
+        header_h = max(b[3] - b[1] for b in ocr_layout.HEADER_CROP_PARTS)
+        assert Image.open(io.BytesIO(header_call["png"])).height == header_h  # the header only: the customer rows are not sent
     for key in ("name", "nationality", "hotelName"):
         field = body["customerInformation"][key]
         assert field["value"] is None and field["source"] == "ink-mark" and field["confidence"] >= 0.9 and not field["needsReview"]
     assert body["evidence"]["customerCropRaw"] is None
-    assert [s["name"] for s in body["timings"]["sections"]] == ["combined"]
+    assert [s["name"] for s in body["timings"]["sections"]] == (["combined"] if mode == "combined" else ["staffOnly", "headerCustomer"])
     gender = body["customerInformation"]["gender"]
     assert gender["value"] is None and gender["needsReview"]  # single choice with nothing marked
     assert body["needsReview"] is True
@@ -402,10 +415,13 @@ def test_jpeg_webp_and_rgba_inputs(client, fake_model):
 
 
 def test_model_failure_is_500(client, monkeypatch):
+    """Every call fails (each after its one retry): the page cannot be read at all -> 500, which the worker retries."""
     import ocr_model
-    monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(fail=True))
+    model = FakeModel(fail=True)
+    monkeypatch.setattr(ocr_model, "call_ocr", model)
     response = post(client, png_of(S.filled_form()))
     assert response.status_code == 500 and "model unavailable" in response.json()["detail"]
+    assert sorted(model.kinds()) == ["headerCustomer", "headerCustomer", "staff", "staff"]
 
 
 def test_upload_is_saved_and_crops_stay_in_memory(client, fake_model, isolated_paths):
@@ -449,10 +465,11 @@ def test_non_form_image_is_unknown_and_nothing_is_read(client, fake_model):
 
 def test_health_reports_v3(client):
     body = client.get("/health").json()
-    assert body["status"] == "ok" and body["version"] == "3.1" and body["engine"] == "typhoon-sections" and body["masterData"] == "ok"
+    assert body["status"] == "ok" and body["version"] == "3.2" and body["engine"] == "typhoon-sections" and body["masterData"] == "ok"
 
 
 def test_combined_mode_sends_one_image_header_and_customer_rows_above_the_unchanged_staff_crop(client, fake_model, monkeypatch):
+    monkeypatch.setenv("OCR_SECTION_MODE", "combined")
     post(client, png_of(S.filled_form()))
     assert len(fake_model.calls) == 1
     call = fake_model.calls[0]
@@ -477,6 +494,7 @@ def test_combined_mode_sends_one_image_header_and_customer_rows_above_the_unchan
 def test_combined_mode_parses_real_model_output(client, monkeypatch):
     """Real Typhoon answers to combined images (2026-09-22, cache-defeating variants of sample2 / sample)."""
     import ocr_model
+    monkeypatch.setenv("OCR_SECTION_MODE", "combined")
     real = {
         "sample2": "Name: chun\nNationality: Chinese\nHotel Name:\nTreatment: ไทย 90 นาที+หน้า 1 ชม. PLOENCHIT\nTherapist Name: พิพี\nRoom No.: 3",
         "sample": ("Cynthia De La Cruz-Eikanter\nNationality:\nHotel Name:\n\nSTAFF ONLY 仅前台使用\nPLOENCHIT\n\n"
@@ -511,6 +529,7 @@ def _section_model(combined_answer, calls):
 def test_combined_answer_without_labels_falls_back_to_both_single_section_calls(client, monkeypatch):
     """Real answer seen once with a looser prompt: bare values, no labels. Both sections are re-read alone."""
     import ocr_model
+    monkeypatch.setenv("OCR_SECTION_MODE", "combined")
     calls = []
     monkeypatch.setattr(ocr_model, "call_ocr", _section_model("chun\nChinese\nPLOENCHIT\nไทย 90 นาที+หน้า 1 ชม. 2.\nฟิพี\n3", calls))
     body = post(client, png_of(S.filled_form())).json()
@@ -525,6 +544,7 @@ def test_combined_answer_without_labels_falls_back_to_both_single_section_calls(
 def test_model_answering_with_its_training_prompt_is_recovered_by_fallbacks(client, monkeypatch):
     """Production 2026-09-22 (1 in 18 fresh documents): the combined call returned Typhoon's own training prompt."""
     import ocr_model
+    monkeypatch.setenv("OCR_SECTION_MODE", "combined")
     calls = []
     regurgitated = ("Extract all text from the image.\n\nInstructions:\n- Only return the clean Markdown.\n\nFormatting Rules:\n"
                     "- Checkboxes: Use ☐ for unchecked and ☑ for checked boxes.")
@@ -537,6 +557,7 @@ def test_model_answering_with_its_training_prompt_is_recovered_by_fallbacks(clie
 
 def test_good_combined_answer_needs_no_fallback(client, monkeypatch):
     import ocr_model
+    monkeypatch.setenv("OCR_SECTION_MODE", "combined")
     calls = []
     monkeypatch.setattr(ocr_model, "call_ocr", _section_model(CUSTOMER_TEXT + "\n\n" + STAFF_TEXT, calls))
     body = post(client, png_of(S.filled_form())).json()
@@ -586,11 +607,12 @@ def test_pink_paid_stamp_is_removed_from_the_model_image(client, fake_model):
     S.pink_stamp(draw, (120, 118, 250, 150))   # over the Nationality box, as on 2 of the 95 real pages
     S.pink_stamp(draw, (560, 500, 690, 540))   # over the STAFF ONLY box
     body = post(client, png_of(image)).json()
-    combined = _crops_of(fake_model.calls)[0]
-    px = combined.load()
-    pink = sum(1 for y in range(combined.height) for x in range(combined.width)
-               if px[x, y][0] - max(px[x, y][1], px[x, y][2]) >= api.STAMP_RED_MIN and px[x, y][2] >= px[x, y][1] - 5)
-    assert pink == 0 and body["evidence"]["stampPixelsRemoved"] > 500
+    for crop in _crops_of(fake_model.calls):  # the STAFF crop and the header + customer image
+        px = crop.load()
+        pink = sum(1 for y in range(crop.height) for x in range(crop.width)
+                   if px[x, y][0] - max(px[x, y][1], px[x, y][2]) >= api.STAMP_RED_MIN and px[x, y][2] >= px[x, y][1] - 5)
+        assert pink == 0
+    assert body["evidence"]["stampPixelsRemoved"] > 500
     reference = post(client, png_of(S.filled_form())).json()
     for key in ("customerInformation", "recommendationCard"):  # the deterministic reading does not change
         assert body[key] == reference[key]
@@ -613,7 +635,7 @@ def test_red_pen_handwriting_reaches_the_model_and_the_stamp_does_not(client, fa
         draw.line([(430 + 20 * k, 500 + 14 * i + (6 if k % 2 else 0)) for k in range(8)], fill=colour, width=3)
     S.pink_stamp(draw, (600, 515, 700, 560))
     body = post(client, png_of(image)).json()
-    crop = Image.open(io.BytesIO(fake_model.calls[0]["png"])).convert("RGB")
+    crop = Image.open(io.BytesIO(fake_model.call("staff")["png"])).convert("RGB")
     pixels = list(crop.getdata())
     assert sum(1 for p in pixels if p in ((190, 45, 60), (200, 40, 80))) > 100, "red / crimson pen strokes are sent"
     assert (236, 118, 170) not in pixels and body["evidence"]["stampPixelsRemoved"] > 100
@@ -678,7 +700,7 @@ def test_uncertain_template_is_read_but_every_field_needs_review(client, fake_mo
     body = post(client, png_of(faded)).json()
     assert_v3_shape(body)
     assert body["layout"]["detection"]["verdict"] == "uncertain" and 20 <= body["layout"]["detection"]["score"] < 28
-    assert any("matches only weakly" in w for w in body["layout"]["warnings"]) and len(fake_model.calls) == 1
+    assert any("matches only weakly" in w for w in body["layout"]["warnings"]) and len(fake_model.calls) == 2
 
     def fields(node):
         if isinstance(node, dict):
@@ -720,3 +742,252 @@ def test_covered_single_choice_box_makes_the_visible_choice_doubtful(client, fak
     ImageDraw.Draw(image).rectangle((x - 4, y - 4, x + s + 30, y + s + 4), fill=(255, 255, 255))  # "Other" hidden
     gender = post(client, png_of(image)).json()["customerInformation"]["gender"]
     assert gender["value"] == "Female" and gender["needsReview"] is True and gender["confidence"] <= 0.5
+
+
+# ---------------------------------------------------------------- v3.2: staff-separate, cleanup, aliases, logprobs, resilience
+
+def http_error(code):
+    import urllib.error
+    return urllib.error.HTTPError("http://ollama/v1/chat/completions", code, "error", None, None)
+
+
+def test_staff_separate_is_the_default_two_concurrent_calls(client, monkeypatch):
+    import ocr_model
+    model = FakeModel(delay=0.3)
+    monkeypatch.setattr(ocr_model, "call_ocr", model)
+    body = post(client, png_of(S.filled_form())).json()
+    assert_v3_shape(body)
+    assert api.section_mode() == "staff-separate" and sorted(model.kinds()) == ["headerCustomer", "staff"]
+    staff, top = model.call("staff"), model.call("headerCustomer")
+    assert staff["prompt"] == ocr_model.STAFF_VOCAB_PROMPT and staff["max_tokens"] == ocr_model.STAFF_MAX_TOKENS == 220
+    assert top["prompt"] == ocr_model.HEADER_CUSTOMER_PROMPT and top["max_tokens"] == ocr_model.HEADER_CUSTOMER_MAX_TOKENS
+    timings = body["timings"]
+    assert [s["name"] for s in timings["sections"]] == ["staffOnly", "headerCustomer"]
+    assert timings["inferenceMs"] >= 580 and timings["inferenceWallMs"] < 0.8 * timings["inferenceMs"]  # the two calls overlap
+    assert body["header"]["formNumber"]["value"] == "01234" and body["customerInformation"]["name"]["value"] == "Chun"
+    assert [t["value"] for t in body["staffOnly"]["treatments"]] == ["นวดไทย", "นวดหน้า"] and body["needsReview"] is False
+
+
+def test_staff_separate_images_are_the_v22_staff_crop_and_the_header_above_the_customer_rows(client, fake_model, monkeypatch):
+    post(client, png_of(S.filled_form()))
+    staff = Image.open(io.BytesIO(fake_model.call("staff")["png"])).convert("RGB")
+    top = Image.open(io.BytesIO(fake_model.call("headerCustomer")["png"])).convert("RGB")
+    fake_model.calls.clear()
+    monkeypatch.setenv("OCR_SECTION_MODE", "separate")
+    post(client, png_of(S.filled_form()))
+    separate_staff = Image.open(io.BytesIO(fake_model.call("staff")["png"])).convert("RGB")
+    customer = Image.open(io.BytesIO(fake_model.call("customer")["png"])).convert("RGB")
+    assert staff.tobytes() == separate_staff.tobytes() and staff.size == (300, 85)  # the proven STAFF pixels, alone
+    header_w = sum(b[2] - b[0] for b in ocr_layout.HEADER_CROP_PARTS) + 8
+    header_h = max(b[3] - b[1] for b in ocr_layout.HEADER_CROP_PARTS)
+    assert top.size == (max(header_w, customer.width), header_h + 12 + customer.height)
+    assert top.crop((0, header_h + 12, customer.width, header_h + 12 + customer.height)).tobytes() == customer.tobytes()
+
+
+def test_v32_prompts_are_the_probe_staff_prompt_and_the_restricted_combined_prompt():
+    import ocr_model as m
+    assert m.STAFF_VOCAB_PROMPT == m.STAFF_PROMPT.replace(
+        "Read handwriting directly.", m.STAFF_VOCAB + "\nWrite Thai words in Thai script.\nRead handwriting directly.")
+    assert m.STAFF_VOCAB.startswith("The Treatment line is handwritten in Thai") and "ไทย, ออย, ออยร้อน, เท้า, หน้า" in m.STAFF_VOCAB
+    labels = [line for line in m.HEADER_CUSTOMER_PROMPT.splitlines() if line.endswith(":") and " " not in line.replace("Hotel Name", "HotelName")]
+    assert labels == ["No.:", "Date:", "Time:", "Name:", "Nationality:", "Hotel Name:"]
+    combined = set(m.COMBINED_PROMPT.splitlines())
+    assert [line for line in m.HEADER_CUSTOMER_PROMPT.splitlines() if line not in combined] == [
+        "Top part: form header. Bottom part: CUSTOMER INFORMATION."]
+    assert "STAFF ONLY" not in m.HEADER_CUSTOMER_PROMPT and "Treatment:" not in m.HEADER_CUSTOMER_PROMPT
+
+
+@pytest.mark.parametrize("value, mode", [(None, "staff-separate"), ("staff-separate", "staff-separate"), ("combined", "combined"),
+                                         (" Separate ", "separate"), ("bogus", "staff-separate")])
+def test_section_mode_values(monkeypatch, value, mode):
+    if value is not None:
+        monkeypatch.setenv("OCR_SECTION_MODE", value)
+    assert api.section_mode() == mode
+
+
+def test_html_table_answers_notes_and_echoed_labels_are_cleaned_but_kept_raw(client, monkeypatch):
+    """Answer shapes of the 2026-09-22 real-model probe: HTML tables, "(handwritten)"-style notes, echoed Chinese labels."""
+    import ocr_model
+    staff = ("STAFF ONLY 仅前台使用\nSUKHUMVIT 33\n\n<table><tr><td>Treatment 治療</td><td>ไทย 1 ชม. (handwritten)</td></tr>"
+             "<tr><td>Therapist Name 理疗师名称</td><td>พีพี (ลายมือ)</td></tr><tr><td>Room No.</td><td>(5)</td></tr></table>")
+    top = ("<table><tr><td>No.</td><td>01234</td></tr><tr><td>Date</td><td></td></tr><tr><td>Time</td><td></td></tr>"
+           "<tr><td>Name</td><td>Chun (hand-written)</td></tr><tr><td>Nationality</td><td>Chinese</td></tr>"
+           "<tr><td>Hotel Name</td><td></td></tr></table>")
+    monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(staff=staff, header=top, customer=""))
+    body = post(client, png_of(S.filled_form())).json()
+    s, customer = body["staffOnly"], body["customerInformation"]
+    assert [(t["value"], t["durationMinutes"], t["needsReview"]) for t in s["treatments"]] == [("นวดไทย", 60, False)]
+    assert s["therapistName"]["value"] == "พีพี" and not s["therapistName"]["needsReview"]
+    assert s["roomNo"]["value"] == "5" and s["branch"]["value"] == "SUKHUMVIT 33"
+    assert customer["name"]["value"] == "Chun" and not customer["name"]["needsReview"] and customer["nationality"]["value"] == "Chinese"
+    assert body["header"]["formNumber"]["value"] == "01234"
+    assert body["evidence"]["staffCropRaw"] == staff and body["evidence"]["combinedRaw"] == top  # the raw answers, untouched
+
+
+def test_visual_alias_values_are_capped_and_always_reviewed(client, monkeypatch):
+    import ocr_model
+    monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(staff="Treatment: 002 / 6M\nTherapist Name: พีพี\nRoom No.: 7"))
+    body = post(client, png_of(S.filled_form())).json()
+    assert_v3_shape(body)
+    [item] = body["staffOnly"]["treatments"]
+    assert (item["value"], item["durationMinutes"], item["source"], item["needsReview"]) == ("นวดน้ำมัน", 60, "visual-alias", True)
+    assert item["confidence"] <= 0.6 and body["staffOnly"]["treatment"]["raw"] == "002 / 6M"  # the model's own text is kept
+    assert "visual alias: '002' read as 'ออย'" in body["evidence"]["treatmentWarnings"] and body["needsReview"] is True
+
+
+def test_confident_token_logprobs_change_nothing_and_are_reported(client, monkeypatch):
+    import ocr_model
+    monkeypatch.setattr(ocr_model, "call_ocr", FakeModel())
+    reference = post(client, png_of(S.filled_form())).json()
+    monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(logprob=-0.01))
+    body = post(client, png_of(S.filled_form())).json()
+    assert_v3_shape(body)
+    def fields(node, path=""):
+        if isinstance(node, dict):
+            if "needsReview" in node and "confidence" in node:
+                yield path, node
+            for key, value in node.items():
+                yield from fields(value, f"{path}.{key}")
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                yield from fields(value, f"{path}.{index}")
+    got, want = dict(fields({k: body[k] for k in api.SECTIONS})), dict(fields({k: reference[k] for k in api.SECTIONS}))
+    assert got.keys() == want.keys()
+    for path, field in got.items():  # same values and flags; a confidence can only drop to the model's 0.99
+        assert {k: v for k, v in field.items() if k != "confidence"} == {k: v for k, v in want[path].items() if k != "confidence"}, path
+        assert field["confidence"] in (want[path]["confidence"], 0.99) and field["confidence"] <= want[path]["confidence"], path
+    confidence = body["evidence"]["tokenConfidence"]
+    assert set(confidence) == {"header.formNumber", "customerInformation.name", "customerInformation.nationality", "staffOnly.treatments.0",
+                               "staffOnly.treatments.1", "staffOnly.therapistName", "staffOnly.roomNo"}  # blank boxes are not model-read
+    assert all(v["mean"] == v["min"] == 0.99 and v["tokens"] >= 1 for v in confidence.values())
+
+
+def test_low_token_confidence_lowers_and_flags_only_that_field(client, monkeypatch):
+    import math
+
+    import ocr_model
+    monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(logprob=-0.01, low={"Chun": -1.0, "พีพี": -0.5, "หน้า 1": -0.7}))
+    body = post(client, png_of(S.filled_form())).json()
+    customer, staff, confidence = body["customerInformation"], body["staffOnly"], body["evidence"]["tokenConfidence"]
+    assert customer["name"]["value"] == "Chun" and customer["name"]["confidence"] == round(math.exp(-1.0), 3) and customer["name"]["needsReview"]
+    assert confidence["customerInformation.name"]["mean"] == confidence["customerInformation.name"]["min"] == 0.368
+    assert staff["therapistName"]["value"] == "พีพี" and staff["therapistName"]["confidence"] == 0.607 and staff["therapistName"]["needsReview"]
+    first, second = staff["treatments"]
+    assert not first["needsReview"] and first["confidence"] == 0.95
+    assert second["needsReview"] and second["confidence"] < 0.8 and confidence["staffOnly.treatments.1"]["min"] == 0.497
+    assert staff["treatment"]["needsReview"] is True and body["needsReview"] is True
+    assert not customer["nationality"]["needsReview"] and customer["nationality"]["confidence"] == 0.99  # min(master 1.0, model 0.99)
+    assert not staff["roomNo"]["needsReview"] and staff["roomNo"]["confidence"] == 0.95
+    monkeypatch.setenv("OCR_MODEL_CONFIDENCE_NAME", "0.3")  # the per-type threshold is an env knob...
+    name = post(client, png_of(S.filled_form())).json()["customerInformation"]["name"]
+    assert name["confidence"] == 0.368 and name["needsReview"] is True  # ...but its tokens are still below the token floor 0.5
+    monkeypatch.setenv("OCR_MODEL_CONFIDENCE_TOKEN", "0.3")  # and so is the floor
+    name = post(client, png_of(S.filled_form())).json()["customerInformation"]["name"]
+    assert name["confidence"] == 0.368 and name["needsReview"] is False
+
+
+def test_room_needs_a_more_confident_reading_than_a_treatment(client, monkeypatch):
+    import ocr_model
+    monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(staff="Treatment : ไทย 90 นาที\nTherapist Name : พีพี\nRoom No. : 3",
+                                                         logprob=-0.01, low={"3": -0.15, "ไทย 90 นาที": -0.15}))
+    staff = post(client, png_of(S.filled_form())).json()["staffOnly"]
+    assert staff["roomNo"]["confidence"] == 0.861 and staff["roomNo"]["needsReview"]  # below the room threshold 0.90
+    assert staff["treatments"][0]["confidence"] == 0.861 and not staff["treatments"][0]["needsReview"]  # above the treatment one, 0.80
+
+
+def test_a_transient_model_error_is_retried_once(client, monkeypatch):
+    import ocr_model
+    model = FakeModel(errors={"staff": [http_error(500)]})
+    monkeypatch.setattr(ocr_model, "call_ocr", model)
+    response = post(client, png_of(S.filled_form()))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert model.kinds().count("staff") == 2 and model.kinds().count("headerCustomer") == 1
+    sections = {s["name"]: s for s in body["timings"]["sections"]}
+    assert sections["staffOnly"]["attempts"] == 2 and "failed" not in sections["staffOnly"] and set(sections["headerCustomer"]) == {"name", "ms"}
+    assert body["layout"]["warnings"] == [] and body["evidence"]["modelErrors"] == [] and body["needsReview"] is False
+    assert [t["value"] for t in body["staffOnly"]["treatments"]] == ["นวดไทย", "นวดหน้า"]
+
+
+def test_a_staff_call_that_fails_twice_degrades_only_the_staff_section(client, monkeypatch):
+    import ocr_model
+    model = FakeModel(errors={"staff": [http_error(500), TimeoutError("timed out")]})
+    monkeypatch.setattr(ocr_model, "call_ocr", model)
+    response = post(client, png_of(S.filled_form()))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert_v3_shape(body)
+    staff = body["staffOnly"]
+    assert staff["treatments"] == [] and staff["treatment"]["needsReview"] and staff["totalMinutes"] is None
+    assert all(staff[key]["needsReview"] and staff[key]["value"] is None for key in ("therapistName", "roomNo", "branch"))
+    customer = body["customerInformation"]  # the other call's fields and the deterministic ones are unchanged
+    assert customer["name"]["value"] == "Chun" and not customer["name"]["needsReview"]
+    assert customer["gender"]["value"] == "Female" and not customer["gender"]["needsReview"]
+    assert body["header"]["formNumber"]["value"] == "01234" and not body["header"]["formNumber"]["needsReview"]
+    assert [w for w in body["layout"]["warnings"] if "model call staffOnly failed after 2 attempt(s)" in w]
+    assert body["evidence"]["modelErrors"] == [{"call": "staffOnly", "attempts": 2, "error": "TimeoutError: timed out"}]
+    assert body["evidence"]["staffCropRaw"] is None and body["needsReview"] is True
+    assert {s["name"]: s.get("failed", False) for s in body["timings"]["sections"]} == {"staffOnly": True, "headerCustomer": False}
+
+
+def test_a_header_customer_call_that_fails_twice_keeps_the_staff_fields(client, monkeypatch):
+    import ocr_model
+    monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(errors={"headerCustomer": [http_error(503), http_error(502)]}))
+    response = post(client, png_of(S.filled_form()))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [t["value"] for t in body["staffOnly"]["treatments"]] == ["นวดไทย", "นวดหน้า"]
+    assert body["staffOnly"]["therapistName"]["value"] == "พีพี" and not body["staffOnly"]["therapistName"]["needsReview"]
+    assert all(field["needsReview"] for field in body["header"].values())
+    assert all(body["customerInformation"][key]["needsReview"] for key in ("name", "nationality", "hotelName"))
+    assert body["customerInformation"]["gender"]["value"] == "Female" and not body["customerInformation"]["gender"]["needsReview"]
+    assert body["evidence"]["customerCropRaw"] is None and body["evidence"]["combinedRaw"] is None
+    assert any("model call headerCustomer failed" in w for w in body["layout"]["warnings"])
+
+
+def test_a_non_transient_model_error_is_not_retried_and_fails_the_page(client, monkeypatch):
+    import ocr_model
+    model = FakeModel(errors={"staff": [http_error(400)]})
+    monkeypatch.setattr(ocr_model, "call_ocr", model)
+    response = post(client, png_of(S.filled_form()))
+    assert response.status_code == 500 and model.kinds().count("staff") == 1
+
+
+def test_combined_mode_retries_its_one_call_and_fails_only_when_it_fails_twice(client, monkeypatch):
+    import ocr_model
+    monkeypatch.setenv("OCR_SECTION_MODE", "combined")
+    monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(errors={"combined": [http_error(500)]}))
+    body = post(client, png_of(S.filled_form())).json()
+    assert body["timings"]["sections"][0]["attempts"] == 2 and body["customerInformation"]["name"]["value"] == "Chun"
+    monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(errors={"combined": [http_error(500), http_error(500)]}))
+    response = post(client, png_of(S.filled_form()))
+    assert response.status_code == 500 and "every model call failed" in response.json()["detail"]
+
+
+def test_separate_mode_customer_failure_keeps_the_staff_fields(client, monkeypatch):
+    import ocr_model
+    monkeypatch.setenv("OCR_SECTION_MODE", "separate")
+    monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(errors={"customer": [ConnectionResetError("reset"), ConnectionResetError("reset")]}))
+    body = post(client, png_of(S.filled_form())).json()
+    assert body["staffOnly"]["therapistName"]["value"] == "พีพี" and body["customerInformation"]["name"]["needsReview"]
+    assert body["evidence"]["modelErrors"][0]["call"] == "customerInformation"
+
+
+@pytest.mark.parametrize("timeout", [TimeoutError("timed out"), "url-timeout"])
+def test_a_timed_out_call_is_not_retried(client, monkeypatch, timeout):
+    """A call that already waited OCR_MODEL_TIMEOUT (600 s, twice the worker's 300 s request timeout) is not sent again:
+    the retry doubled the worst case to 1200 s of Ollama time for a request the worker had given up on (Ollama runs one
+    request at a time, so every other page waited behind it). Its section is degraded at once."""
+    import urllib.error
+
+    import ocr_model
+    error = urllib.error.URLError(TimeoutError("timed out")) if timeout == "url-timeout" else timeout
+    model = FakeModel(errors={"staff": [error]})
+    monkeypatch.setattr(ocr_model, "call_ocr", model)
+    response = post(client, png_of(S.filled_form()))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert model.kinds().count("staff") == 1 and model.kinds().count("headerCustomer") == 1
+    assert body["evidence"]["modelErrors"][0]["call"] == "staffOnly" and body["evidence"]["modelErrors"][0]["attempts"] == 1
+    assert {s["name"]: s.get("failed", False) for s in body["timings"]["sections"]} == {"staffOnly": True, "headerCustomer": False}
+    assert body["staffOnly"]["therapistName"]["needsReview"] and body["customerInformation"]["name"]["value"] == "Chun"

@@ -1,9 +1,49 @@
-# INNOVERA Local AI OCR — v3.1 (`typhoon-sections`)
+# INNOVERA Local AI OCR — v3.2 (`typhoon-sections`)
 
 FastAPI service that reads a scanned **Makkha Health & Spa intake form** and returns the whole document as schema v3
-(version `3.1`). Contract: `docs/operations/full-document-batch-spec.md` §1 plus the v3.1 additions of
-`docs/operations/real-data/release1-plan.md` (Workstream A). It is served as `uvicorn api:app` on port 5000, with
-`/app = /opt/innovera-ocr`, and talks to Ollama (`scb10x/typhoon-ocr1.5-3b`) through the OpenAI-compatible endpoint.
+(version `3.2`). Contract: `docs/operations/full-document-batch-spec.md` §1 plus the v3.1 additions of
+`docs/operations/real-data/release1-plan.md` (Workstream A) and the v3.2 changes below. It is served as `uvicorn api:app`
+on port 5000, with `/app = /opt/innovera-ocr`, and talks to Ollama (`scb10x/typhoon-ocr1.5-3b`) through the
+OpenAI-compatible endpoint.
+
+## What changed in v3.2 (real-model findings on the 95-page SUKHUMVIT 33 file)
+
+In v3.1's single combined call the model read the cursive Thai STAFF handwriting as English/Chinese (`ออย 1 ชม.` ->
+`OOW I 6M`, `水療`): treatment names were right on 25 % of the 95 real pages, the therapist on 12 %; 3 pages failed on an
+Ollama HTTP 500 mid-generation; 47 wrong customer names were not flagged (free text had a fixed confidence of 0.8). A probe
+on 16 hard pages put the STAFF crop **alone** with a Thai vocabulary hint first (Thai script 13/16, room 14/16), the
+combined variants last (room 9-10/16).
+
+| Area | v3.1 | v3.2 |
+|---|---|---|
+| Model calls (`OCR_SECTION_MODE`) | `combined` (default): one image, header + customer rows + STAFF crop | **`staff-separate`** (default): call A = the STAFF crop alone with `STAFF_VOCAB_PROMPT` (the v2.2 `STAFF_PROMPT` plus the probe's vocabulary sentence and "Write Thai words in Thai script.", word for word); call B = the header stacked above the customer rows (the rows only when a customer box is written; the header always) with `HEADER_CUSTOMER_PROMPT` (`COMBINED_PROMPT` restricted to the `No./Date/Time/Name/Nationality/Hotel Name` lines, 260 tokens). A and B run concurrently (`OCR_SECTION_PARALLELISM`); `timings.sections` names them `staffOnly` and `headerCustomer`. `evidence.staffCropRaw` = A's answer, `customerCropRaw` (when the rows were sent) and `combinedRaw` = B's answer, all raw. The v3.1 fallbacks stay: a staff answer without any staff label is re-read with `STAFF_PROMPT`, written customer boxes with nothing parsed with `CUSTOMER_PROMPT`. `combined` and `separate` still work. |
+| Text cleanup (`ocr_normalize.clean_model_text`, in every parser) | tags -> newlines | HTML entities decoded (`&amp;`), table cells -> `Label: value` lines, tags removed, parenthetical model notes dropped (`(handwritten)`, `(hand-written)`, `(Treatments)`, `(Therapists)`, `(circled)`, `(ลายมือ)` …; `(5)` and `(2 คน)` are values and stay; doubt notes such as `(unclear)`, `(illegible)`, `(crossed out)` also stay, so the reading next to them is not taken as confident), echoed Chinese labels dropped (`治療 治疗 疗法 療法`, therapist / room labels such as `理疗师名称`, `房号`). `Treatments:` counts as the label; a room label never takes the next label as its value. The raw answers stay in `evidence`. |
+| Visual-confusion aliases (`master_data.json` `visualAliases`) | – | Look-alikes the model writes for Thai handwriting, applied to the treatment text before parsing: treatment look-alikes (`004 002 00ย 00Y OOW oow oo อยู่ คอย` -> `ออย` = นวดน้ำมัน, `Inw lnw Thw` -> `ไทย`; a whole token, or glued to digits, or glued to a Thai word only when that makes an exact master name: `อยู่ร้อน` -> ออยร้อน); hour-unit look-alikes after an hour count 1-4 (`6M 2M T2 62 5ม Ø2` -> `ชม.`; after a space or `-`, an all-digit one also glued: `004162.` -> `ออย 1 ชม.`; never when a real unit follows); `I l \| /` alone right before an hour unit -> `1` (`002 / 6M` -> `ออย 1 ชม.`). Case-sensitive. An item read through an alias (its text, or a written total that went through one) is source **`visual-alias`**, confidence ≤ 0.6 and **always** `needsReview`; each replacement is listed in `evidence.treatmentWarnings` (`visual alias: '002' read as 'ออย'`). |
+| Model confidence (`ocr_confidence.py`) | rule confidences only | `call_ocr` asks for token logprobs (`logprobs: true, top_logprobs: 1`; `OCR_MODEL_LOGPROBS=0` turns it off) and returns `ModelText` (a `str` with `.tokens`; `call_ocr_text` returns a plain `str`). Each model-read field's value is found in its own answer (after its label; whitespace/separators and Thai digits tolerated) and mapped to the tokens that produced it. Ollama takes a token's `bytes` from its text, and in front of llama-server that text has lost a Thai character split over two tokens (`""` + `"\ufffd"`); such tokens are aligned by UTF-8 structure (linear time), so one split character no longer leaves the whole answer unmapped. modelConfidence = exp(mean token logprob) over the value's tokens, or for the digit fields (room, formNumber, date, time: one wrong digit is a wrong value) the probability of the weakest token. Field confidence = min(rule confidence, modelConfidence) for name, nationality, hotelName, formNumber, date, time, each treatment item, therapist and room; `needsReview` when modelConfidence is below the field type's threshold (`ocr_confidence.REVIEW_BELOW`: 0.85 name/nationality/hotel, 0.80 treatment/therapist, 0.90 room/formNumber/date/time) **or** any of the value's tokens is below the token floor 0.50 (a mean over a long name hides one doubtful letter: one 30 % letter in 18 tokens still averages 0.93). `OCR_MODEL_CONFIDENCE_<TYPE>` overrides one, e.g. `OCR_MODEL_CONFIDENCE_HOTEL_NAME`, `OCR_MODEL_CONFIDENCE_TOKEN`. `evidence.tokenConfidence` = `{"customerInformation.name": {"mean", "min", "tokens"}, …}` (`null`: value not found in an answer that had logprobs). No logprobs (older Ollama, a stub) or no span: the v3.1 rule confidences stand. |
+| Model errors | any failed call -> HTTP 500 for the page | A call that hits an HTTP 5xx or a dropped/refused connection is retried once (after 1 s); a timed-out call is not (it already waited `OCR_MODEL_TIMEOUT`, 600 s, twice the worker's 300 s, and Ollama serves one request at a time). If it still fails, the page is answered from the other call: the failed section's fields are all `needsReview` (staff: every STAFF ONLY field; header+customer: the header fields and name/nationality/hotel; checkbox and body-map fields are not affected), `layout.warnings` gets `model call <name> failed after N attempt(s) (…); its fields need review`, `evidence.modelErrors` lists it and its `timings.sections` entry has `"failed": true` (`"attempts": 2` on any retried call). Only when **every** call failed is the page an HTTP 500 (the worker retries it). Other errors (a 4xx, a malformed answer) are not retried and still fail the page. |
+
+Response: unchanged shape (`version` `"3.2"`, `schemaVersion` 3); field `source` may now be `"visual-alias"`; `evidence` gains
+`tokenConfidence` and `modelErrors`; `timings.sections` entries may carry `attempts` / `failed`.
+
+**Cost:** ~2 model calls per page. Ollama on the CPU-only host serialises requests and every image costs ~1,070 tokens
+(~25-27 s), so a new page takes **≈ 50-55 s** (v3.1 combined: ~25 s), about 1.1 new pages per minute per Ollama slot.
+`OCR_SECTION_MODE=combined` restores the one-call cost with v3.1's STAFF accuracy.
+
+Offline re-score of the real-model probe answers through the v3.2 parser (16 hard pages, STAFF crop alone with the
+vocabulary prompt; names compared with the labels' own naming; outside git, aggregates only):
+
+| staffvocab (16 pages) | v3.1 parser, raw text | v3.1 parser + probe cleanup (before) | v3.2 cleanup only | v3.2 cleanup + aliases (after) |
+|---|---|---|---|---|
+| Treatment names right | 3 | 5 | 5 | **8** |
+| Names + durations right | 3 | 5 | 5 | **8** |
+| Room right | 14 | 14 | 14 | 14 |
+
+(Counting the labels' "hot oil = นวดน้ำมัน" naming as equal: names 7 -> 11.) No page went from right to wrong in any probe
+mode (staff, staffvocab, combvocab, stafffirst); the cleanup also lifts room on the combined probe answers 9 -> 13/16. No
+alias fires on any of the 95 hand-labelled treatment lines and the Release 1 parser evaluation is unchanged (names 89/95
+strict, 95/95 with the hot-oil naming, 0 wrong and unflagged, guests 95/95, totals 95/95). On the 92 v3.1 combined answers
+of the 95-page run, treatment names right go 25 -> 29 with the aliases, none lost. The remaining misses are misreads no
+alias can fix (ออย read as ไทย on 3 pages, confidently: the logprob thresholds are the remedy to measure next).
 
 ## What changed in v3.1 (release 1: real SUKHUMVIT 33 scans)
 
@@ -63,8 +103,9 @@ Extra, additive keys (not in the spec example, safe to ignore):
 | `ocr_layout.py` | Template `makkha-intake-v1`: calibrated reference coordinates (805×569), header regions, `layout` block |
 | `ocr_marks.py` | Deterministic ink detection: pen mask with form dropout, checkboxes (strokes, strikes, beside-box marks), handwriting emptiness, body map |
 | `ocr_normalize.py` | Masters, verified memory, header / STAFF ONLY / customer parsing, branch, treatments, totals, guests, therapists |
-| `ocr_model.py` | Ollama/OpenAI-compatible client and the prompts |
-| `master_data.json` | Editable masters (treatments + allowed durations, therapists with branch/seed, branches, nationalities) |
+| `ocr_model.py` | Ollama/OpenAI-compatible client (token logprobs, transient-error classification) and the prompts |
+| `ocr_confidence.py` | Token-logprob field confidence: value -> token span mapping, per-type review thresholds |
+| `master_data.json` | Editable masters (treatments + allowed durations, therapists with branch/seed, branches, nationalities, visual aliases) |
 | `tests/` | pytest suite, `synthetic_form.py` (draws the template; scaled/rotated pages, PAID-like stamps), `fake_ollama.py`, `bench_deterministic.py` |
 | `Dockerfile.test` | Throwaway python:3.11 test image |
 
@@ -77,7 +118,10 @@ removal; the production base image has it through `paddlepaddle`/`paddleocr`). O
 |---|---|---|
 | `OLLAMA_URL` | `http://host.docker.internal:11434/v1/chat/completions` | Chat-completions endpoint |
 | `OCR_MODEL` | `scb10x/typhoon-ocr1.5-3b` | Model name |
-| `OCR_MODEL_TIMEOUT` | `600` | Seconds per model call (v2.2 value) |
+| `OCR_MODEL_TIMEOUT` | `600` | Seconds per model call (v2.2 value); a timed-out call is not retried, its section is returned for review |
+| `OCR_SECTION_MODE` | `staff-separate` | `staff-separate` (2 calls: STAFF alone + header/customer), `combined` (v3.1, 1 call), `separate` (v3.0, no header) |
+| `OCR_MODEL_LOGPROBS` | `1` | `0` stops asking Ollama for token logprobs (field confidence then follows the rules only) |
+| `OCR_MODEL_CONFIDENCE_<TYPE>` | see `ocr_confidence.REVIEW_BELOW` | Review threshold on modelConfidence for one field type: `NAME`, `NATIONALITY`, `HOTEL_NAME`, `TREATMENT`, `THERAPIST`, `ROOM`, `FORM_NUMBER`, `DATE`, `TIME`; `TOKEN` = the floor for any single token of a value (0.5) (0–1) |
 | `OCR_SECTION_PARALLELISM` | `2` | Concurrent section calls per document (1–8); `1` = sequential |
 | `OCR_CUSTOMER_CROP_SCALE` | `1.0` | Upscale factor for the customer crop (0.5–4); tuning knob for the real model |
 | `OCR_UPLOAD_DIR` | `/app/uploads` | Where the uploaded original is saved |
@@ -147,7 +191,9 @@ docker run --rm -v "$PWD/local-ai":/app -w /app -e OCR_VERIFIED_FILE=/tmp/x.json
   python tests/bench_deterministic.py tests/fixtures/sample2.png --runs 40
 ```
 
-The model call is mocked in `tests/test_api.py`. `tests/test_fake_ollama.py` runs the real HTTP client against `tests/fake_ollama.py`.
+The model call is mocked in `tests/test_api.py` (`FakeModel`: answers per prompt kind, optional fake token logprobs and
+injected errors). `tests/test_fake_ollama.py` runs the real HTTP client against `tests/fake_ollama.py`, which returns
+byte-level token logprobs when asked and can answer HTTP 500 to the first n requests of a prompt kind.
 
 Whole stack locally, without a GPU:
 
@@ -183,14 +229,30 @@ cache-defeating variants (±1 pixel jitter) for real numbers.
 |---|---|---|
 | v2.2 (STAFF crop only) | 24.7-27.6 s | 1.7-2.4 s |
 | v3 `OCR_SECTION_MODE=separate` (2 calls) | 50.2-51.3 s | 2.3-4.0 s |
-| v3 default `combined` (1 call) | 23.9-24.7 s (12/12 fields correct on 6 fresh variants) | ~1.9 s |
+| v3.1 default `combined` (1 call) | 23.9-24.7 s (12/12 fields correct on 6 fresh variants) | ~1.9 s |
+| v3.2 default `staff-separate` (2 calls) | ≈ 50-55 s expected (2 × ~25-27 s; not yet measured) | – |
 
-Throughput is bounded by the single Ollama slot: about 2.5 new documents per minute, whatever
-`OCR_WORKER_CONCURRENCY` is (2 keeps the slot busy; the second request waits in Ollama's queue).
-`OCR_SECTION_MODE` (`combined` default, `separate`) selects one or two model calls; `combined` falls back to a
-second, STAFF-only call only when its answer contains no staff label.
+Throughput is bounded by the single Ollama slot: about 2.5 new documents per minute with one call per page, about 1.1
+with v3.2's two, whatever `OCR_WORKER_CONCURRENCY` is (2 keeps the slot busy; the second request waits in Ollama's queue).
+`OCR_SECTION_MODE` (`staff-separate` default, `combined`, `separate`) selects the calls; `combined` and `staff-separate`
+fall back to a STAFF-only call with `STAFF_PROMPT` only when their answer contains no staff label.
 
-## Must be validated against the real model on the Local AI VPS
+## Must be validated against the real model on the Local AI VPS (v3.2)
+
+1. **Accuracy of staff-separate on all 95 pages** (render them with `native_pages.py`, the worker's page images): treatment
+   names / therapist / room vs the labels, against v3.1's 25 % / 12 %; header and customer fields must not drop (call B
+   sees the same header and customer crops as before).
+2. **Logprobs.** Check that Ollama 0.34.2 returns `choices[0].logprobs.content` through the OpenAI endpoint
+   (`evidence.tokenConfidence` non-empty; a `null` entry = a value that could not be mapped) and whether requesting them
+   changes latency. Ollama derives `bytes` from each token's text (server/logprob.go), so behind llama-server a split Thai
+   character arrives as `""` + `"\ufffd"`; the alignment handles that (tested with that shape end to end), but count the
+   `null` entries on the staff answers. Then tune `REVIEW_BELOW` (and the 0.5 token floor) per field type on the 95 pages:
+   how many wrong names / treatments fall below them vs how many right ones are flagged.
+3. **Cost.** ~2 calls per page: measure cold pages (cache-defeating variants) — expected ≈ 50-55 s.
+4. **Aliases.** Count `visual-alias` items and how many were right on review; add look-alikes only from real answers,
+   and only visually plausible ones that change no correct reading (`tests/test_normalize.py` lists no-regression cases).
+
+### v3.1 items (still open)
 
 v3.1 changes what the model sees (fitted crops, header part, stamp removal) but not how it is called: still one combined
 call, the STAFF crop region and STAFF_PROMPT are unchanged, and the combined prompt only gains three label lines. Check on
@@ -233,7 +295,7 @@ cp -a /opt/innovera-ocr/verified_dataset /opt/innovera-ocr-v3/verified_dataset  
 docker run -d --name innovera-ocr-v3 -p 127.0.0.1:5001:5000 \
   -v /opt/innovera-ocr-v3:/app --add-host=host.docker.internal:host-gateway \
   -e OCR_SECTION_PARALLELISM=2 "$IMAGE" uvicorn api:app --host 0.0.0.0 --port 5000
-curl -s http://127.0.0.1:5001/health          # expect "version":"3.1","masterData":"ok"
+curl -s http://127.0.0.1:5001/health          # expect "version":"3.2","masterData":"ok"
 
 # 4. Compare with the live v2.2 on forms that are ALREADY on the server (e.g. the upload of the sample2 form and a few
 #    recent ones in /opt/innovera-ocr/uploads). Do not copy the repo fixture to the server.
@@ -248,7 +310,8 @@ jq '{c: .customerInformation, rec: .recommendationCard, timings, needsReview}' /
 Acceptance before swapping:
 - `staffCropRaw` and the staff values match v2.2.
 - Customer and checkbox fields match the paper form.
-- Warm `totalMs` is within about +0.3 s of v2.2 (if not, see validation item 1).
+- Warm `totalMs` is within about +0.3 s of v2.2 (if not, see validation item 1). A new (cold) page takes ~2 model calls
+  (≈ 50-55 s) in the default `staff-separate` mode.
 - No 5xx responses in `docker logs innovera-ocr-v3`.
 
 ```bash
@@ -262,7 +325,7 @@ docker run -d --name "$LIVE" --restart unless-stopped -p <LIVE PORT MAPPING FROM
   -v /opt/innovera-ocr/uploads:/app/uploads \
   --add-host=host.docker.internal:host-gateway -e OCR_SECTION_PARALLELISM=2 \
   "$IMAGE" uvicorn api:app --host 0.0.0.0 --port 5000
-curl -s http://127.0.0.1:5000/health          # version 3.1; then push one real document through the app
+curl -s http://127.0.0.1:5000/health          # version 3.2; then push one real document through the app
 
 # 6. Rollback (seconds): the v2.2 container and /opt/innovera-ocr are untouched
 docker stop "$LIVE" && docker rename "$LIVE" innovera-ocr-v3-failed
@@ -286,6 +349,9 @@ Notes:
   (chest, abdomen, buttocks). Uncertain marks are flagged.
 - **Strikes and ticks drawn as one stroke** (a tick whose tail becomes the strike line) are read as struck, with a
   review marker. X marks and scribbled-out boxes are equally dense: both are returned for review.
-- **Free text.** Customer name and hotel have no master, so they are taken as read (confidence 0.8) unless the answer looks
-  malformed. Dates without a year are returned for review.
+- **Free text.** Customer name and hotel have no master: they are taken as read (confidence 0.8), capped by the model's own
+  token confidence when Ollama returns logprobs (mean below 0.85, or any token below 0.5 ⇒ review); without logprobs only a malformed answer is
+  flagged. Dates without a year are returned for review.
+- **Two calls per page** in the default mode (≈ 50-55 s on the CPU host). A section whose call failed (twice, or once on a timeout) is returned
+  empty and flagged; the page itself only fails when both calls failed.
 - **Red pen** is removed from model crops together with pink/red stamps.

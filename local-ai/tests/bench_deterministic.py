@@ -16,6 +16,7 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parent), str(HERE)]
 
 import api  # noqa: E402
+import fake_ollama  # noqa: E402
 import ocr_model  # noqa: E402
 import synthetic_form  # noqa: E402
 from PIL import Image  # noqa: E402
@@ -26,10 +27,9 @@ HEADER = "No. 01234\nDate 日期 : 16/08/26\nTime 时间 :"
 
 
 def canned(png, prompt, max_tokens=220):
-    """Instant model answer; the combined prompt gets all its sections, so no fallback call is triggered."""
-    if "STAFF ONLY" in prompt and "CUSTOMER INFORMATION" in prompt:
-        return f"{HEADER}\n{CUSTOMER}\n\n{STAFF}"
-    return STAFF if "STAFF ONLY" in prompt else CUSTOMER
+    """Instant model answer; every prompt gets all its sections, so no fallback call is triggered."""
+    kind = fake_ollama.prompt_kind(prompt)
+    return {"combined": f"{HEADER}\n{CUSTOMER}\n\n{STAFF}", "staff": STAFF, "headerCustomer": f"{HEADER}\n{CUSTOMER}"}.get(kind, CUSTOMER)
 
 
 def main():

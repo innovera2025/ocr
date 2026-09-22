@@ -12,7 +12,7 @@ export type OcrField = Readonly<{
 export type OcrTreatment = Readonly<OcrField & { name?: string; duration?: string }>;
 
 /** Schema v3 (engine `typhoon-sections` 3.0 / 3.1) shapes. Responses are NOT validated against them — read defensively. */
-export type Source = "ocr" | "checkbox" | "ink-mark" | "rule" | "master-fuzzy" | "verified-memory" | "none" | "human";
+export type Source = "ocr" | "checkbox" | "ink-mark" | "rule" | "master-fuzzy" | "visual-alias" | "verified-memory" | "none" | "human";
 export type Field = Readonly<{ raw: string | null; value: string | null; confidence: number; source: Source; needsReview: boolean }>;
 export type CheckField = Readonly<Field & { checked: true }>;
 /** `guests` (v3.1): a leading guest count ("4 ไทย 1 ชม." → 4), never a duration. */
