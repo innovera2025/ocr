@@ -18,3 +18,9 @@ Status: not started (Release 1 first). Approved order: Release 1 → Release 2 �
   - `หน้า` / `page` — page number within that file (empty for single images), plus `จำนวนหน้า` / `page_count`
   - `อัปโหลดเมื่อ` / `uploaded_at` — upload time (Asia/Bangkok)
 - Show the same original file name (and page N/M) in the UI export preview table.
+
+## Carried over from Release 1 (`release1-report-2026-09-22.md`)
+- The batch strip's elapsed time and pages-per-minute count from the batch's `createdAt`, so a batch retried hours later
+  shows a long elapsed time and a rate near 0. Start the clock at the first claim of the current processing round.
+- Production's host env file still sets `OCR_REQUEST_TIMEOUT=120` (release default 300); raise it before running more
+  than one worker job loop.

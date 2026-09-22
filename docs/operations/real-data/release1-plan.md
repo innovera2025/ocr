@@ -112,3 +112,8 @@ Deviations accepted at integration (details in the workstream reports and `full-
 
 Open before deploy: real-model run; STAFF crop cuts totals written past the Treatment box on some pages; `numpy` import in the
 production Local AI image; ClamAV and app-host nginx size limits (design §7).
+
+## Production (2026-09-22)
+Deployed (Local AI v3.2 first, then web with 0018, then the worker with one job loop); the user's 95-page PDF was retried:
+95 pages split in 18.5 s, all OCR'd in 82 min with 0 failures and verdict `known` on every page. Accuracy, timings, issues
+and rollback: `release1-report-2026-09-22.md`.
