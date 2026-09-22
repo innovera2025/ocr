@@ -97,6 +97,25 @@ Measured locally (Docker Desktop, python 3.11, Pillow 12.3):
 - Deterministic path on sample2: median ≈ 69 ms in total. Decode is ≈ 24 ms (v2.2 also decoded), preprocess ≈ 24 ms, checkbox + body map ≈ 18 ms (overlaps inference) and normalize ≈ 2 ms.
 - With fake 800 ms model calls: `inferenceMs` ≈ 1615 ms, `inferenceWallMs` ≈ 810 ms and `totalMs` ≈ 870 ms.
 
+## Measured on the production Local AI VPS (2026-09-22)
+
+The host is CPU-only (8 vCPU AMD EPYC, 32 GB, no GPU; `size_vram: 0`). Ollama 0.34.2 runs one request at a time
+(one slot, `n_ctx_slot 4096`) and resizes every image to about 1,070 tokens whatever its size, so each model call
+costs about 24-25 s for a document it has not seen. Ollama's prompt cache answers an image it has seen before in
+1-2 s: the "1.5-1.8 s warm latency" quoted for v2.2 came from re-sending the same sample. Measure with
+cache-defeating variants (±1 pixel jitter) for real numbers.
+
+| Build | New document (cache miss) | Repeated sample (cache hit) |
+|---|---|---|
+| v2.2 (STAFF crop only) | 24.7-27.6 s | 1.7-2.4 s |
+| v3 `OCR_SECTION_MODE=separate` (2 calls) | 50.2-51.3 s | 2.3-4.0 s |
+| v3 default `combined` (1 call) | 23.9-24.7 s (12/12 fields correct on 6 fresh variants) | ~1.9 s |
+
+Throughput is bounded by the single Ollama slot: about 2.5 new documents per minute, whatever
+`OCR_WORKER_CONCURRENCY` is (2 keeps the slot busy; the second request waits in Ollama's queue).
+`OCR_SECTION_MODE` (`combined` default, `separate`) selects one or two model calls; `combined` falls back to a
+second, STAFF-only call only when its answer contains no staff label.
+
 ## Must be validated against the real model on the Local AI VPS
 
 1. **Ollama parallelism.** Two section calls run at once. If Ollama serialises them (`OLLAMA_NUM_PARALLEL=1`, or a CPU-bound box), `inferenceWallMs` ≈ `inferenceMs` and latency roughly doubles (≈ 3 s instead of 1.5–1.8 s).

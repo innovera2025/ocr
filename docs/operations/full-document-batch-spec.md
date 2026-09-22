@@ -64,6 +64,10 @@ Engine `typhoon-sections`, version `3.0`. Backward compatible with v2.2 clients:
 - Empty but confidently blank field: `{raw:null, value:null, confidence:≥0.9, source:"ink-mark", needsReview:false}`.
 - Confirm API unchanged: `POST /v1/ocr/confirm {documentId, field: "treatment"|"therapist", raw, verifiedValue}`.
   Verified memory lookup for treatments tries `nameRaw` first, then `raw`.
+- Model calls: by default one call per document (`OCR_SECTION_MODE=combined`: the customer rows stacked above the
+  unchanged STAFF crop, `timings.sections = [{name: "combined"}]`, answer in `evidence.combinedRaw`); a STAFF-only
+  re-read (`staffOnlyFallback`) runs only when that answer has no staff label. `separate` keeps two calls. No model
+  call reads the customer rows when all three handwriting boxes are blank.
 - Inputs: PDF first page when `pypdfium2`/PyMuPDF is installed (the production base image has `pypdfium2`), rendered under a
   process-wide lock (neither library is thread-safe) with the long side at 1610 px; pages over 14400 pt → 400. Raster images
   over 89.5 MP → 400, except JPEGs, which are first decoded at 1/2–1/8 scale (DCT draft, ≥ 4096 px on both sides; e.g. 108 MP
