@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createAppServer, errorStatus, routeLabel, workbenchCsp, type AppDependencies, type DocumentListQuery, type WorkbenchStore } from "./server.js";
-import type { Principal } from "@innovera/ocr-auth";
+import { csrfTokenFor, type AuthContext } from "@innovera/ocr-auth";
 import type { IngestDependencies } from "@innovera/ocr-ingest";
 import type { ReviewDocument } from "@innovera/ocr-persistence";
 
@@ -12,11 +12,21 @@ const userId = "00000000-0000-0000-0000-000000000009";
 const batchId = "10000000-0000-4000-8000-000000000001";
 const failedDocumentId = "20000000-0000-4000-8000-000000000002";
 const unknownId = "30000000-0000-4000-8000-000000000003";
-const auth = { authorization: "Bearer test-token" };
+/** The harness authenticates by a session cookie, like the real server: the token path is gone (§5 C1). */
+const sessionToken = "Mp7xk2Qw9ZbF4nLc8TvRy1DgH6sJuA0eXiVoP3rYkNs";
+const otherSessionToken = "Zq4TmW8yRv2LbXc7NfKj1GdHs6PuA9eYiVoM3rDkQxB";
+const principal = (tenantId: string): AuthContext => ({
+  userId, tenantId, sessionId: "00000000-0000-4000-8000-00000000000a", username: "staff1", displayName: "พนักงาน",
+  role: "staff", canExport: false, mustChangePassword: false
+});
+const cookie = (token: string) => `ocr_session=${token}`;
+const auth = { cookie: cookie(sessionToken), "sec-fetch-site": "same-origin", "x-csrf-token": csrfTokenFor(sessionToken) };
+const otherAuth = { cookie: cookie(otherSessionToken), "sec-fetch-site": "same-origin", "x-csrf-token": csrfTokenFor(otherSessionToken) };
 const reviewExtras = { batchId: null, reviewedAt: null, reviewedBy: null, updatedAt: "2026-09-21T01:00:00.000Z", errorMessage: null, createdAt: "2026-09-21T00:59:00.000Z", processedAt: "2026-09-21T01:00:00.000Z", deliveryStatus: "NONE",
   parentDocumentId: null, pageNumber: null, pageCount: null, parentFilename: null } as const;
 /** Stored views are canonical; tests may still hand the server a legacy flat shape to prove it normalizes defensively. */
 const asView = (value: unknown) => value as ReviewDocument["structuredResult"];
+/** §5 C2: a mutating request also needs the content type, the same-origin proof and the CSRF token. */
 const jsonAuth = { ...auth, "content-type": "application/json" };
 
 function deps(confirmFails = false) {
@@ -33,9 +43,9 @@ function deps(confirmFails = false) {
     ingest: { stage: async () => "key", scan: async () => "CLEAN", enqueue: async () => "job" },
     reviewStore: store,
     ocrClient: { confirmResult: async () => { if (confirmFails) throw new Error("network"); return { accepted: true }; } } as never
-  }, { authenticate: (request): Principal => {
-    if (request.headers.authorization !== "Bearer test-token") throw new Error("UNAUTHENTICATED");
-    return { userId, tenantId: tenant, claims: {} };
+  }, { authenticate: (request): AuthContext => {
+    if (request.headers.cookie !== cookie(sessionToken)) throw new Error("UNAUTHENTICATED");
+    return principal(tenant);
   } });
   return { app, calls };
 }
@@ -49,7 +59,7 @@ test("review endpoint enforces tenant and confirm persists before external call"
   const unauthorized = await fetch(`${base}/api/documents/${documentId}/ocr`);
   assert.equal(unauthorized.status, 401);
   const confirmed = await fetch(`${base}/api/documents/${documentId}/ocr/confirm`, {
-    method: "POST", headers: { authorization: "Bearer test-token", "x-tenant-id": "00000000-0000-0000-0000-000000000099", "content-type": "application/json" },
+    method: "POST", headers: { ...jsonAuth, "x-tenant-id": "00000000-0000-0000-0000-000000000099" },
     body: JSON.stringify({ field: "therapistName", raw: "พิพิ", verifiedValue: "พีพี" })
   });
   assert.equal(confirmed.status, 200);
@@ -62,7 +72,7 @@ test("confirm keeps correction when OCR confirm is unavailable", async () => {
   await new Promise<void>((resolve) => app.listen(0, "127.0.0.1", resolve));
   const address = app.address() as { port: number };
   const response = await fetch(`http://127.0.0.1:${address.port}/api/documents/${documentId}/ocr/confirm`, {
-    method: "POST", headers: { authorization: "Bearer test-token", "x-tenant-id": tenant, "content-type": "application/json" },
+    method: "POST", headers: { ...jsonAuth, "x-tenant-id": tenant },
     body: JSON.stringify({ field: "therapistName", raw: "พิพิ", verifiedValue: "พีพี" })
   });
   assert.equal(response.status, 202);
@@ -140,9 +150,9 @@ function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; store
   };
   const app = createAppServer(dependencies, {
     ...(options.readiness ? { readiness: options.readiness } : {}),
-    authenticate: (request): Principal => {
-      if (request.headers.authorization === "Bearer test-token") return { userId, tenantId: tenant, claims: {} };
-      if (request.headers.authorization === "Bearer other-token") return { userId, tenantId: otherTenant, claims: {} };
+    authenticate: (request): AuthContext => {
+      if (request.headers.cookie === cookie(sessionToken)) return principal(tenant);
+      if (request.headers.cookie === cookie(otherSessionToken)) return principal(otherTenant);
       throw new Error("UNAUTHENTICATED");
     }
   });
@@ -197,7 +207,7 @@ test("GET /review/:id redirects to the workbench for UUIDs only", async () => {
   });
 });
 
-test("every workbench API route requires the bearer token", async () => {
+test("every workbench API route requires a session", async () => {
   const h = workbenchHarness();
   await withServer(h, async (base) => {
     const routes: Array<[string, string]> = [
@@ -206,7 +216,7 @@ test("every workbench API route requires the bearer token", async () => {
       ["POST", `/api/documents/${documentId}/ocr/review`], ["POST", `/api/documents/${documentId}/retry`], ["POST", `/api/documents/${documentId}/ocr/confirm`]
     ];
     for (const [method, path] of routes) {
-      const response = await fetch(`${base}${path}`, { method, headers: { "x-tenant-id": tenant, "content-type": "application/json" }, ...(method === "POST" ? { body: "{}" } : {}) });
+      const response = await fetch(`${base}${path}`, { method, headers: { "x-tenant-id": tenant, "content-type": "application/json", "sec-fetch-site": "same-origin" }, ...(method === "POST" ? { body: "{}" } : {}) });
       await expectError(response, 401, "UNAUTHENTICATED");
     }
     assert.equal(h.calls.length, 0);
@@ -222,8 +232,8 @@ test("tenant comes from the token only; tenant headers are ignored", async () =>
     assert.equal((await fetch(`${base}/api/batches/${batchId}`, { headers: { ...auth, ...spoof } })).status, 200);
     assert.equal((await fetch(`${base}/api/documents/${documentId}/ocr`, { headers: { ...auth, ...spoof } })).status, 200);
     assert.deepEqual(new Set(h.calls.map((call) => call.tenantId)), new Set([tenant]));
-    // A token for another tenant cannot read tenant A's document.
-    await expectError(await fetch(`${base}/api/documents/${documentId}/ocr`, { headers: { authorization: "Bearer other-token", "x-tenant-id": tenant } }), 404, "DOCUMENT_NOT_FOUND");
+    // A session in another tenant cannot read tenant A's document.
+    await expectError(await fetch(`${base}/api/documents/${documentId}/ocr`, { headers: { ...otherAuth, "x-tenant-id": tenant } }), 404, "DOCUMENT_NOT_FOUND");
   });
 });
 

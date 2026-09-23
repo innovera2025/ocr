@@ -1742,3 +1742,46 @@ write the deviation down instead of diverging silently.
 - **`isUuid` moved to `tenant.ts`.** `audit.ts` and `users.ts` need it, and importing it from `index.ts` would make
   the barrel import its own re-exports. It is still exported from the barrel, so every existing import and
   `index.test.ts:72` are unchanged.
+
+**C4 (the server auth flow: `auth.ts`, `auth-routes.ts`, `server.ts` and `auth.test.ts`)**
+
+- **Where the unknown-name budget sits.** C3 numbers the steps "acquire `loginGate` (4) → `findLoginUser` (5) →
+  `verifyPassword` (6)", but B1 requires the budget to sit **in front of** the gate, and whether a name is unknown is
+  only knowable after the lookup. The order implemented is: throttle pre-check → `findLoginUser` → budget → one
+  `loginGate.run` covering the verify **and** the optional rehash. The gate therefore never holds a database query,
+  which B1 also asks for, and one acquisition serves a login that rehashes.
+- **`WebAuthContext` at the seam.** C5's five-minute forced-change window needs `auth_sessions.created_at` and
+  `GET /api/auth/session` needs `expires_at`; C3's `resolveSession` already returns both. Rather than a second query
+  per request, `apps/ocr-web/src/auth.ts` extends B2's `AuthContext` with two optional fields (`sessionCreatedAt`,
+  `sessionExpiresAt`). `AppServerOptions.authenticate` accepts a plain `AuthContext`, so the test seam is unchanged.
+- **`respond`, `respondNoContent` and `readJson` live in `auth.ts`.** §11 lists only the guards there, but
+  `auth-routes.ts` and `server.ts` both need them and importing them from `server.ts` would make the two modules
+  circular.
+- **`PASSWORD_UNCHANGED` (400).** C5 requires the new password to differ from the current one but names no code; the
+  C8 table's default rule makes any unlisted SCREAMING_SNAKE code a 400. The three password checks (current password,
+  unchanged password, new hash) share **one** `adminGate.run`: three acquisitions would push two concurrent changes
+  past the gate's queue of 4.
+- **Route-level `LAST_ADMIN` is unreachable and is tested through `errorStatus` only.** With C6's
+  `CANNOT_CHANGE_SELF` in force, an acting admin can only demote or disable *another* admin, and then at least two
+  active admins exist by definition. The guard stays in the store, where a concurrent demotion and the E1 CLI meet it
+  (covered by C3's two-transaction DB test); the server test asserts the 409 mapping.
+- **`unlock` reads the user list to learn the username.** C7 says the route clears the in-memory username window, but
+  `unlockUser(userId, audit)` returns nothing and that window is keyed by name. The route calls `listUsers()` (the
+  users table is tiny, §6) to find the row first, which also produces the 404 for an unknown id.
+- **`login_ip_throttle_disabled` is logged only when a user store is configured.** C11 says "once at startup";
+  `createAppServer` also runs in every test, and the warning is about the login defence, so it is skipped when no
+  login is possible.
+- **`GET /api/web-token` answers 401 without a session.** C1 says it "falls through to 404"; that holds once the
+  request authenticates, because C2.4 requires a session on every `/api` route except login and logout. §12's case is
+  asserted with a session.
+- **`AppServerOptions` gains `webConfig`, `loginThrottle` and `clock`.** C2 names only `authenticate`; the throttle
+  cases need to drive the sliding windows with injected limits and the session cases need to move time, and production
+  passes the same `webConfig` it built for `PostgresUserStore`. `createAppServer` builds the session authenticator
+  itself when a `userStore` is present rather than receiving one (C12), since both need the same `env` and
+  `sessionIdleMinutes`.
+- **`documents_read_total` (§13) and the `logEvent` key filter (§6) landed here**, not in C5: each is one line at a
+  call site C4 already rewrites.
+- **`server.test.ts` proves same-origin with `Sec-Fetch-Site`, not `Origin`.** §12 asks the helper to add `Origin`,
+  but the file's shared header objects are built before a port is known. `Sec-Fetch-Site: same-origin` is the branch
+  C2.2 defines for a request with no `Origin`, and a browser cannot forge it; `auth.test.ts` covers the `Origin` form,
+  including a sibling `*.innoveraappcenter.com` origin.

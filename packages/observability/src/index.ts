@@ -33,11 +33,15 @@ export function requestId(header: string | string[] | undefined): string {
   return value && /^[A-Za-z0-9._:-]{1,128}$/.test(value) ? value : randomUUID();
 }
 
-/** Emits only explicitly supplied scalar fields. Callers must never pass tokens, bytes, or OCR payloads. */
+/**
+ * Emits only explicitly supplied scalar fields. Callers must never pass tokens, bytes, or OCR payloads. The filter also
+ * drops `cookie`, `authorization` and `csrf` keys, so a session credential cannot reach `docker logs` by a slip of the
+ * spread operator. An action therefore goes in the event **name**: a field named `password_reset` would be dropped.
+ */
 export function logEvent(event: string, fields: Readonly<Record<string, unknown>> = {}): void {
   const safe: Record<string, string | number | boolean> = { event };
   for (const [key, value] of Object.entries(fields)) {
-    if (/(token|secret|password|credential|content|payload|raw|response)/i.test(key)) continue;
+    if (/(token|secret|password|credential|content|payload|raw|response|cookie|authorization|csrf)/i.test(key)) continue;
     if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") safe[key] = value;
   }
   process.stdout.write(`${JSON.stringify(safe)}\n`);

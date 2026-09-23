@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { createHmac, randomBytes } from "node:crypto";
-import { loadConfig, redactLog } from "@innovera/ocr-config";
+import { randomBytes, randomUUID } from "node:crypto";
+import { loadConfig, loadWebConfig, redactLog, type WebConfig } from "@innovera/ocr-config";
 import { handleRawUpload, type IngestDependencies } from "@innovera/ocr-ingest/http";
 import { OcrClient } from "@innovera/ocr-client";
 import { DOCUMENT_STATUS_CATEGORIES, legacyTreatmentIndex, normalizeStructuredResult, type DocumentStatusCategory, type DocumentView, type ReviewStore } from "@innovera/ocr-persistence";
@@ -9,7 +9,13 @@ import { resolve } from "node:path";
 import { PostgresOcrDocumentStore } from "@innovera/ocr-persistence";
 import { createRuntimeIngest } from "./runtime.js";
 import { workbenchPage } from "./workbench.js";
-import { AuthenticationError, authenticateBearer, type Principal } from "@innovera/ocr-auth";
+import { AuthenticationError } from "@innovera/ocr-auth";
+import { AuditRateLimiter, PostgresUserStore } from "@innovera/ocr-persistence";
+import {
+  assertCsrfToken, assertOrigin, assertSecFetchSite, hasRight, headerValue, LoginThrottle, PASSWORD_CHANGE_ROUTES,
+  PUBLIC_API_ROUTES, readJson, requiredRight, respond, sessionAuthenticator, type UserStore, type WebAuthContext
+} from "./auth.js";
+import { handleAuthRoutes, LOGIN_BUSY_RETRY_SECONDS, type AuthRouteDeps } from "./auth-routes.js";
 import { logEvent, metrics, requestId } from "@innovera/ocr-observability";
 import { clamAvHealthCheck } from "@innovera/ocr-ingest/clamav";
 import type { LocalStorage } from "@innovera/ocr-storage/local";
@@ -32,19 +38,36 @@ export type AppDependencies = Readonly<{
   ingestForTenant?: (tenantId: string, idempotencyKey?: string, batchId?: string) => IngestDependencies;
   reviewStore?: ReviewStore;
   workbenchStore?: WorkbenchStore;
+  userStore?: UserStore;
   storage?: LocalStorage;
   ocrClient?: OcrClient;
 }>;
-type AppServerOptions = Readonly<{ readiness?: () => boolean | Promise<boolean>; authenticate?: (request: IncomingMessage) => Principal }>;
+/** `authenticate` stays the test seam (§5 C2.4); `clock` and `loginThrottle` let the login tests drive the sliding windows. */
+type AppServerOptions = Readonly<{
+  readiness?: () => boolean | Promise<boolean>;
+  authenticate?: (request: IncomingMessage) => WebAuthContext | Promise<WebAuthContext>;
+  webConfig?: WebConfig;
+  loginThrottle?: LoginThrottle;
+  clock?: () => number;
+}>;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const AUTH_ERRORS = new Set(["UNAUTHENTICATED", "AUTH_NOT_CONFIGURED", "INVALID_TOKEN", "TOKEN_EXPIRED", "INVALID_ISSUER", "INVALID_AUDIENCE", "INVALID_PRINCIPAL"]);
+const AUTH_ERRORS = new Set(["UNAUTHENTICATED", "AUTH_NOT_CONFIGURED", "INVALID_TOKEN", "TOKEN_EXPIRED", "INVALID_ISSUER", "INVALID_AUDIENCE",
+  "INVALID_PRINCIPAL", "INVALID_CREDENTIALS", "PASSWORD_EXPIRED"]);
+const FORBIDDEN_ERRORS = new Set(["CSRF_REJECTED", "FORBIDDEN", "PASSWORD_CHANGE_REQUIRED"]);
+/** Every 429 carries `Retry-After`; the login route computes its own from the window that is spent. */
+const THROTTLED_ERRORS: ReadonlyMap<string, number> = new Map([["LOGIN_THROTTLED", 900], ["LOGIN_BUSY", LOGIN_BUSY_RETRY_SECONDS], ["EXPORT_BUSY", 30]]);
 const CONFLICT_ERRORS = new Set(["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT",
-  "DOCUMENT_QUARANTINED", "DOCUMENT_NOT_SCANNED", "CONFIRMATION_TARGET_AMBIGUOUS", "UPLOAD_IN_PROGRESS"]);
+  "DOCUMENT_QUARANTINED", "DOCUMENT_NOT_SCANNED", "CONFIRMATION_TARGET_AMBIGUOUS", "UPLOAD_IN_PROGRESS",
+  "USERNAME_TAKEN", "LAST_ADMIN", "CANNOT_CHANGE_SELF"]);
 /** Originals are only served once ClamAV let them through: quarantined bytes never reach a reviewer's browser. */
 const UNSERVED_CONTENT: ReadonlyMap<string, string> = new Map([["QUARANTINED", "DOCUMENT_QUARANTINED"], ["VALIDATING", "DOCUMENT_NOT_SCANNED"], ["SCANNING", "DOCUMENT_NOT_SCANNED"]]);
-const JSON_BODY_LIMIT = 1_048_576;
 const TIMESTAMP = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}(:?\d{2})?)?$/;
+/** D13: Prometheus scrapes `web:3100` directly, so a request that came through nginx-proxy is not a scrape. */
+const PROXY_HEADERS = ["x-forwarded-for", "x-forwarded-host", "x-real-ip"] as const;
+const EXACT_ROUTES = ["/", "/metrics", "/health/live", "/health/ready", "/api/batches", "/api/documents", "/api/auth/login",
+  "/api/auth/logout", "/api/auth/session", "/api/auth/password", "/api/users", "/api/exports/preview",
+  "/api/exports/documents.csv", "/api/exports/documents.jsonl"];
 
 export function healthResponse(pathname: string): { status: number; body: { status: string } } {
   if (pathname === "/health/live") return { status: 200, body: { status: "ok" } };
@@ -55,7 +78,9 @@ export function healthResponse(pathname: string): { status: number; body: { stat
 /** Spec §5 status mapping, shared by every route. Codes are the `{ error }` body values. */
 export function errorStatus(code: string): number {
   if (AUTH_ERRORS.has(code) || code.startsWith("AUTH_") || code.startsWith("TOKEN_")) return 401;
+  if (FORBIDDEN_ERRORS.has(code)) return 403;
   if (/_NOT_FOUND(_OR_FORBIDDEN)?$/.test(code)) return 404;
+  if (THROTTLED_ERRORS.has(code)) return 429;
   if (CONFLICT_ERRORS.has(code)) return 409;
   if (code === "PAYLOAD_TOO_LARGE") return 413;
   if (code === "UNSUPPORTED_MEDIA_TYPE") return 415;
@@ -73,7 +98,9 @@ export function errorCode(error: unknown): string {
 
 /** Bounded metric label: ids are templated so per-document paths cannot grow the registry. */
 export function routeLabel(pathname: string): string {
-  if (["/", "/metrics", "/health/live", "/health/ready", "/api/web-token", "/api/batches", "/api/documents"].includes(pathname)) return pathname;
+  if (EXACT_ROUTES.includes(pathname)) return pathname;
+  const users = /^\/api\/users\/[^/]+(\/reset-password|\/unlock)?$/.exec(pathname);
+  if (users) return `/api/users/:id${users[1] ?? ""}`;
   const match = /^\/(api\/documents|api\/batches|review)\/[^/]+(\/.*)?$/.exec(pathname);
   if (!match) return "unmatched";
   const suffix = match[2] ?? "";
@@ -84,11 +111,6 @@ export function workbenchCsp(nonce: string): string {
   return `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' blob: data:; frame-src 'self' blob:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'`;
 }
 
-function respond(response: ServerResponse, status: number, body: object): void {
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" });
-  response.end(JSON.stringify(body));
-}
-
 function respondWorkbench(response: ServerResponse): void {
   const nonce = randomBytes(16).toString("base64");
   const html = workbenchPage({ nonce });
@@ -97,76 +119,6 @@ function respondWorkbench(response: ServerResponse): void {
     "x-content-type-options": "nosniff", "referrer-policy": "no-referrer"
   });
   response.end(html);
-}
-
-function mintWebJwt(): string {
-  if (process.env.OCR_WEB_AUTO_AUTH !== "1") {
-    throw new Error("WEB_AUTO_AUTH_DISABLED");
-  }
-
-  const secret = (process.env.AUTH_JWT_SECRETS ?? "")
-    .split(",")
-    .map((v) => v.trim())
-    .filter(Boolean)[0];
-
-  const issuer = process.env.AUTH_JWT_ISSUER ?? "";
-  const audience = process.env.AUTH_JWT_AUDIENCE ?? "";
-  const tenantId = process.env.OCR_WEB_TENANT_ID ?? "";
-  const subjectId = process.env.OCR_WEB_SUBJECT_ID ?? "";
-
-  if (!secret || !issuer || !audience || !tenantId || !subjectId) {
-    throw new Error("WEB_AUTO_AUTH_CONFIG_REQUIRED");
-  }
-
-  const now = Math.floor(Date.now() / 1000);
-
-  const header = {
-    alg: "HS256",
-    typ: "JWT"
-  };
-
-  const payload = {
-    sub: subjectId,
-    tenant_id: tenantId,
-    organization_id: tenantId,
-    iss: issuer,
-    aud: audience,
-    iat: now,
-    exp: now + 900
-  };
-
-  const encode = (value: unknown) =>
-    Buffer.from(JSON.stringify(value)).toString("base64url");
-
-  const h = encode(header);
-  const p = encode(payload);
-
-  const signature = createHmac("sha256", secret)
-    .update(`${h}.${p}`)
-    .digest("base64url");
-
-  return `${h}.${p}.${signature}`;
-}
-
-async function readJson(request: IncomingMessage, limit = JSON_BODY_LIMIT): Promise<Record<string, unknown>> {
-  // A declared oversize body is refused before reading, so the client still receives the 413.
-  if (Number(request.headers["content-length"] ?? 0) > limit) throw new Error("PAYLOAD_TOO_LARGE");
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of request) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    size += buffer.byteLength;
-    if (size > limit) throw new Error("PAYLOAD_TOO_LARGE");
-    chunks.push(buffer);
-  }
-  let parsed: unknown;
-  try { parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { throw new Error("INVALID_JSON"); }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("INVALID_JSON");
-  return parsed as Record<string, unknown>;
-}
-
-function headerValue(value: string | string[] | undefined): string | undefined {
-  return Array.isArray(value) ? value[0] : value;
 }
 
 /** Ids are validated before any SQL cast; a malformed id is indistinguishable from a missing one. */
@@ -245,55 +197,93 @@ function hasOtherReview(view: DocumentView, field: string, raw: string): boolean
 
 export function createAppServer(dependencies?: IngestDependencies | AppDependencies, options: AppServerOptions = {}) {
   const config = loadConfig();
-  const principalFor = (request: IncomingMessage): Principal => options.authenticate ? options.authenticate(request) : authenticateBearer(typeof request.headers.authorization === "string" ? request.headers.authorization : undefined, config.auth.jwtSecrets, { issuer: config.auth.issuer, audience: config.auth.audience });
+  const webConfig = options.webConfig ?? loadWebConfig();
+  const env = config.env;
+  const clock = options.clock ?? Date.now;
+  const throttle = options.loginThrottle ?? new LoginThrottle();
+  const deniedAudits = new AuditRateLimiter();
   const app = dependencies && "ingest" in dependencies ? dependencies : dependencies ? { ingest: dependencies } : undefined;
   const workbench = (): WorkbenchStore => { if (!app?.workbenchStore) throw new Error("WORKBENCH_NOT_CONFIGURED"); return app.workbenchStore; };
+  const users = (): UserStore => { if (!app?.userStore) throw new Error("LOGIN_NOT_CONFIGURED"); return app.userStore; };
+  const authenticate = options.authenticate ?? (app?.userStore
+    ? sessionAuthenticator(app.userStore, { env, idleMinutes: webConfig.sessionIdleMinutes })
+    : (_request: IncomingMessage): Promise<WebAuthContext> => { throw new Error("LOGIN_NOT_CONFIGURED"); });
+  // §5 C11: with hops = 0 every request carries the proxy's address, so the per-IP window would be a global switch.
+  if (app?.userStore && config.trustedProxyHops < 1) logEvent("login_ip_throttle_disabled", { level: "warn", trusted_proxy_hops: config.trustedProxyHops });
 
-  /** Tenant always comes from the verified token (principal.tenantId); tenant headers are ignored. Returns false when no /api route matched. Throws coded errors. */
-  const handleApi = async (request: IncomingMessage, response: ServerResponse, url: URL, method: string, reqId: string): Promise<boolean> => {
+  const authDeps = (traceId: string): AuthRouteDeps => ({ store: users(), webConfig, env, throttle, hops: config.trustedProxyHops, now: clock, traceId });
+
+  /** §5 C2.7 and §4 B4: a denied request is audited once, at most 5 times per session per minute. */
+  const recordDenied = (ctx: WebAuthContext, route: string, traceId: string): void => {
+    logEvent("access_denied", { trace_id: traceId, user_id: ctx.userId, route });
+    if (!app?.userStore) return;
+    if (!deniedAudits.allow(ctx.sessionId, clock())) { metrics.increment("access_denied_suppressed_total"); return; }
+    void app.userStore.recordAudit({ actorUserId: ctx.userId, sessionId: ctx.sessionId, requestId: traceId, action: "access.denied", outcome: "denied", detail: { route } })
+      .catch((error: unknown) => { logEvent("audit_write_failed", { trace_id: traceId, action: "access.denied", error: error instanceof Error ? error.message.slice(0, 120) : "unknown" }); });
+  };
+
+  /**
+   * §5 C2, in this order: `Sec-Fetch-Site`, `Origin`, the session, the CSRF token, the forced password change and the
+   * permissions. The content type is checked by `readJson` inside each handler. Returns null for the two routes that
+   * answer without a session.
+   */
+  const authorize = async (request: IncomingMessage, pathname: string, method: string, traceId: string): Promise<WebAuthContext | null> => {
+    assertSecFetchSite(request);
+    assertOrigin(request, method, env, webConfig.publicOrigin);
+    if (PUBLIC_API_ROUTES.has(`${method} ${pathname}`)) return null;
+    const ctx = await authenticate(request);
+    assertCsrfToken(request, method, env);
+    if (ctx.mustChangePassword && !PASSWORD_CHANGE_ROUTES.has(pathname)) throw new Error("PASSWORD_CHANGE_REQUIRED");
+    const right = requiredRight(pathname);
+    if (right !== null && !hasRight(ctx, right)) {
+      recordDenied(ctx, routeLabel(pathname), traceId);
+      throw new Error("FORBIDDEN");
+    }
+    return ctx;
+  };
+
+  /** The tenant is always `ctx.tenantId`, the configured login tenant; tenant headers stay ignored. Returns false when no /api route matched. */
+  const handleApi = async (request: IncomingMessage, response: ServerResponse, url: URL, method: string, reqId: string, traceId: string, ctx: WebAuthContext): Promise<boolean> => {
     const pathname = url.pathname;
     if (pathname === "/api/documents" && method === "POST") {
       if (!app) throw new Error("INGEST_NOT_CONFIGURED");
-      const principal = principalFor(request);
       const batchHeader = headerValue(request.headers["x-batch-id"])?.trim();
       if (batchHeader !== undefined && !UUID.test(batchHeader)) throw new Error("INVALID_BATCH_ID");
       const batchId = batchHeader?.toLowerCase();
       const idempotencyKey = headerValue(request.headers["idempotency-key"]);
-      const uploadDependencies = app.ingestForTenant ? app.ingestForTenant(principal.tenantId, idempotencyKey, batchId) : app.ingest;
+      const uploadDependencies = app.ingestForTenant ? app.ingestForTenant(ctx.tenantId, idempotencyKey, batchId) : app.ingest;
       const uploaded = await handleRawUpload(request, uploadDependencies, config.limits.maxUploadBytes);
       const { stagedKey: _internalStorageKey, ...publicResult } = uploaded;
       metrics.increment("uploads_total", { status: String(uploaded.status) });
-      logEvent("upload_completed", { request_id: reqId, ...("documentId" in uploaded ? { document_id: uploaded.documentId } : {}), ...(batchId ? { batch_id: batchId } : {}), tenant_id: principal.tenantId, status: uploaded.status });
+      logEvent("upload_completed", { request_id: reqId, trace_id: traceId, user_id: ctx.userId, ...("documentId" in uploaded ? { document_id: uploaded.documentId } : {}), ...(batchId ? { batch_id: batchId } : {}), tenant_id: ctx.tenantId, status: uploaded.status });
       respond(response, 202, { ...publicResult, batchId: batchId ?? null });
       return true;
     }
     if (pathname === "/api/documents" && method === "GET") {
       const store = workbench();
-      const principal = principalFor(request);
       const query = parseDocumentListQuery(url.searchParams);
-      const listed = await store.listDocuments(principal.tenantId, query);
+      const listed = await store.listDocuments(ctx.tenantId, query);
+      // D8's compensating control (§13): `can_export` gates the export file, not the data, so bulk reading is metered.
+      metrics.increment("documents_read_total", { kind: "listed" }, listed.documents.length);
       respond(response, 200, { total: listed.total, limit: query.limit, offset: query.offset, documents: listed.documents });
       return true;
     }
     if (pathname === "/api/batches" && method === "POST") {
       const store = workbench();
-      const principal = principalFor(request);
       const input = parseBatchInput(await readJson(request));
-      respond(response, 201, await store.createBatch(principal.tenantId, { createdBy: principal.userId, ...input }));
+      respond(response, 201, await store.createBatch(ctx.tenantId, { createdBy: ctx.userId, ...input }));
       return true;
     }
     if (pathname === "/api/batches" && method === "GET") {
       const store = workbench();
-      const principal = principalFor(request);
       const limit = intParam(url.searchParams.get("limit"), 20, 1, 100, "INVALID_LIMIT");
-      respond(response, 200, { batches: await store.listBatches(principal.tenantId, limit) });
+      respond(response, 200, { batches: await store.listBatches(ctx.tenantId, limit) });
       return true;
     }
     const batchMatch = /^\/api\/batches\/([^/]+)$/.exec(pathname);
     if (batchMatch && method === "GET") {
       const store = workbench();
-      const principal = principalFor(request);
-      const batch = await store.getBatch(principal.tenantId, uuidOr404(batchMatch[1]!, "BATCH_NOT_FOUND"));
+      const batch = await store.getBatch(ctx.tenantId, uuidOr404(batchMatch[1]!, "BATCH_NOT_FOUND"));
       if (!batch) throw new Error("BATCH_NOT_FOUND");
       respond(response, 200, batch);
       return true;
@@ -303,8 +293,7 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
     const action = `${method} ${documentMatch[2]!}`;
     if (action === "GET content") {
       if (!app?.reviewStore?.getOriginal || !app.storage) throw new Error("CONTENT_NOT_CONFIGURED");
-      const principal = principalFor(request);
-      const original = await app.reviewStore.getOriginal(principal.tenantId, uuidOr404(documentMatch[1]!, "DOCUMENT_NOT_FOUND"));
+      const original = await app.reviewStore.getOriginal(ctx.tenantId, uuidOr404(documentMatch[1]!, "DOCUMENT_NOT_FOUND"));
       if (!original) throw new Error("DOCUMENT_NOT_FOUND");
       const refused = UNSERVED_CONTENT.get(original.status);
       if (refused) throw new Error(refused);
@@ -319,36 +308,33 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
     }
     if (action === "GET ocr") {
       if (!app?.reviewStore) throw new Error("REVIEW_NOT_CONFIGURED");
-      const principal = principalFor(request);
-      const document = await app.reviewStore.getReviewDocument(principal.tenantId, uuidOr404(documentMatch[1]!, "DOCUMENT_NOT_FOUND"));
+      const document = await app.reviewStore.getReviewDocument(ctx.tenantId, uuidOr404(documentMatch[1]!, "DOCUMENT_NOT_FOUND"));
       if (!document) throw new Error("DOCUMENT_NOT_FOUND");
+      metrics.increment("documents_read_total", { kind: "opened" });
       respond(response, 200, { document });
       return true;
     }
     if (action === "POST ocr/review") {
       const store = workbench();
-      const principal = principalFor(request);
       const documentId = uuidOr404(documentMatch[1]!, "DOCUMENT_NOT_FOUND");
       const input = parseReviewInput(await readJson(request));
-      const saved = await store.saveReview(principal.tenantId, documentId, { ...input, reviewedBy: principal.userId });
-      logEvent("review_saved", { request_id: reqId, tenant_id: principal.tenantId, document_id: documentId, corrections: saved.corrections, delivery: saved.delivery });
+      const saved = await store.saveReview(ctx.tenantId, documentId, { ...input, reviewedBy: ctx.userId });
+      logEvent("review_saved", { request_id: reqId, trace_id: traceId, user_id: ctx.userId, tenant_id: ctx.tenantId, document_id: documentId, corrections: saved.corrections, delivery: saved.delivery });
       respond(response, 200, { status: "confirmed", delivery: saved.delivery, corrections: saved.corrections, document: saved.document });
       return true;
     }
     if (action === "POST retry") {
       const store = workbench();
-      const principal = principalFor(request);
       const documentId = uuidOr404(documentMatch[1]!, "DOCUMENT_NOT_FOUND");
-      const retried = await store.retryDocument(principal.tenantId, documentId);
-      logEvent("document_retry_queued", { request_id: reqId, tenant_id: principal.tenantId, document_id: documentId, job_id: retried.jobId });
+      const retried = await store.retryDocument(ctx.tenantId, documentId);
+      logEvent("document_retry_queued", { request_id: reqId, trace_id: traceId, user_id: ctx.userId, tenant_id: ctx.tenantId, document_id: documentId, job_id: retried.jobId });
       respond(response, 202, { status: "queued", jobId: retried.jobId });
       return true;
     }
     if (action === "POST ocr/confirm") {
       if (!app?.reviewStore || !app.ocrClient) throw new Error("CONFIRM_NOT_CONFIGURED");
-      const principal = principalFor(request);
-      const tenantId = principal.tenantId;
-      const verifiedBy = principal.userId;
+      const tenantId = ctx.tenantId;
+      const verifiedBy = ctx.userId;
       const documentId = uuidOr404(documentMatch[1]!, "DOCUMENT_NOT_FOUND");
       const body = await readJson(request);
       const field = typeof body.field === "string" ? body.field : "";
@@ -379,23 +365,9 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
     const url = new URL(request.url ?? "/", "http://localhost");
     const pathname = url.pathname;
     const method = request.method ?? "UNKNOWN";
-
-
-    // OCR_WEB_AUTO_TOKEN_ROUTE
-    if (pathname === "/api/web-token" && request.method === "GET") {
-      try {
-        return respond(response, 200, {
-          token: mintWebJwt(),
-          expiresIn: 900
-        });
-      } catch {
-        return respond(response, 503, {
-          error: "WEB_AUTO_AUTH_UNAVAILABLE"
-        });
-      }
-    }
-
     const reqId = requestId(request.headers["x-request-id"]);
+    // §4 B4: `reqId` echoes the client's header, so only this server-minted id may join a log line to an audit row.
+    const traceId = randomUUID();
     const route = routeLabel(pathname);
     response.setHeader("x-request-id", reqId);
     response.once("finish", () => {
@@ -404,9 +376,10 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
       metrics.increment("http_request_duration_ms_sum", { route }, duration);
     });
     try {
-      // INNOVERA_OCR_ROOT_UI: the workbench authenticates itself through /api/web-token (no token prompt).
       if (pathname === "/" && method === "GET") return respondWorkbench(response);
       if (pathname === "/metrics" && method === "GET") {
+        // D13: Prometheus scrapes the container directly, so a metrics request through nginx-proxy does not exist.
+        if (PROXY_HEADERS.some((header) => request.headers[header] !== undefined)) return respond(response, 404, { status: "not_found" });
         response.writeHead(200, { "content-type": "text/plain; version=0.0.4; charset=utf-8", "cache-control": "no-store" });
         response.end(metrics.snapshot());
         return;
@@ -422,15 +395,23 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
         response.end();
         return;
       }
-      if (pathname.startsWith("/api/") && await handleApi(request, response, url, method, reqId)) return;
+      if (pathname.startsWith("/api/")) {
+        const ctx = await authorize(request, pathname, method, traceId);
+        if (pathname.startsWith("/api/auth/") || pathname === "/api/users" || pathname.startsWith("/api/users/")) {
+          if (await handleAuthRoutes(request, response, pathname, method, ctx, authDeps(traceId))) return;
+        }
+        if (!ctx) throw new AuthenticationError("UNAUTHENTICATED");
+        if (await handleApi(request, response, url, method, reqId, traceId, ctx)) return;
+      }
       const result = healthResponse(pathname);
       respond(response, result.status, result.body);
       void redactLog({ requestId: reqId, status: result.status });
     } catch (error) {
       const code = errorCode(error);
-      if (code === "INTERNAL_ERROR") logEvent("request_failed", { request_id: reqId, route, method, error: error instanceof Error ? error.message.slice(0, 200) : "unknown" });
+      if (code === "INTERNAL_ERROR") logEvent("request_failed", { request_id: reqId, trace_id: traceId, route, method, error: error instanceof Error ? error.message.slice(0, 200) : "unknown" });
       if (response.headersSent) { response.destroy(); return; }
-      respond(response, errorStatus(code), { error: code });
+      const retryAfter = THROTTLED_ERRORS.get(code);
+      respond(response, errorStatus(code), { error: code }, retryAfter === undefined ? {} : { "retry-after": String(retryAfter) });
     }
   }).on("error", () => undefined);
 }
@@ -444,7 +425,11 @@ export async function createProductionAppServer(): Promise<{ server: ReturnType<
   const reviewStore = new PostgresOcrDocumentStore(pool);
   const ocrClient = OcrClient.fromConfig();
   const storage = createLocalStorage(process.env.OCR_STORAGE_ROOT ?? "/var/lib/ocr");
-  const server = createAppServer({ ingest: { stage: async () => { throw new Error("TENANT_REQUIRED"); }, scan: async () => "QUARANTINED", enqueue: async () => { throw new Error("QUEUE_RUNTIME_NOT_CONFIGURED"); } }, ingestForTenant: (tenantId, idempotencyKey, batchId) => createRuntimeIngest(pool, tenantId, idempotencyKey, batchId), reviewStore, workbenchStore: reviewStore, storage, ocrClient }, { readiness: async () => { await assertDatabaseReady(pool); return clamAvHealthCheck({ host: process.env.OCR_CLAMAV_HOST ?? "clamav", port: Number(process.env.OCR_CLAMAV_PORT ?? 3310) }); } });
+  const webConfig = loadWebConfig();
+  const userStore = new PostgresUserStore(pool, webConfig.tenantId);
+  // A missing login tenant fails startup loudly, instead of every login answering "wrong password" (§4 B5).
+  await userStore.assertTenant();
+  const server = createAppServer({ ingest: { stage: async () => { throw new Error("TENANT_REQUIRED"); }, scan: async () => "QUARANTINED", enqueue: async () => { throw new Error("QUEUE_RUNTIME_NOT_CONFIGURED"); } }, ingestForTenant: (tenantId, idempotencyKey, batchId) => createRuntimeIngest(pool, tenantId, idempotencyKey, batchId), reviewStore, workbenchStore: reviewStore, userStore, storage, ocrClient }, { webConfig, readiness: async () => { await assertDatabaseReady(pool); return clamAvHealthCheck({ host: process.env.OCR_CLAMAV_HOST ?? "clamav", port: Number(process.env.OCR_CLAMAV_PORT ?? 3310) }); } });
   return { server, close: async () => { await new Promise<void>((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose())); await pool.end(); } };
 }
 
