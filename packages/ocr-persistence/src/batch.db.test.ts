@@ -13,7 +13,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { Pool } from "pg";
-import { hasReviewFields, PostgresOcrDocumentStore, toStructuredResult, type DocumentView, type PageDocumentInput } from "./index.js";
+import { hasReviewFields, PostgresOcrDocumentStore, PostgresUserStore, toStructuredResult, withTenant,
+  type AuditContext, type DocumentView, type PageDocumentInput, type SessionRevokeReason, type UserRole } from "./index.js";
 
 type Claimed = { jobId: string; organizationId: string; runId: string; kind: string; leaseToken: string };
 type Queue = {
@@ -874,5 +875,193 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
       [TENANT_B, userA, tokenHash("cross-tenant")]), { code: "23503" }, "composite FK: a session never points at another tenant's user");
     assert.notEqual(await createUser(TENANT_B, "somchai"), userA, "the same username may exist in both tenants");
     await assert.rejects(createUser(TENANT_A, "somchai"), { code: "23505" }, "it is unique within one tenant");
+  });
+
+  // ---- PostgresUserStore, the session store and the audit log, exercised as ocr_app under FORCE RLS. ----
+  /** A second obviously fake hash, in the stored format, so a rehash is visible without hashing anything. */
+  const FAKE_REHASH = "scrypt$v1$N=65536,r=8,p=3$cmVoYXNoZWQtbm90LXJlYWw$cmVoYXNoZWQtbm90LWEtcmVhbC1rZXk";
+  const storeFor = (tenantId: string) => new PostgresUserStore(appPool, tenantId);
+  /** What a route passes: the server-minted trace id, never the client's echoed X-Request-Id. */
+  const auditAs = (actorUserId: string | null): AuditContext => ({ actorUserId, requestId: randomUUID() });
+  const auditActions = async (tenantId: string, targetId: string): Promise<string[]> =>
+    (await asApp<{ action: string }>(tenantId, "SELECT action FROM audit_events WHERE target_id=$1::uuid ORDER BY occurred_at, action", [targetId])).map((row) => row.action);
+  const auditCount = async (tenantId: string): Promise<number> =>
+    (await asApp<{ count: number }>(tenantId, "SELECT count(*)::int AS count FROM audit_events"))[0]!.count;
+
+  test("the user store creates and lists users under the tenant, refuses bad input and maps a duplicate username to USERNAME_TAKEN", async () => {
+    const store = storeFor(TENANT_A);
+    await store.assertTenant();
+    await assert.rejects(storeFor(randomUUID()).assertTenant(), /LOGIN_TENANT_NOT_FOUND/, "an unknown tenant must fail web startup, not every login");
+    const admin = await store.createUser({ username: "admin.one", displayName: "แอดมิน หนึ่ง", role: "admin", passwordHash: FAKE_HASH, temporary: false, audit: auditAs(null) });
+    assert.deepEqual([admin.role, admin.status, admin.canExport], ["admin", "active", false]);
+    const audit = auditAs(admin.id);
+    const staff = await store.createUser({ username: "nok.staff", displayName: "Nok", role: "staff", canExport: true, passwordHash: FAKE_HASH, audit });
+    assert.equal(staff.status, "must_change", "a new account starts on a temporary password");
+    const temporary = await asApp<{ within_72h: boolean }>(TENANT_A,
+      "SELECT password_expires_at BETWEEN now() + interval '71 hours' AND now() + interval '72 hours' AS within_72h FROM users WHERE id=$1::uuid", [staff.id]);
+    assert.equal(temporary[0]!.within_72h, true, "D6: the temporary password dies after 72 h");
+    const before = await auditCount(TENANT_A);
+    await assert.rejects(store.createUser({ username: "nok.staff", displayName: "Nok Again", role: "staff", passwordHash: FAKE_HASH, audit }), /USERNAME_TAKEN/);
+    assert.equal(await auditCount(TENANT_A), before, "the refused insert and its audit row roll back together");
+    for (const username of ["no", ".nok", "nok staff", "n".repeat(40)]) {
+      await assert.rejects(store.createUser({ username, displayName: "X", role: "staff", passwordHash: FAKE_HASH, audit }), /INVALID_USERNAME/, username);
+    }
+    await assert.rejects(store.createUser({ username: "ok.name", displayName: "   ", role: "staff", passwordHash: FAKE_HASH, audit }), /INVALID_DISPLAY_NAME/);
+    await assert.rejects(store.createUser({ username: "ok.name", displayName: "X", role: "owner" as UserRole, passwordHash: FAKE_HASH, audit }), /INVALID_ROLE/);
+    await assert.rejects(store.createUser({ username: "ok.name", displayName: "X", role: "staff", passwordHash: "not-a-scrypt-hash", audit }), /PASSWORD_HASH_INVALID/);
+    const listed = await store.listUsers();
+    assert.deepEqual(listed.map((user) => user.username), ["admin.one", "nok.staff", "somchai"], "one tenant's users, in username order");
+    assert.ok(!JSON.stringify(listed).includes("scrypt$"), "the admin list never carries a hash");
+    const updated = await store.updateUser(staff.id, { displayName: "Nok N.", canExport: false }, audit);
+    assert.deepEqual([updated.displayName, updated.canExport], ["Nok N.", false]);
+    await assert.rejects(store.updateUser(randomUUID(), { displayName: "Ghost" }, audit), /USER_NOT_FOUND/);
+    await assert.rejects(store.updateUser(staff.id, {}, audit), /USER_INVALID/);
+    assert.deepEqual(await auditActions(TENANT_A, staff.id), ["user.created", "user.updated"]);
+    const detail = await asApp<{ detail: Record<string, unknown> }>(TENANT_A, "SELECT detail FROM audit_events WHERE target_id=$1::uuid AND action='user.updated'", [staff.id]);
+    assert.deepEqual(detail[0]!.detail, { fields: "canExport,displayName" }, "the changed field names only, never their values");
+  });
+
+  test("ten login failures lock the account, unlock clears the counters and a success consumes the temporary password", async () => {
+    const store = storeFor(TENANT_A);
+    const admin = (await store.findLoginUser("admin.one"))!;
+    const audit = auditAs(admin.id);
+    const user = await store.createUser({ username: "lock.me", displayName: "Lock Me", role: "staff", passwordHash: FAKE_HASH, audit });
+    const login = (await store.findLoginUser("  LOCK.ME  "))!;
+    assert.deepEqual([login.id, login.mustChangePassword, login.lockedUntil, login.disabledAt], [user.id, true, null, null], "NFKC, trim and lower case, like the login form");
+    assert.equal(await store.findLoginUser("does.not.exist"), null);
+    assert.equal(await store.findLoginUser("Not A Username!"), null, "a name that cannot exist simply finds no user");
+    const counters = async () => (await asApp<{ failed_logins: number; locked: boolean | null }>(TENANT_A,
+      "SELECT failed_logins, locked_until > now() AS locked FROM users WHERE id=$1::uuid", [user.id]))[0]!;
+    for (let attempt = 1; attempt < 10; attempt += 1) {
+      assert.equal((await store.recordLoginFailure(user.id, { reason: "bad_password", audit })).locked, false, `attempt ${attempt}`);
+    }
+    assert.deepEqual(await counters(), { failed_logins: 9, locked: null });
+    assert.equal((await store.recordLoginFailure(user.id, { reason: "bad_password", audit })).locked, true, "the tenth trips the lock");
+    assert.deepEqual(await counters(), { failed_logins: 0, locked: true }, "the counter resets as the lock trips");
+    assert.equal((await store.recordLoginFailure(user.id, { reason: "locked", audit })).locked, false, "a failure against a locked account does not trip it again");
+    const actions = await auditActions(TENANT_A, user.id);
+    assert.equal(actions.filter((action) => action === "login.failed").length, 11);
+    assert.equal(actions.filter((action) => action === "login.locked").length, 1, "the lock is audited once");
+    assert.equal((await store.listUsers()).find((row) => row.username === "lock.me")!.status, "locked", "the lock is visible to admins only");
+    await store.unlockUser(user.id, audit);
+    assert.deepEqual(await counters(), { failed_logins: 0, locked: null });
+    await assert.rejects(store.unlockUser(randomUUID(), audit), /USER_NOT_FOUND/);
+    await store.recordLoginSuccess(user.id, FAKE_REHASH);
+    const after = (await asApp<{ hash: string; consumed: boolean; last_login: boolean }>(TENANT_A,
+      "SELECT password_hash AS hash, password_expires_at <= now() AS consumed, last_login_at IS NOT NULL AS last_login FROM users WHERE id=$1::uuid", [user.id]))[0]!;
+    assert.deepEqual(after, { hash: FAKE_REHASH, consumed: true, last_login: true }, "the rehash is stored and the temporary password is single-use");
+    await store.recordLoginSuccess(user.id);
+    assert.equal((await store.findLoginUser("lock.me"))!.passwordHash, FAKE_REHASH, "a login without a rehash keeps the stored hash");
+    await store.resetPassword(user.id, FAKE_HASH, audit);
+    const reset = (await asApp<{ status: string; failed_logins: number }>(TENANT_A,
+      `SELECT ${"CASE WHEN locked_until > now() THEN 'locked' WHEN must_change_password THEN 'must_change' ELSE 'active' END AS status"}, failed_logins FROM users WHERE id=$1::uuid`, [user.id]))[0]!;
+    assert.deepEqual(reset, { status: "must_change", failed_logins: 0 }, "a reset clears the lock and asks for a new password");
+    assert.ok((await auditActions(TENANT_A, user.id)).includes("user.password_reset"));
+  });
+
+  test("sessions: create, resolve, touch at most once a minute, idle and absolute expiry, revoke, and a disabled user", async () => {
+    const store = storeFor(TENANT_A);
+    const admin = (await store.findLoginUser("admin.one"))!;
+    const audit = auditAs(admin.id);
+    const user = await store.createUser({ username: "sess.user", displayName: "Session User", role: "staff", passwordHash: FAKE_HASH, audit });
+    const session = await store.createSession({ userId: user.id, tokenHash: tokenHash("sess-live"), absoluteHours: 8, audit: auditAs(user.id) });
+    const resolved = (await store.resolveSession(tokenHash("sess-live"), 30))!;
+    assert.deepEqual([resolved.sessionId, resolved.userId, resolved.username, resolved.role, resolved.canExport, resolved.mustChangePassword],
+      [session.sessionId, user.id, "sess.user", "staff", false, true]);
+    assert.equal(resolved.createdAt, session.createdAt, "the forced-change grace window reads created_at");
+    const loginRow = await asApp<{ session_id: string }>(TENANT_A, "SELECT session_id FROM audit_events WHERE action='login.succeeded' AND target_id=$1::uuid", [user.id]);
+    assert.equal(loginRow[0]!.session_id, session.sessionId, "login.succeeded carries the session it opened");
+    assert.equal(await store.resolveSession(tokenHash("never-issued"), 30), null);
+    assert.equal(await store.resolveSession(Buffer.alloc(16), 30), null, "a token hash of the wrong size is simply no session");
+    await assert.rejects(store.createSession({ userId: user.id, tokenHash: Buffer.alloc(16), absoluteHours: 8, audit }), /SESSION_TOKEN_INVALID/);
+    await assert.rejects(store.createSession({ userId: user.id, tokenHash: tokenHash("bad-hours"), absoluteHours: 0, audit }), /SESSION_HOURS_INVALID/);
+    const idleSeconds = async () => (await asApp<{ age: number }>(TENANT_A,
+      "SELECT extract(epoch FROM now() - last_seen_at)::int AS age FROM auth_sessions WHERE id=$1::uuid", [session.sessionId]))[0]!.age;
+    await superDb.query("UPDATE auth_sessions SET last_seen_at = now() - interval '30 seconds' WHERE id=$1", [session.sessionId]);
+    await store.touchSession(session.sessionId);
+    assert.ok(await idleSeconds() >= 30, "a session seen half a minute ago is not written again");
+    await superDb.query("UPDATE auth_sessions SET last_seen_at = now() - interval '2 minutes' WHERE id=$1", [session.sessionId]);
+    await store.touchSession(session.sessionId);
+    assert.ok(await idleSeconds() < 5, "a user action past the minute moves the deadline");
+    await superDb.query("UPDATE auth_sessions SET last_seen_at = now() - interval '31 minutes' WHERE id=$1", [session.sessionId]);
+    assert.equal(await store.resolveSession(tokenHash("sess-live"), 30), null, "idle past the deadline resolves to nothing");
+    assert.ok(await store.resolveSession(tokenHash("sess-live"), 60), "the same session inside a longer window still resolves");
+    await superDb.query("UPDATE auth_sessions SET last_seen_at = now() WHERE id=$1", [session.sessionId]);
+    const expiring = await store.createSession({ userId: user.id, tokenHash: tokenHash("sess-expired"), absoluteHours: 1, audit: auditAs(user.id) });
+    // The CHECK keeps expires_at after created_at, so an aged-out session is backdated as a whole.
+    await superDb.query("UPDATE auth_sessions SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 second' WHERE id=$1", [expiring.sessionId]);
+    assert.equal(await store.resolveSession(tokenHash("sess-expired"), 30), null, "past the absolute deadline too");
+    assert.deepEqual(await store.revokeSession(tokenHash("sess-live"), "logout", audit), { revoked: true });
+    assert.equal(await store.resolveSession(tokenHash("sess-live"), 30), null, "revocation is immediate");
+    assert.deepEqual(await store.revokeSession(tokenHash("sess-live"), "logout", audit), { revoked: false }, "logout is idempotent");
+    assert.ok((await auditActions(TENANT_A, user.id)).includes("session.logout"));
+    await assert.rejects(store.revokeSession(tokenHash("sess-live"), "expired" as SessionRevokeReason, audit), /SESSION_REASON_INVALID/);
+    await store.createSession({ userId: user.id, tokenHash: tokenHash("sess-disabled"), absoluteHours: 8, audit: auditAs(user.id) });
+    await store.updateUser(user.id, { disabled: true }, audit);
+    assert.equal(await store.resolveSession(tokenHash("sess-disabled"), 30), null, "disabling a user ends their sessions");
+    const revoked = await asApp<{ revoked_reason: string }>(TENANT_A, "SELECT revoked_reason FROM auth_sessions WHERE token_hash=$1", [tokenHash("sess-disabled")]);
+    assert.equal(revoked[0]!.revoked_reason, "disabled");
+  });
+
+  test("a password change revokes every session of that user and no one else's", async () => {
+    const store = storeFor(TENANT_A);
+    const admin = (await store.findLoginUser("admin.one"))!;
+    const user = await store.createUser({ username: "change.me", displayName: "Change Me", role: "staff", passwordHash: FAKE_HASH, audit: auditAs(admin.id) });
+    const other = await store.createUser({ username: "keep.me", displayName: "Keep Me", role: "staff", passwordHash: FAKE_HASH, audit: auditAs(admin.id) });
+    const audit = auditAs(user.id);
+    await store.createSession({ userId: user.id, tokenHash: tokenHash("change-1"), absoluteHours: 8, audit });
+    await store.createSession({ userId: user.id, tokenHash: tokenHash("change-2"), absoluteHours: 8, audit });
+    await store.createSession({ userId: other.id, tokenHash: tokenHash("keep-1"), absoluteHours: 8, audit: auditAs(other.id) });
+    assert.deepEqual(await store.changeOwnPassword(user.id, FAKE_REHASH, audit), { revoked: 2 });
+    assert.equal(await store.resolveSession(tokenHash("change-1"), 30), null);
+    assert.equal(await store.resolveSession(tokenHash("change-2"), 30), null);
+    assert.ok(await store.resolveSession(tokenHash("keep-1"), 30), "another user's session is untouched");
+    const row = (await asApp<{ must_change_password: boolean; cleared: boolean; password_hash: string }>(TENANT_A,
+      "SELECT must_change_password, password_expires_at IS NULL AS cleared, password_hash FROM users WHERE id=$1::uuid", [user.id]))[0]!;
+    assert.deepEqual(row, { must_change_password: false, cleared: true, password_hash: FAKE_REHASH });
+    assert.deepEqual((await auditActions(TENANT_A, user.id)).filter((action) => action === "password.changed"), ["password.changed"]);
+    const reasons = await asApp<{ revoked_reason: string }>(TENANT_A, "SELECT DISTINCT revoked_reason FROM auth_sessions WHERE user_id=$1::uuid", [user.id]);
+    assert.deepEqual(reasons, [{ revoked_reason: "password_changed" }]);
+  });
+
+  test("the last-admin guard holds when two transactions demote the last two admins at once", async () => {
+    const store = storeFor(TENANT_B);
+    const first = await store.createUser({ username: "admin.alpha", displayName: "Alpha", role: "admin", passwordHash: FAKE_HASH, temporary: false, audit: auditAs(null) });
+    const second = await store.createUser({ username: "admin.beta", displayName: "Beta", role: "admin", passwordHash: FAKE_HASH, temporary: false, audit: auditAs(first.id) });
+    assert.equal(await store.countActiveAdmins(), 2);
+    const audit = auditAs(first.id);
+    const results = await Promise.allSettled([store.updateUser(first.id, { role: "staff" }, audit), store.updateUser(second.id, { disabled: true }, audit)]);
+    const refused = results.filter((result) => result.status === "rejected");
+    assert.equal(refused.length, 1, `exactly one change may win: ${results.map((result) => result.status).join(",")}`);
+    assert.match(String((refused[0] as PromiseRejectedResult).reason), /LAST_ADMIN/);
+    assert.equal(await store.countActiveAdmins(), 1, "the tenant is never left without an admin");
+    const remaining = (await store.listUsers()).find((user) => user.role === "admin" && user.status !== "disabled")!;
+    await assert.rejects(store.updateUser(remaining.id, { disabled: true }, audit), /LAST_ADMIN/, "nor by disabling the survivor");
+    await assert.rejects(store.updateUser(remaining.id, { role: "staff" }, audit), /LAST_ADMIN/);
+    assert.deepEqual(await store.updateUser(remaining.id, { canExport: true }, audit), { ...remaining, canExport: true }, "an unrelated change is still allowed");
+  });
+
+  test("the store sees one tenant only, and an audit row can never point at another tenant's actor", async () => {
+    const [a, b] = [storeFor(TENANT_A), storeFor(TENANT_B)];
+    const admin = (await a.findLoginUser("admin.one"))!;
+    assert.equal(await b.findLoginUser("admin.one"), null, "tenant B does not know tenant A's admin");
+    assert.equal(await b.resolveSession(tokenHash("keep-1"), 30), null, "nor its sessions");
+    assert.ok(await a.resolveSession(tokenHash("keep-1"), 30));
+    assert.ok(!(await b.listUsers()).some((user) => user.username === "admin.one"));
+    await a.recordAudit({ actorUserId: admin.id, action: "access.denied", outcome: "denied", detail: { route: "/api/users" } });
+    const denied = async (tenantId: string) => (await asApp<{ count: number }>(tenantId, "SELECT count(*)::int AS count FROM audit_events WHERE action='access.denied'"))[0]!.count;
+    assert.deepEqual([await denied(TENANT_A), await denied(TENANT_B)], [1, 0]);
+    await assert.rejects(b.recordAudit({ actorUserId: admin.id, action: "access.denied", outcome: "denied" }), { code: "23503" }, "the composite FK keeps an actor inside its tenant");
+    await assert.rejects(a.recordAudit({ actorUserId: admin.id, action: "AccessDenied" }), /AUDIT_ACTION_INVALID/);
+    await assert.rejects(a.recordAudit({ actorUserId: admin.id, action: "access.denied", requestId: "forged-by-the-client" }), /AUDIT_REQUEST_ID_INVALID/);
+  });
+
+  test("withTenant opens a read-only transaction that refuses every write", async () => {
+    await assert.rejects(withTenant(appPool, TENANT_A,
+      (client) => client.query("INSERT INTO audit_events(organization_id, action) VALUES ($1::uuid, 'test.write')", [TENANT_A]),
+      { readOnly: true, isolation: "REPEATABLE READ" }), { code: "25006" });
+    const rows = await withTenant(appPool, TENANT_A, async (client) => (await client.query<{ count: number }>("SELECT count(*)::int AS count FROM users")).rows,
+      { readOnly: true, statementTimeoutMs: 5_000, idleInTransactionTimeoutMs: 5_000 });
+    assert.ok(rows[0]!.count > 0, "reading under the tenant still works");
   });
 });

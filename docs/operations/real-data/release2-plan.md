@@ -1709,3 +1709,36 @@ write the deviation down instead of diverging silently.
   `publicBaseUrl`, since C2 step 2 compares the request `Origin` against the origin while the export `review_url`
   needs the full base URL. Error codes: `PRODUCTION_WEB_CONFIG_INVALID` for a production config missing the tenant or
   the https base URL, `INVALID_WEB_TENANT_ID` and `INVALID_PUBLIC_BASE_URL` for a malformed value in any environment.
+
+**C3 (`withTenant`, `audit.ts`, `PostgresUserStore`, DB integration tests)**
+
+- **Argument shapes that carry an audit context.** B5 lists `recordLoginFailure(userId, max=10, lockMinutes=15,
+  audit)`, but a required argument cannot follow defaulted ones in TypeScript, and the audit row needs the failure's
+  `reason` as well (§5 C3.7 writes `login.failed {reason}`). The store therefore takes
+  `recordLoginFailure(userId, { reason, audit, max?, lockMinutes? })`, and the other multi-argument methods follow the
+  same input-object shape. The defaults are unchanged and exported as `LOGIN_MAX_FAILURES` / `LOGIN_LOCK_MINUTES`.
+- **Which method writes `login.succeeded`.** B5 gives `recordLoginSuccess(userId, rehash?)` no audit argument and
+  `createSession(…, audit)` one, so `createSession` writes the row: it is the only one that knows the session id, and
+  `audit_events.session_id` is the column that joins a login to everything that session later did.
+- **`resolveSession` also selects `s.created_at`.** §5 C5 lets a forced-change session omit `currentPassword` within
+  5 minutes of `auth_sessions.created_at`, which the C4 query does not return. Adding the column keeps it one query
+  per request instead of a second round trip on every password change.
+- **`revokeSession` audits a logout only.** The action list in §6 has `session.logout` and no other session verb, and
+  the `relogin`, `password_changed`, `admin_reset` and `disabled` revocations already ride along with the action that
+  caused them (`login.succeeded`, `password.changed`, `user.password_reset`, `user.updated`).
+- **`CANNOT_CHANGE_SELF` is not enforced in the store.** B5 puts only the last-admin guard inside the transaction, and
+  §5 C6 describes the self-guards in terms of the caller's own id, which the route holds; the store keeps
+  `LAST_ADMIN`, `USER_NOT_FOUND` and `USERNAME_TAKEN`. The admins are locked with `ORDER BY id` so two concurrent
+  demotions take the rows in the same order and queue instead of deadlocking (covered by a two-transaction test).
+- **`insertAudit` requires a UUID `requestId`.** B4 says it "rejects a `requestId` it did not receive from the request
+  context". The machine-checkable form of that is the shape of the server-minted `trace_id`: the echoed
+  `X-Request-Id` matches `[A-Za-z0-9._:-]{1,128}` (`packages/observability/src/index.ts:31-34`), so anything that is
+  not a UUID is refused with `AUDIT_REQUEST_ID_INVALID`. `auditDetailJson` also refuses a detail key containing
+  `pass`, `token`, `cookie`, `secret`, `authorization`, `csrf` or `credential`, mirroring the `logEvent` key filter,
+  so the "never a password or a token" rule is enforced and not merely documented.
+- **The `access.denied` budget is a class, not a singleton.** B4 fixes it at 5 rows per session per minute;
+  `audit.ts` exports `AuditRateLimiter` (with `ACCESS_DENIED_AUDIT_LIMIT` / `ACCESS_DENIED_AUDIT_WINDOW_MS` as its
+  defaults) and C4 owns the one instance, next to the other per-process windows in `apps/ocr-web/src/auth.ts`.
+- **`isUuid` moved to `tenant.ts`.** `audit.ts` and `users.ts` need it, and importing it from `index.ts` would make
+  the barrel import its own re-exports. It is still exported from the barrel, so every existing import and
+  `index.test.ts:72` are unchanged.

@@ -1,8 +1,12 @@
 import { Pool, type PoolClient, type PoolConfig } from "pg";
 import type { OcrResponse } from "@innovera/ocr-client";
 import { applyReviewEdits, legacyTreatmentIndex, markReviewed, normalizeStructuredResult, summarizeDocument, type DocumentSummary, type DocumentView } from "./document-view.js";
+import { isUuid, withTenant } from "./tenant.js";
 
 export * from "./document-view.js";
+export * from "./tenant.js";
+export * from "./audit.js";
+export * from "./users.js";
 
 export type OcrDocumentStatus = "PROCESSING" | "SUCCEEDED" | "NEEDS_REVIEW" | "FAILED";
 export type ConfirmStatus = "PENDING" | "SUCCEEDED" | "RETRY";
@@ -131,9 +135,6 @@ export function structuredStaffResult(response: OcrResponse): Readonly<Record<st
 export function structuredDocumentResult(response: OcrResponse): Readonly<Record<string, unknown>> {
   return response as Readonly<Record<string, unknown>>;
 }
-
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-export function isUuid(value: unknown): value is string { return typeof value === "string" && UUID.test(value); }
 
 /** Document row → UI category; "split" for a PDF parent split into page rows (never listed), `null` for DELETED. */
 export function statusCategoryOf(status: string, reviewedAt: unknown): DocumentStatusCategory | "split" | null {
@@ -341,17 +342,9 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     this.pool = config instanceof Pool ? config : new Pool(typeof config === "string" ? { connectionString: config } : config);
   }
 
-  /** Runs `work` in one transaction scoped to `tenantId` through `app.current_org` (RLS). */
-  private async tenantTransaction<T>(tenantId: string, work: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
-      await client.query("SELECT set_config('app.current_org', $1, true)", [tenantId]);
-      const result = await work(client);
-      await client.query("COMMIT");
-      return result;
-    } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; }
-    finally { client.release(); }
+  /** Runs `work` in one transaction scoped to `tenantId` through `app.current_org` (RLS); see `tenant.ts`. */
+  private tenantTransaction<T>(tenantId: string, work: (client: PoolClient) => Promise<T>): Promise<T> {
+    return withTenant(this.pool, tenantId, work);
   }
 
   /** Unexpired upload with the same idempotency key → reused; other fingerprint → IDEMPOTENCY_CONFLICT; none → null. */
