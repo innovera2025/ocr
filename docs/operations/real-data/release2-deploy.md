@@ -1,8 +1,8 @@
-# Release 2 deploy runbook — Deploy A (login)
+# Release 2 deploy runbook — Deploy A (login) and Deploy B (export)
 
 Source of truth: `release2-plan.md` §15. This file is the operator's copy of that section: what to run, in what order,
-and what each step must print. Deploy B (export, the batch clock and the request timeout) is added to this file with
-commit C11 and is **not** part of Deploy A.
+and what each step must print. **Deploy A ships first and on its own**; Deploy B (the export, the batch clock and the
+request timeout) is at the end of this file and runs only after Deploy A is accepted.
 
 Everything runs on the app VPS in `/opt/innovera-ocr-app/ocr`. Set the compose alias once per shell:
 
@@ -144,6 +144,97 @@ $C up -d --no-deps web
 - **Bearer stays closed too**, because step 3 rotated `AUTH_JWT_SECRETS`: every JWT minted before Deploy A now fails
   signature verification on the rolled-back image as well.
 - Restore the dump only if data is damaged. The volume is never recreated.
+
+## Deploy B: export, batch clock and request timeout (0020, web then worker)
+
+Runs only after Deploy A is accepted. It adds migration `0020_batch_round_clock` (two nullable columns and one
+column-scoped GRANT — no function, nothing rewritten), the three `/api/exports/*` routes with the `ส่งออก` dialog, and
+`OCR_REQUEST_TIMEOUT=300`. **Migration 0019 is frozen**: it is applied in production and its sha256 is pinned by
+`test/migration-checksums.test.ts`, so a schema fix takes a new migration, never an edit.
+
+1. **[CHANGE] Backup and tags.**
+   ```sh
+   install -d -m 700 /opt/innovera-backups/release2b-<date>
+   $C exec -T postgres pg_dump -U ocr_bootstrap -d innovera_ocr -Fc > /opt/innovera-backups/release2b-<date>/database-pre-0020.dump
+   $C exec -T postgres pg_restore --list < /opt/innovera-backups/release2b-<date>/database-pre-0020.dump | head -3
+   docker tag <web image> <web repo>:pre-release2b
+   docker tag <worker image> <worker repo>:pre-release2b
+   ```
+   Then `git fetch origin` and `git checkout <release tag>`.
+2. **[CHANGE] Host env edit** (keys only in any output):
+   - **set** `OCR_REQUEST_TIMEOUT=300` — set it, do **not** delete the line. The key is in `production-preflight.sh`'s
+     `required_values` and `has_value` needs it non-empty, so deleting the line fails the preflight.
+   - `OCR_EXPORT_MAX_ROWS` may stay absent; the compose default is 50000. A value outside 1–200000 fails startup
+     rather than widening the cap, and a missing one can no longer disable it.
+   - `grep -oE '^[A-Z_]+=' <the host env file> | sort` to confirm the key set; values are never printed.
+3. **[CHANGE] Stop the old worker FIRST.**
+   ```sh
+   $C build web worker
+   $C stop worker
+   ```
+   This order is load-bearing: while the old worker runs against the new web, a retry can open a new round and clear
+   `processing_started_at`, but the old `markProcessing` sets no clock — `round_started_at` would stay NULL for good
+   and the finished batch would keep showing `รอเริ่มอ่านรอบใหม่`. Stopping first costs at most one in-flight lease,
+   which the queue recovers. Waiting for `count(*) WHERE status='PROCESSING'` = 0 is **not** a substitute: it races
+   with the next claim, and while a long PDF is being read it is almost never 0 (~52 s/page, 95 pages ≈ 82 min).
+4. **[CHANGE] Web.** `$C up -d --no-deps web`, which applies 0020.
+   ```sh
+   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:53100/health/ready          # 200
+   $C exec -T postgres psql -U ocr_bootstrap -d innovera_ocr -AtX -c "SELECT max(version) FROM schema_migrations"   # 0020_batch_round_clock
+   $C logs --since 5m web | grep -c request_failed                                        # 0
+   $C exec -T postgres psql -U ocr_bootstrap -d innovera_ocr -AtX -c "SELECT pg_get_userbyid(proowner), count(*) FROM pg_proc WHERE proname LIKE 'ocr%' GROUP BY 1"
+   ```
+   The last one must still print 7 × `ocr_queue_definer` and 1 × `ocr_migrator`: 0020 defines no function.
+5. **[CHANGE] Worker.** `$C up -d --no-deps worker`, which passes the 0020 gate.
+   ```sh
+   $C exec -T worker printenv OCR_REQUEST_TIMEOUT      # 300
+   $C logs --since 5m worker | grep -c worker_started  # 1
+   ```
+6. **Grant check.** Re-run Deploy A step 6; it must print `FAIL=0`, now including `app:update-batch-round` and
+   `app:no-update-batch-label`.
+7. **Checks by the user** (production exports never leave the user's browser and never reach git or chat):
+   - a staff account **without** export rights sees no `ส่งออก` pill, and opening `/api/exports/documents.csv`
+     directly answers 403;
+   - the admin opens `ส่งออก`, reads `พบ N แถว · แสดง 20 แถวแรก`, checks that the first column is the **original**
+     uploaded file name with หน้า / จำนวนหน้า / อัปโหลดเมื่อ beside it, then downloads the CSV and opens it on their
+     own machine;
+   - **opening the CSV in Excel:** use **Data ▸ From Text/CSV** and set the ห้อง and เลขที่ฟอร์ม columns to **Text**.
+     A double-click works too — Thai reads correctly because of the UTF-8 BOM — but Excel then turns a room number
+     like `007` into `7`. The dialog says the same thing in Thai above the download button. The file itself never
+     uses `="…"`, so no cell can be a formula; a name that starts with `=`, `+`, `-` or `@` gets a leading `'`
+     instead, which Excel does not display.
+   - the audit table has a `started` for every `completed`:
+     ```sh
+     $C exec -T postgres psql -U ocr_bootstrap -d innovera_ocr -AtX -c "SELECT action, count(*) FROM audit_events WHERE action LIKE 'export.%' GROUP BY 1"
+     ```
+   - `curl -s 127.0.0.1:53100/metrics | grep -E 'exports_total|export_rows_total'` (from inside the app network, not
+     through the proxy — a request carrying `X-Forwarded-For` gets 404 by design);
+   - retry one failed row in an idle batch: the strip shows `รอเริ่มอ่านรอบใหม่` with `—` for เวลาที่ใช้ and
+     หน้า/นาที, then a new round once the worker claims the row.
+
+## Rollback B
+
+```sh
+docker tag <web repo>:pre-release2b <web image>
+docker tag <worker repo>:pre-release2b <worker image>
+$C up -d --no-deps web worker
+```
+
+- The Deploy A images require only 0018 (worker) and 0019 (web). 0020's two columns are additive and simply ignored,
+  and `OCR_REQUEST_TIMEOUT` stays 300.
+- The export disappears with the web image; nothing has to be undone in the database.
+
+## If an export does not work
+
+- **A staff member sees no `ส่งออก` pill:** an admin turns on ส่งออกได้ for that account in ผู้ใช้งาน. An admin row
+  reads `ใช่ (ผู้ดูแล)` and has no button there, because the admin role carries the right by itself (D8).
+- **`เกิน 50000 แถว`:** narrow the date range in the dialog, or raise `OCR_EXPORT_MAX_ROWS` (maximum 200000) and
+  recreate the web. The cap exists so one request cannot stream the whole tenant.
+- **`EXPORT_BUSY` (429):** one download per user and two per process are open at a time, and an export is given ten
+  minutes. Wait, or ask whoever is downloading to finish.
+- **The download stops part-way:** the browser saves nothing (the file is fetched as a Blob, and a rejected Blob is
+  never written), and the attempt is in `audit_events` as `export.failed`. `export.started` is always there, so the
+  table still answers who exported what.
 
 ## If a staff member cannot log in
 

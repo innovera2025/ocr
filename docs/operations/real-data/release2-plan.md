@@ -2076,3 +2076,131 @@ write the deviation down instead of diverging silently.
 - **`createDatabasePool` takes an optional `onError` (D10).** H4 asks for `pool.on('error')`; the handler is always
   attached — an unhandled `'error'` is fatal in Node — and the callback is optional so the worker and the CLI are
   unchanged. The web passes its logger when the export routes land in C10.
+
+**Deploy A closeout (the 0019 freeze, landed with the export half)**
+
+- **`test/migration-checksums.test.ts` pins 0001–0020, not only 0019.** §12 asks for 0019's sha256 "next to the
+  existing 0001–0018 expectations"; there were no such expectations — nothing in the repo pinned any migration, so
+  the guard §17 F15 records as fixed was never in place. The file now holds one `version → sha256` map covering every
+  migration on disk, plus a second case asserting that the directory listing and the map are the same set, so a new
+  migration cannot be added without being pinned in the same commit. This is the test that fails first: without it an
+  edit to an applied migration passes typecheck, lint and every other test and then answers
+  `MIGRATION_CHECKSUM_MISMATCH:<version>` at startup in production, crash-looping the only way staff can log in.
+  0020 is pinned now rather than after Deploy B: it is written, and freezing it early costs nothing (a change before
+  the deploy simply updates the pin in the same commit).
+
+**C9 follow-ups (found by the adversarial review of C8–C11, fixed before C10 was written)**
+
+- **`maxRows` is fail-closed.** `Math.max(1, Math.trunc(options.maxRows))` is NaN for a non-finite input, and
+  `total > NaN` is false — so a route that passed `Number(process.env.OCR_EXPORT_MAX_ROWS)` with the variable unset
+  or malformed would have streamed the whole tenant with the cap silently disabled. `openExport` now raises
+  `EXPORT_MAX_ROWS_INVALID` before it opens a transaction. (C10's route passes the zod-validated `webConfig.exportMaxRows`,
+  so this is defence in depth, not the only guard.)
+- **`rows()` honours `closed`.** The docblock invites a client-disconnect handler to call `close()`, and C10's wall
+  clock needs to as well, but the generator issued its next `FETCH` on the captured client unconditionally. Since
+  `close()` has already released that client, the stray `FETCH` would land inside whichever transaction now owns the
+  connection, fail with 34000 and leave that unrelated request aborted with 25P02 — a review save or an upload rolled
+  back. The loop now returns instead of fetching when `closed` is set.
+- **The client's `'error'` listener now covers the teardown.** `close()` removed it *before* its own
+  `CLOSE`/`COMMIT`/`ROLLBACK` — precisely the round-trips most likely to meet a terminated backend, and precisely the
+  window the docblock says an unhandled `'error'` would take the process down in. It is removed in the `finally`,
+  after `client.release()`, and `broken` is re-read at release time so an error that arrives *during* the teardown
+  still destroys the client instead of returning a dead connection to the pool.
+- **The cursor owns a wall clock (`EXPORT_MAX_DURATION_MS`, 10 min).** Every successful `FETCH` resets both
+  `statement_timeout` and `idle_in_transaction_session_timeout`, so a reader that accepts one 500-row page every two
+  minutes trips neither and pins one of the two export slots indefinitely. The next `FETCH` past the deadline raises
+  `EXPORT_TIMEOUT`. H5 puts the same cap in C10's `ExportGate`; having it in both means the bound holds however the
+  route is wired, and the gate's timer can now actually end a stuck download because `close()` is safe.
+- **`documentFilterSql` deduplicates and bounds `status`.** It is multi-valued for the export and
+  `CATEGORY_SQL.succeeded`/`.confirmed` each embed a per-row `jsonb_path_exists`, so `?status=confirmed` repeated 500
+  times built 500 copies of it into both the count and the cursor. More entries than there are categories is now
+  `INVALID_QUERY`.
+- **`withTenant` guards its checked-out client too.** pg-pool emits `'error'` on the *pool* only for clients sitting
+  idle in it; a checked-out client has no listener at all. `previewExport` passes `idleInTransactionTimeoutMs`, whose
+  whole purpose is to have PostgreSQL terminate that backend, so the D10 hardening did not cover the case the export
+  actually creates. `withTenant` now attaches and removes the same listener `openExport` does, and destroys the client
+  when it fired.
+- **A pool error is never silent.** `createDatabasePool`'s `onError` is optional and no caller passed one, so a
+  restarted PostgreSQL left no line in `docker logs` at all. The default handler now writes one structured
+  `db_pool_error` line (message only — never the DSN), and `createProductionAppServer` passes the web's own logger for
+  both pools. The worker and the CLI keep the default. A `db-runtime` unit test emits `'error'` on a real `Pool` and
+  asserts both paths.
+- **The store's `q` slice is 100, not 200.** §10 H2 makes the export's `q` ≤ 100 with the same rules as the list, and
+  the list route already enforced 100. The 200 was inherited from the old `listDocuments` body; it is now
+  `MAX_FILTER_QUERY_LENGTH` with a comment saying it is a backstop for a direct store caller, not the contract.
+
+**C10 (the export routes, the CSV and JSONL writers, the gate and the audit trail)**
+
+- **`parseExportQuery` validates the dates itself, not only their shape.** H2 says the parser is strict like
+  `parseDocumentListQuery`; `documentFilterSql` also rejects a malformed or inverted range, but only once the store is
+  reached, so a bad `to=2026-13-01` would have depended on the store being called. The parser now requires a day that
+  round-trips (`2026-02-31` is not a day) and `from <= to`, so all three routes answer 400 `INVALID_EXPORT_FILTER`
+  before anything is opened. The store keeps its own check: those values reach a `::date` cast where a pg error would
+  be a 500 quoting the input back.
+- **The preview limit has its own code, `EXPORT_THROTTLED`.** H1 rate-limits the preview to 60 per user per 15
+  minutes. Reusing `EXPORT_BUSY` would have answered `Retry-After: 30` for a window of 900 s, telling staff to retry
+  twenty-nine times before it can succeed. `EXPORT_THROTTLED` is 429 with the window's own `Retry-After`; the
+  concurrency refusal keeps `EXPORT_BUSY` and its 30 s.
+- **The formula guard is keyed on the COLUMN's kind, not on the cell's text.** H5 says "every text cell". Testing the
+  rendered string instead would prefix a negative number in a numeric column, and `-5` in `min_confidence` must stay a
+  number Excel can sum. Every `kind: "text"` column is guarded, `original_file_name` and the reviewer names included.
+- **`export.started` is the one audit write that is allowed to fail the export.** H5 says only `export.started` is
+  guaranteed. It is therefore awaited and never swallowed — if the audit insert fails the request is a 500 and no byte
+  leaves. `export.completed` / `.failed` are best-effort: a failure there is logged as `audit_write_failed` and does
+  not turn a finished download into an error.
+- **`X-Export-Rows` and `Content-Disposition` carry nothing a client sent.** The file name is built from a Bangkok
+  timestamp and is ASCII by construction, so no filter value can reach a response header.
+- **The JSONL `_utc` twin sits immediately after its Bangkok value.** H5 says `uploaded_at` is the `+07:00` instant
+  and "the UTC instant is available as `uploaded_at_utc`", without saying where. Keeping the pair adjacent leaves the
+  required four first and in order (`uploaded_at_utc` is the fifth key) and makes the file readable without a lookup.
+  The offset form is second-precision, matching the CSV; `_utc` carries the exact instant with milliseconds.
+- **`EXPORT_NOT_CONFIGURED`.** The export store is a separate optional dependency (`exportStore`), like
+  `workbenchStore` and `userStore`, so the routes 503 rather than 500 when the app is wired without it. Production
+  passes the same `PostgresOcrDocumentStore`.
+
+**C11 (the export dialog, the preview, and the effective export right)**
+
+- **The users table and the `ส่งออก` pill both render the EFFECTIVE right, `admin || canExport`.** This is the real
+  half of the reported "the only admin in production cannot grant themselves export". C8 proved the API lock-out does
+  not reproduce (`hasRight` gives an admin export on the role alone, and the self guard covers only `role` and
+  `disabled`) — but it left the screen that produced the report saying the opposite: ส่งออกได้ rendered `ไม่` for the
+  bootstrap admin and the row still offered `อนุญาตส่งออก`. An admin row now reads `ใช่ (ผู้ดูแล)` and carries no
+  grant button, because the flag has no effect there; a staff row is unchanged. The toolbar pill follows the same
+  rule, so an admin created by `ocr-users create-admin` (`can_export = false`) sees it. **No CLI subcommand and no
+  change to `createAdmin`**: an `ocr-users grant-export` would be a break-glass path for a lock-out that cannot
+  happen, and writing `can_export = true` for admins would make the column mean two different things. This is the
+  smallest fix consistent with D8, whose table already reads "admin ✓ export".
+- **The Excel leading-zero contradiction is resolved by documenting, not by emitting `="…"`.** The requirement says
+  codes must survive as text; §10 H3 concedes that Excel strips leading zeros on a double-click and forbids `="…"`.
+  A quoted `007` is still coerced to `7` by Excel's CSV import, so the two cannot both be satisfied in one file. The
+  export keeps `room` and `form_number` as ordinary text cells — `="007"` is a formula, which is exactly what the
+  formula guard exists to keep out of this file, and it would corrupt the value for every other CSV reader — and the
+  dialog now says in Thai, above the download button, to open the file with **Data ▸ From Text/CSV** and type those
+  columns as Text. `release2-deploy.md` Deploy B step 7 says the same thing to the operator. **Open for the user:** if
+  they would rather double-click, the alternatives are an `.xlsx` variant or a `codes=excel` toggle that emits
+  `="007"` for those two columns only; both are additive and neither is in this release.
+- **The preview does not reuse `pageLabel`.** As H6 requires: it takes a document object, not a row of display
+  strings, and returns the prefixed `หน้า 3/95`, which would make the preview's หน้า column differ from the
+  downloaded file's while จำนวนหน้า repeated the same 95. The cell holds the bare `3` and `หน้า 3/95` is its `title`.
+- **The chips narrow the export only.** `q` and `parentFilter` are copied into `state.exQ` / `state.exParent` when the
+  dialog opens, so removing a chip changes the file without changing the table behind it.
+- **`clearPhi()` clears the preview and closes the dialog.** The preview holds the same customer data the table does,
+  so an expired session must not leave 20 rows of it on a shared front-desk screen. A behaviour case asserts it.
+- **Every status checked means no status filter.** The dialog sends `status` only when between one and five of the six
+  boxes are ticked; all six (or none) is the same query, and sending all six would build six `CATEGORY_SQL` branches
+  for nothing.
+- **The download reads its file name from `Content-Disposition`.** H6 fetches the response and saves it as a Blob, and
+  a Blob download takes its name from the `a[download]` attribute, not from the header — so the header is parsed
+  (ASCII only, from a fixed pattern) and falls back to `ocr-export.<format>`.
+
+**Review findings deliberately not acted on**
+
+- **A user dimension on `documents_read_total`.** The review asked for the actor as a metric label, so a staff account
+  that pages the whole tenant is attributable. §13's own rule for this registry is "counters (bounded labels)", and a
+  user id is the one label that grows with the account list and never shrinks — `MetricsRegistry` keeps a series per
+  label combination for the life of the process. The behaviour itself is D8 as designed and §13 already states it in
+  as many words: `can_export` gates the file, not the data, and `GET /api/documents` / `…/ocr` are neither audited nor
+  rate-limited. `OcrBulkRead` still fires on the aggregate, and who read what is then answered from the nginx access
+  log and the session table rather than from Prometheus. If per-user attribution is wanted it belongs in
+  `audit_events` (a `document.read` row above a per-session threshold), which is a schema-free change for a later
+  release — not a label.
