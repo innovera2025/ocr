@@ -274,7 +274,18 @@ export function formatCell(value: ExportValue, kind: ExportColumnKind): string {
   if (kind === "datetime") return typeof value === "string" ? bangkokTimestamp(value) ?? "" : "";
   if (typeof value === "boolean") return value ? "TRUE" : "FALSE";
   if (typeof value === "number") return String(value);
-  return value.length > MAX_CELL_LENGTH ? `${value.slice(0, MAX_CELL_LENGTH - TRUNCATION_SUFFIX.length)}${TRUNCATION_SUFFIX}` : value;
+  return value.length > MAX_CELL_LENGTH ? `${value.slice(0, truncationEnd(value))}${TRUNCATION_SUFFIX}` : value;
+}
+
+/**
+ * Where a cell is cut. `slice` counts UTF-16 units, so a cut landing between the two halves of a surrogate pair emits
+ * a lone surrogate that any UTF-8 encoder turns into U+FFFD; backing off one unit keeps the cell valid text and still
+ * inside Excel's limit. Thai is entirely BMP — this is for emoji and the astral blocks.
+ */
+function truncationEnd(value: string): number {
+  const end = MAX_CELL_LENGTH - TRUNCATION_SUFFIX.length;
+  const last = value.charCodeAt(end - 1);
+  return last >= 0xd800 && last <= 0xdbff ? end - 1 : end;
 }
 
 /** One document → the display strings of `set`, in column order: the preview's row, and the CSV's row before quoting. */

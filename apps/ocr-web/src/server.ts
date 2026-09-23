@@ -17,7 +17,7 @@ import {
   type WebAuthContext
 } from "./auth.js";
 import { handleAuthRoutes, LOGIN_BUSY_RETRY_SECONDS, type AuthRouteDeps } from "./auth-routes.js";
-import { ExportGate, handleExportRoutes, PREVIEW_LIMIT, PREVIEW_WINDOW_MS, type ExportStore } from "./export.js";
+import { ExportGate, exportFormatLabel, handleExportRoutes, PREVIEW_LIMIT, PREVIEW_WINDOW_MS, type ExportStore } from "./export.js";
 import { logEvent, metrics, requestId } from "@innovera/ocr-observability";
 import { clamAvHealthCheck } from "@innovera/ocr-ingest/clamav";
 import type { LocalStorage } from "@innovera/ocr-storage/local";
@@ -229,6 +229,10 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
    */
   const recordDenied = (ctx: WebAuthContext, route: string, traceId: string): void => {
     logEvent("access_denied", { trace_id: traceId, user_id: ctx.userId, route });
+    // §13 `exports_total{result="forbidden"}`: the export right is checked in `authorize`, before `handleExportRoutes`
+    // is ever entered, so a refused export can only be counted from the denial itself.
+    const exportFormat = exportFormatLabel(route);
+    if (exportFormat !== null) metrics.increment("exports_total", { format: exportFormat, result: "forbidden" });
     if (!app?.userStore) return;
     if (!deniedAudits.allow(ctx.userId, clock())) { metrics.increment("access_denied_suppressed_total"); return; }
     void app.userStore.recordAudit({ actorUserId: ctx.userId, sessionId: ctx.sessionId, requestId: traceId, action: "access.denied", outcome: "denied", detail: { route } })

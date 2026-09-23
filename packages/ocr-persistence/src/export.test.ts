@@ -148,6 +148,19 @@ test("display rules: Bangkok times, TRUE/FALSE, bare numbers and the 32,000-char
   assert.equal(bangkokTimestamp(null), null);
 });
 
+test("a cut that lands inside a surrogate pair drops the pair rather than emit a lone surrogate", () => {
+  // `slice` counts UTF-16 units. A file name or a reading holding an emoji at exactly the cut would otherwise end in
+  // a lone high surrogate, which any UTF-8 encoder writes as U+FFFD — a value the matching JSONL export does not have.
+  const end = MAX_CELL_LENGTH - TRUNCATION_SUFFIX.length;
+  for (const lead of [0, 1]) {
+    const cut = formatCell(`${"ก".repeat(end - 1 + lead)}😀${"ก".repeat(600)}`, "text");
+    assert.ok(cut.length <= MAX_CELL_LENGTH, "still inside Excel's cell limit");
+    assert.ok(cut.endsWith(TRUNCATION_SUFFIX));
+    assert.doesNotMatch(cut, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, "no half of a pair survives alone");
+    assert.ok(!Buffer.from(cut, "utf8").includes(Buffer.from([0xef, 0xbf, 0xbd])), "and no U+FFFD is introduced");
+  }
+});
+
 test("flattenDocument keeps typed values for JSONL: numbers, booleans and the ISO instant", () => {
   const values = flattenDocument(pageDocument, "compact", { publicBaseUrl: "https://ocr.example.test" });
   assert.deepEqual([values.page, values.page_count, values.total_minutes, values.treatment_1_minutes], [2, 5, 150, 90]);

@@ -4,7 +4,8 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { Server } from "node:http";
+import { createServer, type Server } from "node:http";
+import { connect } from "node:net";
 import { AuthenticationError } from "@innovera/ocr-auth";
 import type { WebConfig } from "@innovera/ocr-config";
 import {
@@ -12,8 +13,10 @@ import {
   type OpenExportOptions
 } from "@innovera/ocr-persistence";
 import type { UserStore, WebAuthContext } from "./auth.js";
+import { SlidingWindow } from "./auth.js";
 import {
-  bangkokOffsetIso, csvCell, csvRow, exportFilename, ExportGate, guardFormula, parseExportQuery, type ExportStore
+  bangkokOffsetIso, csvCell, csvRow, exportFilename, exportFormatLabel, ExportGate, guardFormula, handleExportRoutes,
+  parseExportQuery, PREVIEW_LIMIT, PREVIEW_WINDOW_MS, type ExportStore
 } from "./export.js";
 import { createAppServer } from "./server.js";
 
@@ -288,8 +291,65 @@ test("a client that walks away runs the generator's finally and still leaves exp
     await tick();
     assert.equal(instance.store.closed, 1, "the pooled connection is released by the generator's finally");
     assert.equal(started(instance).length, 1);
-    assert.equal(instance.audits.find((event) => event.action === "export.failed")?.detail?.error, "aborted");
+    const failed = instance.audits.find((event) => event.action === "export.failed")!;
+    // The metric bucket AND the code: `aborted` alone cannot tell a statement timeout from a client walking away.
+    assert.deepEqual([failed.detail?.result, failed.detail?.error], ["aborted", "EXPORT_ABORTED"]);
   });
+});
+
+test("the terminal audit rows say what was asked for, not just how it ended", async () => {
+  const instance = app(fakeStore([document()], { total: 2 }));
+  await withServer(instance, async (base) => {
+    const query = "columns=detailed&headers=en&status=confirmed&q=somchai&dateField=reviewed_at&from=2026-09-01&to=2026-09-22";
+    await bodyText(await fetch(`${base}/api/exports/documents.csv?${query}`));
+    const completed = instance.audits.find((event) => event.action === "export.completed")!;
+    // §10 H5: the filters live on the terminal row too, so "which export was that?" needs no join back to
+    // `export.started` on request_id — the row a crash may be the only survivor of.
+    assert.deepEqual(completed.detail, {
+      columns: "detailed", headers: "en", date_field: "reviewed_at", statuses: "confirmed", confirmed_only: false,
+      from: "2026-09-01", to: "2026-09-22", batch_id: null, parent_id: null, has_q: true,
+      format: "csv", rows: 2, complete: true, duration_ms: completed.detail?.duration_ms
+    });
+    assert.equal(completed.detail?.q, undefined, "the search text itself is customer data, never the filter value");
+  });
+});
+
+test("the wall clock ends a download stuck on drain, and gives the user's slot back", async () => {
+  // A client that stops reading but keeps the socket open: response.write() returns false and the route parks on
+  // 'drain', a promise only 'close' can settle. Closing the cursor alone would leave the gate slot and the socket
+  // held, and every later export by that account would answer 429 EXPORT_BUSY until the container restarted.
+  const store = fakeStore([document()], { total: 200_000, pageSize: 500 });
+  const audits: Omit<AuditEvent, "tenantId">[] = [];
+  const gate = new ExportGate();
+  const deps = {
+    store, users: fakeUsers(audits), gate, previewLimit: new SlidingWindow(PREVIEW_LIMIT, PREVIEW_WINDOW_MS),
+    maxRows: 500_000, publicBaseUrl: "https://ocr.example.test", traceId: "t-1", now: Date.now, wallClockMs: 60
+  };
+  const server = createServer((request, response) => {
+    void handleExportRoutes(response, new URL(request.url ?? "/", "http://127.0.0.1"), request.method ?? "GET", context(), deps)
+      .catch(() => { if (!response.headersSent) response.writeHead(500); response.end(); });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  const client = connect(port, "127.0.0.1");
+  try {
+    // A raw socket that sends the request and never reads the answer, so the kernel buffers fill and stay full.
+    client.pause();
+    await new Promise<void>((resolve) => client.on("connect", () => resolve()));
+    client.write("GET /api/exports/documents.csv HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    for (let waited = 0; waited < 200 && gate.size === 0; waited += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(gate.size, 1, "the download holds this user's one slot");
+    for (let waited = 0; waited < 300 && gate.size > 0; waited += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(gate.size, 0, "the wall clock released the slot, so the next export is not 429 EXPORT_BUSY for ever");
+    assert.equal(store.closed, 1, "and the pooled connection went back with it");
+    await tick();
+    const failed = audits.find((event) => event.action === "export.failed")!;
+    assert.deepEqual([failed.detail?.result, failed.detail?.error, failed.detail?.complete], ["aborted", "EXPORT_TIMEOUT", false]);
+  } finally {
+    client.destroy();
+    await new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()); });
+  }
 });
 
 test("an audit store that refuses export.started stops the export before a single byte leaves", async () => {
@@ -418,12 +478,51 @@ test("the export routes need a session, and a staff account without can_export i
   });
   const staff = app(fakeStore([document()]), { ctx: context({ role: "staff", canExport: false }) });
   await withServer(staff, async (base) => {
+    const FORBIDDEN = /exports_total\{format="csv",result="forbidden"\} (\d+)/;
+    const before = await counter(base, FORBIDDEN);
     for (const path of ["/api/exports/preview", "/api/exports/documents.csv", "/api/exports/documents.jsonl"]) {
       const response = await fetch(`${base}${path}`);
       assert.equal(response.status, 403, path);
       assert.deepEqual(await response.json(), { error: "FORBIDDEN" }, path);
     }
     assert.equal(staff.store.opened, 0);
+    // §13 lists `result="forbidden"`, and the right is checked in authorize() before the handler is entered — so the
+    // counter has to be raised from the denial itself or the dashboard panel is "No data" for ever.
+    assert.equal(await counter(base, FORBIDDEN) - before, 1);
+    assert.ok(await counter(base, /exports_total\{format="preview",result="forbidden"\} (\d+)/) >= 1);
+    assert.ok(await counter(base, /exports_total\{format="jsonl",result="forbidden"\} (\d+)/) >= 1);
+  });
+});
+
+test("exportFormatLabel names the three export routes and nothing else", () => {
+  assert.deepEqual(["/api/exports/preview", "/api/exports/documents.csv", "/api/exports/documents.jsonl"].map(exportFormatLabel),
+    ["preview", "csv", "jsonl"]);
+  for (const path of ["/api/documents", "/api/exports", "/api/exports/documents.txt", "unmatched"]) {
+    assert.equal(exportFormatLabel(path), null, path);
+  }
+});
+
+test("a throttled preview is its own metric bucket, not the download gate's", async () => {
+  // 429 EXPORT_BUSY (Retry-After 30) and 429 EXPORT_THROTTLED (Retry-After 900) have different remedies, so an
+  // operator watching `busy` climb must not be looking at preview throttling.
+  const instance = app(fakeStore([document()]));
+  await withServer(instance, async (base) => {
+    const THROTTLED = /exports_total\{format="preview",result="throttled"\} (\d+)/;
+    const before = await counter(base, THROTTLED);
+    for (let call = 0; call < PREVIEW_LIMIT; call += 1) await fetch(`${base}/api/exports/preview`);
+    assert.equal((await fetch(`${base}/api/exports/preview`)).status, 429);
+    assert.equal(await counter(base, THROTTLED) - before, 1);
+  });
+});
+
+test("a preview that cannot be audited returns no rows at all", async () => {
+  // §10 H1: the preview is the export's own paging API — the full column set for any filter, 20 rows a call — so
+  // `export.previewed` is as load-bearing as `export.started`, and a failed write must fail the request.
+  const instance = app(fakeStore([document()], { previewTotal: 500 }), { failAudit: "export.previewed" });
+  await withServer(instance, async (base) => {
+    const response = await fetch(`${base}/api/exports/preview`);
+    assert.equal(response.status, 500, "no audit row, no customer rows");
+    assert.deepEqual(await response.json(), { error: "INTERNAL_ERROR" });
   });
 });
 

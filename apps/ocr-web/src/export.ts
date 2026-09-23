@@ -221,6 +221,8 @@ export type ExportRouteDeps = Readonly<{
   publicBaseUrl: string;
   traceId: string;
   now: () => number;
+  /** The download's wall clock; production leaves it at `EXPORT_WALL_CLOCK_MS` and only tests shorten it. */
+  wallClockMs?: number | undefined;
 }>;
 
 /** `Content-Disposition` is ASCII by construction — the name is a Bangkok timestamp, never anything a client sent. */
@@ -229,13 +231,30 @@ export function exportFilename(format: ExportFormat, at: number): string {
   return `ocr-export-${stamp}.${format}`;
 }
 
+/**
+ * §13's `exports_total{result}` buckets. `busy` is the per-user download gate (429, `Retry-After: 30`) and
+ * `throttled` the preview limiter (429, `Retry-After: 900`): two different remedies, so two different labels.
+ */
 const RESULTS: ReadonlyMap<string, string> = new Map([
-  ["EXPORT_TOO_LARGE", "too_large"], ["EXPORT_BUSY", "busy"], ["EXPORT_THROTTLED", "busy"], ["EXPORT_ABORTED", "aborted"],
+  ["EXPORT_TOO_LARGE", "too_large"], ["EXPORT_BUSY", "busy"], ["EXPORT_THROTTLED", "throttled"], ["EXPORT_ABORTED", "aborted"],
   ["EXPORT_TIMEOUT", "aborted"], ["INVALID_EXPORT_FILTER", "error"]
 ]);
 function resultOf(error: unknown): string {
   const message = error instanceof Error ? error.message : "";
   return RESULTS.get(message) ?? "error";
+}
+/** Only SCREAMING_SNAKE codes are recorded; a pg or TypeError message would put internals (and possibly data) in the audit row. */
+function errorCodeOf(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  return /^[A-Z][A-Z0-9_]{2,63}$/.test(message) ? message : "INTERNAL_ERROR";
+}
+
+/**
+ * The `format` label of an export route, or null for anything else. `authorize` refuses a request before the handler
+ * is entered, so the 403 is counted from there (§13 `exports_total{result="forbidden"}`).
+ */
+export function exportFormatLabel(pathname: string): string | null {
+  return FILE_ROUTES.get(pathname) ?? (pathname === PREVIEW_ROUTE ? "preview" : null);
 }
 
 /**
@@ -321,11 +340,13 @@ async function download(response: ServerResponse, ctx: WebAuthContext, query: Ex
     // Step 2: the audit row is committed BEFORE the first byte. Only `export.started` is guaranteed — a crash, a
     // redeploy or an OOM kill during the stream would otherwise let the data leave with no audit row at all.
     await audit(deps, ctx, "export.started", "success", { ...filterDetail(query), format, rows: open.total });
-    // The gate's wall clock. `rows()` honours close(), so this ends a stalled download instead of only refusing new
-    // ones — but a closed cursor ends the loop QUIETLY, so the flag is what stops a truncated file being sent as a
-    // complete one with a 200. (The cursor enforces the same budget itself; this half ends a download stuck on drain.)
+    // The gate's wall clock. It ends BOTH halves of a stalled download: `close()` gives the pooled connection back,
+    // and `destroy()` ends the response — without it the loop would stay parked on a `'drain'` that a client which
+    // stopped reading never fires, so `release()` below would never run and that user's next export would answer 429
+    // `EXPORT_BUSY` for good. A closed cursor ends the loop QUIETLY, so the flag is what stops a truncated file being
+    // handed over as a complete one with a 200, and what names the failure EXPORT_TIMEOUT rather than EXPORT_ABORTED.
     let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; void open.close(); }, EXPORT_WALL_CLOCK_MS);
+    const timer = setTimeout(() => { timedOut = true; void open.close(); response.destroy(); }, deps.wallClockMs ?? EXPORT_WALL_CLOCK_MS);
     timer.unref?.();
     try {
       const columns = exportColumns(query.columns);
@@ -334,7 +355,9 @@ async function download(response: ServerResponse, ctx: WebAuthContext, query: Ex
         "content-disposition": `attachment; filename="${exportFilename(format, startedAt)}"`,
         "cache-control": "no-store", "x-content-type-options": "nosniff", "x-export-rows": String(open.total)
       });
-      // Step 3: the BOM and the header row go out at once, so nginx-proxy's read timeout is never reached.
+      // Step 3: the BOM and the header row go out at once, so nginx-proxy does not sit waiting with no data at all.
+      // It does not make the proxy's read timeout irrelevant: a FETCH may take up to EXPORT_STATEMENT_TIMEOUT_MS
+      // between two writes, which is the gap Deploy B's `proxy_read_timeout` precondition is there to cover.
       if (format === "csv") await write(response, CSV_BOM + csvRow(columns.map((column) => columnLabel(column, query.headers))));
       for await (const page of open.rows()) {
         const chunk = page.map((document) => format === "csv"
@@ -350,15 +373,23 @@ async function download(response: ServerResponse, ctx: WebAuthContext, query: Ex
       if (rows !== open.total) throw new Error("EXPORT_TRUNCATED");
       complete = true;
       response.end();
+    } catch (error) {
+      // The wall clock destroys the response, so the parked write() rejects with EXPORT_ABORTED; the flag is what
+      // tells the audit row and the metric that it was our ten minutes, not the client walking away.
+      throw timedOut ? new Error("EXPORT_TIMEOUT") : error;
     } finally { clearTimeout(timer); }
     metrics.increment("exports_total", { format, result: "ok" });
     metrics.increment("export_rows_total", { format }, rows);
-    await audit(deps, ctx, "export.completed", "success", { format, rows, complete, duration_ms: deps.now() - startedAt });
+    // §10 H5: the terminal rows carry the same filter detail as `export.started`, so one row answers what was asked
+    // for without a join back to the started row on request_id (which a crash may be the only survivor of).
+    await audit(deps, ctx, "export.completed", "success",
+      { ...filterDetail(query), format, rows, complete, duration_ms: deps.now() - startedAt });
     logEvent("export_completed", { trace_id: deps.traceId, user_id: ctx.userId, format, rows, duration_ms: deps.now() - startedAt });
   } catch (error) {
     metrics.increment("export_rows_total", { format }, rows);
+    // Both the metric bucket and the code: `aborted` alone cannot tell a statement timeout from a client walking away.
     await audit(deps, ctx, "export.failed", "failure",
-      { format, rows, complete, duration_ms: deps.now() - startedAt, error: resultOf(error) });
+      { ...filterDetail(query), format, rows, complete, duration_ms: deps.now() - startedAt, result: resultOf(error), error: errorCodeOf(error) });
     throw error;
   } finally {
     await cursor?.close();
@@ -366,10 +397,15 @@ async function download(response: ServerResponse, ctx: WebAuthContext, query: Ex
   }
 }
 
-/** An audit write must never be what fails an export that already left; a failure is logged and the stream goes on. */
+/**
+ * An audit write must never be what fails an export that already left; a failure is logged and the stream goes on.
+ * The two rows written BEFORE any data leaves are the exception, and they are awaited: §10 H1 rests on
+ * `export.previewed` for the preview (20 rows of the export's own columns, for any filter) exactly as §10 H5 rests on
+ * `export.started` for the file — no audit row, no rows returned.
+ */
 async function audit(deps: ExportRouteDeps, ctx: WebAuthContext, action: string, outcome: "success" | "failure",
   detail: Record<string, string | number | boolean | null>): Promise<void> {
-  if (action === "export.started") {
+  if (action === "export.started" || action === "export.previewed") {
     await deps.users.recordAudit({ actorUserId: ctx.userId, sessionId: ctx.sessionId, requestId: deps.traceId, action, outcome, targetType: "export", detail });
     return;
   }
