@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Script } from "node:vm";
+import { LEGACY_REVIEWER_LABEL } from "@innovera/ocr-persistence";
 import { workbenchPage } from "./workbench.js";
 
 const html = workbenchPage({ nonce: "test-nonce-123" });
@@ -30,11 +31,30 @@ test("page works under the CSP: no inline handlers, external scripts, eval or ja
   for (const [, href] of html.matchAll(/<link[^>]+rel="stylesheet"[^>]+href="([^"]+)"/g)) assert.match(href ?? "", /^https:\/\/fonts\.googleapis\.com\//);
 });
 
-test("no native prompt/alert/confirm dialogs and no token inputs or token storage", () => {
+test("no native prompt/alert/confirm dialogs, and the session credential is a cookie the script cannot read", () => {
   assert.doesNotMatch(inlineScript, /(^|[^\w.$])(window\.)?(prompt|alert|confirm)\s*\(/);
   assert.doesNotMatch(inlineScript, /window\.confirm|localStorage|sessionStorage|document\.cookie/);
-  assert.doesNotMatch(markup, /<input[^>]*(token|password)/i);
-  assert.doesNotMatch(html, /Bearer token/i);
+  for (const banned of ["Authorization", "Bearer", "/api/web-token", "HS256", "createHmac", "AUTH_JWT", "jwtSecrets", "subtle.sign"]) {
+    assert.equal(inlineScript.includes(banned), false, `the script still mentions ${banned}`);
+  }
+});
+
+test("password fields are real password inputs inside a posting form, and no input carries a token", () => {
+  const inputs = [...markup.matchAll(/<input\b[^>]*>/g)].map(([tag]) => tag);
+  assert.ok(inputs.length >= 6);
+  for (const tag of inputs) assert.doesNotMatch(tag, /token/i, tag);
+  const forms = [...markup.matchAll(/<form\b([^>]*)>([\s\S]*?)<\/form>/g)];
+  const passwords = inputs.filter((tag) => /password/i.test(tag));
+  assert.equal(passwords.length, 4, "login, current, new and confirm");
+  for (const tag of passwords) {
+    assert.match(tag, /\btype="password"/, tag);
+    assert.match(tag, /\bautocomplete="(current-password|new-password)"/, tag);
+    const form = forms.find(([, , body]) => (body ?? "").includes(tag));
+    assert.ok(form, `${tag} sits outside every form`);
+    // A form post means a script failure can never put a password in a URL or in an nginx access log.
+    assert.match(form?.[1] ?? "", /\bmethod="post"/, "the form around a password field must post");
+  }
+  assert.match(markup, /<form id="login-form" method="post" action="\/api\/auth\/login">/);
 });
 
 test("document text never goes through HTML parsing sinks", () => {
@@ -56,13 +76,18 @@ test("every element id the script looks up exists in the markup", () => {
 });
 
 test("script follows the HTTP contract of spec §5", () => {
-  for (const needle of ["'/api/web-token'", "'/api/batches'", "'/api/batches?limit=20'", "'/api/documents?'", "'/ocr/review'", "'/retry'", "'/content'", "'X-Batch-Id'", "'X-Upload-Filename'", "encodeURIComponent(u.file.name)", "'X-Upload-Filename-Encoding','uri'", "'Idempotency-Key'", "expectedUpdatedAt", "structuredResult:state.draft", "CONCURRENCY=3", "MAX_FILES=100", "'document'"]) {
+  for (const needle of ["'/api/auth/session'", "'/api/auth/login'", "'/api/auth/logout'", "'/api/auth/password'", "'/api/users'", "'X-CSRF-Token'", "'X-OCR-Background'", "'/api/batches'", "'/api/batches?limit=20'", "'/api/documents?'", "'/ocr/review'", "'/retry'", "'/content'", "'X-Batch-Id'", "'X-Upload-Filename'", "encodeURIComponent(u.file.name)", "'X-Upload-Filename-Encoding','uri'", "'Idempotency-Key'", "expectedUpdatedAt", "structuredResult:state.draft", "CONCURRENCY=3", "MAX_FILES=100", "'document'"]) {
     assert.ok(inlineScript.includes(needle), `missing ${needle}`);
   }
   for (const key of ["name", "gender", "nationality", "hotelName", "referralSources", "healthConditions", "pressure", "massageOilScrub", "preferredAreas", "avoidAreas", "treatments", "therapistName", "roomNo", "duration"]) {
     assert.match(inlineScript, new RegExp(`[{,]${key}:'[^']+'`), `no Thai label for ${key}`);
   }
   for (const section of ["ข้อมูลลูกค้า", "คำแนะนำการนวด", "สำหรับพนักงาน", "บันทึกและยืนยัน"]) assert.ok(html.includes(section), section);
+});
+
+test("the drawer's label for pre-login reviews is the one the export and the store share", () => {
+  // The inline script cannot import a module, so it carries its own copy; this pins the two together.
+  assert.ok(inlineScript.includes(`const LEGACY_REVIEWER='${LEGACY_REVIEWER_LABEL}'`), LEGACY_REVIEWER_LABEL);
 });
 
 test("search box never exceeds the server's q limit (100 characters → otherwise 400 INVALID_QUERY)", () => {

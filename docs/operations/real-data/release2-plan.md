@@ -1813,3 +1813,54 @@ write the deviation down instead of diverging silently.
   ingest, review-store and OCR-client fakes that only `workbenchHarness` has, and the same file already holds the
   `reviewedBy` spoofing case §12 says to keep. `auth.test.ts` proves the other half — that the user id and session id
   reaching the store come from a live session — next to C4's forged `X-Request-Id` case.
+
+**C6 (the workbench: login dialog, session handling, password and users screens, tests)**
+
+- **`X-OCR-Background` is a counter around the call, not a parameter.** F2 says `api()` adds the header "for calls made
+  by `tick()`", but `loadDocuments`, `loadBatch` and `pollDrawer` are each called from both polling and user actions.
+  `background(fn)` raises `state.bg` while `fn` starts its fetches — every one of them reaches `fetch` synchronously —
+  so `tick()` marks exactly its own three calls and nothing threads a flag through five signatures. A call retried
+  after a login is a user action and correctly loses the header.
+- **The auth routes do not go through `api()`.** `GET /api/auth/session`, `POST /api/auth/login`, `/api/auth/password`
+  and `/api/auth/logout` use one small `authCall` helper instead. F2 only says `api()` opens the overlay "on 401 from
+  any non-auth route"; routing the auth routes through it as well would mean a wrong password reopens the login
+  dialog on top of the login dialog, and the password dialog's `PASSWORD_INCORRECT` (a 400 by design, §5 C5) would be
+  the only refusal it could report.
+- **`restoreAfterLogin` skips the list when one is already in flight.** F2 wants the rows and the drawer "re-rendered
+  from a fresh load" after a same-user login, and `api()` separately retries the call that hit the 401. When the 401
+  came from `loadDocuments` itself, both would fetch the same list and the seq guard would discard one. The restore
+  therefore reloads only when `state.listAbort` is null, which is precisely "no waiter is going to do it", and §12's
+  "retried exactly once" is asserted as two list fetches in total.
+- **A forced password change blocks startup, and `restoreAfterLogin` waits for it.** F2's `init()` puts the forced
+  change at step 3, before the loads — and it has to, because with `mustChangePassword` set every other route answers
+  403 `PASSWORD_CHANGE_REQUIRED` (§5 C2.6). `init()` awaits the dialog; a mid-session re-login that comes back with
+  the flag opens it and defers the restore to the successful change instead of loading into a 403.
+- **The 5-minute grace window is inferred, not computed.** F1 hides the current-password field "when C5's 5-minute
+  forced-change window applies", but the session payload carries `expiresAt`, not `auth_sessions.created_at`, so the
+  client cannot compute it. A forced change opens seconds after the login, so the field starts hidden; if the server
+  answers 400 `PASSWORD_INCORRECT` (the window has passed while the dialog sat open), the field appears with
+  `หน้านี้เปิดค้างไว้นานเกินไป กรุณากรอกรหัสผ่านปัจจุบันอีกครั้ง` instead of dead-ending.
+- **Two new upload states, `authwait` and `cancelled`.** F2 asks for `รอเข้าสู่ระบบ` and `ยกเลิก (เปลี่ยนผู้ใช้)`, which
+  the existing five-state vocabulary (`waiting`/`uploading`/`done`/`failed`/`rejected`) cannot express without lying
+  to `pump()` (a `waiting` row would be picked up again) or to the retry button (a `failed` row offers one). Both are
+  counted in the upload summary, and `beforeunload` and the logout confirmation treat `authwait` like `waiting`.
+- **The `≤720px` header collapse is driven by `matchMedia`, not by CSS alone.** §12 asks for a test that at phone
+  width the header renders one `#me-open` pill "and no separate action pills", which no CSS rule can prove in the
+  fake DOM. `showMenu()` sets `hidden` on `#me` and `#me-open` from `window.matchMedia('(max-width: 720px)')` (and on
+  `resize`), so the DOM states it; the `body[data-auth]` rules stay in CSS.
+- **`ส่งออก` is not part of the staff-permissions case.** §12 wants "staff see no `#users-open` or `ส่งออก`", but
+  workstream H is Deploy B and this commit adds no export control. The case asserts `#users-open` and `#me-users` are
+  hidden for staff and visible for an admin; C11 extends it when the export button exists.
+- **`LEGACY_REVIEWER` is a copy inside the inline script.** The script is a string that runs in the browser under a
+  CSP nonce and cannot import a module, so it carries its own constant, as §12's "the Thai labels equal the workbench
+  copies" already assumes. `workbench.test.ts` pins that copy to `LEGACY_REVIEWER_LABEL` from
+  `@innovera/ocr-persistence`, so the two cannot drift.
+- **`workbench.test.ts:36` became two rules, not three.** §12 asks for (a) no `token` in any `<input>` attribute,
+  (b) every password input typed and autocompleted, (c) inside a `method="post"` form. (b) and (c) are asserted per
+  input in one case (a password input outside a form is a property of that input), and the banned-text rule
+  (`Authorization`, `Bearer`, `/api/web-token`, `HS256`, `createHmac`, `AUTH_JWT`, `jwtSecrets`, `subtle.sign`) moved
+  into the case that already owned the storage and cookie bans.
+- **`load()`'s fakes.** Beyond §12's list (`replace`, `showModal`/`close`/`open`, `value`/`checked`, form submit,
+  `headers.get`, a controllable clock) the harness also records each fetch's headers and body, each XHR's headers and
+  `abort()`, and can make one upload hang — without which "no request is sent after B's login", "the same
+  `Idempotency-Key`", "the new `X-CSRF-Token`" and "the XHR is aborted" cannot be observed at all.
