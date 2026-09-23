@@ -6,8 +6,15 @@ set -u
 : "${DATABASE_URL_WORKER:?set DATABASE_URL_WORKER}"
 : "${DATABASE_URL_QUEUE:?set DATABASE_URL_QUEUE}"
 
-pass=0; fail=0
-check_sql() { local name="$1" url="$2" sql="$3" expected="$4"; local actual; actual="$(psql "$url" -AtX -v ON_ERROR_STOP=1 -c "$sql" 2>/dev/null || true)"; if [ "$actual" = "$expected" ]; then printf 'PASS %s\n' "$name"; pass=$((pass+1)); else printf 'FAIL %s\n' "$name"; fail=$((fail+1)); fi; }
+pass=0; fail=0; skip=0
+# A fifth argument is a guard: a boolean SQL expression saying whether this check can be asked of this database yet.
+# It answers false where the migration behind the check has not run, and the check then prints SKIP rather than FAIL —
+# psql's stderr is discarded below, so a question that errors would otherwise read as a failed answer.
+check_sql() { local name="$1" url="$2" sql="$3" expected="$4" guard="${5:-}"; local actual
+  if [ -n "$guard" ] && [ "$(psql "$url" -AtX -v ON_ERROR_STOP=1 -c "SELECT ($guard)::int" 2>/dev/null || true)" != "1" ]; then printf 'SKIP %s\n' "$name"; skip=$((skip+1)); return; fi
+  actual="$(psql "$url" -AtX -v ON_ERROR_STOP=1 -c "$sql" 2>/dev/null || true)"; if [ "$actual" = "$expected" ]; then printf 'PASS %s\n' "$name"; pass=$((pass+1)); else printf 'FAIL %s\n' "$name"; fail=$((fail+1)); fi; }
+# 0020 is applied by Deploy B. Between Deploy A and Deploy B this is false and the two checks it guards are skipped.
+round_clock="EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('public.ocr_batches') AND attname = 'round_opened_at' AND NOT attisdropped)"
 check_sql "app:not-superuser" "$DATABASE_URL_APP" "SELECT rolsuper::int FROM pg_roles WHERE rolname=current_user" 0
 check_sql "worker:not-superuser" "$DATABASE_URL_WORKER" "SELECT rolsuper::int FROM pg_roles WHERE rolname=current_user" 0
 check_sql "queue:not-superuser" "$DATABASE_URL_QUEUE" "SELECT rolsuper::int FROM pg_roles WHERE rolname=current_user" 0
@@ -48,8 +55,10 @@ check_sql "definer:no-sessions" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column
 check_sql "definer:no-audit" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_queue_definer','public.audit_events','SELECT')::int" 0
 check_sql "force-rls:release2" "$DATABASE_URL_BOOTSTRAP" "SELECT bool_and(relforcerowsecurity) FROM pg_class WHERE relname IN ('users','auth_sessions','audit_events')" t
 # 0020: round_opened_at is the only column of ocr_batches the web runtime may change (the batch clock). The label and
-# the capacity stay as they were created, so a compromised web process can neither relabel nor resize a batch.
-check_sql "app:update-batch-round" "$DATABASE_URL_BOOTSTRAP" "SELECT has_column_privilege('ocr_app','public.ocr_batches','round_opened_at','UPDATE')::int" 1
-check_sql "app:no-update-batch-label" "$DATABASE_URL_BOOTSTRAP" "SELECT has_column_privilege('ocr_app','public.ocr_batches','label','UPDATE')::int" 0
-printf 'SUMMARY PASS=%s FAIL=%s\n' "$pass" "$fail"
+# the capacity stay as they were created, so a compromised web process can neither relabel nor resize a batch. Both
+# are guarded on 0020: has_column_privilege() raises 42703 for a column that is not there, and the empty result would
+# be a FAIL — and a non-zero exit out of deploy/go-live-check.sh — on the schema production carries until Deploy B.
+check_sql "app:update-batch-round" "$DATABASE_URL_BOOTSTRAP" "SELECT has_column_privilege('ocr_app','public.ocr_batches','round_opened_at','UPDATE')::int" 1 "$round_clock"
+check_sql "app:no-update-batch-label" "$DATABASE_URL_BOOTSTRAP" "SELECT has_column_privilege('ocr_app','public.ocr_batches','label','UPDATE')::int" 0 "$round_clock"
+printf 'SUMMARY PASS=%s SKIP=%s FAIL=%s\n' "$pass" "$skip" "$fail"
 [ "$fail" -eq 0 ]

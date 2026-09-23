@@ -101,5 +101,23 @@ test("the grant checks of plan A2 exist in verify-db-roles.sh and in verify-rele
   }
   const forceRls = "bool_and(relforcerowsecurity) FROM pg_class WHERE relname IN ('users','auth_sessions','audit_events')";
   assert.ok(script.includes(forceRls) && verify.includes(forceRls), "FORCE RLS is machine-checked, not eyeballed");
-  assert.match(verify, /'SUMMARY PASS=' \|\| count\(\*\) FILTER \(WHERE ok\) \|\| ' FAIL=' \|\| count\(\*\) FILTER \(WHERE ok IS NOT TRUE\)/);
+  assert.match(verify, /'SUMMARY PASS=' \|\| count\(\*\) FILTER \(WHERE ok\)\s*\|\| ' SKIP=' \|\| count\(\*\) FILTER \(WHERE ok IS NULL\)\s*\|\| ' FAIL=' \|\| count\(\*\) FILTER \(WHERE ok IS FALSE\)/);
+  assert.match(script, /printf 'SUMMARY PASS=%s SKIP=%s FAIL=%s\\n'/);
+});
+
+test("a check whose migration is not applied here skips, so the gate never reads a missing column as a failure", () => {
+  // Deploy A is in production at 0019; 0020 ships in Deploy B. has_column_privilege() raises 42703 for a column that
+  // does not exist, which aborts the WHOLE SQL statement (no PASS lines, no SUMMARY) and, in the shell, discards to
+  // an empty result that check_sql reads as FAIL — taking deploy/go-live-check.sh's exit code with it.
+  const script = read("../deploy/verify-db-roles.sh");
+  const verify = read("../deploy/sql/verify-release2-grants.sql");
+  const guard = "EXISTS (SELECT 1 FROM pg_attribute\n                 WHERE attrelid = to_regclass('public.ocr_batches') AND attname = 'round_opened_at' AND NOT attisdropped)";
+  assert.ok(verify.includes(guard), "the SQL file computes the 0020 guard from the catalogue, not from a bare privilege call");
+  assert.match(verify, /SELECT 19, 'app:update-batch-round',\s*\n\s*CASE WHEN round_clock THEN has_column_privilege\('ocr_app','public\.ocr_batches','round_opened_at','UPDATE'\) END/);
+  assert.match(verify, /SELECT 20, 'app:no-update-batch-label',\s*\n\s*CASE WHEN round_clock THEN NOT has_column_privilege\('ocr_app','public\.ocr_batches','label','UPDATE'\) END/);
+  assert.match(verify, /WHEN ok IS NULL THEN 'SKIP '/);
+  // The shell passes the same guard as check_sql's fifth argument for exactly the two 0020 checks, and no others.
+  assert.ok(script.includes(`round_clock="${guard.replace(/\s+/g, " ")}"`), "verify-db-roles.sh declares the same guard on one line");
+  const guarded = script.split("\n").filter((line) => line.startsWith("check_sql ") && line.includes('"$round_clock"'));
+  assert.deepEqual(guarded.map((line) => /^check_sql "([^"]+)"/.exec(line)![1]), ["app:update-batch-round", "app:no-update-batch-label"]);
 });

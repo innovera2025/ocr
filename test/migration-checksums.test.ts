@@ -39,7 +39,8 @@ const CHECKSUMS: Readonly<Record<string, string>> = {
   "0018_multipage_documents": "90c44786f7424ade6012f722354c41b0a8af19d87c9b326f934aef1435c416cc",
   // Applied in production by Deploy A and frozen there: a policy fix takes 0021, never an edit to this file.
   "0019_user_auth": "45700e3814d1c3472dc017ae1b7384af9de81cede0d8ae26ee0b592895bda58c",
-  // Applied by Deploy B; frozen from the moment that deploy runs.
+  // Applied by NO deploy yet — Deploy B applies it and freezes it. Until then an edit is allowed: regenerate this
+  // line in the same commit (`sha256sum prisma/migrations/0020_batch_round_clock/migration.sql`).
   "0020_batch_round_clock": "a8a351fd40364a96c60b67672a0e83de3073de2ccfb02cd5af1053e4d3e6ecd9"
 };
 
@@ -47,11 +48,21 @@ function sha256(version: string): string {
   return createHash("sha256").update(readFileSync(join(directory, version, "migration.sql"), "utf8")).digest("hex");
 }
 
+/**
+ * The newest version `schema_migrations` records in production today: Deploy A applied 0001–0019. Everything up to
+ * and including it is frozen — a fix goes in a NEW migration. Anything after it is not applied anywhere yet and may
+ * still be edited; the pin is simply regenerated in the same commit, because the pin is what freezes it the moment
+ * the deploy that applies it runs. Move this line in the same commit as the deploy that applies the next one.
+ */
+export const APPLIED_IN_PRODUCTION = "0019_user_auth";
+
 test("every applied migration still hashes to the value production recorded", () => {
   for (const [version, expected] of Object.entries(CHECKSUMS)) {
-    assert.equal(sha256(version), expected,
-      `${version} changed. An applied migration is frozen: put the fix in a new migration, or production answers `
-      + `MIGRATION_CHECKSUM_MISMATCH:${version} at startup and crash-loops.`);
+    assert.equal(sha256(version), expected, version <= APPLIED_IN_PRODUCTION
+      ? `${version} changed, and it is applied in production (0001–${APPLIED_IN_PRODUCTION} are frozen): put the fix `
+        + `in a new migration, or production answers MIGRATION_CHECKSUM_MISMATCH:${version} at startup and crash-loops.`
+      : `${version} changed. It is not applied anywhere yet, so editing it is allowed — regenerate its pin in this `
+        + "same commit, which is what freezes it when the deploy that applies it runs.");
   }
 });
 
