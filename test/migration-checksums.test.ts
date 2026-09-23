@@ -54,7 +54,7 @@ function sha256(version: string): string {
  * still be edited; the pin is simply regenerated in the same commit, because the pin is what freezes it the moment
  * the deploy that applies it runs. Move this line in the same commit as the deploy that applies the next one.
  */
-export const APPLIED_IN_PRODUCTION = "0019_user_auth";
+export const APPLIED_IN_PRODUCTION = "0020_batch_round_clock";
 
 test("every applied migration still hashes to the value production recorded", () => {
   for (const [version, expected] of Object.entries(CHECKSUMS)) {
