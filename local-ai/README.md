@@ -6,6 +6,34 @@ FastAPI service that reads a scanned **Makkha Health & Spa intake form** and ret
 on port 5000, with `/app = /opt/innovera-ocr`, and talks to Ollama (`scb10x/typhoon-ocr1.5-3b`) through the
 OpenAI-compatible endpoint.
 
+## Review thresholds live in `calibration.json` (W6, 2026-09-23)
+
+`ocr_confidence.REVIEW_BELOW` is now the **fallback**, not the last word. A threshold that has been moved on measured
+evidence lives in `calibration.json` beside the code, one entry per field type:
+
+```json
+"nationality": { "reviewBelow": 0.80, "movedFrom": 0.85, "acceptedBecause": "…what was measured…" }
+```
+
+The loader refuses the **whole file** — and falls back to `REVIEW_BELOW`, which always flags *more*, never less — unless
+every entry names a known field type, carries a non-empty `acceptedBecause` and moves its threshold by at most **±0.05**
+from the `movedFrom` it replaces (`accuracy-learning-plan.md` §4 G6, §8.6: no threshold move without recorded held-out
+evidence, none larger than ±0.05 per release). A refusal is visible: `/health` answers `status:"degraded"` with
+`calibration:"rejected: …"`, and the pages keep being read. `OCR_MODEL_CONFIDENCE_<TYPE>` still overrides one field type
+for one deployment, and deleting an entry restores its code default.
+
+Shipped in this release, the two **clamped** moves of plan §3 W6 — *not* the all-data argmin, which has no out-of-sample
+support: `nationality` 0.85 → **0.80** and `date` 0.90 → **0.85**. Measured on the 95 stored production answers, 0 model
+calls: right-but-flagged nationality 11 → 9 and date 20 → 19 (3 pages leave the review queue), wrong-and-unflagged **0 →
+0** on every field, and every other number in the benchmark byte-identical. `benchmark.py --thresholds` prints the
+evidence for any threshold: the sweep, the margin over the most confident wrong page, and what a refit of the threshold
+would score leave-one-out and odd/even (for `date` the refit adds a silent error the all-data argmin hides — that is why
+the moves are clamped instead of fitted).
+
+**Deploying it:** `calibration.json` is a file beside `master_data.json` and has to be copied to `/opt/innovera-ocr/`
+with the rest of the service. If it is missing the service still runs on the v3.2 thresholds and says so —
+`/health` answers `calibration:"default"` instead of `"ok"`, which is the check worth making after a swap.
+
 ## The confirm route is audit-only (W3a, 2026-09-23)
 
 `POST /v1/ocr/confirm` still accepts `treatment` and `therapist`, still appends the same six-field record to
@@ -72,7 +100,7 @@ combined variants last (room 9-10/16).
 | Model calls (`OCR_SECTION_MODE`) | `combined` (default): one image, header + customer rows + STAFF crop | **`staff-separate`** (default): call A = the STAFF crop alone with `STAFF_VOCAB_PROMPT` (the v2.2 `STAFF_PROMPT` plus the probe's vocabulary sentence and "Write Thai words in Thai script.", word for word); call B = the header stacked above the customer rows (the rows only when a customer box is written; the header always) with `HEADER_CUSTOMER_PROMPT` (`COMBINED_PROMPT` restricted to the `No./Date/Time/Name/Nationality/Hotel Name` lines, 260 tokens). A and B run concurrently (`OCR_SECTION_PARALLELISM`); `timings.sections` names them `staffOnly` and `headerCustomer`. `evidence.staffCropRaw` = A's answer, `customerCropRaw` (when the rows were sent) and `combinedRaw` = B's answer, all raw. The v3.1 fallbacks stay: a staff answer without any staff label is re-read with `STAFF_PROMPT`, written customer boxes with nothing parsed with `CUSTOMER_PROMPT`. `combined` and `separate` still work. |
 | Text cleanup (`ocr_normalize.clean_model_text`, in every parser) | tags -> newlines | HTML entities decoded (`&amp;`), table cells -> `Label: value` lines, tags removed, parenthetical model notes dropped (`(handwritten)`, `(hand-written)`, `(Treatments)`, `(Therapists)`, `(circled)`, `(ลายมือ)` …; `(5)` and `(2 คน)` are values and stay; doubt notes such as `(unclear)`, `(illegible)`, `(crossed out)` also stay, so the reading next to them is not taken as confident), echoed Chinese labels dropped (`治療 治疗 疗法 療法`, therapist / room labels such as `理疗师名称`, `房号`). `Treatments:` counts as the label; a room label never takes the next label as its value. The raw answers stay in `evidence`. |
 | Visual-confusion aliases (`master_data.json` `visualAliases`) | – | Look-alikes the model writes for Thai handwriting, applied to the treatment text before parsing: treatment look-alikes (`004 002 00ย 00Y OOW oow oo อยู่ คอย` -> `ออย` = นวดน้ำมัน, `Inw lnw Thw` -> `ไทย`; a whole token, or glued to digits, or glued to a Thai word only when that makes an exact master name: `อยู่ร้อน` -> ออยร้อน); hour-unit look-alikes after an hour count 1-4 (`6M 2M 5M T2 62 57 5ม Ø2 会` -> `ชม.`, the last three added by W1e; after a space or `-`, an all-digit one also glued: `004162.` -> `ออย 1 ชม.`; never when a real unit follows); `I l \| /` alone right before an hour unit -> `1` (`002 / 6M` -> `ออย 1 ชม.`). Case-sensitive. An item read through an alias (its text, or a written total that went through one) is source **`visual-alias`**, confidence ≤ 0.6 and **always** `needsReview`; each replacement is listed in `evidence.treatmentWarnings` (`visual alias: '002' read as 'ออย'`). |
-| Model confidence (`ocr_confidence.py`) | rule confidences only | `call_ocr` asks for token logprobs (`logprobs: true, top_logprobs: 1`; `OCR_MODEL_LOGPROBS=0` turns it off) and returns `ModelText` (a `str` with `.tokens`; `call_ocr_text` returns a plain `str`). Each model-read field's value is found in its own answer (after its label; whitespace/separators and Thai digits tolerated) and mapped to the tokens that produced it. Ollama takes a token's `bytes` from its text, and in front of llama-server that text has lost a Thai character split over two tokens (`""` + `"\ufffd"`); such tokens are aligned by UTF-8 structure (linear time), so one split character no longer leaves the whole answer unmapped. modelConfidence = exp(mean token logprob) over the value's tokens, or for the digit fields (room, formNumber, date, time: one wrong digit is a wrong value) the probability of the weakest token. Field confidence = min(rule confidence, modelConfidence) for name, nationality, hotelName, formNumber, date, time, each treatment item, therapist and room; `needsReview` when modelConfidence is below the field type's threshold (`ocr_confidence.REVIEW_BELOW`: 0.85 name/nationality/hotel, 0.80 treatment/therapist, 0.90 room/formNumber/date/time) **or** any of the value's tokens is below the token floor 0.50 (a mean over a long name hides one doubtful letter: one 30 % letter in 18 tokens still averages 0.93). `OCR_MODEL_CONFIDENCE_<TYPE>` overrides one, e.g. `OCR_MODEL_CONFIDENCE_HOTEL_NAME`, `OCR_MODEL_CONFIDENCE_TOKEN`. `evidence.tokenConfidence` = `{"customerInformation.name": {"mean", "min", "tokens"}, …}` (`null`: value not found in an answer that had logprobs). No logprobs (older Ollama, a stub) or no span: the v3.1 rule confidences stand. |
+| Model confidence (`ocr_confidence.py`) | rule confidences only | `call_ocr` asks for token logprobs (`logprobs: true, top_logprobs: 1`; `OCR_MODEL_LOGPROBS=0` turns it off) and returns `ModelText` (a `str` with `.tokens`; `call_ocr_text` returns a plain `str`). Each model-read field's value is found in its own answer (after its label; whitespace/separators and Thai digits tolerated) and mapped to the tokens that produced it. Ollama takes a token's `bytes` from its text, and in front of llama-server that text has lost a Thai character split over two tokens (`""` + `"\ufffd"`); such tokens are aligned by UTF-8 structure (linear time), so one split character no longer leaves the whole answer unmapped. modelConfidence = exp(mean token logprob) over the value's tokens, or for the digit fields (room, formNumber, date, time: one wrong digit is a wrong value) the probability of the weakest token. Field confidence = min(rule confidence, modelConfidence) for name, nationality, hotelName, formNumber, date, time, each treatment item, therapist and room; `needsReview` when modelConfidence is below the field type's threshold (`ocr_confidence.REVIEW_BELOW`: 0.85 name/nationality/hotel, 0.80 treatment/therapist, 0.90 room/formNumber/date/time, W6 then moving nationality to 0.80 and date to 0.85 in `calibration.json`) **or** any of the value's tokens is below the token floor 0.50 (a mean over a long name hides one doubtful letter: one 30 % letter in 18 tokens still averages 0.93). `calibration.json` moves one on recorded evidence and `OCR_MODEL_CONFIDENCE_<TYPE>` overrides both, e.g. `OCR_MODEL_CONFIDENCE_HOTEL_NAME`, `OCR_MODEL_CONFIDENCE_TOKEN`. `evidence.tokenConfidence` = `{"customerInformation.name": {"mean", "min", "tokens"}, …}` (`null`: value not found in an answer that had logprobs). No logprobs (older Ollama, a stub) or no span: the v3.1 rule confidences stand. |
 | Model errors | any failed call -> HTTP 500 for the page | A call that hits an HTTP 5xx or a dropped/refused connection is retried once (after 1 s); a timed-out call is not (it already waited `OCR_MODEL_TIMEOUT`, 600 s, twice the worker's 300 s, and Ollama serves one request at a time). If it still fails, the page is answered from the other call: the failed section's fields are all `needsReview` (staff: every STAFF ONLY field; header+customer: the header fields and name/nationality/hotel; checkbox and body-map fields are not affected), `layout.warnings` gets `model call <name> failed after N attempt(s) (…); its fields need review`, `evidence.modelErrors` lists it and its `timings.sections` entry has `"failed": true` (`"attempts": 2` on any retried call). Only when **every** call failed is the page an HTTP 500 (the worker retries it). Other errors (a 4xx, a malformed answer) are not retried and still fail the page. |
 
 Response: unchanged shape (`version` `"3.2"`, `schemaVersion` 3); field `source` may now be `"visual-alias"`; `evidence` gains
@@ -144,7 +172,7 @@ header ink counts in `textInk`; `layoutOffset` now reports the fitted shift and 
 
 Extra, additive keys (not in the spec example, safe to ignore):
 - `evidence`: `checkboxNotes` (`stroke-through` / `faint` / `mark-beside-box`), `bodyMap` (shape features), `textInk` (ink pixels per handwriting box), `layoutOffset` (registration shift), `treatmentWarnings`, `treatmentTotalMinutes`.
-- `/health`: `engine`, `schemaVersion`, `model`, `pdfSupport`, `masterData`. `status` is `"degraded"` (HTTP 200) while master data does not load.
+- `/health`: `engine`, `schemaVersion`, `model`, `pdfSupport`, `masterData`, `calibration`. `status` is `"degraded"` (HTTP 200) while master data does not load or the calibration file is refused (`"default"` = no calibration file, the code thresholds).
 - `evidence.customerCropRaw` is `null` when the customer call was skipped.
 
 ## Files
@@ -159,8 +187,9 @@ Extra, additive keys (not in the spec example, safe to ignore):
 | `ocr_model.py` | Ollama/OpenAI-compatible client (token logprobs, transient-error classification) and the prompts |
 | `ocr_confidence.py` | Token-logprob field confidence: value -> token span mapping, per-type review thresholds |
 | `master_data.json` | Editable masters (treatments + allowed durations, therapists with branch/seed, branches, nationalities, visual aliases) |
+| `calibration.json` | Review thresholds moved off `REVIEW_BELOW` on measured evidence, one entry per field type (`reviewBelow`, `movedFrom`, `acceptedBecause`); refused whole unless every entry is evidenced and within ±0.05 |
 | `tests/` | pytest suite, `synthetic_form.py` (draws the template; scaled/rotated pages, PAID-like stamps), `fake_ollama.py`, `bench_deterministic.py` |
-| `tools/` | Offline reading-accuracy benchmark: `replay.py` (rebuild a stored answer through today's parsers), `scoring.py` (the one scorer), `benchmark.py` (CLI + §4 gates), `baseline-v3.2-prod-95.txt` (frozen baseline). Not imported by the service. |
+| `tools/` | Offline reading-accuracy benchmark: `replay.py` (rebuild a stored answer through today's parsers), `scoring.py` (the one scorer), `benchmark.py` (CLI + §4 gates), `learning_loop.py` (the page-ordered confirm replay), `thresholds.py` (what each review threshold costs and catches), `baseline-v3.2-prod-95.txt` (frozen baseline). Not imported by the service. |
 | `Dockerfile.test` | Throwaway python:3.11 test image |
 
 Runtime dependencies: fastapi, uvicorn, python-multipart, Pillow and **numpy** (new in v3.1, for the registration and stamp
@@ -181,6 +210,7 @@ removal; the production base image has it through `paddlepaddle`/`paddleocr`). O
 | `OCR_UPLOAD_DIR` | `/app/uploads` | Where the uploaded original is saved |
 | `OCR_VERIFIED_FILE` | `/app/verified_dataset/corrections.jsonl` | Where `POST /v1/ocr/confirm` appends. Audit trail only since W3a — written, never read back into a reading |
 | `OCR_MASTER_DATA` | `<module dir>/master_data.json` | Masters file |
+| `OCR_CALIBRATION_FILE` | `<module dir>/calibration.json` | Review-threshold calibration file (plan §8.6). Absent = the `REVIEW_BELOW` defaults; refused = the same defaults plus `status:"degraded"` |
 | `OCR_MAX_UPLOAD_BYTES` | `31457280` (30 MiB) | Larger uploads ⇒ 413 |
 
 ## Calibration (sample2.png)
@@ -247,6 +277,7 @@ docker run --rm --network none -v "$PWD/local-ai":/app -w /app -e PYTHONDONTWRIT
 docker run ... python tools/benchmark.py --data /data --results results-v32       # any other stored run
 docker run ... python tools/benchmark.py --data /data --freeze tools/baseline-v3.2-prod-95.txt   # re-freeze
 docker run ... python tools/benchmark.py --data /data --learning-loop             # + the page-ordered confirm replay (W3a)
+docker run ... python tools/benchmark.py --data /data --thresholds                # + the review-threshold evidence (W6)
 ```
 
 Only counts, page numbers, field names and error categories are printed, so the output is safe to paste into a report or a
@@ -261,6 +292,17 @@ pages (26-29) differ in `source` and two of them in `confidence`, because produc
 `verified-memory` hook (`corrections.jsonl`), which the stored response does not carry; pass `--verified <operator copy>`
 to reproduce those too. That hook is off since W3a — and on exactly those four pages it changed no `value` and no
 `needsReview`, only the `source` label and two confidences, because the master list already knew the answer.
+
+Fidelity is measured against production, so a deliberate change shows up in it: with W1's parser fixes and W6's
+thresholds in place the same run reproduces **61/95** pages exactly, and the difference *is* the change — W1's values and
+raw strings, and W6's three cleared flags (nationality 15 and 74, date 75). The frozen baseline and the G2 page lists are
+what say which.
+
+`--thresholds` reports, per model-read scalar field, what the review threshold in force costs (right-but-flagged) and
+what it catches (wrong-and-unflagged), the sweep across a grid, the margin between the threshold and the most confident
+**wrong** page, and what refitting the threshold would score leave-one-out and odd/even. It is a report, never a gate: it
+changes nothing and cannot move the exit code. A fixed, pre-specified threshold has nothing to leave out — those two
+columns score the *refit procedure*, which is the thing that overfits (plan §10 item 6).
 
 `--learning-loop` adds the page-ordered run the stateless benchmark cannot do: the same pages replayed **in order** with
 the confirm route live, a reviewer confirming each page to its label before the next is read. It reports the `v3.2` and

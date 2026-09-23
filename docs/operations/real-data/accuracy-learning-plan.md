@@ -866,7 +866,7 @@ then     W1 parser/vocabulary (incl. W1f)                    DONE 2026-09-23 (§
             W2f's possibleMissedMark carrier ships BEFORE W2b/W2d          0 calls ~3 d
          W3a stop the bleeding (confirm audit-only, weight-0 rule)   DONE 2026-09-23 (§13), 0 calls
          W3b-d learning store + snapshot, schema with RLS, outbox          0 calls ~1 w  (no votes written yet)
-         W6 the two CLAMPED threshold moves (±0.05)                        config  ~0 d
+         W6 the two CLAMPED threshold moves (±0.05)           DONE 2026-09-23 (§14), config
 parallel R0 instrumentation, R1 image-first probe                                  2 probes
          R5a W7 room-gate probe on 9 pages                                         ~4 min
          W4 prompt / crops / decoding                                              3-4 runs
@@ -1142,3 +1142,91 @@ zero-model-call jobs and both remain the cheapest work left.
 **The two carrier gaps are still unowned.** `staffOnly.totalMinutes` has no `needsReview` carrier at all, so its 7
 remaining errors of 31 pages are silent by construction (W4b fixes the cause, not the carrier), and body-map item
 recall is 286/414 with 128 misses that nothing can flag until W2f's `possibleMissedMark` exists.
+
+---
+
+## 14. Step 4 — W6, the two clamped review-threshold moves (2026-09-23)
+
+`local-ai/ocr_confidence.py` + a new `local-ai/calibration.json`, plus `local-ai/tools/thresholds.py`
+(`benchmark.py --thresholds`) and 24 new local-ai tests (**529 local-ai pass**; the app is untouched — `pnpm typecheck`,
+`pnpm test` **389** and `pnpm lint` clean). §9's "W6 the two CLAMPED threshold moves (±0.05)" line is done. **G0 frozen
+inputs and the label-hygiene hour are still outstanding** and still block every W2 number.
+
+### What shipped
+
+* **`OCR_MODEL_CONFIDENCE_NATIONALITY` 0.85 → 0.80 and `..._DATE` 0.90 → 0.85** — §3 W6's clamped pair, *not* the
+  all-data argmin (0.70 and 0.75 under today's scorer; 0.50 and 0.75 under the one the original experiment used).
+* **The thresholds became configurable where §8.6 and G6 say they should be.** `ocr_confidence.REVIEW_BELOW` is now the
+  fallback; a moved threshold lives in `calibration.json` as `{reviewBelow, movedFrom, acceptedBecause, …}`. The loader
+  **refuses the whole file** unless every entry names a known field type, carries a non-empty `acceptedBecause` and moves
+  its threshold by at most **±0.05** from the value it replaces — G6's two conditions, now mechanical rather than
+  editorial. A refused file falls back to `REVIEW_BELOW` (which always flags *more*, never less), the pages keep being
+  read, and `/health` reports `status:"degraded"`, `calibration:"rejected: …"`. `OCR_MODEL_CONFIDENCE_<TYPE>` still
+  overrides one field type for one deployment, and deleting an entry restores its code default.
+* **`benchmark.py --thresholds`** (`tools/thresholds.py`): per model-read scalar field, the sweep of right-but-flagged /
+  wrong-but-flagged / wrong-and-unflagged across a threshold grid, the margin between the threshold in force and the most
+  confident **wrong** page, the all-data argmin, and what that *refit procedure* scores leave-one-out and odd/even. A
+  report, never a gate. A test pins it to the service: at the threshold in force the report must reproduce the
+  `needsReview` the real `/v1/ocr` set, field for field.
+
+### Measured, 95 stored production answers, 0 model calls
+
+Both runs are the same code; the "before" column is the same binary with the old thresholds forced through the env
+override, so nothing but the two numbers differs.
+
+| Field | right | right-but-flagged | wrong-but-flagged | wrong-and-UNFLAGGED |
+|---|---|---|---|---|
+| `customerInformation.nationality` 0.85 → 0.80 | 90 → **90** | 11 → **9** | 5 → 5 | **0 → 0** |
+| `header.date` 0.90 → 0.85 | 84 → **84** | 20 → **19** | 11 → 11 | **0 → 0** |
+
+**Every other number in the benchmark is byte-identical** — the two frozen runs differ in exactly those two cells. No
+page changed right ↔ wrong, no field's wrong-and-unflagged *page list* moved (G1 and G2 can miss a silent error that
+merely moves; the diff of the two `--freeze` files cannot). Three right pages left the review queue: nationality 15 and
+74, date 75. None of them is a stale-gate page, so all three flags were evidence-backed before they were cleared.
+`--learning-loop` re-run: the W3a invariant and the loop's determinism both still PASS, and its 200/128 confirmation
+counts are unchanged (the loop confirms therapist and treatment, whose thresholds did not move).
+
+### Why clamped, in numbers rather than by assertion
+
+| Field | margin to the most confident WRONG page | all-data argmin | the same refit, leave-one-out | odd/even |
+|---|---|---|---|---|
+| nationality @ 0.80 | wrong pages top out at **0.574** → 0.226 of margin | 0.70 (R&F 7) | R&F 8, W&U **0** | R&F 9, W&U **0** |
+| date @ 0.85 | the wrong page at **0.749** → 0.101 of margin | 0.75 (R&F 17) | R&F 18, W&U **1** | R&F 14, W&U **1** |
+
+* For **date** the refit procedure *creates a silent error out of sample* while scoring 0 in sample — the plan's §10 item
+  6, reproduced by the repo's own harness on today's code. The argmin 0.75 clears the wrong page by **0.001**; the
+  shipped 0.85 clears it by 0.101. date is a digit field, so `modelConfidence` already *is* the weakest token and the
+  0.50 token floor adds nothing: this threshold is the only thing between a wrong date and a silent error.
+* For **nationality** the clamp costs about one page of review versus the argmin (R&F 9 vs 7–8) and buys back the margin.
+  All 5 wrong nationality pages are held by the token floor or a parser rule, not by this threshold: its
+  wrong-and-unflagged stays 0 all the way down to 0.00 *on this set*, which is exactly the kind of in-sample freebie
+  §8.6 refuses to ship.
+* **The leave-one-out caveat the review record demands, stated plainly:** a fixed, pre-specified threshold has nothing
+  to leave out — dropping a page cannot move it, so its LOO is its own count (0 silent errors in all 95 folds for both
+  fields). The LOO and odd/even columns above therefore score the *refit procedure*, never these two numbers. What makes
+  the shipped pair credible is not a cross-validation score, it is that ±0.05 was chosen before the data was consulted,
+  so the 95 pages **evaluate** it instead of fitting it.
+
+### What this step does NOT do, and must not be read as doing
+
+1. **No recalibration job.** §8.6's job — ≥ 200 confirmed documents containing the field and ≥ 50 wrong, fit on the older
+   70 % by document time, accept only on a held-out improvement — is not built. `calibration.json` is where it will
+   write; today its two entries were written by hand and measured by `--thresholds`.
+2. **No third move, although the sweep offers two.** `customerInformation.name` 0.85 → 0.90 would turn its **3** silent
+   errors into flagged ones for +2 right-but-flagged (and its refit is stable: LOO and odd/even agree), and
+   `staffOnly.roomNo` 0.90 → 0.95 would clear its 1 silent error for +10 right-but-flagged (over G3's +5 budget, which
+   the falling W&U would exempt). Both are *upward* moves, both are within ±0.05, and neither is in W6's scope: they are
+   the best-evidenced candidates for the next release, not decisions taken here.
+3. **The stale-gate caveat carries over unchanged.** The replay scores flags from the stored token statistics, so on the
+   21 pages where W1 changed a field's `raw` the FLAG is still not evidence-backed (the value is): nationality
+   [31, 37, 51, 76, 82, 89] among them. None of the three pages this step unflags is one of them, and no
+   wrong-and-unflagged page coincides with one. Re-measuring the flags needs a model run and belongs with W4.
+4. **The 95 pages are one sample, and a small one per field**: 5 wrong nationality pages (2 uncertain labels) and 11
+   wrong date pages (3 uncertain). §8.6's ≥ 200 documents / ≥ 50 wrong rule is what the *next* move must clear, and a
+   W4 model run moves the token statistics under all of it.
+5. **`therapist`, `treatment`, `room`, `formNumber`, `hotelName` and `name` keep their v3.2 thresholds**, and the token
+   floor stays 0.50 for every field.
+6. **It is a file, so it has to be deployed.** `calibration.json` must be copied to `/opt/innovera-ocr/` with the rest of
+   the Local AI (`full-document-batch-deploy.md` §C copies the directory, so this is only a risk for a hand-picked file
+   list). A missing file is fail-safe and visible: the v3.2 thresholds stand and `/health` answers
+   `calibration:"default"` rather than `"ok"`.

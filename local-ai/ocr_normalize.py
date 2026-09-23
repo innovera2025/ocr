@@ -42,10 +42,10 @@ def master_path():
     return Path(os.environ.get("OCR_MASTER_DATA", str(HERE / "master_data.json")))
 
 
-class _FileCache:
+class FileCache:
     """Re-parses a file only when its (path, mtime_ns, size) changes. When a changed file does not load (e.g. a typo in
     a hand-edited master_data.json), the last good value keeps being served and `error` says why; only a file that has
-    never loaded raises."""
+    never loaded raises. Shared: master data, the verified memory and `ocr_confidence`'s calibration file."""
 
     def __init__(self, loader):
         self._loader, self._lock, self._key, self._value, self._loaded, self.error = loader, threading.Lock(), None, None, False, None
@@ -127,7 +127,7 @@ def _load_visual_aliases(section, path):
     return out
 
 
-_verified_cache, _master_cache = _FileCache(_load_verified), _FileCache(_load_master)
+_verified_cache, _master_cache = FileCache(_load_verified), FileCache(_load_master)
 _append_lock = threading.Lock()
 
 

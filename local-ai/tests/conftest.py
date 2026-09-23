@@ -23,8 +23,8 @@ def isolated_paths(tmp_path, monkeypatch):
     """Uploads and verified memory go to a temp dir, never /app. No retry pause, no model-confidence env overrides."""
     import ocr_model
     monkeypatch.setattr(ocr_model, "RETRY_DELAY_S", 0.0)
-    for name in [n for n in os.environ if n.startswith("OCR_MODEL_CONFIDENCE_")] + ["OCR_MODEL_LOGPROBS"]:
-        monkeypatch.delenv(name, raising=False)
+    for name in [n for n in os.environ if n.startswith("OCR_MODEL_CONFIDENCE_")] + ["OCR_MODEL_LOGPROBS", "OCR_CALIBRATION_FILE"]:
+        monkeypatch.delenv(name, raising=False)  # the repo's own calibration.json stays in force: it is what production runs
     monkeypatch.setenv("OCR_UPLOAD_DIR", str(tmp_path / "uploads"))
     monkeypatch.setenv("OCR_VERIFIED_FILE", str(tmp_path / "verified_dataset" / "corrections.jsonl"))
     monkeypatch.delenv("OCR_MASTER_DATA", raising=False)

@@ -1,5 +1,6 @@
 """Token-logprob confidence (ocr_confidence): span mapping, thresholds, application to fields."""
 
+import json
 import math
 
 import pytest
@@ -175,3 +176,60 @@ def test_review_is_decided_on_unrounded_probabilities():
     evidence = C.apply(sections, {"header": None, "customer": answer, "staff": None})
     assert evidence["customerInformation.name"]["mean"] == 0.85  # reported rounded
     assert sections["customerInformation"]["name"]["needsReview"] is True
+
+
+# ------------------------------------------------------------------ calibration file (plan §3 W6, §4 G6, §8.6)
+
+
+def calibration_file(tmp_path, monkeypatch, thresholds):
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps({"thresholds": thresholds}), encoding="utf-8")
+    monkeypatch.setenv("OCR_CALIBRATION_FILE", str(path))
+    return path
+
+
+def test_the_shipped_calibration_file_holds_the_two_w6_moves():
+    """The W6 release: nationality 0.85 -> 0.80 and date 0.90 -> 0.85, each with its evidence. REVIEW_BELOW keeps v3.2's
+    values as the fallback, so losing the file only flags MORE fields."""
+    entries = json.loads((C.HERE / "calibration.json").read_text(encoding="utf-8"))["thresholds"]
+    assert set(entries) == {"nationality", "date"}
+    assert C.threshold("nationality") == 0.80 and C.threshold("date") == 0.85
+    assert C.REVIEW_BELOW["nationality"] == 0.85 and C.REVIEW_BELOW["date"] == 0.90
+    for kind, entry in entries.items():
+        assert entry["movedFrom"] == C.REVIEW_BELOW[kind] and entry["acceptedBecause"].strip()
+        assert abs(entry["reviewBelow"] - entry["movedFrom"]) <= C.CALIBRATION_MAX_MOVE + 1e-9
+    assert C.calibration_state() == "ok"
+
+
+def test_the_calibration_file_moves_a_threshold_and_an_env_override_still_wins(tmp_path, monkeypatch):
+    calibration_file(tmp_path, monkeypatch, {"hotelName": {"reviewBelow": 0.80, "movedFrom": 0.85,
+                                                           "acceptedBecause": "measured on the 95-page benchmark"}})
+    assert C.threshold("hotelName") == 0.80 and C.threshold("name") == 0.85  # untouched types keep REVIEW_BELOW
+    monkeypatch.setenv("OCR_MODEL_CONFIDENCE_HOTEL_NAME", "0.95")
+    assert C.threshold("hotelName") == 0.95
+
+
+@pytest.mark.parametrize("entry, why", [
+    ({"reviewBelow": 0.80, "movedFrom": 0.85}, "no acceptedBecause"),
+    ({"reviewBelow": 0.80, "movedFrom": 0.85, "acceptedBecause": "  "}, "empty acceptedBecause"),
+    ({"reviewBelow": 0.50, "movedFrom": 0.85, "acceptedBecause": "the all-data argmin"}, "moves further than ±0.05"),
+    ({"reviewBelow": 0.80, "acceptedBecause": "no previous value to clamp against"}, "no movedFrom"),
+    ({"reviewBelow": "0.80", "movedFrom": 0.85, "acceptedBecause": "a string"}, "not a number"),
+])
+def test_a_threshold_move_without_evidence_or_beyond_the_clamp_is_refused(tmp_path, monkeypatch, entry, why):
+    """§4 G6: no threshold moves without recorded held-out evidence, and none further than ±0.05 per release. A refused
+    file leaves REVIEW_BELOW in force -- more review, never a silently unflagged field -- and says so on /health."""
+    calibration_file(tmp_path, monkeypatch, {"hotelName": entry})
+    assert C.threshold("hotelName") == 0.85, why
+    assert C.calibration_state().startswith("rejected: "), why
+
+
+def test_an_unknown_field_type_is_refused(tmp_path, monkeypatch):
+    calibration_file(tmp_path, monkeypatch, {"roomNo": {"reviewBelow": 0.88, "movedFrom": 0.90, "acceptedBecause": "typo: the kind is 'room'"}})
+    assert C.threshold("room") == 0.90 and C.calibration_state().startswith("rejected: ")
+
+
+def test_a_missing_calibration_file_is_not_an_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("OCR_CALIBRATION_FILE", str(tmp_path / "absent.json"))
+    assert C.calibration() == {} and C.calibration_state() == "default"
+    assert C.threshold("nationality") == C.REVIEW_BELOW["nationality"]

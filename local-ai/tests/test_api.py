@@ -378,7 +378,7 @@ def test_master_data_that_never_loaded_is_an_error(client, tmp_path, monkeypatch
     import ocr_normalize as N
     broken = tmp_path / "broken.json"
     broken.write_text("{", encoding="utf-8")
-    cache = N._FileCache(N._load_master)
+    cache = N.FileCache(N._load_master)
     with pytest.raises(ValueError):
         cache.get(broken)
     with pytest.raises(ValueError):  # cached failure, re-raised without re-parsing
@@ -467,6 +467,21 @@ def test_non_form_image_is_unknown_and_nothing_is_read(client, fake_model):
 def test_health_reports_v3(client):
     body = client.get("/health").json()
     assert body["status"] == "ok" and body["version"] == "3.2" and body["engine"] == "typhoon-sections" and body["masterData"] == "ok"
+    assert body["calibration"] == "ok"  # the shipped calibration.json (plan §3 W6) loaded
+
+
+def test_a_refused_calibration_file_degrades_health_and_leaves_the_code_thresholds_in_force(client, fake_model, tmp_path, monkeypatch):
+    """A hand-edited calibration file that breaks §4 G6 may not change what is flagged: the page is still read, the
+    thresholds fall back to REVIEW_BELOW (more review, never a silently unflagged field) and monitoring sees it."""
+    import ocr_confidence as C
+    custom = tmp_path / "calibration.json"
+    custom.write_text(json.dumps({"thresholds": {"nationality": {"reviewBelow": 0.50, "movedFrom": 0.85,
+                                                                 "acceptedBecause": "the all-data argmin"}}}), encoding="utf-8")
+    monkeypatch.setenv("OCR_CALIBRATION_FILE", str(custom))
+    assert post(client, png_of(S.filled_form())).status_code == 200
+    health = client.get("/health").json()
+    assert health["status"] == "degraded" and health["calibration"].startswith("rejected: ")
+    assert C.threshold("nationality") == C.REVIEW_BELOW["nationality"]
 
 
 def test_combined_mode_sends_one_image_header_and_customer_rows_above_the_unchanged_staff_crop(client, fake_model, monkeypatch):

@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Review thresholds that have been moved off ocr_confidence.REVIEW_BELOW, each with the evidence for the move",
+    "(docs/operations/real-data/accuracy-learning-plan.md §3 W6, §4 G6, §8.6). The loader (ocr_confidence._load_calibration)",
+    "rejects the whole file unless every entry names a known field type, carries a non-empty 'acceptedBecause' and moves",
+    "its threshold by at most ±0.05 from the 'movedFrom' it replaces; a rejected file falls back to REVIEW_BELOW, which is",
+    "always the stricter, more-review direction. OCR_MODEL_CONFIDENCE_<TYPE> still overrides one entry for one deployment,",
+    "and deleting an entry restores its code default. Field types: name, nationality, hotelName, treatment, therapist,",
+    "room, formNumber, date, time, token. No customer data belongs in this file: counts, page numbers and field names only.",
+    "Every number below was produced by local-ai/tools/benchmark.py and tools/thresholds.py on the 95 stored production",
+    "answers with 0 model calls (the operator's data directory; --results results-prod)."
+  ],
+  "thresholds": {
+    "nationality": {
+      "reviewBelow": 0.80,
+      "movedFrom": 0.85,
+      "release": "W6, 2026-09-23",
+      "acceptedBecause": "Pre-specified ±0.05 clamp, not the all-data argmin (0.50 on this set), so the 95 pages evaluate the move instead of fitting it. Measured: right-but-flagged 11 -> 9 (2 pages leave the queue), wrong-and-unflagged 0 -> 0, no page changes right/wrong. Margin: the highest-confidence wrong nationality page sits at modelConfidence 0.574, 0.226 below the new threshold, and all 5 wrong pages are held by the 0.50 token floor or by a rule flag rather than by this threshold (wrong-and-unflagged stays 0 down to 0.00 on this set). Halves agree: odd right-but-flagged 5 -> 4, even 6 -> 5, silent errors 0 in both.",
+      "caveats": "In-sample only in the sense that the evaluation set is the same 95 labelled pages as every other W6 number; 5 wrong pages and 2 uncertain labels are all the evidence there is. The refit PROCEDURE that would choose 0.50 is what overfits (plan §10 item 6): leave-one-out and odd/even refits score no better than the fixed thresholds. Re-measure after W4 (a model run moves the token statistics) and on ≥ 200 confirmed documents before moving again."
+    },
+    "date": {
+      "reviewBelow": 0.85,
+      "movedFrom": 0.90,
+      "release": "W6, 2026-09-23",
+      "acceptedBecause": "Pre-specified ±0.05 clamp, not the all-data argmin (0.75 on this set). Measured: right-but-flagged 20 -> 19 (1 page leaves the queue), wrong-and-unflagged 0 -> 0, no page changes right/wrong. Margin: the highest-confidence wrong date page sits at modelConfidence 0.749, 0.101 below the new threshold; the first silent date error appears below 0.75. Halves agree: odd right-but-flagged 10 -> 9, even 10 -> 10, silent errors 0 in both.",
+      "caveats": "date is a digit field, so modelConfidence is already the weakest token's probability and the 0.50 token floor adds nothing: this threshold is the ONLY thing between a wrong date and a silent error. That is why the argmin 0.75 is not shipped -- it would clear the same wrong page by 0.001. 11 wrong pages, 3 uncertain labels. Re-measure after W4 and on ≥ 200 confirmed documents before moving again."
+    }
+  }
+}

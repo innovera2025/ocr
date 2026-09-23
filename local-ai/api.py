@@ -563,10 +563,13 @@ def process_image(image, document_id, source_file, started, extra_warnings=()):
 @app.get("/health")
 def health():
     master_state = N.master_state()  # never raises: /health must answer
-    # Not "ok" while master data is broken, so OcrClient.healthCheck and monitoring see it (HTTP stays 200).
-    return {"status": "ok" if master_state == "ok" else "degraded", "service": "innovera-ocr", "version": VERSION, "engine": ENGINE,
+    calibration_state = C.calibration_state()  # likewise; "rejected: ..." = the review thresholds are the code defaults
+    # Not "ok" while master data or the calibration file is broken, so OcrClient.healthCheck and monitoring see it
+    # (HTTP stays 200). A rejected calibration file only flags MORE fields, so it degrades review load, not accuracy.
+    return {"status": "ok" if master_state == "ok" and not calibration_state.startswith("rejected") else "degraded",
+            "service": "innovera-ocr", "version": VERSION, "engine": ENGINE,
             "schemaVersion": SCHEMA_VERSION, "model": ocr_model.model_name(), "pdfSupport": _pdf_renderer() is not None,
-            "masterData": master_state}
+            "masterData": master_state, "calibration": calibration_state}
 
 
 @app.post("/v1/ocr")

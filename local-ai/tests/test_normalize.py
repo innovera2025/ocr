@@ -199,7 +199,7 @@ def test_treatment_verified_memory_tries_name_raw_then_raw(retired_memory):
 def test_file_cache_keeps_last_good_value_when_a_changed_file_does_not_load(tmp_path):
     path = tmp_path / "master.json"
     path.write_text(N.master_path().read_text(encoding="utf-8"), encoding="utf-8")
-    cache = N._FileCache(N._load_master)
+    cache = N.FileCache(N._load_master)
     good = cache.get(path)
     path.write_text('{"treatments": [], "therapists": [], "nationalities": [],}', encoding="utf-8")
     assert cache.get(path) is good and isinstance(cache.error, ValueError)

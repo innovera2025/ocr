@@ -4,6 +4,7 @@
     python tools/benchmark.py --data <dir> --results results-v32            # any other stored run
     python tools/benchmark.py --data <dir> --freeze tools/baseline-....txt  # re-freeze after a scorer change
     python tools/benchmark.py --data <dir> --learning-loop                  # + the page-ordered confirmation replay (W3a)
+    python tools/benchmark.py --data <dir> --thresholds                     # + the review-threshold evidence (W6)
 
 No customer data lives in this repository. `--data` points at the operator's own directory, which must contain
 `labels.json` and a results directory of stored v3 responses (`pNNN.json`). Nothing but counts, page numbers, field names
@@ -25,7 +26,7 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parent)]
 sys.dont_write_bytecode = True
 
-from tools import learning_loop, replay, scoring  # noqa: E402
+from tools import learning_loop, replay, scoring, thresholds  # noqa: E402
 
 DEFAULT_BASELINE = HERE / "baseline-v3.2-prod-95.txt"
 COLUMNS = ("n", "right", "rightFlagged", "wrongFlagged", "wrongUnflagged", "markers", "uncertain", "want", "hit", "missed", "extra")
@@ -220,6 +221,8 @@ def main(argv=None):
     parser.add_argument("--no-baseline", action="store_true", help="report only, do not gate")
     parser.add_argument("--learning-loop", action="store_true", help="also replay the pages IN ORDER with the confirm route "
                                                                      "live (plan §1D, §3 W3a); the W3a invariant joins the gates")
+    parser.add_argument("--thresholds", action="store_true", help="also report what each review threshold costs and catches "
+                                                                  "(plan §3 W6, §8.6): a report, never a gate")
     parser.add_argument("--verified", type=Path, help="operator copy of the production corrections.jsonl. W3a made the confirm "
                                                       "route audit-only, so this ALSO re-enables the retired raw->value memory "
                                                       "in-process: archaeology only, never a candidate run")
@@ -250,6 +253,9 @@ def main(argv=None):
                      == [(f, {k: r[k] for k in COLUMNS}) for f, r in repeat[m][0].ordered()] for m in learning_loop.MODES)
         ok = learning_loop.print_report(runs) and stable and ok
         print(f"       {'PASS' if stable else 'FAIL'}  the page-ordered loop is deterministic across two runs (§4 G6)")
+
+    if args.thresholds:  # a report, not a gate: it changes nothing and never moves `ok`
+        thresholds.print_report(labels, pages)
 
     if args.freeze:
         scored_bad = {p for p, bad in mismatches.items() if any(b[1] not in ("source", "confidence") for b in bad)}

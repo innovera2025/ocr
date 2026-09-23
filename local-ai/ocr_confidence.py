@@ -8,15 +8,19 @@ its tokens is below the token floor (a mean over a long value hides one doubtful
 Ollama, a fake model) or when a value cannot be found in the answer, the field keeps its rule confidence.
 """
 
+import json
 import math
 import os
 import re
+from pathlib import Path
 
-from ocr_normalize import THAI_DIGITS
+from ocr_normalize import THAI_DIGITS, FileCache
 
-# Review threshold per field type on modelConfidence. Conservative first values (a wrong but confident-looking value is
-# the costly error); tune them on the next real-model run. OCR_MODEL_CONFIDENCE_<TYPE> overrides one, e.g.
-# OCR_MODEL_CONFIDENCE_NAME=0.9, OCR_MODEL_CONFIDENCE_HOTEL_NAME=0.8, OCR_MODEL_CONFIDENCE_FORM_NUMBER=0.95.
+HERE = Path(__file__).resolve().parent
+
+# v3.2's conservative review threshold per field type on modelConfidence (a wrong but confident-looking value is the
+# costly error). These are the FALLBACK: `calibration.json` may move one on recorded evidence (see `calibration()`),
+# and OCR_MODEL_CONFIDENCE_<TYPE> overrides both for one deployment, e.g. OCR_MODEL_CONFIDENCE_NAME=0.9.
 REVIEW_BELOW = {
     "name": 0.85, "nationality": 0.85, "hotelName": 0.85,  # names / free text
     "treatment": 0.80, "therapist": 0.80,
@@ -25,6 +29,7 @@ REVIEW_BELOW = {
 }
 DIGIT_KINDS = ("room", "formNumber", "date", "time")  # modelConfidence = the weakest token's probability, not the mean
 ENV_PREFIX = "OCR_MODEL_CONFIDENCE_"
+CALIBRATION_MAX_MOVE = 0.05  # accuracy-learning-plan.md \u00a74 G6 / \u00a78.6: at most this much per release, evidence recorded
 _REPLACEMENT = "\ufffd".encode("utf-8")
 
 # Where each field's value is searched first: after its printed label in the answer (then from the start of the answer).
@@ -36,12 +41,71 @@ _ANCHORS = {
 _SKIP_SOURCES = ("ink-mark", "none", "checkbox")  # not read by the model
 
 
+def calibration_path():
+    return Path(os.environ.get("OCR_CALIBRATION_FILE", str(HERE / "calibration.json")))
+
+
+def _load_calibration(path):
+    """{kind: reviewBelow} from the calibration file (accuracy-learning-plan.md §8.6). Every entry must name a field type
+    of REVIEW_BELOW, carry a non-empty `acceptedBecause` (§4 G6 forbids a threshold move whose held-out evidence is not
+    recorded), name in `movedFrom` the value it replaces, and move it by at most ±CALIBRATION_MAX_MOVE. A file that
+    breaks any of those is refused WHOLE -- never half applied, and never left on the value from before the edit:
+    REVIEW_BELOW comes back into force, which is always the stricter, more-review direction, and /health says so."""
+    if path is None:
+        return {}  # no calibration file: the code defaults are the calibration
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("thresholds", {}), dict):
+        raise ValueError(f"calibration {path}: must be a JSON object with an object 'thresholds'")
+    out = {}
+    for kind, entry in (data.get("thresholds") or {}).items():
+        if kind not in REVIEW_BELOW:
+            raise ValueError(f"calibration {path}: '{kind}' is not a field type ({', '.join(sorted(REVIEW_BELOW))})")
+        if not isinstance(entry, dict) or not isinstance(entry.get("acceptedBecause"), str) or not entry["acceptedBecause"].strip():
+            raise ValueError(f"calibration {path}: '{kind}' needs a non-empty 'acceptedBecause' (plan §4 G6)")
+        value, previous = entry.get("reviewBelow"), entry.get("movedFrom")
+        if not all(type(v) in (int, float) and 0.0 <= v <= 1.0 for v in (value, previous)):
+            raise ValueError(f"calibration {path}: '{kind}' needs a 'reviewBelow' and a 'movedFrom' between 0 and 1")
+        if abs(value - previous) > CALIBRATION_MAX_MOVE + 1e-9:
+            raise ValueError(f"calibration {path}: '{kind}' moves {previous} -> {value}, further than the "
+                             f"±{CALIBRATION_MAX_MOVE} one release may move a threshold (plan §4 G6)")
+        out[kind] = float(value)
+    return out
+
+
+_calibration_cache = FileCache(_load_calibration)
+
+
+def calibration():
+    """{kind: reviewBelow} currently in force from the calibration file ({} when there is none or it was refused)."""
+    values = _calibration_cache.get(calibration_path())
+    return {} if _calibration_cache.error is not None else values
+
+
+def calibration_state():
+    """'ok' / 'default' (no calibration file) / 'rejected: …' -- never raises, so /health can report it. A rejected file
+    means the thresholds below are REVIEW_BELOW's, not the operator's."""
+    try:
+        calibration()
+    except Exception as error:
+        return f"rejected: {error}"
+    if _calibration_cache.error is not None:
+        return f"rejected: {_calibration_cache.error}"
+    return "ok" if calibration_path().exists() else "default"
+
+
 def threshold(kind):
+    """The review threshold in force for a field type: the OCR_MODEL_CONFIDENCE_<TYPE> override, else the calibration
+    file, else REVIEW_BELOW. A broken calibration file falls back to REVIEW_BELOW instead of failing the read."""
     name = ENV_PREFIX + re.sub(r"(?<=[a-z])(?=[A-Z])", "_", kind).upper()  # hotelName -> OCR_MODEL_CONFIDENCE_HOTEL_NAME
     try:
         return max(0.0, min(1.0, float(os.environ[name])))
     except (KeyError, ValueError):
-        return REVIEW_BELOW[kind]
+        pass
+    try:
+        calibrated = calibration().get(kind)
+    except Exception:
+        calibrated = None  # /health reports it; a threshold must never fail a page
+    return REVIEW_BELOW[kind] if calibrated is None else calibrated
 
 
 class TokenMap:
