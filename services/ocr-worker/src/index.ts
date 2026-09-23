@@ -386,8 +386,8 @@ export function startWorkerLoops(dependencies: WorkerDependencies & MaintenanceD
   return { concurrency, done, stop: async () => { control.stop(); await done; } };
 }
 
-/** The newest migration this worker's SQL needs (`getWorkerDocument` reads the 0018 page columns). */
-export const REQUIRED_SCHEMA_VERSION = "0018_multipage_documents";
+/** The newest migration this worker's SQL needs (`markProcessing` writes the 0020 `processing_started_at`). */
+export const REQUIRED_SCHEMA_VERSION = "0020_batch_round_clock";
 
 /**
  * Refuses to start before the web has applied REQUIRED_SCHEMA_VERSION (it migrates at startup): a worker that claimed

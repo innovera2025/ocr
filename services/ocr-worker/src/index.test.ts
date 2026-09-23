@@ -202,16 +202,17 @@ test("heartbeat runs during OCR and its timer is cleared on success and on failu
   }
 });
 
-test("the worker refuses to start until the web applied 0018 (on an older schema every claimed job would fail with 42703)", async () => {
+test("the worker refuses to start until the web applied 0020 (on an older schema every claimed job would fail with 42703)", async () => {
   const seen: Array<{ sql: string; values: unknown[] | undefined }> = [];
   const pool = (applied: string[]) => ({ query: async (sql: string, values?: unknown[]) => {
     seen.push({ sql, values });
     return { rowCount: applied.includes(String(values?.[0])) ? 1 : 0 };
   } });
-  assert.equal(REQUIRED_SCHEMA_VERSION, "0018_multipage_documents");
-  await assert.rejects(assertSchemaReady(pool(["0016_fair_queue", "0017_batch_processing"])), /^Error: SCHEMA_NOT_READY: migration 0018_multipage_documents is not applied yet/);
-  await assertSchemaReady(pool(["0017_batch_processing", "0018_multipage_documents"]));
-  assert.deepEqual(seen.at(-1), { sql: "SELECT 1 FROM schema_migrations WHERE version = $1", values: ["0018_multipage_documents"] });
+  // Deploy B raises the gate: markProcessing writes 0020's processing_started_at, so a worker on 0019 fails every claim.
+  assert.equal(REQUIRED_SCHEMA_VERSION, "0020_batch_round_clock");
+  await assert.rejects(assertSchemaReady(pool(["0018_multipage_documents", "0019_user_auth"])), /^Error: SCHEMA_NOT_READY: migration 0020_batch_round_clock is not applied yet/);
+  await assertSchemaReady(pool(["0019_user_auth", "0020_batch_round_clock"]));
+  assert.deepEqual(seen.at(-1), { sql: "SELECT 1 FROM schema_migrations WHERE version = $1", values: ["0020_batch_round_clock"] });
   assert.match(readFileSync(new URL("./index.ts", import.meta.url), "utf8"), /await assertDatabaseReady\(pool\);\s*await assertSchemaReady\(pool\);/, "startWorkerRuntime checks the schema before any loop claims a job");
 });
 

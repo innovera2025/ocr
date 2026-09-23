@@ -772,6 +772,37 @@ test("the batch strip counts files and rows separately and trusts the server's f
   assert.doesNotMatch($("batch-title").textContent, /อ่านครบแล้ว/, "1 file, 1 of 6 rows read: not finished (the old files-vs-rows rule said it was)");
 });
 
+test("a reopened round shows '—' until its first claim, then counts from that claim and from the round's completions", () => {
+  const { wb, $ } = load(() => new Promise(() => undefined));
+  // Uploaded hours ago, one page retried just now: the retry is queued and the server has no duration to give yet.
+  const reopened = { batchId: ID, label: null, createdAt: "2026-09-22T01:00:00.000Z", expectedTotal: 1, uploaded: 1,
+    rows: 95, pages: 95, pagesExpected: 95, splitting: 0, rowsExpected: 95, queued: 1, processing: 0, succeeded: 93,
+    needsReview: 0, failed: 1, confirmed: 0, completed: 94, finished: false, finishedAt: null, durationMs: null,
+    throughputPerMinute: null, roundOpenedAt: "2026-09-22T05:00:00.000Z", roundStartedAt: null, roundCompleted: 0 };
+  wb.state.batchId = ID;
+  wb.state.batch = reopened;
+  wb.renderBatch();
+  const waiting = $("batch-stats").textContent;
+  assert.match(waiting, /เวลาที่ใช้—/, "a fallback to createdAt would print the four idle hours since the upload");
+  assert.match(waiting, /หน้า\/นาที—/, "and a rate near 0 beside it — the Release 1 symptom this carry-over removes");
+  assert.doesNotMatch(waiting, /เอกสาร\/นาที/, "the rows are pages: one PDF is 95 of them");
+  assert.match($("batch-meta").textContent, /รอเริ่มอ่านรอบใหม่/);
+  // The worker claimed it: the server sends the round's own duration and rate, and the meta line names the round.
+  wb.state.batch = { ...reopened, queued: 0, processing: 0, succeeded: 94, completed: 95, finished: true,
+    finishedAt: "2026-09-22T05:03:00.000Z", durationMs: 120_000, throughputPerMinute: 0.5,
+    roundStartedAt: "2026-09-22T05:01:00.000Z", roundCompleted: 1 };
+  wb.renderBatch();
+  assert.match($("batch-stats").textContent, /เวลาที่ใช้2:00/);
+  assert.match($("batch-stats").textContent, /หน้า\/นาที0\.5/);
+  assert.match($("batch-meta").textContent, /รอบอ่านใหม่ เริ่ม /);
+  // No server numbers (a poll between rounds): the client falls back to the round's start and the round's completions.
+  wb.state.batch = { ...reopened, queued: 0, processing: 1, succeeded: 94, completed: 95, durationMs: null,
+    throughputPerMinute: null, roundStartedAt: new Date(Date.now() - 120_000).toISOString(), roundCompleted: 1 };
+  wb.renderBatch();
+  assert.match($("batch-stats").textContent, /เวลาที่ใช้2:0\d/, "the fallback start is the round's first claim, not createdAt");
+  assert.match($("batch-stats").textContent, /หน้า\/นาที0\.5/, "the fallback rate counts the round's completions, not all 95");
+});
+
 test("the drawer of a page is titled 'file.pdf · หน้า 12/95' and opens the original PDF at that page", async () => {
   const { wb, $, fetches } = load(async () => json(200, {}));
   wb.applyDocument({ ...page12, structuredResult: { schemaVersion: 3, header: { formNumber: { raw: "012345", value: "012345", confidence: 0.9, source: "ocr", needsReview: false } }, customerInformation: {}, recommendationCard: {},

@@ -796,6 +796,27 @@ test("staff are refused the admin and export routes, and the denial is audited a
   });
 });
 
+test("the admin role carries export by itself, and can_export is not one of the self guards", async () => {
+  const h = harness();
+  await withServer(h, async (base) => {
+    // What `ocr-users create-admin` writes: the bootstrap admin owns the tenant but carries can_export = false.
+    assert.equal(h.store.users.find((user) => user.id === ownerId)!.canExport, false);
+    const owner = await signedIn(base, "owner1", OWNER_PASSWORD);
+    // D8: the flag gates the export file for STAFF. An admin passes the gate on the role alone, so the only admin of a
+    // fresh tenant is never locked out of the export. Past the gate the Deploy B handlers are still missing: 404, not 403.
+    for (const path of ["/api/exports/preview", "/api/exports/documents.csv", "/api/exports/documents.jsonl"]) {
+      const response = await fetch(`${base}${path}`, { headers: authHeaders(owner) });
+      assert.equal(response.status, 404, path);
+      assert.deepEqual(await body(response), { status: "not_found" });
+    }
+    // §5 C6 guards your own role and your own disabled state — not your own flags — so an admin can still turn it on.
+    const granted = await fetch(`${base}/api/users/${ownerId}`, { method: "POST", headers: { ...authHeaders(owner), "content-type": "application/json" }, body: JSON.stringify({ canExport: true }) });
+    assert.equal(granted.status, 200);
+    assert.equal(((await body(granted)).user as UserListItem).canExport, true);
+    assert.equal(h.store.users.find((user) => user.id === ownerId)!.canExport, true);
+  });
+});
+
 test("an admin creates and updates users, with the self guards and the one-time password", async () => {
   const h = harness();
   await withServer(h, async (base) => {

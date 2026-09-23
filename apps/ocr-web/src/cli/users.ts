@@ -192,8 +192,10 @@ async function run(parsed: Parsed, ctx: Run): Promise<void> {
 
 /**
  * The bootstrap admin owns a password they chose themselves, so `must_change_password` is false and there is no
- * 72-hour temporary window: there is no one else to hand it over to. Export rights follow the admin role, so the flag
- * stays off.
+ * 72-hour temporary window: there is no one else to hand it over to. `can_export` stays off because the **role**
+ * carries the export right (D8, and `hasRight` in `../auth.ts`): the flag gates the export file for staff only, so the
+ * first admin of a fresh tenant reaches the export without it — and may still turn it on for itself, since §5 C6's
+ * self guards cover your own role and your own disabled state, not your own flags.
  */
 async function createAdmin(flags: Flags, ctx: Run): Promise<void> {
   if (await ctx.store.countActiveAdmins() > 0) throw new CliError("ADMIN_EXISTS");

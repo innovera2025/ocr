@@ -110,9 +110,15 @@ export type BatchSummary = { batchId: string; label: string | null; createdAt: s
   /** Every promised file arrived and no row is queued or processing (so every page exists and was read). */
   finished: boolean;
   finishedAt: string | null /* last completion, once finished */;
-  durationMs: number | null /* createdAt → last completion once finished, or once nothing is queued or processing and
-    nothing arrived or completed for 5 minutes (fewer files than expected arrived), else → now; null before the first upload */;
-  throughputPerMinute: number | null /* completed per minute of durationMs */ };
+  durationMs: number | null /* the round's start → last completion once finished, or once nothing is queued or processing
+    and nothing arrived or completed for 5 minutes (fewer files than expected arrived), else → now; null before the first
+    upload, and null while a reopened round waits for its first claim */;
+  throughputPerMinute: number | null /* completions per minute of durationMs: the round's completions while a round is open */;
+  /** D11, the batch clock. A retry into an idle batch opens a new round; a never-retried batch keeps `createdAt` and has
+   * all three null. `roundStartedAt` is the first claim of that round, so it stays null until the worker picks a row up. */
+  roundOpenedAt: string | null;
+  roundStartedAt: string | null;
+  roundCompleted: number /* rows completed since the round opened; 0 while no round is open */ };
 /** `createdBy` is `users.id` (§6 D9); `audit` writes `batch.created` in the same transaction. */
 export type CreateBatchInput = { createdBy: string; expectedTotal: number; label?: string | null | undefined; audit?: AuditContext | undefined };
 export type DocumentListItem = { documentId: string; batchId: string | null; filename: string; mimeType: string;
@@ -219,7 +225,10 @@ FROM documents d ${PARENT_JOIN} WHERE d.id = $1::uuid AND d.organization_id = $2
  * Counters are derived from document rows on every read (nothing stored, nothing to drift). `uploaded` counts files
  * (top-level documents), the status counters count visible rows (SPLIT parents match none of them).
  */
-const BATCH_SELECT = `SELECT b.id, b.label, b.created_at, b.expected_total, now() AS db_now,
+const BATCH_SELECT = `SELECT b.id, b.label, b.created_at, b.expected_total, now() AS db_now, b.round_opened_at,
+  min(d.processing_started_at) FILTER (WHERE b.round_opened_at IS NOT NULL AND d.processing_started_at >= b.round_opened_at) AS round_started_at,
+  count(d.id) FILTER (WHERE b.round_opened_at IS NOT NULL AND d.status IN ('SUCCEEDED','NEEDS_REVIEW','FAILED','QUARANTINED')
+    AND COALESCE(d.processed_at, d.updated_at) >= b.round_opened_at)::int AS round_completed,
   count(d.id) FILTER (WHERE d.parent_document_id IS NULL)::int AS uploaded,
   count(d.id) FILTER (WHERE d.status <> 'SPLIT')::int AS rows,
   count(d.id) FILTER (WHERE d.parent_document_id IS NOT NULL)::int AS pages,
@@ -279,12 +288,20 @@ export function toBatchSummary(row: Row): BatchSummary {
   const lastActivity = Math.max(lastCompleted ?? 0, ms(row.last_created_at) ?? 0);
   const idle = uploaded > 0 && queued + processing === 0 && lastCompleted !== null && now - lastActivity >= BATCH_IDLE_AFTER_MS;
   const end = finished || idle ? lastCompleted! : now;
-  const durationMs = uploaded > 0 ? Math.max(0, end - createdAt) : null;
-  const throughputPerMinute = completed > 0 && durationMs !== null && durationMs > 0 ? Math.round((completed / (durationMs / 60_000)) * 100) / 100 : null;
+  // D11: a retry into an idle batch opens a round, and the clock then counts from that round's FIRST CLAIM, not from
+  // the upload hours earlier. Until the worker claims a row the start is unknown, so there is no duration to show and
+  // no rate to compute — a wrong number is worse than "—" (the reopened row may sit behind another batch for ~40 min).
+  const roundOpenedAt = iso(row.round_opened_at), roundStartedAt = iso(row.round_started_at);
+  const roundCompleted = num(row.round_completed);
+  const start = roundOpenedAt === null ? createdAt : ms(row.round_started_at);
+  const counted = roundOpenedAt === null ? completed : roundCompleted;
+  const durationMs = uploaded > 0 && start !== null ? Math.max(0, end - start) : null;
+  const throughputPerMinute = counted > 0 && durationMs !== null && durationMs > 0 ? Math.round((counted / (durationMs / 60_000)) * 100) / 100 : null;
   return { batchId: String(row.id), label: str(row.label), createdAt: iso(row.created_at) ?? "", expectedTotal, uploaded,
     rows, pages, pagesExpected, splitting: num(row.splitting), rowsExpected,
     queued, processing, succeeded, needsReview, failed, confirmed: num(row.confirmed), completed,
-    finished, finishedAt: finished ? iso(row.last_completed_at) : null, durationMs, throughputPerMinute };
+    finished, finishedAt: finished ? iso(row.last_completed_at) : null, durationMs, throughputPerMinute,
+    roundOpenedAt, roundStartedAt, roundCompleted };
 }
 
 /** Canonical view of a row; a confirmed row (see REVIEWED_AT_SQL) has nothing left to review. */
@@ -502,9 +519,14 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; } finally { client.release(); }
   }
 
+  /**
+   * The worker claimed the document. `processing_started_at` is the FIRST claim since the row was (re)queued (D11, the
+   * batch clock): COALESCE keeps it across a queue retry (`markRetrying` leaves it alone), and only `retryDocument`
+   * clears it. ocr_worker's table-level UPDATE on documents (0009) already covers the new column.
+   */
   async markProcessing(tenantId: string, documentId: string): Promise<void> {
     const client = await this.pool.connect();
-    try { await client.query("BEGIN"); await client.query("SELECT set_config('app.current_org', $1, true)", [tenantId]); const result = await client.query("UPDATE documents SET status='PROCESSING', error_message=NULL, updated_at=now() WHERE id=$1::uuid AND organization_id=$2::uuid", [documentId, tenantId]); if (result.rowCount !== 1) throw new Error("DOCUMENT_NOT_FOUND_OR_FORBIDDEN"); await client.query("COMMIT"); }
+    try { await client.query("BEGIN"); await client.query("SELECT set_config('app.current_org', $1, true)", [tenantId]); const result = await client.query("UPDATE documents SET status='PROCESSING', error_message=NULL, processing_started_at=COALESCE(processing_started_at, now()), updated_at=now() WHERE id=$1::uuid AND organization_id=$2::uuid", [documentId, tenantId]); if (result.rowCount !== 1) throw new Error("DOCUMENT_NOT_FOUND_OR_FORBIDDEN"); await client.query("COMMIT"); }
     catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; } finally { client.release(); }
   }
 
@@ -853,7 +875,16 @@ export class PostgresOcrDocumentStore implements ReviewStore {
          FROM document_runs r WHERE r.organization_id=$1::uuid AND r.document_id=$2::uuid ORDER BY r.created_at DESC LIMIT 1`, [tenantId, documentId]);
       const latest = run.rows[0];
       if (!latest || (!latest.queued && document.rows[0].is_page !== true)) throw new Error("DOCUMENT_NOT_RETRYABLE");
-      await client.query("UPDATE documents SET status='CLEAN', error_message=NULL, updated_at=now() WHERE id=$1::uuid AND organization_id=$2::uuid", [documentId, tenantId]);
+      // D11, the batch clock: a retry landing in an IDLE batch opens a new processing round, so the strip stops counting
+      // from an upload that may be hours old. A retry while the batch is still busy joins the running round and changes
+      // nothing. `now()` is the transaction start, always earlier than the claim that will set processing_started_at.
+      await client.query(
+        `UPDATE ocr_batches b SET round_opened_at = now()
+         WHERE b.organization_id = $1::uuid AND b.id = (SELECT batch_id FROM documents WHERE id = $2::uuid AND organization_id = $1::uuid)
+           AND NOT EXISTS (SELECT 1 FROM documents x WHERE x.organization_id = b.organization_id AND x.batch_id = b.id AND x.id <> $2::uuid
+                           AND x.deleted_at IS NULL AND x.status IN ('VALIDATING','SCANNING','CLEAN','PROCESSING'))`,
+        [tenantId, documentId]);
+      await client.query("UPDATE documents SET status='CLEAN', error_message=NULL, processing_started_at=NULL, updated_at=now() WHERE id=$1::uuid AND organization_id=$2::uuid", [documentId, tenantId]);
       const job = await client.query<{ id: string }>(
         "INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, available_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'OCR', 'PENDING', now()) RETURNING id",
         [tenantId, latest.id]);

@@ -77,7 +77,10 @@ test("the grant checks of plan A2 exist in verify-db-roles.sh and in verify-rele
     "app:no-update-users-org", "app:no-update-users-username", "app:no-update-audit", "app:no-update-session-identity",
     "worker:no-select-users", "worker:no-select-sessions", "worker:no-select-audit",
     "queue:no-select-users", "queue:no-select-sessions", "queue:no-select-audit",
-    "definer:no-users", "definer:no-sessions", "definer:no-audit", "force-rls:release2"];
+    "definer:no-users", "definer:no-sessions", "definer:no-audit", "force-rls:release2",
+    // 0020 (§9 G1) rides in the same two lists: the batch clock's one column-level UPDATE, and the column beside it
+    // that must stay immutable. test/batch-round-migration.test.ts pins the exact SQL of both.
+    "app:update-batch-round", "app:no-update-batch-label"];
   const lines = script.split("\n").filter((line) => checks.some((name) => line.startsWith(`check_sql "${name}"`)));
   assert.equal(lines.length, checks.length, "every A2 check is a check_sql line");
   for (const name of checks) assert.ok(verify.includes(`'${name}'`), `verify-release2-grants.sql is missing ${name}`);

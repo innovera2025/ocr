@@ -170,7 +170,9 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     batchA = created.batchId;
     const { batchId: _id, createdAt: _created, ...counters } = created;
     assert.deepEqual(counters, { label: "Morning intake", expectedTotal: 3, uploaded: 0, rows: 0, pages: 0, pagesExpected: 0, splitting: 0, rowsExpected: 3, queued: 0, processing: 0,
-      succeeded: 0, needsReview: 0, failed: 0, confirmed: 0, completed: 0, finished: false, finishedAt: null, durationMs: null, throughputPerMinute: null });
+      succeeded: 0, needsReview: 0, failed: 0, confirmed: 0, completed: 0, finished: false, finishedAt: null, durationMs: null, throughputPerMinute: null,
+      // 0020: a batch that was never retried has no round, so the clock still starts at createdAt.
+      roundOpenedAt: null, roundStartedAt: null, roundCompleted: 0 });
     assert.ok(Date.parse(created.createdAt) > 0);
     batchB = (await app.createBatch(TENANT_B, { createdBy: "user-b", expectedTotal: 1 })).batchId;
     assert.deepEqual(await app.getBatch(TENANT_A, batchA), created);
@@ -667,7 +669,7 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     assert.equal((await superDb.query<{ ok: boolean }>("SELECT has_any_column_privilege('ocr_worker', 'extraction_jobs', 'SELECT') AS ok")).rows[0]!.ok, false);
     const functions = await superDb.query<{ proname: string }>("SELECT proname FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND prokind = 'f' AND proname LIKE 'ocr%' ORDER BY proname");
     assert.deepEqual(functions.rows.map((row) => row.proname), ["ocr_claim_confirm_outbox_v1", "ocr_claim_v1", "ocr_finish_confirm_outbox_v1", "ocr_finish_retry_v1", "ocr_finish_v1",
-      "ocr_heartbeat_v1", "ocr_recover_confirm_outbox_v1", "ocr_recover_expired_v1"], "0018 and 0019 created no function");
+      "ocr_heartbeat_v1", "ocr_recover_confirm_outbox_v1", "ocr_recover_expired_v1"], "0019 and 0020 created no function");
     // CHECK: a page number needs a parent and vice versa; bounds 1..1000.
     const parent = await uploadFile(TENANT_A, "shape.pdf", "application/pdf");
     for (const [parentId, page, count] of [[null, 1, null], [parent.documentId, null, 3], [parent.documentId, 0, 3], [parent.documentId, 1, 1001]] as const) {
@@ -1127,5 +1129,79 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     const rows = await withTenant(appPool, TENANT_A, async (client) => (await client.query<{ count: number }>("SELECT count(*)::int AS count FROM users")).rows,
       { readOnly: true, statementTimeoutMs: 5_000, idleInTransactionTimeoutMs: 5_000 });
     assert.ok(rows[0]!.count > 0, "reading under the tenant still works");
+  });
+
+  // ---- 0020: the batch clock (§9 Workstream G) -------------------------------------------------------------------
+
+  test("0020 grants ocr_app the round column of ocr_batches and nothing else on that table", async () => {
+    assert.ok(applied.indexOf("0020_batch_round_clock") > applied.indexOf("0019_user_auth"), applied.join(","));
+    // The worker's startup gate (services/ocr-worker assertSchemaReady) runs exactly this query as ocr_worker.
+    assert.equal((await workerPool.query("SELECT 1 FROM schema_migrations WHERE version = $1", ["0020_batch_round_clock"])).rowCount, 1);
+    const canUpdate = async (column: string) =>
+      (await superDb.query<{ ok: boolean }>("SELECT has_column_privilege('ocr_app','public.ocr_batches',$1,'UPDATE') AS ok", [column])).rows[0]!.ok;
+    assert.deepEqual(await Promise.all(["round_opened_at", "label", "expected_total", "created_at"].map(canUpdate)), [true, false, false, false]);
+    assert.equal((await superDb.query<{ ok: boolean }>("SELECT has_table_privilege('ocr_app','public.ocr_batches','UPDATE') AS ok")).rows[0]!.ok, false,
+      "a column grant only: `UPDATE ocr_batches SET label=…` must still be refused");
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 1 });
+    await assert.rejects(asApp(TENANT_A, "UPDATE ocr_batches SET label='renamed' WHERE id=$1::uuid", [batch.batchId]), { code: "42501" });
+    await assert.rejects(asWorker(TENANT_A, "UPDATE ocr_batches SET round_opened_at=now() WHERE id=$1::uuid", [batch.batchId]), { code: "42501" },
+      "the worker never opens a round; it only stamps its own first claim on the document");
+  });
+
+  test("the batch clock: a retry into an idle batch opens a round, and the strip shows nothing until the first claim", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3 });
+    const started = async (documentId: string) =>
+      (await superDb.query<{ at: Date | null }>("SELECT processing_started_at AS at FROM documents WHERE id=$1", [documentId])).rows[0]!.at;
+    const round = async () => (await superDb.query<{ at: Date | null }>("SELECT round_opened_at AS at FROM ocr_batches WHERE id=$1", [batch.batchId])).rows[0]!.at;
+
+    // One document read and confirmed in the first round; the second fails.
+    const good = await upload(app, TENANT_A, "round-good.png", { batchId: batch.batchId });
+    await app.updateScanStatus(TENANT_A, good.documentId, "CLEAN");
+    await appQueue.enqueue({ organizationId: TENANT_A, runId: good.runId });
+    await worker.markProcessing(TENANT_A, good.documentId);
+    await saveResult(TENANT_A, good.documentId, { ...cleanResponse, documentId: `local-${randomUUID()}` });
+    const bad = await upload(app, TENANT_A, "round-bad.png", { batchId: batch.batchId });
+    await app.updateScanStatus(TENANT_A, bad.documentId, "CLEAN");
+    await appQueue.enqueue({ organizationId: TENANT_A, runId: bad.runId });
+    await worker.markProcessing(TENANT_A, bad.documentId);
+    const firstClaim = await started(bad.documentId);
+    assert.ok(firstClaim, "markProcessing stamps the claim");
+    await worker.markProcessing(TENANT_A, bad.documentId);
+    assert.deepEqual(await started(bad.documentId), firstClaim, "COALESCE: a queue retry of the same round keeps the FIRST claim");
+    await worker.markRetrying(TENANT_A, bad.documentId, "HTTP 503");
+    await worker.markProcessing(TENANT_A, bad.documentId);
+    assert.deepEqual(await started(bad.documentId), firstClaim, "markRetrying leaves it alone, so a queue retry is the same round");
+    await worker.markFailure(TENANT_A, bad.documentId, "HTTP 503");
+    assert.equal(await round(), null, "no retry yet: a never-retried batch keeps createdAt");
+
+    // Two hours pass and a staff member clicks ลองอีกครั้ง. The batch is idle, so the retry opens a new round.
+    await superDb.query("UPDATE ocr_batches SET created_at = now() - interval '2 hours' WHERE id = $1", [batch.batchId]);
+    await superDb.query("UPDATE documents SET created_at = now() - interval '2 hours' WHERE batch_id = $1", [batch.batchId]);
+    await app.retryDocument(TENANT_A, bad.documentId);
+    const opened = await round();
+    assert.ok(opened, "a retry into an idle batch opens a round");
+    assert.equal(await started(bad.documentId), null, "the retry clears the claim: the new round has not started yet");
+    const waiting = (await app.getBatch(TENANT_A, batch.batchId))!;
+    assert.equal(waiting.roundOpenedAt, opened.toISOString());
+    assert.deepEqual([waiting.roundStartedAt, waiting.durationMs, waiting.throughputPerMinute], [null, null, null],
+      "before the first claim there is no honest number: the old code showed the two idle hours and a rate near 0");
+
+    // The worker claims it: the clock runs from that claim, and only this round's completion counts.
+    await worker.markProcessing(TENANT_A, bad.documentId);
+    const claim = await started(bad.documentId);
+    assert.ok(claim && claim >= opened, "the claim is inside the round `now()` opened");
+    const running = (await app.getBatch(TENANT_A, batch.batchId))!;
+    assert.equal(running.roundStartedAt, claim.toISOString());
+    assert.ok(running.durationMs !== null && running.durationMs < 60_000, `the round's own elapsed time, not two hours (got ${running.durationMs} ms)`);
+    await saveResult(TENANT_A, bad.documentId, { ...cleanResponse, documentId: `local-${randomUUID()}` });
+    const done = (await app.getBatch(TENANT_A, batch.batchId))!;
+    assert.deepEqual([done.completed, done.roundCompleted], [2, 1], "the all-time counter stays; the round counts only what it read");
+
+    // A retry while the batch is still busy joins the running round instead of restarting the clock.
+    const busy = await upload(app, TENANT_A, "round-busy.png", { batchId: batch.batchId });
+    assert.equal((await app.getBatch(TENANT_A, batch.batchId))!.queued, 1, `${busy.documentId} keeps the batch busy`);
+    await worker.markFailure(TENANT_A, bad.documentId, "HTTP 503 again");
+    await app.retryDocument(TENANT_A, bad.documentId);
+    assert.deepEqual(await round(), opened, "a retry into a busy batch joins the running round");
   });
 });

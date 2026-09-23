@@ -1985,3 +1985,39 @@ write the deviation down instead of diverging silently.
   refusal of password flags and files, the compose keys, the preflight checks and the alert rules). Its
   forbidden-text assertions run against comment-stripped sources, exactly as `test/batch-migration.test.ts:8` does
   for SQL, because these files explain in prose why they take no password.
+
+**C8 (0020, the batch clock in the store, the worker gate, the strip, and the `can_export` check)**
+
+- **The reported `can_export` lock-out does not reproduce, so C8 pins the behaviour instead of changing it.** The
+  report was that `create-admin` writes `can_export = false` (`cli/users.ts:205`) while the user-update guard refuses
+  your own flags, leaving production's only admin unable to export. Neither half holds in the shipped code:
+  `hasRight` is `right === "admin" ? ctx.role === "admin" : ctx.role === "admin" || ctx.canExport`
+  (`apps/ocr-web/src/auth.ts:237-239`), which is exactly D8's table — the admin row is ✓ for export — and the route
+  guard refuses only your own `role` and your own `disabled` (`auth-routes.ts:322`), never `canExport`. So the first
+  admin of a fresh tenant reaches `/api/exports/*` on the role alone **and** may still turn the flag on for itself.
+  The smallest correct fix is therefore no code change but a regression test: `auth.test.ts` now signs in the
+  bootstrap admin (`can_export = false`, as the CLI writes it), asserts all three export routes answer 404 rather
+  than 403 — past the gate, handlers still to come in C10 — and then grants the flag to itself through
+  `POST /api/users/:id`. An `ocr-users grant-export` subcommand would have added a break-glass path for a lock-out
+  that cannot happen, and "admin implies export" is already D8's wording. The CLI comment now names D8 and
+  `hasRight` so the next reader does not re-derive this.
+- **`BatchSummary` gains three fields, so the whole-object pin in `batch.db.test.ts` had to list them.** G4 adds
+  `roundOpenedAt`, `roundStartedAt` and `roundCompleted`; the create/get/list case compares the entire summary with
+  `deepEqual`, so it now spells out `null, null, 0` — which is the same statement §12 asks for elsewhere, that a
+  never-retried batch is unchanged. `index.test.ts:130` is untouched.
+- **`throughputPerMinute`'s own guard moved with the counter.** G4 says the throughput counter is `round_completed`
+  while a round is open. The guard `completed > 0` became `counted > 0`, so a reopened round that has claimed a row
+  but finished none shows `—` instead of a rate derived from the previous round's completions.
+- **The worker-gate test changed every name in the case, not only the pinned constant.** §12 pins
+  `index.test.ts:211`; the surrounding case also asserted the `SCHEMA_NOT_READY` message and the query parameter
+  against 0018. All three now read `0020_batch_round_clock`, and the "older schema" branch passes
+  `0018 + 0019` — what production runs between Deploy A and Deploy B, which is the state the gate exists for.
+- **`deploy/README.md` is updated here, as C7's deviation promised.** E6 asked for ":15 for the 0020 worker gate";
+  C7 left it naming 0018 because the gate only moves now. The gate sentence names `0020_batch_round_clock`; the
+  deploy-order sentence above it **lost** its migration number instead of gaining a new one, because it describes the
+  shape of a deploy ("the web migrates, then the worker"), not which migration is current.
+- **Where the two new grant checks are asserted.** A2 adds `app:update-batch-round` and `app:no-update-batch-label`
+  to the A2 list, so both names join the list in `test/user-auth-migration.test.ts` — that is what keeps
+  `lines.length === checks.length` meaning "every check is a `check_sql` line". Their exact SQL is pinned in the new
+  `test/batch-round-migration.test.ts`, next to the migration that grants them, and the DB suite proves the grant
+  itself (`ocr_app` may write `round_opened_at`, may not write `label`, and `ocr_worker` may write neither).

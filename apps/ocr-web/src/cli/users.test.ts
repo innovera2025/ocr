@@ -138,6 +138,7 @@ test("create-admin inserts one admin under the tenant and prints only the succes
   assert.equal(created.displayName, "ผู้ดูแลระบบ");
   assert.equal(created.role, "admin");
   assert.equal(created.temporary, false);
+  // D8: the admin ROLE carries the export right (auth.test.ts pins the gate), so the flag stays off here.
   assert.equal(created.canExport, false);
   assert.equal(created.passwordHash, FAKE_HASH);
   assert.equal(created.audit.actorUserId, null);

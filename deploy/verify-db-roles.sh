@@ -47,5 +47,9 @@ check_sql "definer:no-users" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_pr
 check_sql "definer:no-sessions" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_queue_definer','public.auth_sessions','SELECT')::int" 0
 check_sql "definer:no-audit" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_queue_definer','public.audit_events','SELECT')::int" 0
 check_sql "force-rls:release2" "$DATABASE_URL_BOOTSTRAP" "SELECT bool_and(relforcerowsecurity) FROM pg_class WHERE relname IN ('users','auth_sessions','audit_events')" t
+# 0020: round_opened_at is the only column of ocr_batches the web runtime may change (the batch clock). The label and
+# the capacity stay as they were created, so a compromised web process can neither relabel nor resize a batch.
+check_sql "app:update-batch-round" "$DATABASE_URL_BOOTSTRAP" "SELECT has_column_privilege('ocr_app','public.ocr_batches','round_opened_at','UPDATE')::int" 1
+check_sql "app:no-update-batch-label" "$DATABASE_URL_BOOTSTRAP" "SELECT has_column_privilege('ocr_app','public.ocr_batches','label','UPDATE')::int" 0
 printf 'SUMMARY PASS=%s FAIL=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

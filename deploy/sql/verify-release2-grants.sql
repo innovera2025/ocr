@@ -26,7 +26,11 @@ WITH checks(seq, name, ok) AS (VALUES
   (16, 'definer:no-sessions',            NOT has_any_column_privilege('ocr_queue_definer','public.auth_sessions','SELECT')),
   (17, 'definer:no-audit',               NOT has_any_column_privilege('ocr_queue_definer','public.audit_events','SELECT')),
   -- FORCE RLS on the three new tables is machine-checked, not eyeballed.
-  (18, 'force-rls:release2',             (SELECT bool_and(relforcerowsecurity) FROM pg_class WHERE relname IN ('users','auth_sessions','audit_events')))
+  (18, 'force-rls:release2',             (SELECT bool_and(relforcerowsecurity) FROM pg_class WHERE relname IN ('users','auth_sessions','audit_events'))),
+  -- 0020: the batch clock. round_opened_at is the only column of ocr_batches the web runtime may change; the label
+  -- and the capacity stay as they were created.
+  (19, 'app:update-batch-round',         has_column_privilege('ocr_app','public.ocr_batches','round_opened_at','UPDATE')),
+  (20, 'app:no-update-batch-label',      NOT has_column_privilege('ocr_app','public.ocr_batches','label','UPDATE'))
 )
 SELECT line FROM (
   SELECT seq, (CASE WHEN ok THEN 'PASS ' ELSE 'FAIL ' END) || name AS line FROM checks

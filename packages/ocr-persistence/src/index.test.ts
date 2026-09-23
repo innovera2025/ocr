@@ -142,3 +142,23 @@ test("batch summary: files still arriving keep a batch open; a failed split is a
   const empty = toBatchSummary(batchRow({ uploaded: 0, rows: 0, last_created_at: null }));
   assert.deepEqual([empty.finished, empty.durationMs, empty.throughputPerMinute], [false, null, null]);
 });
+
+test("batch clock (D11): a retried batch counts from the round's first claim, not from an upload hours earlier", () => {
+  // A never-retried batch is untouched: createdAt → the last completion, and every all-time completion counts.
+  const plain = toBatchSummary(batchRow({ rows: 2, succeeded: 2, last_completed_at: new Date("2026-09-22T01:20:00Z") }));
+  assert.deepEqual([plain.roundOpenedAt, plain.roundStartedAt, plain.roundCompleted], [null, null, 0]);
+  assert.deepEqual([plain.durationMs, plain.throughputPerMinute], [20 * 60_000, 0.1]);
+  // A retry reopened the round two hours after the upload and the worker has not claimed the row yet.
+  const waiting = toBatchSummary(batchRow({ rows: 2, queued: 1, succeeded: 1, round_opened_at: new Date("2026-09-22T03:00:00Z"),
+    round_started_at: null, round_completed: 0, last_completed_at: new Date("2026-09-22T01:20:00Z"), db_now: new Date("2026-09-22T03:05:00Z") }));
+  assert.deepEqual([waiting.roundOpenedAt, waiting.roundStartedAt], ["2026-09-22T03:00:00.000Z", null]);
+  assert.deepEqual([waiting.durationMs, waiting.throughputPerMinute], [null, null],
+    "no first claim yet: a duration from createdAt would show the two idle hours this carry-over exists to remove");
+  // Claimed at 03:01 and finished at 03:03: two minutes of work, not the two hours since the upload.
+  const running = toBatchSummary(batchRow({ rows: 2, succeeded: 2, round_opened_at: new Date("2026-09-22T03:00:00Z"),
+    round_started_at: new Date("2026-09-22T03:01:00Z"), round_completed: 1, last_completed_at: new Date("2026-09-22T03:03:00Z"),
+    db_now: new Date("2026-09-22T03:03:30Z") }));
+  assert.deepEqual([running.finished, running.durationMs], [true, 2 * 60_000]);
+  assert.equal(running.throughputPerMinute, 0.5, "only the round's completions count: the all-time 2 would read as 1/min");
+  assert.deepEqual([running.completed, running.roundCompleted], [2, 1], "the all-time counter is still reported beside it");
+});
