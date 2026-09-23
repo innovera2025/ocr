@@ -85,6 +85,8 @@ type Workbench = {
   loadDocuments(): Promise<void>;
   logout(): Promise<void>;
   openUsers(): void;
+  openExportDialog(): void;
+  downloadExport(): Promise<void>;
   applyUser(): void;
   renderHead(): void;
   reviewerLabel(by: unknown, name: unknown): string | null;
@@ -100,12 +102,13 @@ type Workbench = {
   state: {
     uploads: Upload[]; batch: unknown; batchId: string | null; current: unknown; draft: unknown; editable: boolean;
     openSeq: number; originalSig: string; user: { id: string } | null; csrf: string; dirty: boolean; leaving: boolean;
-    timer: number; users: unknown[]; tempPass: string;
+    timer: number; users: unknown[]; tempPass: string; q: string; status: string; parentFilter: string; parentName: string;
+    exQ: string; exParent: string; exTotal: number; exMax: number;
   };
 };
 
 const inline = /<script\b[^>]*>([\s\S]*?)<\/script>/.exec(workbenchPage({ nonce: "n" }))?.[1] ?? "";
-const EXPOSE = "globalThis.__wb={wire,init,checkSession,requireLogin,api,loadDocuments,logout,openUsers,applyUser,renderHead,reviewerLabel,"
+const EXPOSE = "globalThis.__wb={wire,init,checkSession,requireLogin,api,loadDocuments,logout,openUsers,openExportDialog,downloadExport,applyUser,renderHead,reviewerLabel,"
   + "row,renderBatch,addFiles,loadPreview,save,ERRORS,state,applyDocument,failText,toggleOriginal};";
 
 /** setTimeout/clearTimeout with no wall clock: a test decides when an armed timer fires (and can see that one is armed). */
@@ -888,4 +891,159 @@ test("a missing original is explained by what is open; after a Retry re-renders 
   await settle();
   assert.equal(fetches.filter((url) => url.endsWith("/content")).length, before + 1);
   assert.equal(($("p-content").children[0] as FakeElement).tagName, "IMG");
+});
+
+// ---- the export dialog (§10 H6) -------------------------------------------------------------------------------------
+
+const EXPORT_PREVIEW = {
+  columns: [{ key: "original_file_name", label: "ชื่อไฟล์ต้นฉบับ" }, { key: "page", label: "หน้า" },
+    { key: "page_count", label: "จำนวนหน้า" }, { key: "uploaded_at", label: "อัปโหลดเมื่อ" }],
+  total: 240, maxRows: 50_000,
+  rows: [["ใบลูกค้า 22-09-2026.pdf", "3", "95", "2026-09-22 14:05:00"]]
+};
+const previewRoutes = (body: unknown = EXPORT_PREVIEW): Routes =>
+  (url) => url.startsWith("/api/exports/preview") ? json(200, body) : null;
+/** The dialog's preview is debounced, so a case fires whatever timer the script armed last. */
+function runLastTimer(ctx: { clock: FakeClock }): void {
+  const id = [...ctx.clock.timers.keys()].at(-1);
+  if (id !== undefined) ctx.clock.run(id);
+}
+
+test("the ส่งออก pill follows the EFFECTIVE export right, not the raw can_export flag", async () => {
+  const staff = await bootedIn({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 });
+  assert.equal(staff.$("export-open").hidden, true, "a staff account without the flag has no way in");
+  const exporter = await bootedIn({ user: { ...STAFF, canExport: true }, csrf: "csrf-1", sessionStatus: 200 });
+  assert.equal(exporter.$("export-open").hidden, false);
+  // D8: the admin role carries export by itself, and `ocr-users create-admin` writes can_export = false — the
+  // bootstrap admin must still see the button, which is the whole of the reported "the only admin cannot export".
+  const admin = await bootedIn({ user: { ...ADMIN, canExport: false }, csrf: "csrf-1", sessionStatus: 200 });
+  assert.equal(admin.$("export-open").hidden, false);
+});
+
+test("the preview table shows the file's own cells: the original name first, 3 in หน้า and 95 in จำนวนหน้า", async () => {
+  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, previewRoutes());
+  ctx.wb.openExportDialog();
+  await settle();
+  assert.equal(ctx.$("export-dlg").open, true);
+  assert.deepEqual(ctx.$("ex-head").children.map((cell) => cell.textContent), ["ชื่อไฟล์ต้นฉบับ", "หน้า", "จำนวนหน้า", "อัปโหลดเมื่อ"]);
+  const cells = ctx.$("ex-rows").children[0]!.children;
+  assert.deepEqual(cells.map((cell) => cell.textContent), ["ใบลูกค้า 22-09-2026.pdf", "3", "95", "2026-09-22 14:05:00"]);
+  // pageLabel() is deliberately not reused: it returns the prefixed "หน้า 3/95", which would make the preview's หน้า
+  // column differ from the downloaded file's while จำนวนหน้า repeated the same 95.
+  assert.equal((cells[1] as FakeElement & { title?: string }).title, "หน้า 3/95");
+  assert.equal(ctx.$("ex-count").textContent, "พบ 240 แถว · แสดง 1 แถวแรก");
+  assert.equal(ctx.$("ex-download").disabled, false);
+  assert.equal(ctx.$("ex-limit").textContent, "");
+});
+
+test("the inherited search and PDF filters are removable chips that narrow only the export", async () => {
+  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, previewRoutes());
+  ctx.wb.state.q = "สมชาย";
+  ctx.wb.state.status = "confirmed";
+  ctx.wb.state.parentFilter = ID;
+  ctx.wb.state.parentName = "ใบลูกค้า 22-09-2026.pdf";
+  ctx.wb.openExportDialog();
+  await settle();
+  const first = ctx.calls.find((call) => call.url.startsWith("/api/exports/preview"))!.url;
+  assert.match(first, /q=%E0%B8%AA/, "the page's search still applies unless it is removed");
+  assert.ok(first.includes(`parentId=${ID}`));
+  assert.ok(first.includes("status=confirmed"), "the page's status checkbox is pre-ticked");
+  assert.ok(first.includes("dateField=created_at") && first.includes("columns=compact"));
+  const chips = ctx.$("ex-chips");
+  assert.equal(chips.hidden, false);
+  assert.deepEqual(chips.children.map((chip) => chip.children[0]!.textContent),
+    ["ค้นหา: สมชาย", "เฉพาะหน้าของ ใบลูกค้า 22-09-2026.pdf"]);
+  ctx.calls.length = 0;
+  chips.children[0]!.descendants().find((node) => node.tagName === "BUTTON")!.dispatch("click");
+  runLastTimer(ctx);
+  await settle();
+  const second = ctx.calls.find((call) => call.url.startsWith("/api/exports/preview"))!.url;
+  assert.ok(!second.includes("q="), "the chip is gone, so the file is no longer narrowed by it");
+  assert.ok(second.includes(`parentId=${ID}`), "the other chip is untouched");
+  assert.equal(ctx.wb.state.q, "สมชาย", "and the page's own filter is unchanged");
+});
+
+test("more rows than OCR_EXPORT_MAX_ROWS disables the download and says so in Thai", async () => {
+  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 },
+    previewRoutes({ ...EXPORT_PREVIEW, total: 60_000, maxRows: 50_000 }));
+  ctx.wb.openExportDialog();
+  await settle();
+  assert.equal(ctx.$("ex-download").disabled, true);
+  assert.equal(ctx.$("ex-limit").textContent, "เกิน 50000 แถว กรุณาเลือกช่วงวันที่ให้แคบลง");
+  assert.equal(ctx.wb.state.exTotal, 60_000);
+});
+
+test("an empty result disables the download instead of handing over an empty file", async () => {
+  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 },
+    previewRoutes({ ...EXPORT_PREVIEW, total: 0, rows: [] }));
+  ctx.wb.openExportDialog();
+  await settle();
+  assert.equal(ctx.$("ex-download").disabled, true);
+  assert.equal(ctx.$("ex-limit").textContent, "ไม่มีเอกสารที่ตรงกับตัวกรองนี้");
+});
+
+test("the download goes through the session cookie and releases its blob URL", async () => {
+  const blobs = { created: 0, revoked: 0 };
+  const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
+  const download = (url: string): FakeResponse | null => url.startsWith("/api/exports/documents.csv")
+    ? { ok: true, status: 200, headers: { get: (name) => name === "content-disposition" ? 'attachment; filename="ocr-export-20260922-1405.csv"' : null },
+      json: async () => ({}), blob: async () => new Blob(["﻿a,b\r\n"]) }
+    : null;
+  const ctx = load(server(state, (url) => download(url) ?? previewRoutes()(url, {})), undefined, { blobs });
+  await ctx.wb.init();
+  await settle();
+  ctx.wb.openExportDialog();
+  await settle();
+  ctx.$("ex-download").dispatch("click");
+  await settle();
+  const call = ctx.calls.find((entry) => entry.url.startsWith("/api/exports/documents.csv"));
+  assert.ok(call, "the file is fetched, not linked: a plain <a href> would carry no credentials check we can retry");
+  assert.equal(call.method, "GET");
+  assert.deepEqual([blobs.created, blobs.revoked], [1, 1], "no object URL is left alive");
+  assert.equal(ctx.$("ex-error").textContent, "");
+  assert.equal(ctx.$("ex-download").textContent, "ดาวน์โหลด", "the button goes back from กำลังเตรียมไฟล์…");
+});
+
+test("a refused download shows the Thai error in the dialog and leaves the button usable", async () => {
+  const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
+  const ctx = await bootedIn(state, (url) => url.startsWith("/api/exports/documents.csv")
+    ? json(429, { error: "EXPORT_BUSY" }) : previewRoutes()(url, {}));
+  ctx.wb.openExportDialog();
+  await settle();
+  ctx.$("ex-download").dispatch("click");
+  await settle();
+  assert.match(ctx.$("ex-error").textContent, /EXPORT_BUSY|คำขอไม่สำเร็จ/);
+  assert.equal(ctx.$("ex-download").disabled, false);
+});
+
+test("an expired session leaves no exported customer data on screen", async () => {
+  const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
+  const ctx = await bootedIn(state, previewRoutes());
+  ctx.wb.openExportDialog();
+  await settle();
+  assert.match(ctx.dom(), /ใบลูกค้า 22-09-2026\.pdf/);
+  state.sessionStatus = 401;
+  void ctx.wb.requireLogin();
+  await settle();
+  assert.ok(!ctx.dom().includes("ใบลูกค้า 22-09-2026.pdf"), "the preview holds the same data the table does");
+  assert.equal(ctx.$("export-dlg").open, false);
+  assert.equal(ctx.$("export-open").hidden, true);
+});
+
+test("the users table shows the effective export right and offers no pointless grant on an admin row", async () => {
+  // Exactly what `ocr-users create-admin` writes: the bootstrap admin owns the tenant with can_export = false.
+  const users = [
+    { id: ADMIN.id, username: "boss", displayName: "บอส", role: "admin", canExport: false, status: "active", lockedUntil: null, lastLoginAt: null, createdAt: "2026-01-01T00:00:00.000Z" },
+    { id: STAFF.id, username: "nok", displayName: "นก", role: "staff", canExport: false, status: "active", lockedUntil: null, lastLoginAt: null, createdAt: "2026-02-01T00:00:00.000Z" }
+  ];
+  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 },
+    (url, init) => url === "/api/users" && String(init.method ?? "GET") === "GET" ? json(200, { users }) : null);
+  ctx.$("users-open").dispatch("click");
+  await settle();
+  const rows = ctx.$("users-rows").children;
+  assert.match(rows[0]!.textContent, /ใช่ \(ผู้ดูแล\)/, "an admin reaches /api/exports/* on the role alone");
+  assert.match(rows[1]!.textContent, /ไม่/);
+  const labels = (row: FakeElement) => row.descendants().filter((node) => node.tagName === "BUTTON").map((node) => node.textContent);
+  assert.equal(labels(rows[0]!).includes("อนุญาตส่งออก"), false, "the flag does nothing on an admin row");
+  assert.equal(labels(rows[1]!).includes("อนุญาตส่งออก"), true);
 });

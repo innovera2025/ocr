@@ -241,6 +241,15 @@ input[type=password]:focus-visible,input[type=date]:focus-visible{outline:none;b
 input[type=checkbox]{flex:none;width:18px;height:18px;margin:0;accent-color:var(--fg)}
 .chk{display:flex;align-items:center;gap:8px;margin-top:14px;font-size:14px}
 .x-scroll{overflow:auto;max-height:44vh;margin-top:16px;border-radius:8px;box-shadow:0 0 0 1px var(--line)}
+fieldset{min-width:0;margin:14px 0 0;padding:0;border:0}
+legend{padding:0}
+.ex-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.ex-grid .fld{margin-top:0;min-width:0}
+.ex-st{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:6px}
+.ex-st .chk{margin-top:0}
+.ex-chips{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:14px}
+.chip-x{display:inline-flex;align-items:center;gap:6px;max-width:100%;padding:0 4px 0 12px;border-radius:9999px;background:var(--fill);font-size:13px}
+.chip-x .chip-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* The document table is 1280px wide with a sticky first column; inside a dialog the table is ordinary again. */
 .modal table,.x-scroll table{min-width:0;font-size:13px}
 .modal th,.modal td{white-space:nowrap;padding:8px 12px}
@@ -267,7 +276,9 @@ body[data-auth="out"] #me,body[data-auth="out"] #me-open{display:none!important}
    display name, and .btn is nowrap, so without a cap a long Thai name gives the page a horizontal scrollbar. The
    connection text keeps its live region (it is only taken out of the flow), so its state is still announced. */
 .me-name{max-width:min(30vw,120px)}
-#conn-text{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}}
+#conn-text{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}
+/* The export dialog's two-column field grid stacks, so a date field never forces the card past 375px. */
+.ex-grid{grid-template-columns:1fr}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 `;
 
@@ -281,7 +292,7 @@ const BODY = String.raw`<a class="skip" href="#docs-title">ข้ามไปท
 <section id="batch" class="batch card" aria-labelledby="batch-title" hidden><div class="batch-head"><div><h2 id="batch-title" class="h-sm">ชุดอัปโหลดล่าสุด</h2><p id="batch-meta" class="sub"></p></div><button id="batch-view" class="btn sm" type="button">ดูเอกสารในชุดนี้</button></div><div id="batch-bar" class="stack" role="img"></div><dl id="batch-stats" class="stats"></dl></section>
 <section aria-labelledby="docs-title">
 <div class="docs-head"><h2 id="docs-title" class="h-sm" tabindex="-1">รายการเอกสาร</h2><span id="updated" class="sub mono" aria-live="off"></span></div>
-<div class="toolbar"><label class="fld grow"><span class="fld-l">ค้นหา</span><input id="q" type="search" autocomplete="off" maxlength="100" placeholder="ชื่อไฟล์ ชื่อลูกค้า ชื่อพนักงาน หรือเลขที่ฟอร์ม"></label><label class="fld"><span class="fld-l">สถานะ</span><select id="status"><option value="">ทุกสถานะ</option><option value="review">รอตรวจสอบ</option><option value="failed">ไม่สำเร็จ</option><option value="processing">กำลังอ่าน</option><option value="queued">รอคิว</option><option value="succeeded">อ่านสำเร็จ (ยังไม่ยืนยัน)</option><option value="confirmed">ยืนยันแล้ว</option></select></label><label class="fld"><span class="fld-l">ชุดอัปโหลด</span><select id="batch-filter"><option value="">ทุกชุดอัปโหลด</option></select></label><button id="reload" class="btn" type="button">รีเฟรช</button></div>
+<div class="toolbar"><label class="fld grow"><span class="fld-l">ค้นหา</span><input id="q" type="search" autocomplete="off" maxlength="100" placeholder="ชื่อไฟล์ ชื่อลูกค้า ชื่อพนักงาน หรือเลขที่ฟอร์ม"></label><label class="fld"><span class="fld-l">สถานะ</span><select id="status"><option value="">ทุกสถานะ</option><option value="review">รอตรวจสอบ</option><option value="failed">ไม่สำเร็จ</option><option value="processing">กำลังอ่าน</option><option value="queued">รอคิว</option><option value="succeeded">อ่านสำเร็จ (ยังไม่ยืนยัน)</option><option value="confirmed">ยืนยันแล้ว</option></select></label><label class="fld"><span class="fld-l">ชุดอัปโหลด</span><select id="batch-filter"><option value="">ทุกชุดอัปโหลด</option></select></label><button id="reload" class="btn" type="button">รีเฟรช</button><button id="export-open" class="btn" type="button" hidden>ส่งออก</button></div>
 <div id="parent-chip" class="filter-chip" role="status" hidden><span id="parent-chip-text"></span><button id="parent-clear" class="btn sm ghost" type="button">แสดงเอกสารทั้งหมด</button></div>
 <div class="card table-card"><div id="scroll" class="scroll" tabindex="0" role="region" aria-labelledby="docs-title" aria-describedby="scroll-hint"><table><caption class="sr-only">หนึ่งแถวต่อหนึ่งเอกสาร</caption><thead><tr><th scope="col">ไฟล์</th><th scope="col">ลูกค้า</th><th scope="col">เพศ</th><th scope="col">สัญชาติ</th><th scope="col">ทรีตเมนต์</th><th scope="col">ระยะเวลา</th><th scope="col">พนักงานนวด</th><th scope="col">ห้อง</th><th scope="col">สถานะ</th><th scope="col">ความมั่นใจ</th><th scope="col">จัดการ</th></tr></thead><tbody id="rows"></tbody></table></div><div id="empty" class="empty"><p class="sub">กำลังโหลดเอกสาร…</p></div></div>
 <p id="scroll-hint" class="sr-only">ตารางกว้างกว่าหน้าจอ ใช้ปุ่มลูกศรซ้ายขวาเพื่อเลื่อนดูทุกคอลัมน์</p>
@@ -333,6 +344,34 @@ const BODY = String.raw`<a class="skip" href="#docs-title">ข้ามไปท
 <div class="acts"><button id="nu-add" class="btn primary" type="submit">เพิ่มผู้ใช้</button></div>
 </form>
 </div></div></dialog>
+<dialog id="export-dlg" class="modal" aria-labelledby="ex-title"><div class="m-wrap"><div class="m-card wide">
+<div class="m-head"><h2 id="ex-title">ส่งออกข้อมูล</h2><button id="ex-close" class="btn sm" type="button">ปิด</button></div>
+<p class="sub">ไฟล์จะมีทุกคอลัมน์ของเอกสารที่ตรงกับตัวกรอง เริ่มจาก ชื่อไฟล์ต้นฉบับ · หน้า · จำนวนหน้า · อัปโหลดเมื่อ (เวลาประเทศไทย)</p>
+<div id="ex-chips" class="ex-chips" hidden></div>
+<div class="ex-grid" style="margin-top:14px">
+<label class="fld"><span class="fld-l">ชุดอัปโหลด</span><select id="ex-batch"><option value="">ทุกชุดอัปโหลด</option></select></label>
+<label class="fld"><span class="fld-l">รูปแบบไฟล์</span><select id="ex-format"><option value="csv">Excel (CSV)</option><option value="jsonl">JSONL (ข้อมูลครบทุกรายละเอียด)</option></select></label>
+<label class="fld"><span class="fld-l">ช่วงวันที่ตาม</span><select id="ex-datefield"><option value="created_at">วันที่อัปโหลด</option><option value="reviewed_at">วันที่ยืนยัน</option></select></label>
+<label class="fld"><span class="fld-l">คอลัมน์</span><select id="ex-columns"><option value="compact">สรุป</option><option value="detailed">ละเอียด</option></select></label>
+<label class="fld"><span class="fld-l">ตั้งแต่วันที่</span><input id="ex-from" type="date"></label>
+<label class="fld"><span class="fld-l">ถึงวันที่</span><input id="ex-to" type="date"></label>
+</div>
+<fieldset><legend class="fld-l">สถานะ</legend><div class="ex-st">
+<label class="chk"><input id="ex-st-queued" type="checkbox"><span>รอคิว</span></label>
+<label class="chk"><input id="ex-st-processing" type="checkbox"><span>กำลังอ่าน</span></label>
+<label class="chk"><input id="ex-st-review" type="checkbox"><span>รอตรวจสอบ</span></label>
+<label class="chk"><input id="ex-st-succeeded" type="checkbox"><span>อ่านสำเร็จ (ยังไม่ยืนยัน)</span></label>
+<label class="chk"><input id="ex-st-confirmed" type="checkbox"><span>ยืนยันแล้ว</span></label>
+<label class="chk"><input id="ex-st-failed" type="checkbox"><span>ไม่สำเร็จ</span></label>
+</div></fieldset>
+<label class="chk"><input id="ex-confirmed" type="checkbox"><span>เฉพาะที่ยืนยันแล้ว</span></label>
+<p id="ex-count" class="sub" role="status"></p>
+<div class="x-scroll"><table><caption class="sr-only">ตัวอย่าง 20 แถวแรกของไฟล์ที่จะได้</caption><thead><tr id="ex-head"></tr></thead><tbody id="ex-rows"></tbody></table></div>
+<p class="sub">เปิดไฟล์ CSV ใน Excel ด้วยเมนู Data ▸ From Text/CSV แล้วตั้งคอลัมน์ ห้อง และ เลขที่ฟอร์ม เป็น “ข้อความ” มิฉะนั้น Excel จะตัดเลข 0 ข้างหน้าทิ้ง (007 จะกลายเป็น 7)</p>
+<p id="ex-limit" class="sub"></p>
+<p id="ex-error" class="err" role="alert"></p>
+<div class="acts"><button id="ex-download" class="btn primary" type="button" disabled>ดาวน์โหลด</button></div>
+</div></div></dialog>
 <dialog id="me-dlg" class="modal" aria-labelledby="me-title"><div class="m-wrap"><div class="m-card">
 <div class="m-head"><h2 id="me-title">บัญชีของฉัน</h2><button id="me-close" class="btn sm" type="button">ปิด</button></div>
 <p id="me-who" class="sub"></p>
@@ -366,10 +405,13 @@ const LEGACY_REVIEWER='บัญชีรวม (ก่อนมีระบบ�
 const ROLE={admin:'ผู้ดูแล',staff:'พนักงาน'};
 const USER_STATUS={active:'ใช้งานอยู่',disabled:'ปิดใช้งาน',locked:'ถูกล็อกชั่วคราว',must_change:'ต้องตั้งรหัสผ่านใหม่'};
 /* Every top-layer dialog. The drop zone and the "/" shortcut are ignored while any of them is open. */
-const MODALS=['auth-dlg','pw-dlg','users-dlg','me-dlg','confirm-dlg'];
+const MODALS=['auth-dlg','pw-dlg','users-dlg','me-dlg','confirm-dlg','export-dlg'];
+/* The export's status checkboxes, in the order they appear; each has a checkbox with the id 'ex-st-'+key. */
+const EXPORT_STATUSES=['queued','processing','review','succeeded','confirmed','failed'];
 const ERRORS={NETWORK:'เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ กรุณาตรวจสอบอินเทอร์เน็ตแล้วลองใหม่',TIMEOUT:'อัปโหลดใช้เวลานานเกินไป กรุณาลองใหม่',REVIEW_CONFLICT:'มีผู้อื่นบันทึกเอกสารนี้หลังจากที่คุณเปิด',DOCUMENT_NOT_REVIEWABLE:'เอกสารนี้ยังไม่อยู่ในสถานะที่ตรวจสอบได้',DOCUMENT_NOT_RETRYABLE:'เอกสารนี้ส่งอ่านใหม่ไม่ได้ (ไฟล์ยังไม่ผ่านการตรวจความปลอดภัย หรือไม่ได้อยู่ในสถานะไม่สำเร็จ) กรุณาอัปโหลดไฟล์ใหม่',DOCUMENT_QUARANTINED:'ไฟล์นี้ไม่ผ่านการตรวจความปลอดภัย จึงไม่แสดงต้นฉบับ กรุณาอัปโหลดไฟล์ใหม่',DOCUMENT_NOT_SCANNED:'ไฟล์นี้ยังตรวจความปลอดภัยไม่เสร็จ จึงยังแสดงต้นฉบับไม่ได้',UPLOAD_IN_PROGRESS:'ไฟล์นี้ยังอยู่ระหว่างตรวจจากการส่งครั้งก่อน กรุณาลองใหม่ในอีก 2–3 นาที',INVALID_UPLOAD_HEADERS:'ข้อมูลไฟล์ไม่ถูกต้อง (ไฟล์ว่าง ใหญ่เกิน 200 MB หรือชื่อไฟล์ผิดรูปแบบ)',FILENAME_TOO_LONG:'ชื่อไฟล์ยาวเกิน 120 ตัวอักษร กรุณาเปลี่ยนชื่อไฟล์',FILENAME_TOO_LARGE:'ชื่อไฟล์ยาวเกินกำหนด กรุณาเปลี่ยนชื่อไฟล์',INVALID_BATCH_ID:'รหัสชุดอัปโหลดไม่ถูกต้อง',DOCUMENT_NOT_FOUND:'ไม่พบเอกสารนี้',CONTENT_NOT_FOUND:'ไม่พบไฟล์ต้นฉบับของเอกสารนี้',BATCH_NOT_FOUND:'ไม่พบชุดอัปโหลดนี้',BATCH_FULL:'ชุดอัปโหลดนี้ครบจำนวนไฟล์แล้ว',IDEMPOTENCY_CONFLICT:'ไฟล์นี้ถูกส่งซ้ำด้วยข้อมูลต่างกัน กรุณาเลือกไฟล์ใหม่อีกครั้ง',PAYLOAD_TOO_LARGE:'ไฟล์มีขนาดใหญ่เกินกำหนด',UNSUPPORTED_MEDIA_TYPE:'ไม่รองรับไฟล์ประเภทนี้ (ใช้ได้เฉพาะ PNG, JPG, WebP และ PDF)',REVIEW_INVALID:'ข้อมูลที่แก้ไขไม่ถูกต้อง (ข้อความยาวเกิน 500 ตัวอักษร หรือรายการเกิน 50 รายการ)',
 USER_CHANGED:'มีการเข้าสู่ระบบด้วยบัญชีอื่น กำลังโหลดหน้านี้ใหม่',INVALID_CREDENTIALS:'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง',PASSWORD_EXPIRED:'รหัสผ่านชั่วคราวหมดอายุหรือถูกใช้ไปแล้ว กรุณาขอรหัสผ่านใหม่จากผู้ดูแลระบบ',LOGIN_THROTTLED:'พยายามเข้าสู่ระบบบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่',LOGIN_BUSY:'ระบบกำลังตรวจสอบรหัสผ่านจำนวนมาก กรุณาลองใหม่ในอีกสักครู่',LOGIN_NOT_CONFIGURED:'ระบบเข้าสู่ระบบยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแลระบบ',INVALID_LOGIN:'ข้อมูลเข้าสู่ระบบไม่ถูกต้อง',UNAUTHENTICATED:'กรุณาเข้าสู่ระบบอีกครั้ง',CSRF_REJECTED:'คำขอถูกปฏิเสธเพื่อความปลอดภัย กรุณาลองใหม่อีกครั้ง',FORBIDDEN:'บัญชีของคุณไม่มีสิทธิ์ใช้งานส่วนนี้',PASSWORD_CHANGE_REQUIRED:'กรุณาตั้งรหัสผ่านใหม่ก่อนใช้งานต่อ',PASSWORD_INCORRECT:'รหัสผ่านปัจจุบันไม่ถูกต้อง',PASSWORD_UNCHANGED:'รหัสผ่านใหม่ต้องไม่ซ้ำกับรหัสผ่านเดิม',WEAK_PASSWORD:'รหัสผ่านไม่ปลอดภัยพอ: ใช้อย่างน้อย 12 ตัวอักษร ไม่ซ้ำกับชื่อผู้ใช้ และไม่ใช่รหัสผ่านที่ใช้กันทั่วไป',USERNAME_TAKEN:'มีชื่อผู้ใช้นี้อยู่แล้ว',INVALID_USERNAME:'ชื่อผู้ใช้ไม่ถูกต้อง (ใช้ได้เฉพาะภาษาอังกฤษ ตัวเลข จุด ขีดกลางและขีดล่าง)',INVALID_DISPLAY_NAME:'ชื่อที่แสดงไม่ถูกต้อง',INVALID_ROLE:'บทบาทไม่ถูกต้อง',USER_INVALID:'ข้อมูลผู้ใช้ไม่ถูกต้อง',USER_NOT_FOUND:'ไม่พบผู้ใช้นี้',LAST_ADMIN:'ต้องเหลือผู้ดูแลระบบที่ใช้งานได้อย่างน้อยหนึ่งคน',CANNOT_CHANGE_SELF:'เปลี่ยนสิทธิ์หรือรีเซ็ตรหัสผ่านของบัญชีตัวเองที่นี่ไม่ได้'};
-const state={user:null,csrf:'',authWait:null,authSettle:null,authBefore:null,csrfWait:null,rearm:null,leaving:false,started:false,bg:0,xhrs:new Set(),users:[],tempPass:'',pwForced:false,pwBusy:false,pwResolve:null,loginBusy:false,confirmResolve:null,confirmReturn:null,conn:'',docs:[],total:0,offset:0,q:'',status:'',batchFilter:'',parentFilter:'',parentName:'',pdfView:false,batches:[],batchId:null,batch:null,listSeq:0,listAbort:null,listSig:'',loaded:false,uploads:[],active:0,timer:0,ticking:false,soon:0,searchTimer:0,noticeTimer:0,current:null,draft:null,originalSig:'',editable:false,dirty:false,saving:false,blobUrl:'',previewSeq:0,previewAbort:null,previewMissing:false,zoom:1,openSeq:0,lastFocus:null,askResolve:null,askReturn:null,uid:0,inputs:new WeakMap()};
+const state={exSeq:0,exAbort:null,exTimer:0,exBusy:false,exTotal:0,exMax:0,exQ:'',exParent:'',exParentName:'',
+user:null,csrf:'',authWait:null,authSettle:null,authBefore:null,csrfWait:null,rearm:null,leaving:false,started:false,bg:0,xhrs:new Set(),users:[],tempPass:'',pwForced:false,pwBusy:false,pwResolve:null,loginBusy:false,confirmResolve:null,confirmReturn:null,conn:'',docs:[],total:0,offset:0,q:'',status:'',batchFilter:'',parentFilter:'',parentName:'',pdfView:false,batches:[],batchId:null,batch:null,listSeq:0,listAbort:null,listSig:'',loaded:false,uploads:[],active:0,timer:0,ticking:false,soon:0,searchTimer:0,noticeTimer:0,current:null,draft:null,originalSig:'',editable:false,dirty:false,saving:false,blobUrl:'',previewSeq:0,previewAbort:null,previewMissing:false,zoom:1,openSeq:0,lastFocus:null,askResolve:null,askReturn:null,uid:0,inputs:new WeakMap()};
 const $=id=>document.getElementById(id);
 const dateFmt=new Intl.DateTimeFormat('th-TH',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
 const timeFmt=new Intl.DateTimeFormat('th-TH',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
@@ -489,6 +531,8 @@ const name=str(u.displayName)||str(u.username),admin=u.role==='admin',role=ROLE[
 document.body.dataset.auth='in';document.body.dataset.role=admin?'admin':'staff';
 $('me-name').textContent=name;$('me-role').textContent=role;$('me-open-name').textContent=name;$('me-who').textContent=name+' · '+role;
 $('users-open').hidden=!admin;$('me-users').hidden=!admin;
+/* D8: the admin role carries the export right by itself, so the pill follows the effective right, not the raw flag. */
+$('export-open').hidden=!(admin||u.canExport===true);
 showMenu(true);}
 /* Everything rendered from customer data. Only state.draft and the id of the open document survive, so an interrupted
    review resumes after the same user logs back in. */
@@ -501,6 +545,8 @@ renderBatchOptions();
 $('d-title').textContent='กำลังโหลด…';$('d-status').replaceChildren();$('editor').replaceChildren();$('d-draft').textContent='';hideAlert();
 clearPreview();
 $('users-rows').replaceChildren();$('users-msg').textContent='';clearTemp();
+/* The export preview holds the same customer data the table does, so it goes with everything else. */
+clearExportPreview();$('export-open').hidden=true;
 $('notice').hidden=true;showMenu(false);}
 async function logout(){const busy=state.active>0||state.uploads.some(u=>u.status==='waiting'||u.status==='authwait');
 if(busy&&!(await confirmAsk('ออกจากระบบ?','ยังมีไฟล์ที่กำลังอัปโหลดหรือรออัปโหลด ไฟล์เหล่านี้จะถูกยกเลิก','ออกจากระบบ')))return;
@@ -551,8 +597,11 @@ function closeUsers(){const d=$('users-dlg');if(d.open)d.close();}
 async function loadUsers(){try{const data=await getJson('/api/users');state.users=(Array.isArray(data.users)?data.users:[]).filter(isObj);$('users-msg').textContent='';renderUsers();}
 catch(e){$('users-msg').textContent=e.message;}}
 function renderUsers(){$('users-rows').replaceChildren(...state.users.map(userRow));}
-function userRow(u){const tr=el('tr'),me=!!(state.user&&state.user.id===u.id),admin=u.role==='admin',off=u.status==='disabled',exp=u.canExport===true;
-tr.append(cell(u.displayName),cell(u.username,'mono'),cell(ROLE[u.role]||u.role),cell(exp?'ใช่':'ไม่'));
+/* The column shows the EFFECTIVE right, not the raw flag (D8): an admin passes the export gate on the role alone, so a
+   bootstrap admin whose can_export is false must not read their own row as "ไม่" — that misreading is what was
+   reported as "the only admin cannot export". */
+function userRow(u){const tr=el('tr'),me=!!(state.user&&state.user.id===u.id),admin=u.role==='admin',off=u.status==='disabled',flag=u.canExport===true;
+tr.append(cell(u.displayName),cell(u.username,'mono'),cell(ROLE[u.role]||u.role),cell(admin?'ใช่ (ผู้ดูแล)':flag?'ใช่':'ไม่'));
 const st=el('td'),badgeEl=el('span','badge u-'+str(u.status));badgeEl.append(el('span','dot'),document.createTextNode(USER_STATUS[u.status]||str(u.status)));st.append(badgeEl);
 tr.append(st,cell(u.lastLoginAt?when(u.lastLoginAt):'ยังไม่เคยเข้าใช้'));
 const act=el('td'),box=el('div','acts'),who=str(u.displayName)||str(u.username);
@@ -560,7 +609,8 @@ const act=el('td'),box=el('div','acts'),who=str(u.displayName)||str(u.username);
 if(!me)box.append(btn('รีเซ็ตรหัสผ่าน','sm',()=>resetUser(u,who)),btn('ปลดล็อก','sm',()=>unlockUser(u,who)));
 box.append(btn(off?'เปิดใช้งาน':'ปิดใช้งาน','sm'+(off?'':' danger'),()=>changeUser(u,{disabled:!off},off?'เปิดใช้งานบัญชีนี้?':'ปิดใช้งานบัญชีนี้?',(off?'ผู้ใช้จะเข้าสู่ระบบได้อีกครั้ง · ':'ผู้ใช้จะออกจากระบบทันทีและเข้าใช้ไม่ได้อีก · ')+who)));
 box.append(btn(admin?'เปลี่ยนเป็นพนักงาน':'เปลี่ยนเป็นผู้ดูแล','sm',()=>changeUser(u,{role:admin?'staff':'admin'},'เปลี่ยนบทบาท?',(admin?'บัญชีนี้จะจัดการผู้ใช้ไม่ได้อีก · ':'บัญชีนี้จะจัดการผู้ใช้ทั้งหมดได้ · ')+who)));
-box.append(btn(exp?'ยกเลิกสิทธิ์ส่งออก':'อนุญาตส่งออก','sm',()=>changeUser(u,{canExport:!exp},'เปลี่ยนสิทธิ์ส่งออก?',(exp?'บัญชีนี้จะดาวน์โหลดไฟล์ส่งออกไม่ได้ · ':'บัญชีนี้จะดาวน์โหลดไฟล์ส่งออกได้ · ')+who)));
+/* No grant button on an admin row: the flag has no effect there, so the button would promise a change that changes nothing. */
+if(!admin)box.append(btn(flag?'ยกเลิกสิทธิ์ส่งออก':'อนุญาตส่งออก','sm',()=>changeUser(u,{canExport:!flag},'เปลี่ยนสิทธิ์ส่งออก?',(flag?'บัญชีนี้จะดาวน์โหลดไฟล์ส่งออกไม่ได้ · ':'บัญชีนี้จะดาวน์โหลดไฟล์ส่งออกได้ · ')+who)));
 act.append(box);tr.append(act);return tr;}
 async function userAction(run){$('users-msg').textContent='';try{await run();await loadUsers();}catch(e){$('users-msg').textContent=e.message;}}
 async function changeUser(u,changes,title,text){if(!(await confirmAsk(title,text,'ยืนยัน')))return;
@@ -575,6 +625,78 @@ const role=$('nu-role').value==='admin'?'admin':'staff',canExport=$('nu-export')
 return userAction(async()=>{const r=await postJson('/api/users',{username,displayName,role,canExport});showTemp(displayName,r&&r.temporaryPassword);
 $('nu-name').value='';$('nu-display').value='';$('nu-export').checked=false;$('nu-role').value='staff';});}
 function copyTemp(){if(!state.tempPass)return;try{if(typeof navigator!=='undefined'&&navigator.clipboard)navigator.clipboard.writeText(state.tempPass).then(()=>notify('คัดลอกรหัสผ่านชั่วคราวแล้ว'),()=>notify('คัดลอกไม่สำเร็จ กรุณาเลือกข้อความแล้วคัดลอกเอง','error'));}catch(e){}}
+
+/* ---------- export (§10 H6) ---------- */
+/* The dialog inherits the page's filters, but the search text and the "pages of one PDF" chip get their own removable
+   chips: a
+   customer name typed into the search box an hour ago would otherwise narrow the file silently, and staff would be
+   left wondering why it has fewer rows than the table says. Removing a chip narrows only the export. */
+function setExportError(text){$('ex-error').textContent=text||'';}
+function clearExportPreview(){state.exTotal=0;state.exMax=0;$('ex-head').replaceChildren();$('ex-rows').replaceChildren();$('ex-count').textContent='';$('ex-limit').textContent='';
+const d=$('export-dlg');if(d.open)d.close();}
+function exportChip(text,onRemove){const s=el('span','chip-x');s.append(el('span','chip-t',text),btn('✕','sm ghost',onRemove,'ลบตัวกรองนี้'));return s;}
+function renderExportChips(){const box=$('ex-chips'),chips=[];
+if(state.exQ)chips.push(exportChip('ค้นหา: '+state.exQ,()=>{state.exQ='';renderExportChips();exportPreviewSoon();}));
+if(state.exParent)chips.push(exportChip('เฉพาะหน้าของ '+(state.exParentName||'ไฟล์ PDF ที่เลือก'),()=>{state.exParent='';state.exParentName='';renderExportChips();exportPreviewSoon();}));
+box.replaceChildren(...chips);box.hidden=!chips.length;}
+/* Every status checked is the same as none checked: the server reads "no status filter" either way. */
+function exportParams(){const p=new URLSearchParams();
+const picked=EXPORT_STATUSES.filter(s=>$('ex-st-'+s).checked===true);
+if(picked.length&&picked.length<EXPORT_STATUSES.length)p.set('status',picked.join(','));
+if($('ex-batch').value)p.set('batchId',$('ex-batch').value);
+if($('ex-confirmed').checked===true)p.set('confirmedOnly','1');
+p.set('dateField',$('ex-datefield').value==='reviewed_at'?'reviewed_at':'created_at');
+if($('ex-from').value)p.set('from',$('ex-from').value);
+if($('ex-to').value)p.set('to',$('ex-to').value);
+if(state.exQ)p.set('q',state.exQ);
+if(state.exParent)p.set('parentId',state.exParent);
+p.set('columns',$('ex-columns').value==='detailed'?'detailed':'compact');
+return p.toString();}
+function updateDownload(){const over=state.exMax>0&&state.exTotal>state.exMax,none=state.exTotal===0;
+$('ex-download').disabled=state.exBusy||none||over;
+$('ex-limit').textContent=over?'เกิน '+state.exMax+' แถว กรุณาเลือกช่วงวันที่ให้แคบลง':none?'ไม่มีเอกสารที่ตรงกับตัวกรองนี้':'';}
+/* The preview renders the file's own columns and values through textContent: 'หน้า' holds the bare 3 that the file
+   holds, with 'จำนวนหน้า' beside it, and 'หน้า 3/95' only as the cell's title. */
+function renderExportPreview(data){const cols=Array.isArray(data.columns)?data.columns.filter(isObj):[],rows=Array.isArray(data.rows)?data.rows:[];
+state.exTotal=typeof data.total==='number'?data.total:0;state.exMax=typeof data.maxRows==='number'?data.maxRows:0;
+$('ex-head').replaceChildren(...cols.map(c=>{const th=el('th',null,str(c.label)||str(c.key));th.setAttribute('scope','col');return th;}));
+$('ex-rows').replaceChildren(...rows.map(r=>{const tr=el('tr'),values=Array.isArray(r)?r:[];
+values.forEach((v,i)=>{const td=cell(v),key=cols[i]?str(cols[i].key):'';
+if(key==='page'&&str(v))td.title='หน้า '+str(v)+(str(values[i+1])?'/'+str(values[i+1]):'');
+tr.append(td);});return tr;}));
+$('ex-count').textContent='พบ '+state.exTotal+' แถว · แสดง '+rows.length+' แถวแรก';
+setExportError('');updateDownload();}
+function exportPreviewSoon(){clearTimeout(state.exTimer);state.exTimer=setTimeout(()=>{loadExportPreview();},300);}
+async function loadExportPreview(){const seq=++state.exSeq;if(state.exAbort)state.exAbort.abort();const ctrl=new AbortController();state.exAbort=ctrl;
+$('ex-count').textContent='กำลังนับจำนวนแถว…';
+try{const data=await getJson('/api/exports/preview?'+exportParams(),{signal:ctrl.signal});if(seq!==state.exSeq)return;renderExportPreview(data);}
+catch(e){if(e&&e.name==='AbortError')return;if(seq!==state.exSeq)return;$('ex-count').textContent='';state.exTotal=0;updateDownload();setExportError(e.message);}
+finally{if(state.exAbort===ctrl)state.exAbort=null;}}
+function openExportDialog(){closeMe();
+state.exQ=state.q;state.exParent=state.parentFilter;state.exParentName=state.parentName;
+EXPORT_STATUSES.forEach(s=>{$('ex-st-'+s).checked=state.status===s;});
+const sel=$('ex-batch');sel.replaceChildren(new Option('ทุกชุดอัปโหลด',''));state.batches.forEach(b=>sel.append(new Option(batchName(b),b.batchId)));sel.value=state.batchFilter||'';
+$('ex-confirmed').checked=false;$('ex-datefield').value='created_at';$('ex-from').value='';$('ex-to').value='';$('ex-format').value='csv';$('ex-columns').value='compact';
+state.exTotal=0;state.exMax=0;$('ex-head').replaceChildren();$('ex-rows').replaceChildren();$('ex-limit').textContent='';setExportError('');updateDownload();
+renderExportChips();
+const d=$('export-dlg');if(!d.open)d.showModal();
+loadExportPreview();}
+function closeExportDialog(){clearTimeout(state.exTimer);if(state.exAbort){state.exAbort.abort();state.exAbort=null;}
+const d=$('export-dlg');if(d.open)d.close();}
+function downloadName(header,format){const m=/filename="([A-Za-z0-9._-]+)"/.exec(str(header));return m?m[1]:'ocr-export.'+format;}
+/* The file goes through api() so it carries the session cookie and can survive one re-login; a rejected fetch leaves
+   no half-written file on disk, because the browser only saves a Blob that resolved. */
+async function downloadExport(){if(state.exBusy)return;
+const format=$('ex-format').value==='jsonl'?'jsonl':'csv';
+state.exBusy=true;updateDownload();$('ex-download').textContent='กำลังเตรียมไฟล์…';setExportError('');
+try{const r=await api('/api/exports/documents.'+format+'?'+exportParams());
+const blob=await r.blob();const url=URL.createObjectURL(blob);
+const a=el('a');a.href=url;a.download=downloadName(r.headers&&r.headers.get('content-disposition'),format);
+if(typeof a.click==='function')a.click();
+if(typeof URL.revokeObjectURL==='function')URL.revokeObjectURL(url);
+notify('ดาวน์โหลดไฟล์ส่งออกแล้ว');}
+catch(e){setExportError(e.message);}
+finally{state.exBusy=false;$('ex-download').textContent='ดาวน์โหลด';updateDownload();}}
 
 /* ---------- a real top-level confirmation ---------- */
 /* The drawer's "ask" overlay lives inside <dialog id="drawer"> and is only un-hidden there: called from the header or
@@ -835,6 +957,12 @@ $('pw-save').addEventListener('click',e=>{e.preventDefault();submitPassword();})
 $('pw-cancel').addEventListener('click',closePassword);
 $('pw-logout').addEventListener('click',()=>{logout();});
 $('pw-dlg').addEventListener('cancel',e=>{e.preventDefault();closePassword();});
+$('export-open').addEventListener('click',openExportDialog);
+$('ex-close').addEventListener('click',closeExportDialog);
+$('export-dlg').addEventListener('cancel',e=>{e.preventDefault();closeExportDialog();});
+$('ex-download').addEventListener('click',()=>{downloadExport();});
+['ex-batch','ex-datefield','ex-from','ex-to','ex-confirmed','ex-columns'].forEach(id=>$(id).addEventListener('change',exportPreviewSoon));
+EXPORT_STATUSES.forEach(s=>$('ex-st-'+s).addEventListener('change',exportPreviewSoon));
 $('users-open').addEventListener('click',openUsers);$('me-users').addEventListener('click',openUsers);
 $('users-close').addEventListener('click',closeUsers);
 $('users-dlg').addEventListener('cancel',e=>{e.preventDefault();closeUsers();});

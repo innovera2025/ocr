@@ -76,7 +76,7 @@ test("every element id the script looks up exists in the markup", () => {
 });
 
 test("script follows the HTTP contract of spec §5", () => {
-  for (const needle of ["'/api/auth/session'", "'/api/auth/login'", "'/api/auth/logout'", "'/api/auth/password'", "'/api/users'", "'X-CSRF-Token'", "'X-OCR-Background'", "'/api/batches'", "'/api/batches?limit=20'", "'/api/documents?'", "'/ocr/review'", "'/retry'", "'/content'", "'X-Batch-Id'", "'X-Upload-Filename'", "encodeURIComponent(u.file.name)", "'X-Upload-Filename-Encoding','uri'", "'Idempotency-Key'", "expectedUpdatedAt", "structuredResult:state.draft", "CONCURRENCY=3", "MAX_FILES=100", "'document'"]) {
+  for (const needle of ["'/api/auth/session'", "'/api/auth/login'", "'/api/auth/logout'", "'/api/auth/password'", "'/api/users'", "'/api/exports/preview?'", "'/api/exports/documents.'", "'X-CSRF-Token'", "'X-OCR-Background'", "'/api/batches'", "'/api/batches?limit=20'", "'/api/documents?'", "'/ocr/review'", "'/retry'", "'/content'", "'X-Batch-Id'", "'X-Upload-Filename'", "encodeURIComponent(u.file.name)", "'X-Upload-Filename-Encoding','uri'", "'Idempotency-Key'", "expectedUpdatedAt", "structuredResult:state.draft", "CONCURRENCY=3", "MAX_FILES=100", "'document'"]) {
     assert.ok(inlineScript.includes(needle), `missing ${needle}`);
   }
   for (const key of ["name", "gender", "nationality", "hotelName", "referralSources", "healthConditions", "pressure", "massageOilScrub", "preferredAreas", "avoidAreas", "treatments", "therapistName", "roomNo", "duration"]) {
