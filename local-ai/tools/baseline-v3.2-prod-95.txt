@@ -1,0 +1,72 @@
+# INNOVERA OCR reading-accuracy benchmark - frozen baseline (counts, page numbers and field names only).
+# Produced by local-ai/tools/benchmark.py. Every number is scored on stored production responses with 0 model calls.
+# results: results-prod
+# pages: 95
+# engine: typhoon-sections v3.2
+# replay fidelity: 95/95 pages reproduce the stored production value, raw and needsReview exactly; 91/95 also reproduce source and confidence
+[fields] field n right rightFlagged wrongFlagged wrongUnflagged markers uncertain want hit missed extra
+header.formNumber 95 95 8 0 0 0 0 0 0 0 0
+header.date 95 84 20 11 0 0 3 0 0 0 0
+customerInformation.gender 95 94 33 1 0 0 3 0 0 0 0
+customerInformation.name 95 41 25 51 3 0 25 0 0 0 0
+customerInformation.nationality 95 83 8 12 0 0 2 0 0 0 0
+customerInformation.hotelName 95 73 9 21 1 0 5 0 0 0 0
+customerInformation.referralSources 95 94 11 1 0 0 3 60 60 0 1
+customerInformation.healthConditions 95 91 19 4 0 14 4 17 17 0 4
+recommendationCard.pressure 95 90 17 5 0 0 5 0 0 0 0
+recommendationCard.massageOilScrub 95 91 49 4 0 38 10 55 53 2 2
+recommendationCard.preferredAreas 95 38 13 54 3 0 20 384 272 112 23
+recommendationCard.avoidAreas 95 55 1 39 1 0 3 30 14 16 65
+recommendationCard.bodyMap 95 35 12 60 0 0 23 414 286 128 88
+staffOnly.treatmentNames 95 46 31 47 2 0 21 129 81 48 47
+staffOnly.treatmentsWithDuration 95 42 27 51 2 0 21 0 0 0 0
+staffOnly.roomNo 95 73 12 21 1 0 14 0 0 0 0
+staffOnly.therapistName 95 6 6 89 0 0 91 0 0 0 0
+staffOnly.totalMinutes 31 19 0 0 12 0 14 0 0 0 0
+[pages] field bucket comma-separated page numbers (the wrong pages; every other page was right)
+header.formNumber wrongFlagged -
+header.formNumber wrongUnflagged -
+header.date wrongFlagged 10,16,29,32,54,62,73,78,87,90,91
+header.date wrongUnflagged -
+customerInformation.gender wrongFlagged 44
+customerInformation.gender wrongUnflagged -
+customerInformation.name wrongFlagged 2,5,7,8,9,10,14,15,16,18,21,22,25,26,27,28,30,31,33,34,35,36,37,39,43,45,47,49,50,51,52,56,59,61,62,64,65,67,68,69,71,74,76,77,82,85,87,88,89,90,91
+customerInformation.name wrongUnflagged 24,29,75
+customerInformation.nationality wrongFlagged 4,5,8,22,31,37,51,71,76,82,88,89
+customerInformation.nationality wrongUnflagged -
+customerInformation.hotelName wrongFlagged 1,4,5,8,10,24,33,35,47,48,51,58,59,71,73,74,76,78,81,82,91
+customerInformation.hotelName wrongUnflagged 31
+customerInformation.referralSources wrongFlagged 70
+customerInformation.referralSources wrongUnflagged -
+customerInformation.healthConditions wrongFlagged 18,20,48,60
+customerInformation.healthConditions wrongUnflagged -
+recommendationCard.pressure wrongFlagged 15,23,39,41,53
+recommendationCard.pressure wrongUnflagged -
+recommendationCard.massageOilScrub wrongFlagged 14,74,76,80
+recommendationCard.massageOilScrub wrongUnflagged -
+recommendationCard.preferredAreas wrongFlagged 2,3,4,5,7,9,10,11,12,14,15,17,19,20,22,23,25,27,28,29,30,31,32,34,39,40,48,50,51,52,53,55,56,57,60,61,62,64,65,70,74,75,78,79,80,81,82,84,85,87,89,93,94,95
+recommendationCard.preferredAreas wrongUnflagged 13,43,88
+recommendationCard.avoidAreas wrongFlagged 2,3,8,9,11,12,13,15,22,23,25,27,30,34,40,43,48,51,53,55,57,60,61,62,64,65,70,71,72,74,79,81,82,85,88,89,93,94,95
+recommendationCard.avoidAreas wrongUnflagged 7
+recommendationCard.bodyMap wrongFlagged 2,3,4,5,7,8,9,10,11,12,13,14,15,17,19,20,22,23,25,27,28,29,30,31,32,34,39,40,43,48,50,51,52,53,55,56,57,60,61,62,64,65,70,71,72,74,75,78,79,80,81,82,84,85,87,88,89,93,94,95
+recommendationCard.bodyMap wrongUnflagged -
+staffOnly.treatmentNames wrongFlagged 1,3,4,6,8,9,10,13,14,15,16,21,22,24,29,38,42,43,46,47,49,51,52,53,55,56,58,59,61,65,66,67,68,69,71,73,74,75,77,78,79,81,90,91,92,93,95
+staffOnly.treatmentNames wrongUnflagged 23,88
+staffOnly.treatmentsWithDuration wrongFlagged 1,3,4,6,8,9,10,13,14,15,16,21,22,24,29,38,42,43,44,46,47,49,51,52,53,54,55,56,58,59,61,65,66,67,68,69,71,73,74,75,77,78,79,81,84,85,90,91,92,93,95
+staffOnly.treatmentsWithDuration wrongUnflagged 23,88
+staffOnly.roomNo wrongFlagged 3,8,11,12,20,27,33,42,43,55,71,73,75,77,81,83,90,92,93,94,95
+staffOnly.roomNo wrongUnflagged 5
+staffOnly.therapistName wrongFlagged 1,2,3,4,5,6,7,8,9,10,11,12,13,14,16,17,19,20,21,22,23,25,26,27,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95
+staffOnly.therapistName wrongUnflagged -
+staffOnly.totalMinutes wrongFlagged -
+staffOnly.totalMinutes wrongUnflagged 9,46,47,48,49,52,56,59,73,79,89,90
+
+# Gate thresholds this file freezes (plan §4). `benchmark.py --baseline <this file>` checks G1, G1b, G2, G3, G6.
+#   G1  no field's wrongUnflagged may exceed the number above. 0 new silent errors is the release condition.
+#   G1b no list field's `hit` may fall or `missed` may rise: a missed item has no entry and so no flag, and
+#       v3.2 has no possibleMissedMark carrier (plan W2f), so every miss is silent by construction.
+#   G2  every page that flips right<->wrong must be named and explained; the page lists above are what it diffs.
+#   G3  rightFlagged may rise by at most +5 per field unless that field's wrongUnflagged falls.
+#   G6  the replay and the scorer must be deterministic across two runs of the same inputs.
+#   G0, G4, G5, G7 are NOT computable from stored answers: they need the archived 1610 px production renders
+#       (G0/G5/G7) or the full deterministic image pipeline (G4, tests/bench_deterministic.py).

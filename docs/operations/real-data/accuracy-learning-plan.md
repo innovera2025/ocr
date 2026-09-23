@@ -34,9 +34,9 @@ plan optimises.
 | Referral sources | 94/95 | 1 | 0 | done |
 | Pressure | 89–90/95 | 5 | 0 | 6 misses are genuine double marks / circled labels — by design |
 | Date | 84/95 | 11 | 0 | 9 year/month digit misreads, 2 unread; every form in the batch shares one visit date |
-| Nationality | 81/95 strict | 13 | 0 | 82 counting equivalents; **0 W&U** once labels go through the master list |
-| Health conditions | reported 81 % | 18 | 0 | **91/95 value-exact**; 14 pages scored wrong only by the struck-out marker |
-| Oil / scrub | reported 59 % | 39 | 0 | **89/95 value-exact** (92/95 on the JPEG render); 35 pages are the same artefact |
+| Nationality | 81/95 strict | 13 | 0 | **83/95, W&F 12** measured; 81 was an *asymmetric* key (§1E) |
+| Health conditions | reported 81 % | 18 | 0 | **91/95 value-exact** (77 + the 14 marker-only pages), W&F 4 — confirmed |
+| Oil / scrub | reported 59 % | 39 | 0 | **91/95 value-exact**, W&F 4 (56 + the 35 marker-only pages); "89" did not match its own arithmetic |
 | Hotel | 73/95 | 21 | 1 | the 1 unflagged is a parser fault, not handwriting |
 | Room | 73/95 | 21 | 1 | 16 distinct rooms exist at this branch |
 | Customer name | 41/95 exact | 51 | 3 | 66 at similarity ≥ 0.8; character error rate 52 % |
@@ -47,6 +47,19 @@ plan optimises.
 | Body map — avoid | 55/95 | 39 | 1 | item recall 14/30 |
 | **Body map — both lists as one unit** | **35/95** | 60 | **0** | the only honest body-map metric (§1E) |
 | Therapist | 6/95 | 89 | 0 | labels marked uncertain on 91/95 — **not measurable today** |
+
+> **This table is now produced by code, not by hand.** `local-ai/tools/benchmark.py --data <operator dir>` replays all 95
+> stored production answers through today's parsers and prints every row above plus the §4 gate verdicts, with 0 model
+> calls. Its frozen output is `local-ai/tools/baseline-v3.2-prod-95.txt` and **that file, not this table, is the baseline
+> every later change is gated against.** Measured 2026-09-23: every row above reproduces except the three restated in the
+> "Corrected" column. Three further corrections the harness forced:
+> * **`staffOnly.totalMinutes` has no flag carrier at all.** It is a bare integer on `staffOnly` with no `needsReview`, so
+>   all **12 of its 31** wrong written totals are silent by construction and cannot be gated. W4b targets the cause; a
+>   carrier for it is a separate, unplanned piece of work.
+> * **Silent errors on the model-read text fields are 9, not 10** — name 3, hotel 1, room 1, treatment names 2, treatments
+>   +durations 2 (the same 2 pages) — on 7 distinct pages. §4 G1's "treatment 5" is not reproducible from `results-prod`.
+> * **Body map, one unit, at item level: 286 of 414 labelled items found, 128 missed, 88 extra.** The page-level unit row
+>   above (35 right, 0 W&U) cannot see any of that; §4 G1b is what gates it.
 
 > **Render caveat — read this before any body-map number in §3.** Production ran 1610 px renders of the source PDF. The offline
 > harness can only re-render the native 1400 px JPEGs, either as they are (`source=jpg`) or bilinearly upsampled to 1610 px
@@ -144,9 +157,15 @@ already confirmed to a different value (`out_alias_ceiling.txt`). Any raw→valu
 
 ### E — Metric artefacts. Fix the scorer, not the reader.
 * `compare.py:12` scores `value or raw`, so the value-less `"struck out: …"` marker (`api.py:303-306`) counts as a list item:
-  **35 oil and 14 health pages** are reported wrong although their value sets match the labels exactly.
+  **35 oil and 14 health pages** are reported wrong although their value sets match the labels exactly. Measured with the
+  value-set fix: oil **56 → 91/95**, health **77 → 91/95**; 38 oil and 14 health pages carry a marker and stay flagged
+  (review cost, not an error). The oil figure quoted as "89" elsewhere in this plan was wrong — 56 + 35 is 91.
 * `compare.py`'s nationality map lacks 2 country codes; all 5–7 nationality "wrong & unflagged" cases disappear once both sides
-  go through `normalize_nationality`.
+  go through `normalize_nationality`. Measured with that fix: **83/95 right, W&F 12, W&U 0** (strict text alone is 62/95).
+  The replaced `natkey` was worse than "missing 2 codes" — it was **asymmetric**, matching the read value without its
+  token branch and the label with it, so **2 pages whose reading was character-for-character identical to the label scored
+  wrong**. The rule the harness now keeps: the scorer applies *the reader's own* normaliser, identically to both sides, and
+  never carries an alias the reader lacks — otherwise W1c's master-list additions would be invisible instead of measurable.
 * The A8 claim *"checkbox lists exactly right on 87/95, 0 unflagged false positives"* covers **referral + health + oils only**
   (`eval_det.py:124-127`) and counts only false *positives*; a **missed** mark is counted separately and can never carry a flag.
   In the same A8 run the body map was 42/95 preferred and 56/95 avoid **on the 1400 px JPEGs**, against production's own
@@ -623,7 +642,7 @@ staff crops (1 000–2 000 comfortable), an off-host GPU (USD 2–10 per run, US
 | Room | 73 (W&U 1) | 74 (W&U 0) | **75** with W5a; W7 ceiling 82, yield unmeasured | — |
 | Treatment names | 46 | **52** (W1a–e 49 + W1f 3); 56 under the corrected hot-oil convention | W4a unmeasured — see §6 R2 | — |
 | Body map (one unit) | **35 (W&U 0)**, production | **not yet measured on production inputs** — `sim-1610` says 50, G0 decides | same | form labels for 4 items (§5) |
-| Oil / scrub | 89 value-exact, 55.8 % flagged | 89, 55.8 % flagged (queue re-ordered, no flags cleared) | same | — |
+| Oil / scrub | **91** value-exact, 55.8 % flagged | 91, 55.8 % flagged (queue re-ordered, no flags cleared) | same | — |
 | Therapist | 6 | 6 | 6 | **roster (W8a)** |
 | Silent errors, all model-read text fields | 10 | ≤ 8 | ≤ 8 | — |
 
@@ -634,16 +653,26 @@ per-list avoid regression (4 → 9 there) has to be re-measured on the archived 
 
 ## 4. Benchmark and gates
 
-**One scorer.** Replace `compare.py` and `calibrate.py` with `scripts/eval-learning.py` in the repo (code only — labels, page
-images and raw responses stay in the operator scratch dir, never in git). It must: score list fields by **value set** with markers
-counted as review cost, not as items; put both sides of nationality through `normalize_nationality`; score the body map **as one
-unit** and count every **miss** as an unflagged error unless the group carries an explicit "possible missed mark" flag; report
-`n / right / wrong-flagged / wrong-unflagged / right-flagged` per field, split by certain vs uncertain labels.
+**One scorer — SHIPPED 2026-09-23 as `local-ai/tools/` (`replay.py`, `scoring.py`, `benchmark.py`).** It replaces `compare.py`
+and `calibrate.py` (code only — labels, page images and raw responses stay in the operator scratch dir, given on the command
+line with `--data`, never in git). It scores list fields by **value set**, with markers counted as review cost and not as
+items; puts both sides of nationality through `normalize_nationality`; scores and flags the body map **as one unit** and reports
+each list separately as well; counts every **miss** at item level, where a miss is an unflagged error unless the group carries an
+explicit "possible missed mark" flag (G1b — v3.2 has no such carrier, so today every miss is silent); and reports
+`n / right / right-flagged / wrong-flagged / wrong-unflagged` per field, marking the pages whose label is uncertain. Its output is
+counts, page numbers, field names and error categories only, so a run can be pasted into a report or a commit unedited.
 
-**Replay, not re-run.** `eval-c/dict-calib/base.py` + `check_base.py` rebuild the v3.2 values **and** re-apply the token-confidence
-gate from the stored `evidence.tokenConfidence`, reproducing production on **95/95 pages with 0 mismatches**. Promote that harness
-into the repo. Consequence: W1, W2, W3, W5 and W6 are scored with **zero model calls**, and any future parser, dictionary or
-threshold change is scored the same way on every reviewed document.
+**Replay, not re-run — SHIPPED.** `local-ai/tools/replay.py` rebuilds the v3.2 values by calling the service's own functions
+(`api._customer_text_fields`, `N.header_fields`, `N.parse_treatments`, `N.normalize_therapist`, `N.normalize_room`) and re-applies
+the token gate from the stored `evidence.tokenConfidence`. With the code unchanged it reproduces **95/95 pages exactly on
+`value`, `raw` and `needsReview`**; 91/95 also on `source` and `confidence`, the four exceptions (pages 26-29) being treatment
+items production served from the `verified-memory` hook, which the stored response does not carry and W3a removes. Two limits
+that are properties of the method, not bugs: the **image-derived fields are copied through** from the stored response (no page
+pixels offline, so no checkbox or body-map *change* is scorable here — G0 stands), and the gate is replayed from the stored
+per-field statistics, which describe the field's exact `raw` string, so a variant that changes a `raw` gets an explicit
+`staleGate` warning instead of an unbacked flag. Round-trip tests on synthetic pages (`tests/test_benchmark_replay.py`) hold the
+replay to `api.process_image` in both section modes. Consequence: W1, W2, W3, W5 and W6 are scored with **zero model calls**, and
+any future parser, dictionary or threshold change is scored the same way on every reviewed document.
 
 **Freeze the inputs — do this first, before any body-map work.** Archive the exact page PNGs the Local AI received (they are in
 `OCR_UPLOAD_DIR`, `api.py:588-592`, or re-split the source PDF with the deployed worker) with a `sha256` manifest and point the
@@ -653,12 +682,17 @@ alone moves the body map on 30/95 pages. Neither offline render is a usable stan
 identical on 12/95 and 11/95 pages. Until the archived PNGs exist, **every W2 figure is labelled `sim-1610` and none of them is
 a release target.**
 
+**The frozen baseline is `local-ai/tools/baseline-v3.2-prod-95.txt`** (committed 2026-09-23, counts and page numbers only).
+`benchmark.py --baseline <that file>` checks **G1, G1b, G2, G3 and G6** and exits non-zero on a failure; **G0, G4, G5 and G7
+cannot be computed from stored answers** and the tool says so on every run rather than silently omitting them. The G1 numbers
+below are superseded where the frozen file differs — the file is the baseline, this paragraph is the explanation.
+
 **Gates — every change, both sources (1400 px and 1610 px):**
 * **G0 frozen inputs (blocking, precedes G1–G7):** the archived production PNGs exist with a `sha256` manifest and the
   deterministic eval runs on them. No body-map or checkbox change ships against a simulated render.
 * **G1 safety (blocking):** total wrong-and-**unflagged** must not rise, and no field may rise above its **production** frozen
-  baseline, measured on `results-prod`: hotel 1, room 1, treatment 5, name 3, nationality 0, date 0, **body map preferred 3,
-  avoid 1, and 0 as one unit**. The earlier "body map 2 as one unit" was the simulated render's figure; production's is **0**,
+  baseline, measured on `results-prod`: hotel 1, room 1, **treatment 2** (names and names+durations alike, pages 23 and 88 —
+  "5" was not reproducible), name 3, nationality 0, date 0, **body map preferred 3, avoid 1, and 0 as one unit**. The earlier "body map 2 as one unit" was the simulated render's figure; production's is **0**,
   and freezing the higher number would have silently authorised two new silent errors. The per-list numbers are frozen
   **as well as** the unit number, because W2's measured regression is per-list (avoid 4 → 9 on `sim-1610`) and the merge hides
   it. **0 new unflagged errors** is the release condition, not a target.
@@ -817,8 +851,8 @@ a variant must beat the baseline by more than that to earn a full run. Raw respo
 ## 9. Sequencing
 
 ```
-now      §4 scorer fix, replay harness, FROZEN INPUTS (G0), label hygiene  0 calls ~2 d  ← unblocks every measurement;
-                                                                                          W2 cannot be scored without it
+now      §4 scorer fix + replay harness                          DONE 2026-09-23 (§11), local-ai/tools/
+         FROZEN INPUTS (G0), label hygiene                      0 calls ~1 d  ← still blocks every W2 measurement
          verify Local AI auth on the host (§2.5.9)                         0 calls ~0 d  ← precondition for W3
 then     W1 parser/vocabulary (incl. W1f)                                  0 calls ~2 d  ← biggest measured gain per day
          W2 body-map/checkbox geometry, re-measured on the frozen PNGs;
@@ -900,3 +934,40 @@ migrations) raised 20 findings. Checks were re-run before each change; new measu
   which also means the plan's "room 76 with W5a" was itself one page too high (now 75). Fixed under item 8.
 * The learning-curve evidence for W6 is in `dict-calib/out_calib_sweep.txt`, not `out_calib_cv.txt` as cited; the substance
   (fitting on 20 pages makes it worse) is correct and is now quoted from the right file.
+
+---
+
+## 11. Step 1 — measurement harness built and baseline frozen (2026-09-23)
+
+`local-ai/tools/{replay,scoring,benchmark}.py` + `local-ai/tools/baseline-v3.2-prod-95.txt` + `tests/test_benchmark_replay.py`
+and `tests/test_benchmark_scoring.py` (24 tests, synthetic fixtures only). §9's first line ("§4 scorer fix, replay harness") is
+done; **FROZEN INPUTS (G0) is not** — it needs the archived 1610 px PNGs and is still what blocks every W2 number.
+
+What the corrected scorer changed, all measured on the 95 stored production answers with 0 model calls:
+
+| Field | Reported 2026-09-22 | Corrected | Why |
+|---|---|---|---|
+| Oil / scrub | 56/95 (the "59 %" row) | **91/95** | the struck-out marker is review cost, not a selected item (§1E) |
+| Health conditions | 77/95 (the "81 %" row) | **91/95** | same marker artefact, 14 pages |
+| Nationality | 81/95 | **83/95** | the old key was asymmetric and failed 2 character-identical readings (§1E) |
+| Body map, one unit | 35/95 pages | 35/95 pages, **286 of 414 items** | page-level scoring cannot see a miss; G1b now gates recall |
+| Written total | 19/31 | 19/31, **all 12 errors unflaggable** | `staffOnly.totalMinutes` has no `needsReview` carrier |
+
+Everything else in §0 reproduced exactly: form number 95, gender 94, referral 94, pressure 90, date 84, hotel 73 (W&U 1),
+room 73 (W&U 1), name 41 (W&U 3), treatment names 46 (W&U 2), treatments+durations 42 (W&U 2), body map preferred 38 (W&U 3),
+avoid 55 (W&U 1), unit 35 (W&U 0), therapist 6.
+
+Three things the harness proved about itself, because a benchmark nobody has checked is not evidence:
+
+1. **The replay is faithful.** Code unchanged, it reproduces `value`, `raw` and `needsReview` on **95/95** pages. The only
+   divergences are `source` on 4 pages and `confidence` on 2 (pages 26-29), all of them treatment items production served from
+   the `verified-memory` hook of §2.1 — state that lives in `corrections.jsonl`, not in the response. That is §1D's "in
+   production 4 of 4 real hits (p026-p029)", found independently, and W3a removes it.
+2. **The gates fire.** Scored against a different stored run the harness reports G1 failures, G1b recall losses and the named
+   page flips of G2; it also warns when the page counts differ, so a baseline from another page set cannot be read as a verdict.
+3. **It is deterministic** across two runs (G6), and it refuses to pretend about the gates it cannot compute: G0, G4, G5 and G7
+   are printed as NOT MEASURABLE with the reason, on every run.
+
+One rule the harness now enforces and the old scripts did not: **the scorer uses the reader's own normalisers and never carries
+an alias the reader lacks.** The old `natkey` hard-coded two country codes the master list is missing, which would have made
+W1c's master-list fix score as +0 while genuinely improving the product.

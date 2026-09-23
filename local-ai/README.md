@@ -107,6 +107,7 @@ Extra, additive keys (not in the spec example, safe to ignore):
 | `ocr_confidence.py` | Token-logprob field confidence: value -> token span mapping, per-type review thresholds |
 | `master_data.json` | Editable masters (treatments + allowed durations, therapists with branch/seed, branches, nationalities, visual aliases) |
 | `tests/` | pytest suite, `synthetic_form.py` (draws the template; scaled/rotated pages, PAID-like stamps), `fake_ollama.py`, `bench_deterministic.py` |
+| `tools/` | Offline reading-accuracy benchmark: `replay.py` (rebuild a stored answer through today's parsers), `scoring.py` (the one scorer), `benchmark.py` (CLI + §4 gates), `baseline-v3.2-prod-95.txt` (frozen baseline). Not imported by the service. |
 | `Dockerfile.test` | Throwaway python:3.11 test image |
 
 Runtime dependencies: fastapi, uvicorn, python-multipart, Pillow and **numpy** (new in v3.1, for the registration and stamp
@@ -178,6 +179,33 @@ scans the printed text next to the boxes pulls the shift-only coarse search off 
 steps stayed `known` only up to about ±0.55 degrees of total skew; beyond that the verdict falls to `uncertain` (everything
 flagged) or `unknown` (nothing read, flagged) -- visibly, never silently. The 95 real pages are within -0.4…+0.1 degrees; a
 rotation step in the coarse search (deskew) is Release 3.
+
+## Reading-accuracy benchmark (`tools/`, 0 model calls)
+
+The one scorer of `docs/operations/real-data/accuracy-learning-plan.md` §4. It **replays** the answers the model already
+gave on archived pages through today's `ocr_normalize` / `ocr_confidence`, scores every field against the hand labels and
+prints the §4 gate verdicts. No model call, no page image, no network — a parser, vocabulary, dictionary or threshold
+change is scored in about two seconds.
+
+```bash
+# labels.json + results-prod/pNNN.json live in the operator's scratch directory and never in git (customer data)
+docker run --rm --network none -v "$PWD/local-ai":/app -w /app -e PYTHONDONTWRITEBYTECODE=1 \
+  -v /path/to/realdata:/data:ro ocr-local-ai-test:py311 python tools/benchmark.py --data /data
+docker run ... python tools/benchmark.py --data /data --results results-v32       # any other stored run
+docker run ... python tools/benchmark.py --data /data --freeze tools/baseline-v3.2-prod-95.txt   # re-freeze
+```
+
+Only counts, page numbers, field names and error categories are printed, so the output is safe to paste into a report or a
+commit. Exit code 0 = every computable gate passed (G1 no new silent error, G1b no lost item recall, G2 page flips named,
+G3 review budget, G6 determinism). **G0, G4, G5 and G7 are not computable here**: they need the archived 1610 px production
+renders or the full deterministic image pipeline (`tests/bench_deterministic.py`). The image-derived fields (checkboxes,
+body map) are therefore production's own stored answers, copied through — the benchmark can measure a *text* change, not a
+*mark* change.
+
+Fidelity, 95 stored production pages, code unchanged: **95/95 reproduce `value`, `raw` and `needsReview` exactly**. Four
+pages (26-29) differ in `source` and two of them in `confidence`, because production served those treatment items from the
+`verified-memory` hook (`corrections.jsonl`), which the stored response does not carry; pass `--verified <operator copy>`
+to reproduce those too. Plan W3a removes that hook.
 
 ## Testing
 
