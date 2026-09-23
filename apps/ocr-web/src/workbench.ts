@@ -368,7 +368,7 @@ const BODY = String.raw`<a class="skip" href="#docs-title">ข้ามไปท
 <p id="ex-count" class="sub" role="status"></p>
 <div class="x-scroll"><table><caption class="sr-only">ตัวอย่าง 20 แถวแรกของไฟล์ที่จะได้</caption><thead><tr id="ex-head"></tr></thead><tbody id="ex-rows"></tbody></table></div>
 <p class="sub">เปิดไฟล์ CSV ใน Excel ด้วยเมนู Data ▸ From Text/CSV แล้วตั้งคอลัมน์ ห้อง และ เลขที่ฟอร์ม เป็น “ข้อความ” มิฉะนั้น Excel จะตัดเลข 0 ข้างหน้าทิ้ง (007 จะกลายเป็น 7)</p>
-<p id="ex-limit" class="sub"></p>
+<p id="ex-limit" class="sub" role="status"></p>
 <p id="ex-error" class="err" role="alert"></p>
 <div class="acts"><button id="ex-download" class="btn primary" type="button" disabled>ดาวน์โหลด</button></div>
 </div></div></dialog>
@@ -409,8 +409,11 @@ const MODALS=['auth-dlg','pw-dlg','users-dlg','me-dlg','confirm-dlg','export-dlg
 /* The export's status checkboxes, in the order they appear; each has a checkbox with the id 'ex-st-'+key. */
 const EXPORT_STATUSES=['queued','processing','review','succeeded','confirmed','failed'];
 const ERRORS={NETWORK:'เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ กรุณาตรวจสอบอินเทอร์เน็ตแล้วลองใหม่',TIMEOUT:'อัปโหลดใช้เวลานานเกินไป กรุณาลองใหม่',REVIEW_CONFLICT:'มีผู้อื่นบันทึกเอกสารนี้หลังจากที่คุณเปิด',DOCUMENT_NOT_REVIEWABLE:'เอกสารนี้ยังไม่อยู่ในสถานะที่ตรวจสอบได้',DOCUMENT_NOT_RETRYABLE:'เอกสารนี้ส่งอ่านใหม่ไม่ได้ (ไฟล์ยังไม่ผ่านการตรวจความปลอดภัย หรือไม่ได้อยู่ในสถานะไม่สำเร็จ) กรุณาอัปโหลดไฟล์ใหม่',DOCUMENT_QUARANTINED:'ไฟล์นี้ไม่ผ่านการตรวจความปลอดภัย จึงไม่แสดงต้นฉบับ กรุณาอัปโหลดไฟล์ใหม่',DOCUMENT_NOT_SCANNED:'ไฟล์นี้ยังตรวจความปลอดภัยไม่เสร็จ จึงยังแสดงต้นฉบับไม่ได้',UPLOAD_IN_PROGRESS:'ไฟล์นี้ยังอยู่ระหว่างตรวจจากการส่งครั้งก่อน กรุณาลองใหม่ในอีก 2–3 นาที',INVALID_UPLOAD_HEADERS:'ข้อมูลไฟล์ไม่ถูกต้อง (ไฟล์ว่าง ใหญ่เกิน 200 MB หรือชื่อไฟล์ผิดรูปแบบ)',FILENAME_TOO_LONG:'ชื่อไฟล์ยาวเกิน 120 ตัวอักษร กรุณาเปลี่ยนชื่อไฟล์',FILENAME_TOO_LARGE:'ชื่อไฟล์ยาวเกินกำหนด กรุณาเปลี่ยนชื่อไฟล์',INVALID_BATCH_ID:'รหัสชุดอัปโหลดไม่ถูกต้อง',DOCUMENT_NOT_FOUND:'ไม่พบเอกสารนี้',CONTENT_NOT_FOUND:'ไม่พบไฟล์ต้นฉบับของเอกสารนี้',BATCH_NOT_FOUND:'ไม่พบชุดอัปโหลดนี้',BATCH_FULL:'ชุดอัปโหลดนี้ครบจำนวนไฟล์แล้ว',IDEMPOTENCY_CONFLICT:'ไฟล์นี้ถูกส่งซ้ำด้วยข้อมูลต่างกัน กรุณาเลือกไฟล์ใหม่อีกครั้ง',PAYLOAD_TOO_LARGE:'ไฟล์มีขนาดใหญ่เกินกำหนด',UNSUPPORTED_MEDIA_TYPE:'ไม่รองรับไฟล์ประเภทนี้ (ใช้ได้เฉพาะ PNG, JPG, WebP และ PDF)',REVIEW_INVALID:'ข้อมูลที่แก้ไขไม่ถูกต้อง (ข้อความยาวเกิน 500 ตัวอักษร หรือรายการเกิน 50 รายการ)',
-USER_CHANGED:'มีการเข้าสู่ระบบด้วยบัญชีอื่น กำลังโหลดหน้านี้ใหม่',INVALID_CREDENTIALS:'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง',PASSWORD_EXPIRED:'รหัสผ่านชั่วคราวหมดอายุหรือถูกใช้ไปแล้ว กรุณาขอรหัสผ่านใหม่จากผู้ดูแลระบบ',LOGIN_THROTTLED:'พยายามเข้าสู่ระบบบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่',LOGIN_BUSY:'ระบบกำลังตรวจสอบรหัสผ่านจำนวนมาก กรุณาลองใหม่ในอีกสักครู่',LOGIN_NOT_CONFIGURED:'ระบบเข้าสู่ระบบยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแลระบบ',INVALID_LOGIN:'ข้อมูลเข้าสู่ระบบไม่ถูกต้อง',UNAUTHENTICATED:'กรุณาเข้าสู่ระบบอีกครั้ง',CSRF_REJECTED:'คำขอถูกปฏิเสธเพื่อความปลอดภัย กรุณาลองใหม่อีกครั้ง',FORBIDDEN:'บัญชีของคุณไม่มีสิทธิ์ใช้งานส่วนนี้',PASSWORD_CHANGE_REQUIRED:'กรุณาตั้งรหัสผ่านใหม่ก่อนใช้งานต่อ',PASSWORD_INCORRECT:'รหัสผ่านปัจจุบันไม่ถูกต้อง',PASSWORD_UNCHANGED:'รหัสผ่านใหม่ต้องไม่ซ้ำกับรหัสผ่านเดิม',WEAK_PASSWORD:'รหัสผ่านไม่ปลอดภัยพอ: ใช้อย่างน้อย 12 ตัวอักษร ไม่ซ้ำกับชื่อผู้ใช้ และไม่ใช่รหัสผ่านที่ใช้กันทั่วไป',USERNAME_TAKEN:'มีชื่อผู้ใช้นี้อยู่แล้ว',INVALID_USERNAME:'ชื่อผู้ใช้ไม่ถูกต้อง (ใช้ได้เฉพาะภาษาอังกฤษ ตัวเลข จุด ขีดกลางและขีดล่าง)',INVALID_DISPLAY_NAME:'ชื่อที่แสดงไม่ถูกต้อง',INVALID_ROLE:'บทบาทไม่ถูกต้อง',USER_INVALID:'ข้อมูลผู้ใช้ไม่ถูกต้อง',USER_NOT_FOUND:'ไม่พบผู้ใช้นี้',LAST_ADMIN:'ต้องเหลือผู้ดูแลระบบที่ใช้งานได้อย่างน้อยหนึ่งคน',CANNOT_CHANGE_SELF:'เปลี่ยนสิทธิ์หรือรีเซ็ตรหัสผ่านของบัญชีตัวเองที่นี่ไม่ได้'};
-const state={exSeq:0,exAbort:null,exTimer:0,exBusy:false,exTotal:0,exMax:0,exQ:'',exParent:'',exParentName:'',
+USER_CHANGED:'มีการเข้าสู่ระบบด้วยบัญชีอื่น กำลังโหลดหน้านี้ใหม่',INVALID_CREDENTIALS:'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง',PASSWORD_EXPIRED:'รหัสผ่านชั่วคราวหมดอายุหรือถูกใช้ไปแล้ว กรุณาขอรหัสผ่านใหม่จากผู้ดูแลระบบ',LOGIN_THROTTLED:'พยายามเข้าสู่ระบบบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่',LOGIN_BUSY:'ระบบกำลังตรวจสอบรหัสผ่านจำนวนมาก กรุณาลองใหม่ในอีกสักครู่',LOGIN_NOT_CONFIGURED:'ระบบเข้าสู่ระบบยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแลระบบ',INVALID_LOGIN:'ข้อมูลเข้าสู่ระบบไม่ถูกต้อง',UNAUTHENTICATED:'กรุณาเข้าสู่ระบบอีกครั้ง',CSRF_REJECTED:'คำขอถูกปฏิเสธเพื่อความปลอดภัย กรุณาลองใหม่อีกครั้ง',FORBIDDEN:'บัญชีของคุณไม่มีสิทธิ์ใช้งานส่วนนี้',PASSWORD_CHANGE_REQUIRED:'กรุณาตั้งรหัสผ่านใหม่ก่อนใช้งานต่อ',PASSWORD_INCORRECT:'รหัสผ่านปัจจุบันไม่ถูกต้อง',PASSWORD_UNCHANGED:'รหัสผ่านใหม่ต้องไม่ซ้ำกับรหัสผ่านเดิม',WEAK_PASSWORD:'รหัสผ่านไม่ปลอดภัยพอ: ใช้อย่างน้อย 12 ตัวอักษร ไม่ซ้ำกับชื่อผู้ใช้ และไม่ใช่รหัสผ่านที่ใช้กันทั่วไป',USERNAME_TAKEN:'มีชื่อผู้ใช้นี้อยู่แล้ว',INVALID_USERNAME:'ชื่อผู้ใช้ไม่ถูกต้อง (ใช้ได้เฉพาะภาษาอังกฤษ ตัวเลข จุด ขีดกลางและขีดล่าง)',INVALID_DISPLAY_NAME:'ชื่อที่แสดงไม่ถูกต้อง',INVALID_ROLE:'บทบาทไม่ถูกต้อง',USER_INVALID:'ข้อมูลผู้ใช้ไม่ถูกต้อง',USER_NOT_FOUND:'ไม่พบผู้ใช้นี้',LAST_ADMIN:'ต้องเหลือผู้ดูแลระบบที่ใช้งานได้อย่างน้อยหนึ่งคน',CANNOT_CHANGE_SELF:'เปลี่ยนสิทธิ์หรือรีเซ็ตรหัสผ่านของบัญชีตัวเองที่นี่ไม่ได้',
+/* The export's own codes (§10 H6): every one of them is reachable from the dialog, so none may reach staff as a raw
+   English code. EXPORT_INCOMPLETE is this script's own: the server cuts the socket instead of sending a code. */
+EXPORT_TOO_LARGE:'ข้อมูลที่เลือกมีจำนวนแถวเกินที่ส่งออกได้ในครั้งเดียว กรุณาเลือกช่วงวันที่ให้แคบลงแล้วลองใหม่',EXPORT_BUSY:'การดาวน์โหลดครั้งก่อนของคุณยังไม่เสร็จ กรุณารอสักครู่แล้วลองใหม่',EXPORT_THROTTLED:'ปรับตัวกรองบ่อยเกินไป กรุณารอประมาณ 15 นาทีแล้วเปิดหน้าต่างส่งออกใหม่',INVALID_EXPORT_FILTER:'ตัวกรองส่งออกไม่ถูกต้อง กรุณาตรวจสอบช่วงวันที่และตัวเลือกอีกครั้ง',INVALID_EXPORT_RANGE:'ถึงวันที่ต้องไม่อยู่ก่อนตั้งแต่วันที่',EXPORT_TIMEOUT:'การส่งออกใช้เวลานานเกินไปจึงถูกยกเลิก กรุณาเลือกช่วงวันที่ให้แคบลงแล้วลองใหม่',EXPORT_INCOMPLETE:'ไฟล์ส่งออกถูกตัดกลางคัน จึงไม่ได้บันทึกไฟล์ กรุณาเลือกช่วงวันที่ให้แคบลงแล้วลองใหม่',EXPORT_NOT_CONFIGURED:'ระบบส่งออกยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแลระบบ'};
+const state={exSeq:0,exAbort:null,exTimer:0,exBusy:false,exTotal:null,exMax:0,exQ:'',exParent:'',exParentName:'',
 user:null,csrf:'',authWait:null,authSettle:null,authBefore:null,csrfWait:null,rearm:null,leaving:false,started:false,bg:0,xhrs:new Set(),users:[],tempPass:'',pwForced:false,pwBusy:false,pwResolve:null,loginBusy:false,confirmResolve:null,confirmReturn:null,conn:'',docs:[],total:0,offset:0,q:'',status:'',batchFilter:'',parentFilter:'',parentName:'',pdfView:false,batches:[],batchId:null,batch:null,listSeq:0,listAbort:null,listSig:'',loaded:false,uploads:[],active:0,timer:0,ticking:false,soon:0,searchTimer:0,noticeTimer:0,current:null,draft:null,originalSig:'',editable:false,dirty:false,saving:false,blobUrl:'',previewSeq:0,previewAbort:null,previewMissing:false,zoom:1,openSeq:0,lastFocus:null,askResolve:null,askReturn:null,uid:0,inputs:new WeakMap()};
 const $=id=>document.getElementById(id);
 const dateFmt=new Intl.DateTimeFormat('th-TH',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
@@ -632,7 +635,10 @@ function copyTemp(){if(!state.tempPass)return;try{if(typeof navigator!=='undefin
    customer name typed into the search box an hour ago would otherwise narrow the file silently, and staff would be
    left wondering why it has fewer rows than the table says. Removing a chip narrows only the export. */
 function setExportError(text){$('ex-error').textContent=text||'';}
-function clearExportPreview(){state.exTotal=0;state.exMax=0;$('ex-head').replaceChildren();$('ex-rows').replaceChildren();$('ex-count').textContent='';$('ex-limit').textContent='';
+/* exTotal is null until a preview has actually answered: 0 is a claim about the data ("no documents match"), and
+   making it while the first count is in flight — or beside a 429 — tells staff to widen a filter that is fine. */
+function blankExportPreview(){state.exTotal=null;state.exMax=0;$('ex-head').replaceChildren();$('ex-rows').replaceChildren();$('ex-count').textContent='';$('ex-limit').textContent='';$('ex-chips').replaceChildren();$('ex-chips').hidden=true;setExportError('');}
+function clearExportPreview(){blankExportPreview();
 const d=$('export-dlg');if(d.open)d.close();}
 function exportChip(text,onRemove){const s=el('span','chip-x');s.append(el('span','chip-t',text),btn('✕','sm ghost',onRemove,'ลบตัวกรองนี้'));return s;}
 function renderExportChips(){const box=$('ex-chips'),chips=[];
@@ -652,9 +658,14 @@ if(state.exQ)p.set('q',state.exQ);
 if(state.exParent)p.set('parentId',state.exParent);
 p.set('columns',$('ex-columns').value==='detailed'?'detailed':'compact');
 return p.toString();}
-function updateDownload(){const over=state.exMax>0&&state.exTotal>state.exMax,none=state.exTotal===0;
-$('ex-download').disabled=state.exBusy||none||over;
-$('ex-limit').textContent=over?'เกิน '+state.exMax+' แถว กรุณาเลือกช่วงวันที่ให้แคบลง':none?'ไม่มีเอกสารที่ตรงกับตัวกรองนี้':'';}
+/* The server answers 400 INVALID_EXPORT_FILTER for from > to, which says nothing about which field to change. */
+function badExportRange(){const from=str($('ex-from').value),to=str($('ex-to').value);return !!(from&&to&&from>to);}
+/* exTotal===null means "not counted yet": the button stays disabled and #ex-limit stays silent, because the count on
+   screen belongs to the previous filters and the request at click time would carry the new ones. */
+function updateDownload(){const counted=typeof state.exTotal==='number',bad=badExportRange();
+const over=counted&&state.exMax>0&&state.exTotal>state.exMax,none=counted&&state.exTotal===0;
+$('ex-download').disabled=state.exBusy||!counted||none||over||bad;
+$('ex-limit').textContent=bad?ERRORS.INVALID_EXPORT_RANGE:over?'เกิน '+state.exMax+' แถว กรุณาเลือกช่วงวันที่ให้แคบลง':none?'ไม่มีเอกสารที่ตรงกับตัวกรองนี้':'';}
 /* The preview renders the file's own columns and values through textContent: 'หน้า' holds the bare 3 that the file
    holds, with 'จำนวนหน้า' beside it, and 'หน้า 3/95' only as the cell's title. */
 function renderExportPreview(data){const cols=Array.isArray(data.columns)?data.columns.filter(isObj):[],rows=Array.isArray(data.rows)?data.rows:[];
@@ -666,22 +677,32 @@ if(key==='page'&&str(v))td.title='หน้า '+str(v)+(str(values[i+1])?'/'+st
 tr.append(td);});return tr;}));
 $('ex-count').textContent='พบ '+state.exTotal+' แถว · แสดง '+rows.length+' แถวแรก';
 setExportError('');updateDownload();}
-function exportPreviewSoon(){clearTimeout(state.exTimer);state.exTimer=setTimeout(()=>{loadExportPreview();},300);}
-async function loadExportPreview(){const seq=++state.exSeq;if(state.exAbort)state.exAbort.abort();const ctrl=new AbortController();state.exAbort=ctrl;
-$('ex-count').textContent='กำลังนับจำนวนแถว…';
+/* The count on screen stops matching the filters the moment a control moves, so the button goes dead with it. */
+function exportPreviewSoon(){clearTimeout(state.exTimer);state.exTotal=null;updateDownload();state.exTimer=setTimeout(()=>{loadExportPreview();},300);}
+async function loadExportPreview(){const seq=++state.exSeq;if(state.exAbort){state.exAbort.abort();state.exAbort=null;}
+state.exTotal=null;
+/* Caught here rather than as the server's 400, which can only say INVALID_EXPORT_FILTER for any of its filters. */
+if(badExportRange()){$('ex-count').textContent='';updateDownload();setExportError(ERRORS.INVALID_EXPORT_RANGE);return;}
+const ctrl=new AbortController();state.exAbort=ctrl;
+$('ex-count').textContent='กำลังนับจำนวนแถว…';updateDownload();
 try{const data=await getJson('/api/exports/preview?'+exportParams(),{signal:ctrl.signal});if(seq!==state.exSeq)return;renderExportPreview(data);}
-catch(e){if(e&&e.name==='AbortError')return;if(seq!==state.exSeq)return;$('ex-count').textContent='';state.exTotal=0;updateDownload();setExportError(e.message);}
+catch(e){if(e&&e.name==='AbortError')return;if(seq!==state.exSeq)return;$('ex-count').textContent='';state.exTotal=null;updateDownload();setExportError(e.message);}
 finally{if(state.exAbort===ctrl)state.exAbort=null;}}
 function openExportDialog(){closeMe();
 state.exQ=state.q;state.exParent=state.parentFilter;state.exParentName=state.parentName;
 EXPORT_STATUSES.forEach(s=>{$('ex-st-'+s).checked=state.status===s;});
-const sel=$('ex-batch');sel.replaceChildren(new Option('ทุกชุดอัปโหลด',''));state.batches.forEach(b=>sel.append(new Option(batchName(b),b.batchId)));sel.value=state.batchFilter||'';
+/* The same fallback option as the toolbar's filter: /api/batches?limit=20 may not hold the selected batch, and a
+   <select> given a value that matches no <option> reads back as '' — the export would silently cover every batch. */
+fillBatchOptions($('ex-batch'),state.batchFilter||'');
 $('ex-confirmed').checked=false;$('ex-datefield').value='created_at';$('ex-from').value='';$('ex-to').value='';$('ex-format').value='csv';$('ex-columns').value='compact';
-state.exTotal=0;state.exMax=0;$('ex-head').replaceChildren();$('ex-rows').replaceChildren();$('ex-limit').textContent='';setExportError('');updateDownload();
+blankExportPreview();updateDownload();
 renderExportChips();
 const d=$('export-dlg');if(!d.open)d.showModal();
 loadExportPreview();}
+/* Closing is not logging out, but the preview holds the same customer data the table does — and with คอลัมน์ =
+   ละเอียด more of it than the table ever shows — so it leaves the DOM with the dialog. */
 function closeExportDialog(){clearTimeout(state.exTimer);if(state.exAbort){state.exAbort.abort();state.exAbort=null;}
+state.exSeq++;blankExportPreview();
 const d=$('export-dlg');if(d.open)d.close();}
 function downloadName(header,format){const m=/filename="([A-Za-z0-9._-]+)"/.exec(str(header));return m?m[1]:'ocr-export.'+format;}
 /* The file goes through api() so it carries the session cookie and can survive one re-login; a rejected fetch leaves
@@ -690,10 +711,18 @@ async function downloadExport(){if(state.exBusy)return;
 const format=$('ex-format').value==='jsonl'?'jsonl':'csv';
 state.exBusy=true;updateDownload();$('ex-download').textContent='กำลังเตรียมไฟล์…';setExportError('');
 try{const r=await api('/api/exports/documents.'+format+'?'+exportParams());
-const blob=await r.blob();const url=URL.createObjectURL(blob);
+/* api() only turns a rejected fetch() into a Thai error; once the 200 headers are out the body is ours. The route
+   destroys the socket on purpose when a stream is cut short (EXPORT_TRUNCATED / EXPORT_TIMEOUT), and that rejects
+   here with the platform's own English TypeError. */
+let blob;try{blob=await r.blob();}catch(e){throw apiError(0,'EXPORT_INCOMPLETE');}
+const url=URL.createObjectURL(blob);
 const a=el('a');a.href=url;a.download=downloadName(r.headers&&r.headers.get('content-disposition'),format);
+/* Appended before the click and revoked a turn later: a detached anchor, or a URL invalidated in the same tick as
+   the click, is only reliable in Chromium. */
+document.body.append(a);
 if(typeof a.click==='function')a.click();
-if(typeof URL.revokeObjectURL==='function')URL.revokeObjectURL(url);
+a.remove();
+if(typeof URL.revokeObjectURL==='function')setTimeout(()=>{URL.revokeObjectURL(url);},0);
 notify('ดาวน์โหลดไฟล์ส่งออกแล้ว');}
 catch(e){setExportError(e.message);}
 finally{state.exBusy=false;$('ex-download').textContent='ดาวน์โหลด';updateDownload();}}
@@ -756,7 +785,11 @@ async function retryDocument(id,button){if(button)button.disabled=true;try{await
 
 /* ---------- batches ---------- */
 function batchName(b){return (b.label?b.label+' · ':'')+when(b.createdAt)+' · '+(Number(b.expectedTotal)||0)+' ไฟล์';}
-function renderBatchOptions(){const sel=$('batch-filter');const cur=state.batchFilter;sel.replaceChildren(new Option('ทุกชุดอัปโหลด',''));state.batches.forEach(b=>sel.append(new Option(batchName(b),b.batchId)));if(cur&&!state.batches.some(b=>b.batchId===cur))sel.append(new Option('ชุดที่เลือก',cur));sel.value=cur;}
+/* state.batches is only /api/batches?limit=20, while the held filter may name a batch outside it (a batch just
+   created by an upload, or any batch once 20 newer ones exist). A <select> set to a value no <option> carries reads
+   back as '', so the fallback option is what keeps the filter from disappearing silently. */
+function fillBatchOptions(sel,cur){sel.replaceChildren(new Option('ทุกชุดอัปโหลด',''));state.batches.forEach(b=>sel.append(new Option(batchName(b),b.batchId)));if(cur&&!state.batches.some(b=>b.batchId===cur))sel.append(new Option('ชุดที่เลือก',cur));sel.value=cur;}
+function renderBatchOptions(){fillBatchOptions($('batch-filter'),state.batchFilter);}
 async function loadBatches(){try{const data=await getJson('/api/batches?limit=20');state.batches=(Array.isArray(data.batches)?data.batches:[]).filter(b=>isObj(b)&&typeof b.batchId==='string').sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt)));renderBatchOptions();if(!state.batchId&&state.batches.length){state.batchId=state.batches[0].batchId;state.batch=state.batches[0];renderBatch();}}catch(e){}}
 async function loadBatch(){if(!state.batchId)return;const id=state.batchId;try{const b=await getJson('/api/batches/'+encodeURIComponent(id));if(id!==state.batchId||!isObj(b))return;state.batch=b;renderBatch();}catch(e){if(e.status===404&&id===state.batchId){state.batchId=null;state.batch=null;renderBatch();}}}
 function localPending(batchId){return state.uploads.some(u=>u.group&&u.group.batchId===batchId&&(u.status==='waiting'||u.status==='uploading'));}

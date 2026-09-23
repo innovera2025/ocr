@@ -33,6 +33,9 @@ class FakeElement {
   htmlFor = "";
   id = "";
   href: string | undefined;
+  /** The parent is tracked so `remove()` behaves: the export's download anchor is appended and taken away again. */
+  parent: FakeElement | null = null;
+  clicks = 0;
   private ownText = "";
   constructor(tagName: string) { this.tagName = tagName.toUpperCase(); }
   get textContent(): string { return this.ownText + this.children.map((child) => child.textContent).join(""); }
@@ -48,7 +51,12 @@ class FakeElement {
       contains: (name: string) => names().includes(name)
     };
   }
-  append(...nodes: Array<FakeElement | string>): void { for (const node of nodes) this.children.push(typeof node === "string" ? textNode(node) : node); }
+  append(...nodes: Array<FakeElement | string>): void {
+    for (const node of nodes) { const child = typeof node === "string" ? textNode(node) : node; child.parent = this; this.children.push(child); }
+  }
+  remove(): void { const index = this.parent?.children.indexOf(this) ?? -1; if (this.parent && index >= 0) this.parent.children.splice(index, 1); this.parent = null; }
+  /** The real anchor's click is what starts the download; counting it keeps that path from going untested. */
+  click(): void { this.clicks += 1; }
   replaceChildren(...nodes: Array<FakeElement | string>): void { this.children = []; this.ownText = ""; this.append(...nodes); }
   setAttribute(name: string, value: unknown): void { this.attributes.set(name, String(value)); }
   getAttribute(name: string): string | null { return this.attributes.get(name) ?? null; }
@@ -103,7 +111,7 @@ type Workbench = {
     uploads: Upload[]; batch: unknown; batchId: string | null; current: unknown; draft: unknown; editable: boolean;
     openSeq: number; originalSig: string; user: { id: string } | null; csrf: string; dirty: boolean; leaving: boolean;
     timer: number; users: unknown[]; tempPass: string; q: string; status: string; parentFilter: string; parentName: string;
-    exQ: string; exParent: string; exTotal: number; exMax: number;
+    exQ: string; exParent: string; exTotal: number | null; exMax: number; batchFilter: string;
   };
 };
 
@@ -994,26 +1002,121 @@ test("the download goes through the session cookie and releases its blob URL", a
   await settle();
   ctx.wb.openExportDialog();
   await settle();
+  const armed = [...ctx.clock.timers.keys()];
   ctx.$("ex-download").dispatch("click");
   await settle();
   const call = ctx.calls.find((entry) => entry.url.startsWith("/api/exports/documents.csv"));
   assert.ok(call, "the file is fetched, not linked: a plain <a href> would carry no credentials check we can retry");
   assert.equal(call.method, "GET");
-  assert.deepEqual([blobs.created, blobs.revoked], [1, 1], "no object URL is left alive");
+  // The anchor is in the document when it is clicked and gone afterwards, and the blob URL outlives the click by a
+  // turn: a detached anchor and a same-tick revoke are only reliable in Chromium.
+  const anchors = ctx.body.children.filter((node) => node.tagName === "A");
+  assert.deepEqual(anchors, [], "the anchor does not stay in the document");
+  assert.deepEqual([blobs.created, blobs.revoked], [1, 0], "the object URL survives the click");
+  // The first timer armed by the click is the deferred revoke (the one after it is the notice's own auto-hide).
+  ctx.clock.run([...ctx.clock.timers.keys()].find((id) => !armed.includes(id))!);
+  assert.deepEqual([blobs.created, blobs.revoked], [1, 1], "and is revoked on the next turn, so none is left alive");
   assert.equal(ctx.$("ex-error").textContent, "");
   assert.equal(ctx.$("ex-download").textContent, "ดาวน์โหลด", "the button goes back from กำลังเตรียมไฟล์…");
 });
 
-test("a refused download shows the Thai error in the dialog and leaves the button usable", async () => {
+test("every export error the routes can answer with has a Thai message, never the raw code", async () => {
+  // Each of these is reachable from the dialog: the per-user gate, the preview limiter, the row cap and a bad range.
+  for (const [status, code] of [[429, "EXPORT_BUSY"], [429, "EXPORT_THROTTLED"], [400, "EXPORT_TOO_LARGE"], [400, "INVALID_EXPORT_FILTER"]] as const) {
+    const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
+    const ctx = await bootedIn(state, (url) => url.startsWith("/api/exports/documents.csv")
+      ? json(status, { error: code }) : previewRoutes()(url, {}));
+    ctx.wb.openExportDialog();
+    await settle();
+    ctx.$("ex-download").dispatch("click");
+    await settle();
+    // Equality, not a match: an alternation on the code would pass on the untranslated fallback.
+    assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS[code], code);
+    assert.ok(!ctx.$("ex-error").textContent.includes(code), `${code} must not reach staff as a raw code`);
+    assert.equal(ctx.$("ex-download").disabled, false);
+  }
+});
+
+test("a stream cut off after the 200 headers is a Thai error and no success notice", async () => {
+  // What the route does on EXPORT_TRUNCATED / EXPORT_TIMEOUT: the headers are out, so it destroys the socket and the
+  // browser rejects the body read with its own English TypeError.
   const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
   const ctx = await bootedIn(state, (url) => url.startsWith("/api/exports/documents.csv")
-    ? json(429, { error: "EXPORT_BUSY" }) : previewRoutes()(url, {}));
+    ? { ok: true, status: 200, headers: { get: () => null }, json: async () => ({}),
+      blob: async () => { throw new TypeError("terminated"); } } : previewRoutes()(url, {}));
   ctx.wb.openExportDialog();
   await settle();
   ctx.$("ex-download").dispatch("click");
   await settle();
-  assert.match(ctx.$("ex-error").textContent, /EXPORT_BUSY|คำขอไม่สำเร็จ/);
+  assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS.EXPORT_INCOMPLETE);
+  assert.ok(!ctx.$("notice").textContent.includes("ดาวน์โหลดไฟล์ส่งออกแล้ว"), "nothing was saved, so nothing is announced");
   assert.equal(ctx.$("ex-download").disabled, false);
+});
+
+test("a batch the /api/batches page does not carry still narrows the export", async () => {
+  // ensureBatch() sets the filter to a batch just created; loadBatches() lists only the newest 20 and swallows its
+  // own errors. A <select> set to a value no <option> holds reads back as '', which would export every batch.
+  const held = "99999999-9999-4999-8999-999999999999";
+  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, previewRoutes());
+  ctx.wb.state.batchFilter = held;
+  ctx.wb.openExportDialog();
+  await settle();
+  assert.equal(ctx.$("ex-batch").value, held, "the fallback option keeps the selection");
+  assert.ok(ctx.$("ex-batch").children.some((option) => option.value === held));
+  const url = ctx.calls.find((call) => call.url.startsWith("/api/exports/preview"))!.url;
+  assert.ok(url.includes(`batchId=${held}`), "the export covers the batch the table is showing, not every batch");
+});
+
+test("the dialog makes no claim about the data before a count has answered, and none beside an error", async () => {
+  const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
+  let refuse = false;
+  const ctx = await bootedIn(state, (url) => url.startsWith("/api/exports/preview")
+    ? (refuse ? json(429, { error: "EXPORT_THROTTLED" }) : json(200, EXPORT_PREVIEW)) : null);
+  ctx.wb.openExportDialog();
+  assert.equal(ctx.$("ex-limit").textContent, "", "ไม่มีเอกสาร… is a claim about the data, and nothing has been counted");
+  assert.equal(ctx.$("ex-download").disabled, true);
+  await settle();
+  assert.equal(ctx.$("ex-download").disabled, false);
+  // A filter change invalidates the count on screen before the debounce even fires: the request at click time would
+  // carry the new filters while the enabled/disabled decision came from the old count.
+  refuse = true;
+  ctx.$("ex-columns").value = "detailed";
+  ctx.$("ex-columns").dispatch("change");
+  assert.equal(ctx.$("ex-download").disabled, true, "the button dies with the count it was based on");
+  runLastTimer(ctx);
+  await settle();
+  assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS.EXPORT_THROTTLED);
+  assert.equal(ctx.$("ex-limit").textContent, "", "waiting is the remedy, not widening a filter that was never counted");
+  assert.equal(ctx.$("ex-download").disabled, true);
+});
+
+test("ถึงวันที่ before ตั้งแต่วันที่ is named in Thai and never reaches the server", async () => {
+  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, previewRoutes());
+  ctx.wb.openExportDialog();
+  await settle();
+  ctx.calls.length = 0;
+  ctx.$("ex-from").value = "2026-09-22";
+  ctx.$("ex-to").value = "2026-09-01";
+  ctx.$("ex-to").dispatch("change");
+  runLastTimer(ctx);
+  await settle();
+  // parseExportQuery throws INVALID_EXPORT_FILTER for from > to, which names none of the dialog's six filters.
+  assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS.INVALID_EXPORT_RANGE);
+  assert.equal(ctx.$("ex-download").disabled, true);
+  assert.deepEqual(ctx.calls.filter((call) => call.url.startsWith("/api/exports/")), [], "nothing is asked of the server");
+});
+
+test("closing the dialog takes the previewed customer rows with it", async () => {
+  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, previewRoutes());
+  ctx.wb.state.q = "สมชาย";
+  ctx.wb.openExportDialog();
+  await settle();
+  assert.match(ctx.dom(), /ใบลูกค้า 22-09-2026\.pdf/);
+  ctx.$("ex-close").dispatch("click");
+  await settle();
+  assert.equal(ctx.$("export-dlg").open, false);
+  assert.ok(!ctx.dom().includes("ใบลูกค้า 22-09-2026.pdf"), "ปิด is not a weaker clear than logging out");
+  assert.ok(!ctx.dom().includes("ค้นหา: สมชาย"), "the chip carries the staff member's search text");
 });
 
 test("an expired session leaves no exported customer data on screen", async () => {
