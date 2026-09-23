@@ -7,15 +7,20 @@ docker compose -f deploy/docker-compose.yml up --build
 ```
 
 The base compose file is the production shape: `OCR_ENV=production`, an https `OCR_PUBLIC_BASE_URL` and a required
-`OCR_WEB_TENANT_ID`. To exercise the **login** locally, add the dev override and seed the tenant row once on a fresh
-database (never on production, which already has its row):
+`OCR_WEB_TENANT_ID`. Every `${VAR:?}` in it must resolve before compose will read the file at all, so a dev machine
+needs a local env file first: copy `deploy/production.env.example` to `deploy/dev.env` (git-ignored), add
+`POSTGRES_BOOTSTRAP_PASSWORD` (the example does not list it) and fill in local values for the `DATABASE_URL_*` DSNs,
+`AUTH_JWT_*` (reserved, any non-empty value) and `OCR_WEB_TENANT_ID=00000000-0000-4000-8000-000000000001` — the id
+`deploy/sql/seed-dev-tenant.sql` inserts. Then add the dev override and seed the tenant row once on a fresh database
+(never on production, which already has its row):
 
 ```sh
-OCR_WEB_TENANT_ID=00000000-0000-4000-8000-000000000001 \
-  docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml up --build
-docker compose -f deploy/docker-compose.yml exec -T postgres \
-  psql -U ocr_bootstrap -d innovera_ocr -v ON_ERROR_STOP=1 -f - < deploy/sql/seed-dev-tenant.sql
-./deploy/ocr-users.sh create-admin     # then open http://127.0.0.1:53100 and log in
+D="docker compose --env-file deploy/dev.env -f deploy/docker-compose.yml -f deploy/docker-compose.dev.yml"
+$D up --build
+$D exec -T postgres psql -U ocr_bootstrap -d innovera_ocr -v ON_ERROR_STOP=1 -f - < deploy/sql/seed-dev-tenant.sql
+# ocr-users.sh loads the base compose file and /etc/innovera/ocr-compose.env unless OCR_COMPOSE_ENV says otherwise;
+# `exec` runs inside the container the override already started, so the dev settings still apply.
+OCR_COMPOSE_ENV=deploy/dev.env ./deploy/ocr-users.sh create-admin   # then open http://127.0.0.1:53100 and log in
 ```
 
 The web health endpoint is available at `http://127.0.0.1:53100/health/live`. PostgreSQL is bound to `127.0.0.1:55432`; ClamAV is internal-only. OCR integration reads `OCR_API_BASE_URL` (default `https://ai.innoveraappcenter.com/ocr`), `OCR_REQUEST_TIMEOUT` (seconds, default `300`) and `OCR_MAX_RETRIES` (default `3`). The worker image includes poppler-utils: a PDF upload is split into one page image and one row per page (`OCR_MAX_PDF_PAGES`, default `300`, at most `1000`; `OCR_PAGE_FORMAT` `png` (default; the only format validated against the real scans) or `jpeg`), rendered in `${OCR_STORAGE_ROOT}/tmp` and stored next to the originals (a scanned page keeps its own pixels: about 1.4 MB per PNG page for the 1400 px real scans; at most 1610 px). Deploy order: stop the old worker, deploy the web (it runs migration 0018), then the worker — the new worker refuses to start (`SCHEMA_NOT_READY`) until 0018 is applied. Stop and remove local containers with:

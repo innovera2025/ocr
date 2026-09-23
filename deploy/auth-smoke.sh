@@ -17,7 +17,8 @@ check() {
 status() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$@"; }
 json='{"probe":"auth-smoke"}'
 
-check "web-token:gone" 404 "$(status "${base}/api/web-token")"
+# The route is gone either way; without a session an /api path answers 401 before it can fall through to 404 (C2.4).
+check "web-token:gone" 401 "$(status "${base}/api/web-token")"
 check "documents:unauthenticated" 401 "$(status "${base}/api/documents")"
 check "batches:no-origin" 403 "$(status -X POST -H 'content-type: application/json' --data "$json" "${base}/api/batches")"
 check "batches:foreign-origin" 403 "$(status -X POST -H 'content-type: application/json' -H 'Origin: https://example.invalid' --data "$json" "${base}/api/batches")"

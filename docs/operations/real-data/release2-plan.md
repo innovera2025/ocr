@@ -1773,7 +1773,13 @@ write the deviation down instead of diverging silently.
   login is possible.
 - **`GET /api/web-token` answers 401 without a session.** C1 says it "falls through to 404"; that holds once the
   request authenticates, because C2.4 requires a session on every `/api` route except login and logout. §12's case is
-  asserted with a session.
+  asserted with a session. **E4's credential-free check therefore expects 401, not the 404 the plan's bullet names**
+  (fixed after review): the route is gone either way, and answering 404 to an anonymous probe would put back the
+  route-existence oracle C2.4 removes. `test/deploy-scripts.test.ts` pins the 401.
+- **A `canExport` staff user gets 404, not 200, on the export routes.** §12 wants 200 there; workstream H is Deploy B,
+  so in Deploy A `/api/exports/*` exists only as the permission gate. The user passes the gate and falls through to
+  `404 {status:'not_found'}`, which is what `auth.test.ts` asserts; C10 raises it to 200 when the handlers ship. This
+  is the same deferral as the `ส่งออก` note under C6.
 - **`AppServerOptions` gains `webConfig`, `loginThrottle` and `clock`.** C2 names only `authenticate`; the throttle
   cases need to drive the sliding windows with injected limits and the session cases need to move time, and production
   passes the same `webConfig` it built for `PostgresUserStore`. `createAppServer` builds the session authenticator
@@ -1896,6 +1902,17 @@ write the deviation down instead of diverging silently.
 - **`auth-smoke.sh` prints nine checks, not eight.** E4's list ends with "`GET /` gives 200 with a
   `content-security-policy` header", which is two different failures (a 500 page, and a page with no CSP), so it is
   two lines in the output. The set of requests is exactly E4's.
+- **A3's design-doc renumbering is done in this branch** (after review). `design-2026-09-22.md` now names
+  `0021_cancel_queue_visibility` (§4.3) and `0022_document_template` (§5/§6, and the phase summaries), so the repo
+  does not contradict itself about which migration 0019 and 0020 are while 0019 is being frozen. §14 also lists
+  "design-doc renumbering" under C11; nothing is left for C11 to renumber unless a schema fix shifts the numbers
+  again (A3 says how).
+- **The dev quickstart in `deploy/README.md` names a local env file.** E5b's stack cannot be started by the commands
+  as they were written: every `${VAR:?}` in `deploy/docker-compose.yml` (`POSTGRES_BOOTSTRAP_PASSWORD`, the
+  `DATABASE_URL_*` DSNs, `AUTH_JWT_*`, `OCR_WEB_TENANT_ID`) has to resolve before compose will read the file at all,
+  and `ocr-users.sh` defaults to `--env-file /etc/innovera/ocr-compose.env`, which no developer machine has. The
+  block now builds one `docker compose --env-file deploy/dev.env -f … -f …` prefix and calls the wrapper with
+  `OCR_COMPOSE_ENV=deploy/dev.env`. `ocr-users.sh` itself is unchanged (it matches E2), and deploy/dev.env is git-ignored.
 - **`deploy/README.md:15` still names 0018 as the worker gate.** E6 asks for ":15 for the 0020 worker gate", but
   `REQUIRED_SCHEMA_VERSION` only moves to `0020_batch_round_clock` in C8 (G2), and Deploy A leaves the worker alone.
   The sentence names 0018 as today's gate and says Deploy B raises it to 0020, so the README is true at every commit

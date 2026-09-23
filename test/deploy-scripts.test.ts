@@ -59,6 +59,9 @@ test("auth-smoke.sh needs no credentials at all", () => {
     "content-security-policy", "/health/ready", "https://example.invalid"]) {
     assert.ok(smoke.includes(needle), needle);
   }
+  // The route is gone, but C2.4 refuses an /api path with no session long before it could fall through to 404, so the
+  // credential-free probe must expect 401 — otherwise Deploy A step 8 can never report FAIL=0.
+  assert.match(smoke, /check "web-token:gone" 401 /);
   assert.match(smoke, /SUMMARY PASS=%s FAIL=%s/);
 });
 

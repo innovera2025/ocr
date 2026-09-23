@@ -12,3 +12,4 @@ local-ai/tests/fixtures/*.jpg
 local-ai/**/__pycache__/
 local-ai/.pytest_cache/
 **/tsconfig.tsbuildinfo
+deploy/dev.env
