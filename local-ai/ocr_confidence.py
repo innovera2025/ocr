@@ -50,7 +50,15 @@ def _load_calibration(path):
     of REVIEW_BELOW, carry a non-empty `acceptedBecause` (§4 G6 forbids a threshold move whose held-out evidence is not
     recorded), name in `movedFrom` the value it replaces, and move it by at most ±CALIBRATION_MAX_MOVE. A file that
     breaks any of those is refused WHOLE -- never half applied, and never left on the value from before the edit:
-    REVIEW_BELOW comes back into force, which is always the stricter, more-review direction, and /health says so."""
+    REVIEW_BELOW comes back into force, which is always the stricter, more-review direction, and /health says so.
+
+    The ±CALIBRATION_MAX_MOVE clamp is measured against **REVIEW_BELOW[kind], the value actually in force in the code**,
+    and `movedFrom` must equal it. Checking the move against the file's own `movedFrom` -- the first implementation --
+    made the clamp self-declared and therefore vacuous: `{"reviewBelow": 0.00, "movedFrom": 0.05}` for `date` loaded
+    clean and put 0.00 in force against a code default of 0.90 (adversarial review, 2026-09-23). `movedFrom` stays in
+    the file as the recorded evidence of what was replaced, and a file that lies about it is refused whole.
+    The consequence is deliberate: a threshold cannot be walked further than ±CALIBRATION_MAX_MOVE from its code
+    default by editing this file again. A second release's move is a change to REVIEW_BELOW, reviewed as code."""
     if path is None:
         return {}  # no calibration file: the code defaults are the calibration
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -62,11 +70,14 @@ def _load_calibration(path):
             raise ValueError(f"calibration {path}: '{kind}' is not a field type ({', '.join(sorted(REVIEW_BELOW))})")
         if not isinstance(entry, dict) or not isinstance(entry.get("acceptedBecause"), str) or not entry["acceptedBecause"].strip():
             raise ValueError(f"calibration {path}: '{kind}' needs a non-empty 'acceptedBecause' (plan §4 G6)")
-        value, previous = entry.get("reviewBelow"), entry.get("movedFrom")
+        value, previous, in_force = entry.get("reviewBelow"), entry.get("movedFrom"), REVIEW_BELOW[kind]
         if not all(type(v) in (int, float) and 0.0 <= v <= 1.0 for v in (value, previous)):
             raise ValueError(f"calibration {path}: '{kind}' needs a 'reviewBelow' and a 'movedFrom' between 0 and 1")
-        if abs(value - previous) > CALIBRATION_MAX_MOVE + 1e-9:
-            raise ValueError(f"calibration {path}: '{kind}' moves {previous} -> {value}, further than the "
+        if abs(previous - in_force) > 1e-9:
+            raise ValueError(f"calibration {path}: '{kind}' says it replaces {previous}, but the threshold in force is "
+                             f"{in_force} (ocr_confidence.REVIEW_BELOW). 'movedFrom' records what was replaced (plan §4 G6)")
+        if abs(value - in_force) > CALIBRATION_MAX_MOVE + 1e-9:
+            raise ValueError(f"calibration {path}: '{kind}' moves {in_force} -> {value}, further than the "
                              f"±{CALIBRATION_MAX_MOVE} one release may move a threshold (plan §4 G6)")
         out[kind] = float(value)
     return out

@@ -9,6 +9,7 @@ match. No customer data: the form and the answers are generated.
 
 import pytest
 
+import conftest
 import ocr_model
 from conftest import FakeModel, png_of
 from tools import replay
@@ -69,3 +70,67 @@ def test_replay_reports_a_stale_gate_when_the_raw_value_changes(client, monkeypa
     body["staffOnly"]["roomNo"] = body["staffOnly"]["roomNo"] | {"raw": "changed"}
     _, notes = replay.replay_page(body)
     assert "staffOnly.roomNo" in notes["staleGate"]
+
+
+# ------------------------------------------------------------------ the re-read branches (plan §4, replay.staleRoute)
+
+
+class FallbackModel(FakeModel):
+    """Answers the first call of a kind with `first[kind]`, later calls with the FakeModel default, so the service takes
+    a re-read branch of `api.process_image` and the two answers genuinely differ."""
+
+    def __init__(self, first, **kw):
+        super().__init__(**kw)
+        self.first, self.used = first, set()
+
+    def answer(self, kind):
+        if kind in self.first and kind not in self.used:
+            self.used.add(kind)
+            return self.first[kind]
+        return super().answer(kind)
+
+
+def fallback_response(client, monkeypatch, first):
+    monkeypatch.setenv("OCR_SECTION_MODE", "staff-separate")
+    monkeypatch.setattr(ocr_model, "call_ocr", FallbackModel(first, logprob=-0.05))
+    result = client.post("/v1/ocr", files={"file": ("form.png", png_of(S.filled_form()), "image/png")})
+    assert result.status_code == 200, result.text
+    body = result.json()
+    return body, [s["name"] for s in body["timings"]["sections"]]
+
+
+def test_replay_reproduces_a_page_that_took_the_customer_re_read(client, monkeypatch):
+    """`api.py:493-496` decides the re-read from `N.parse_customer_text`, and the replay has to take the same branch --
+    `replay.py:65` reads the re-read answer out of `evidence.customerCropRaw`. Nothing exercised it before."""
+    body, names = fallback_response(client, monkeypatch, {"headerCustomer": conftest.HEADER_TEXT})
+    assert "customerInformationFallback" in names
+    assert body["customerInformation"]["name"]["value"], "the re-read must be what produced the customer values"
+    sections, notes = replay.replay_page(body)
+    assert replay.fidelity(body, sections) == []
+    assert "customerInformation" not in notes["staleRoute"]  # this parser makes production's decision again
+
+
+def test_replay_reports_a_stale_route_when_todays_parser_would_not_re_read(client, monkeypatch):
+    """The stored response froze PRODUCTION's call graph. A parser change that makes the first answer parseable means
+    the shipped code would never ask for the re-read, so scoring the page from the re-read answer measures nothing."""
+    body, names = fallback_response(client, monkeypatch, {"headerCustomer": conftest.HEADER_TEXT})
+    assert "customerInformationFallback" in names
+    body["evidence"]["combinedRaw"] = conftest.HEADER_TEXT + "\n" + conftest.CUSTOMER_TEXT  # ...now it parses
+    _, notes = replay.replay_page(body)
+    assert "customerInformation" in notes["staleRoute"]
+
+
+def test_replay_reports_a_stale_route_for_every_page_that_took_the_staff_re_read(client, monkeypatch):
+    """`evidence.staffCropRaw` is the answer AFTER the re-read, so the answer today's predicate would see is not in the
+    file at all: the route cannot be confirmed either way and the page must not count towards a verdict."""
+    body, names = fallback_response(client, monkeypatch, {"staff": "no staff labels in this answer"})
+    assert "staffOnlyFallback" in names
+    sections, notes = replay.replay_page(body)
+    assert replay.fidelity(body, sections) == []  # the replay still reproduces the stored answer exactly...
+    assert "staffOnly" in notes["staleRoute"]     # ...it just cannot vouch for the route that produced it
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_an_ordinary_page_has_no_stale_route(client, monkeypatch, mode):
+    body = response(client, monkeypatch, mode, logprob=-0.05)
+    assert replay.replay_page(body)[1]["staleRoute"] == []

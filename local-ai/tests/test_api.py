@@ -39,7 +39,7 @@ def assert_field(value, extra=()):
 def assert_v3_shape(body, checkboxes=39):
     assert list(body) == ["documentId", "sourceFile", "engine", "version", "schemaVersion", "layout", "header", "customerInformation",
                           "recommendationCard", "staffOnly", "evidence", "timings", "needsReview"]
-    assert body["engine"] == "typhoon-sections" and body["version"] == "3.2" and body["schemaVersion"] == 3
+    assert body["engine"] == "typhoon-sections" and body["version"] == api.VERSION and body["schemaVersion"] == 3
     assert set(body["layout"]) == {"template", "imageWidth", "imageHeight", "scaleX", "scaleY", "aspectMatch", "warnings", "detection"}
     detection = body["layout"]["detection"]
     assert list(detection) == ["verdict", "score", "foundRatio", "rmsPx", "scaleX", "scaleY", "rotationDeg", "dx", "dy"]
@@ -466,13 +466,24 @@ def test_non_form_image_is_unknown_and_nothing_is_read(client, fake_model):
 
 def test_health_reports_v3(client):
     body = client.get("/health").json()
-    assert body["status"] == "ok" and body["version"] == "3.2" and body["engine"] == "typhoon-sections" and body["masterData"] == "ok"
+    assert body["status"] == "ok" and body["version"] == "3.3" and body["engine"] == "typhoon-sections" and body["masterData"] == "ok"
     assert body["calibration"] == "ok"  # the shipped calibration.json (plan §3 W6) loaded
 
 
-def test_a_refused_calibration_file_degrades_health_and_leaves_the_code_thresholds_in_force(client, fake_model, tmp_path, monkeypatch):
-    """A hand-edited calibration file that breaks §4 G6 may not change what is flagged: the page is still read, the
-    thresholds fall back to REVIEW_BELOW (more review, never a silently unflagged field) and monitoring sees it."""
+def test_the_reader_version_moved_with_what_the_reader_returns(client):
+    """`documents.ocr_version` is the app's only record of WHICH READER produced a stored answer, and plan §2.5.6 keys
+    kind-B learned entries by it. W1/W3a/W6 changed `value`, `raw` and `needsReview` on dozens of pages without touching
+    the schema, so VERSION had to move and SCHEMA_VERSION had to stay."""
+    assert api.VERSION == "3.3" and api.SCHEMA_VERSION == 3
+
+
+def test_a_refused_calibration_file_keeps_health_ok_and_leaves_the_code_thresholds_in_force(client, fake_model, tmp_path, monkeypatch):
+    """A hand-edited calibration file that breaks §4 G6 may not change what is flagged: the page is still read and the
+    thresholds fall back to REVIEW_BELOW (more review, never a silently unflagged field).
+
+    `status` stays "ok" and only `calibration` carries the rejection. `OcrClient.healthCheck` returns false for any other
+    "degraded" body, and the ocr-worker uses it as the half-open probe of a gate that nothing else can reset, so a
+    "degraded" here would stall the whole document pipeline on a configuration typo -- while reading is unaffected."""
     import ocr_confidence as C
     custom = tmp_path / "calibration.json"
     custom.write_text(json.dumps({"thresholds": {"nationality": {"reviewBelow": 0.50, "movedFrom": 0.85,
@@ -480,7 +491,7 @@ def test_a_refused_calibration_file_degrades_health_and_leaves_the_code_threshol
     monkeypatch.setenv("OCR_CALIBRATION_FILE", str(custom))
     assert post(client, png_of(S.filled_form())).status_code == 200
     health = client.get("/health").json()
-    assert health["status"] == "degraded" and health["calibration"].startswith("rejected: ")
+    assert health["status"] == "ok" and health["masterData"] == "ok" and health["calibration"].startswith("rejected: ")
     assert C.threshold("nationality") == C.REVIEW_BELOW["nationality"]
 
 

@@ -9,11 +9,17 @@ loop. Still zero model calls: the confirmations are simulated, the readings are 
 Three runs are compared:
 
     stateless   `benchmark.py`'s ordinary run -- no confirmations at all
-    v3.2        production before W3a: the app confirms a field the reviewer CHANGED *or* merely accepted while it was
+    v3.2        the PRE-W3a RULES: the app confirms a field the reviewer CHANGED *or* merely accepted while it was
                 flagged (`document-view.ts:305,362`), and `ocr_normalize.verified_match` serves the result back at
                 confidence 1.0 with `needsReview: false`
     w3a         after W3a: the app confirms only what the reviewer actually changed (weight 1; flagged-but-unedited is
                 weight 0), and the confirm route is audit-only -- the record is written, nothing reads it back
+
+The mode key "v3.2" names the RULES, not the binary: every run reads the pages through `replay.replay_page`, i.e.
+through TODAY's parser, and only `VERIFIED_MEMORY_ENABLED` and the weight rule are reverted. Its accuracy columns are
+therefore an honest measurement of the loop's harm (both sides share one parser), while its confirmation VOLUME is a
+post-W1 count and must not be quoted as production's (adversarial review, 2026-09-23). `MODE_LABELS` prints it as
+"pre-W3a rules" so the report cannot be read the other way.
 
 W3a's claim is an INVARIANT, not a score: the `w3a` run must come out identical, page for page, to the stateless run,
 because a confirmation may no longer change any later reading. `verdict()` is that check. The `v3.2` run is kept so the
@@ -42,6 +48,11 @@ import ocr_normalize as N  # noqa: E402
 from tools import replay, scoring  # noqa: E402
 
 MODES = ("stateless", "v3.2", "w3a")
+# What each run IS, printed instead of the bare mode key. The "v3.2" run is NOT the v3.2 binary: every run replays the
+# CURRENT parser and reverts only the weight rule and the memory switch, so its confirmation VOLUME is a post-W1 count,
+# not production's (adversarial review, 2026-09-23). Its accuracy columns are still the honest measure of the loop's
+# harm, because both sides of that comparison are the same parser.
+MODE_LABELS = {"stateless": "stateless", "v3.2": "pre-W3a rules", "w3a": "W3a"}
 # The only two fields the confirm route accepts (`api.confirm_ocr`), and so the only ones this loop can move.
 LOOP_FIELDS = ("staffOnly.therapistName", "staffOnly.treatmentNames", "staffOnly.treatmentsWithDuration")
 
@@ -152,18 +163,20 @@ def print_report(runs):
     """-> True when the W3a invariant holds. Counts, page numbers and field names only."""
     print("\n== learning loop: what a confirmation does to the NEXT page (§1D, §2.1, §3 W3a) ==")
     print("  page-ordered replay of the same stored answers, a reviewer confirming every page to its label before the")
-    print("  next is read; 0 model calls. 'v3.2' = the app's pre-W3a weight rule + the raw->value memory applied;")
-    print("  'w3a' = only an EDITED field confirms, and the confirm route is audit-only.")
-    print(f"\n{'field':38} {'run':10} {'right':>6} {'R&flag':>7} {'W&flag':>7} {'W&UNFLAGGED':>12}")
+    print("  next is read; 0 model calls. 'pre-W3a rules' = the app's pre-W3a weight rule + the raw->value memory")
+    print("  applied; 'W3a' = only an EDITED field confirms, and the confirm route is audit-only.")
+    print("  ALL THREE RUNS USE TODAY'S PARSER: only the weight rule and the memory switch are reverted, so the")
+    print("  confirmation counts below are post-W1 counts, not the volume the v3.2 binary produced in production.")
+    print(f"\n{'field':38} {'run':14} {'right':>6} {'R&flag':>7} {'W&flag':>7} {'W&UNFLAGGED':>12}")
     for field in LOOP_FIELDS:
         for mode in MODES:
             row = _row(runs[mode][0], field)
-            print(f"{field if mode == MODES[0] else '':38} {mode:10} {row['right']:6} {row['rightFlagged']:7} "
+            print(f"{field if mode == MODES[0] else '':38} {MODE_LABELS[mode]:14} {row['right']:6} {row['rightFlagged']:7} "
                   f"{row['wrongFlagged']:7} {row['wrongUnflagged']:12}")
     for mode in ("v3.2", "w3a"):
         stats = runs[mode][1]
         by_field = "  ".join(f"{name} {posted} ({weight0} weight-0)" for name, (posted, weight0) in stats["byField"].items())
-        print(f"\n  {mode:5} confirmations posted {stats['confirmations']:3}, of which weight-0 (flagged but NOT edited, "
+        print(f"\n  {MODE_LABELS[mode]:13} confirmations posted {stats['confirmations']:3}, of which weight-0 (flagged but NOT edited, "
               f"§2.5.2) {stats['weight0']:3}; memory served {stats['memoryHits']:3} field(s)")
         print(f"        by field: {by_field}   distinct weight-0 keys (the junk ROWS of §1D): {len(stats['weight0Keys'])}")
         if stats["ambiguousPages"]:

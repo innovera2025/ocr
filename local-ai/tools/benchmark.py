@@ -31,6 +31,17 @@ from tools import learning_loop, replay, scoring, thresholds  # noqa: E402
 DEFAULT_BASELINE = HERE / "baseline-v3.2-prod-95.txt"
 COLUMNS = ("n", "right", "rightFlagged", "wrongFlagged", "wrongUnflagged", "markers", "uncertain", "want", "hit", "missed", "extra")
 REVIEW_BUDGET = 5  # §4 G3: flagged pages (right+wrong) may rise by at most this per field unless wrong-and-unflagged falls
+# The table has three overlapping views on purpose, so one sum of it would double count: the two body-map lists are
+# superseded by the merged `recommendationCard.bodyMap` row (§1E), and `staffOnly.totalMinutes` is scored on its own
+# 31 pages with no flag carrier at all. The cross-field total that §4 G1's first clause names excludes these three.
+SUPERSEDED = ("recommendationCard.preferredAreas", "recommendationCard.avoidAreas", "staffOnly.totalMinutes")
+
+
+def cross_field_unflagged(totals, exclude=()):
+    """§4 G1's first clause: total wrong-and-unflagged, body map as ONE unit, every other field counted once.
+    `exclude` drops the named pages (the route-stale ones), and the caller drops them from the baseline too."""
+    return sum(len(set(row["pages"]["wrongUnflagged"]) - set(exclude))
+               for field, row in totals.ordered() if field not in SUPERSEDED)
 
 
 def load(data_dir, results):
@@ -70,8 +81,13 @@ def freeze(totals, path, meta):
     for field, row in totals.ordered():
         for bucket in ("wrongFlagged", "wrongUnflagged"):
             lines.append(f"{field} {bucket} " + (",".join(str(p) for p in row["pages"][bucket]) or "-"))
+    lines.append("[totals] name value")
+    lines.append(f"wrongUnflagged {cross_field_unflagged(totals)}")
     lines += ["", "# Gate thresholds this file freezes (plan §4). `benchmark.py --baseline <this file>` checks G1, G1b, G2, G3, G6.",
-              "#   G1  no field's wrongUnflagged may exceed the number above. 0 new silent errors is the release condition.",
+              "# This block is EMITTED BY freeze(), so it cannot drift from the code that enforces it.",
+              "#   G1  no field's wrongUnflagged may exceed the number above, no page may be NEWLY in a field's",
+              "#       wrongUnflagged page list, the cross-field [totals] wrongUnflagged may not rise, and every scored",
+              "#       field must have a baseline row (--allow-new-field to score one that does not).",
               "#   G1b no list field's `hit` may fall or `missed` may rise: a missed item has no entry and so no flag, and",
               "#       v3.2 has no possibleMissedMark carrier (plan W2f), so every miss is silent by construction.",
               "#   G2  every page that flips right<->wrong must be named and explained; the page lists above are what it diffs.",
@@ -84,7 +100,9 @@ def freeze(totals, path, meta):
 
 
 def read_frozen(path):
-    fields, wrong = {}, {}
+    """-> (per-field rows, {(field, bucket): page set}, cross-field totals). `totals` is {} in a file frozen before the
+    [totals] block existed; the caller then says the cross-field gate has nothing to compare against."""
+    fields, wrong, totals = {}, {}, {}
     section = None
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.startswith("#") or not line.strip():
@@ -97,7 +115,9 @@ def read_frozen(path):
             fields[parts[0]] = dict(zip(COLUMNS, (int(v) for v in parts[1:])))
         elif section == "pages":
             wrong[(parts[0], parts[1])] = set() if parts[2] == "-" else {int(p) for p in parts[2].split(",")}
-    return fields, wrong
+        elif section == "totals":
+            totals[parts[0]] = int(parts[1])
+    return fields, wrong, totals
 
 
 # ------------------------------------------------------------------ report
@@ -112,6 +132,15 @@ def print_report(totals, mismatches, notes, pages):
     if stale:
         print(f"WARNING: {len(stale)} confidence key(s) changed their raw value, so the stored token statistics no longer "
               f"describe them; their flags are NOT evidence-backed: {stale[:8]}{' ...' if len(stale) > 8 else ''}")
+    routed = {p: n["staleRoute"] for p, n in notes.items() if n["staleRoute"]}
+    if routed:
+        by_section = {}
+        for page, sections in sorted(routed.items()):
+            for section in sections:
+                by_section.setdefault(section, []).append(page)
+        print(f"WARNING: on {len(routed)} page(s) today's parser would change the MODEL-CALL GRAPH (api.py:493-496 "
+              f"decides its two re-reads from parsers this change touches), so the stored answer is one the shipped code "
+              f"would not receive: " + "; ".join(f"{s} {p}" for s, p in sorted(by_section.items())))
 
     print("\n== replay fidelity (does today's code reproduce the stored production answers?) ==")
     scored = [b for bad in mismatches.values() for b in bad if b[1] in ("value", "raw", "needsReview", "count", "durationMinutes")]
@@ -133,11 +162,9 @@ def print_report(totals, mismatches, notes, pages):
     for field, row in totals.ordered():
         print(f"{field:38} {row['n']:4} {row['right']:6} {row['rightFlagged']:7} {row['wrongFlagged']:7} "
               f"{row['wrongUnflagged']:12} {row['markers']:7} {row['uncertain']:6}")
-    # The table has three overlapping views on purpose, so one sum of it would double count. State what is summed.
-    superseded = ("recommendationCard.preferredAreas", "recommendationCard.avoidAreas", "staffOnly.totalMinutes")
-    total_unflagged = sum(r["wrongUnflagged"] for f, r in totals.ordered() if f not in superseded)
-    print(f"\nTOTAL wrong-and-unflagged (SILENT errors), body map as one unit (§1E), every other field once: {total_unflagged}")
-    per_list = {f: (totals.field(f) or {}).get("wrongUnflagged") for f in superseded[:2]}
+    print(f"\nTOTAL wrong-and-unflagged (SILENT errors), body map as one unit (§1E), every other field once: "
+          f"{cross_field_unflagged(totals)}")
+    per_list = {f: (totals.field(f) or {}).get("wrongUnflagged") for f in SUPERSEDED[:2]}
     print("  the same body map per list (the merge is what would hide a per-list regression, §4 G1): "
           f"preferred {per_list['recommendationCard.preferredAreas']}, avoid {per_list['recommendationCard.avoidAreas']}")
     no_carrier = totals.field("staffOnly.totalMinutes")
@@ -160,24 +187,49 @@ def print_report(totals, mismatches, notes, pages):
               + " -- not measurable today.")
 
 
-def print_gates(totals, frozen_fields, frozen_wrong, deterministic):
-    """-> True when every gate this harness can compute passes."""
+def print_gates(totals, frozen_fields, frozen_wrong, frozen_totals, deterministic, stale_route=None, allow_new_field=False):
+    """-> True when every gate this harness can compute passes.
+
+    `stale_route` is {page: [section]} from `replay.replay_page`: pages whose model-call graph today's code would change,
+    so their score is not a verdict on this change. They are named and kept OUT of G1's per-page check and G2's flip
+    lists rather than being scored as if the shipped reader had seen that answer.
+    """
     print("\n== §4 gate verdicts ==")
     g1 = g1b = g3 = True
+    stale_route = stale_route or {}
+    routed = {page for page, sections in stale_route.items() if sections}
+    if routed:
+        print(f"  ---- {len(routed)} page(s) would take a DIFFERENT model-call graph under today's parser "
+              f"(replay.staleRoute): {sorted(routed)}. They are excluded from the per-page checks of G1 and G2 below.")
     if frozen_fields is None:
         print("  G1/G1b/G2/G3: no frozen baseline given (--baseline); the table above is the candidate baseline (--freeze).")
     else:
         for field, row in totals.ordered():
             base = frozen_fields.get(field)
             if base is None:
-                print(f"  G1   NEW FIELD {field}: not in the frozen baseline, nothing to compare")
+                if allow_new_field:
+                    print(f"  G1   NEW FIELD {field}: not in the frozen baseline, nothing to compare (--allow-new-field)")
+                    continue
+                g1 = False
+                print(f"  G1   FAIL {field}: scored but not in the frozen baseline, so it ships ungated. Re-freeze the "
+                      f"baseline, or pass --allow-new-field to accept it for this run.")
                 continue
             if base["n"] != row["n"]:
                 print(f"  ---- {field}: {row['n']} pages scored against a baseline of {base['n']}. The gates below compare "
                       f"different page sets and are NOT a verdict on this change.")
-            if row["wrongUnflagged"] > base["wrongUnflagged"]:
+            # Route-stale pages are dropped from BOTH sides, so the comparison stays symmetric.
+            now_silent = set(row["pages"]["wrongUnflagged"]) - routed
+            base_silent = frozen_wrong.get((field, "wrongUnflagged"), set()) - routed
+            if len(now_silent) > len(base_silent):
                 g1 = False
-                print(f"  G1   FAIL {field}: wrong-and-unflagged {base['wrongUnflagged']} -> {row['wrongUnflagged']}")
+                print(f"  G1   FAIL {field}: wrong-and-unflagged {len(base_silent)} -> {len(now_silent)}")
+            # A count cannot see a silent error that MOVES: one page losing a silent error while another gains one nets
+            # to zero, and G2's diff unions the two wrong buckets, so a page sliding wrongFlagged -> wrongUnflagged is
+            # invisible to both. The frozen file already stores the page list; compare identity, not size.
+            newly_silent = sorted(now_silent - base_silent)
+            if newly_silent:
+                g1 = False
+                print(f"  G1   FAIL {field}: page(s) {newly_silent} are wrong-and-unflagged now and were not in the baseline")
             if row["missed"] > base["missed"] or row["hit"] < base["hit"]:
                 g1b = False
                 print(f"  G1b  FAIL {field}: items found {base['hit']} -> {row['hit']}, missed {base['missed']} -> {row['missed']}")
@@ -190,7 +242,19 @@ def print_gates(totals, frozen_fields, frozen_wrong, deterministic):
                 g3 = False
                 print(f"  G3   FAIL {field}: flagged pages {base_flagged} -> {flagged} (+{rise}, budget +{REVIEW_BUDGET}) with no "
                       f"fall in silent errors; right-but-flagged {base['rightFlagged']} -> {row['rightFlagged']}")
-        print(f"  G1   {'PASS' if g1 else 'FAIL'}  no field raised its wrong-and-unflagged count above the frozen baseline")
+        now_total = cross_field_unflagged(totals, routed)
+        base_total = frozen_totals.get("wrongUnflagged")
+        if base_total is not None and routed:  # the same pages leave the baseline's side of the comparison
+            base_total -= sum(len(frozen_wrong.get((f, "wrongUnflagged"), set()) & routed)
+                              for f in frozen_fields if f not in SUPERSEDED)
+        if base_total is None:
+            print("  ---- the frozen baseline predates the [totals] block, so §4 G1's cross-field total has nothing to "
+                  "compare against. Re-freeze it.")
+        elif now_total > base_total:
+            g1 = False
+            print(f"  G1   FAIL cross-field TOTAL wrong-and-unflagged {base_total} -> {now_total}")
+        print(f"  G1   {'PASS' if g1 else 'FAIL'}  no field and no page newly silent, cross-field total "
+              f"{'not risen' if base_total is not None else 'NOT COMPARED'}, every scored field gated")
         print(f"  G1b  {'PASS' if g1b else 'FAIL'}  no list field lost item recall")
         print(f"  G3   {'PASS' if g3 else 'FAIL'}  review budget (flagged pages +{REVIEW_BUDGET}/field unless silent errors fall)")
         print("  G2   paired page flips (a deterministic change must explain all of them):")
@@ -198,7 +262,7 @@ def print_gates(totals, frozen_fields, frozen_wrong, deterministic):
         for field, row in totals.ordered():
             was = frozen_wrong.get((field, "wrongFlagged"), set()) | frozen_wrong.get((field, "wrongUnflagged"), set())
             now = set(row["pages"]["wrongFlagged"]) | set(row["pages"]["wrongUnflagged"])
-            fixed, broke = sorted(was - now), sorted(now - was)
+            fixed, broke = sorted(was - now - routed), sorted(now - was - routed)
             if fixed or broke:
                 flips += len(fixed) + len(broke)
                 print(f"       {field:36} fixed {len(fixed):3} {fixed}   broke {len(broke):3} {broke}")
@@ -219,6 +283,8 @@ def main(argv=None):
     parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE, help="frozen baseline to gate against")
     parser.add_argument("--freeze", type=Path, help="write the run's counts to this file as the new frozen baseline")
     parser.add_argument("--no-baseline", action="store_true", help="report only, do not gate")
+    parser.add_argument("--allow-new-field", action="store_true", help="accept a scored field that has no row in the frozen "
+                                                                       "baseline instead of failing G1 on it")
     parser.add_argument("--learning-loop", action="store_true", help="also replay the pages IN ORDER with the confirm route "
                                                                      "live (plan §1D, §3 W3a); the W3a invariant joins the gates")
     parser.add_argument("--thresholds", action="store_true", help="also report what each review threshold costs and catches "
@@ -240,10 +306,11 @@ def main(argv=None):
                     [(f, {k: r[k] for k in COLUMNS}) for f, r in again.ordered()]
 
     print_report(totals, mismatches, notes, pages)
-    frozen_fields = frozen_wrong = None
+    frozen_fields, frozen_wrong, frozen_totals = None, {}, {}
     if not args.no_baseline and args.baseline and args.baseline.exists():
-        frozen_fields, frozen_wrong = read_frozen(args.baseline)
-    ok = print_gates(totals, frozen_fields, frozen_wrong, deterministic)
+        frozen_fields, frozen_wrong, frozen_totals = read_frozen(args.baseline)
+    ok = print_gates(totals, frozen_fields, frozen_wrong, frozen_totals, deterministic,
+                     {page: note["staleRoute"] for page, note in notes.items()}, args.allow_new_field)
 
     if args.learning_loop:
         runs = {mode: learning_loop.run(labels, pages, mode) for mode in learning_loop.MODES}

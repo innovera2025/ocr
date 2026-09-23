@@ -1,8 +1,13 @@
-# INNOVERA Local AI OCR — v3.2 (`typhoon-sections`)
+# INNOVERA Local AI OCR — v3.3 (`typhoon-sections`)
 
 FastAPI service that reads a scanned **Makkha Health & Spa intake form** and returns the whole document as schema v3
-(version `3.2`). Contract: `docs/operations/full-document-batch-spec.md` §1 plus the v3.1 additions of
-`docs/operations/real-data/release1-plan.md` (Workstream A) and the v3.2 changes below. It is served as `uvicorn api:app`
+(version `3.3`). Contract: `docs/operations/full-document-batch-spec.md` §1 plus the v3.1 additions of
+`docs/operations/real-data/release1-plan.md` (Workstream A) and the v3.2 / v3.3 changes below.
+
+**Why `3.3` and not `3.2`.** `SCHEMA_VERSION` is still 3 and the prompts, crops and model are byte-for-byte v3.2's —
+but W1, W3a and W6 changed what the READER returns for `value`, `raw` and `needsReview` on dozens of pages.
+`documents.ocr_version` is the app's only record of which reader produced a stored answer, and
+`accuracy-learning-plan.md` §2.5.6 keys kind-B learned entries by it, so the string had to move. It is served as `uvicorn api:app`
 on port 5000, with `/app = /opt/innovera-ocr`, and talks to Ollama (`scb10x/typhoon-ocr1.5-3b`) through the
 OpenAI-compatible endpoint.
 
@@ -16,11 +21,20 @@ evidence lives in `calibration.json` beside the code, one entry per field type:
 ```
 
 The loader refuses the **whole file** — and falls back to `REVIEW_BELOW`, which always flags *more*, never less — unless
-every entry names a known field type, carries a non-empty `acceptedBecause` and moves its threshold by at most **±0.05**
-from the `movedFrom` it replaces (`accuracy-learning-plan.md` §4 G6, §8.6: no threshold move without recorded held-out
-evidence, none larger than ±0.05 per release). A refusal is visible: `/health` answers `status:"degraded"` with
-`calibration:"rejected: …"`, and the pages keep being read. `OCR_MODEL_CONFIDENCE_<TYPE>` still overrides one field type
-for one deployment, and deleting an entry restores its code default.
+every entry names a known field type, carries a non-empty `acceptedBecause`, and **moves its threshold by at most
+±0.05 from `ocr_confidence.REVIEW_BELOW`, the value actually in force in the code** — `movedFrom` must equal that value
+and is refused if it does not (`accuracy-learning-plan.md` §4 G6, §8.6: no threshold move without recorded held-out
+evidence, none larger than ±0.05 per release). Clamping against the file's own `movedFrom`, as the first implementation
+did, made the clamp self-declared and so vacuous: `{"reviewBelow": 0.00, "movedFrom": 0.05}` for `date` loaded clean and
+put 0.00 in force against a code default of 0.90. The consequence is deliberate — this file cannot walk a threshold
+further than ±0.05 from its code default by being edited again; a second release's move is a change to `REVIEW_BELOW`,
+reviewed as code.
+
+A refusal is visible in `/health`'s `calibration:"rejected: …"` and **not** in its `status`, which tracks master data
+alone. `OcrClient.healthCheck()` treats any other `degraded` body as down, and the ocr-worker uses it as the half-open
+probe of a gate only a completed job can reset — so degrading on a refused calibration file would stall the whole
+document pipeline on a configuration typo, while reading is in fact unaffected. `OCR_MODEL_CONFIDENCE_<TYPE>` still
+overrides one field type for one deployment, and deleting an entry restores its code default.
 
 Shipped in this release, the two **clamped** moves of plan §3 W6 — *not* the all-data argmin, which has no out-of-sample
 support: `nationality` 0.85 → **0.80** and `date` 0.90 → **0.85**. Measured on the 95 stored production answers, 0 model
@@ -49,8 +63,13 @@ label before the next is read (`tools/benchmark.py --learning-loop`, 0 model cal
 
 | | therapist W&U | treatment-name W&U | confirmations posted | of which weight-0 |
 |---|---|---|---|---|
-| v3.2 (memory applied) | **8** | 3 | 200 | 75 (26 distinct junk rows) |
+| pre-W3a rules (memory applied) | **8** | 3 | 200 | 75 (26 distinct junk rows) |
 | W3a (audit-only) | **0** | 2 | 128 | **0** |
+
+**Read the first row as "the pre-W3a RULES", not "the v3.2 binary".** All three runs of `--learning-loop` replay the
+pages through *today's* parser and revert only the weight rule and the memory switch. The accuracy columns are therefore
+an honest measurement of the loop's harm (both sides share one parser), but the 200 / 128 / 26 confirmation counts are
+post-W1 counts and are not what production posted: §1D measured 13 + 15 = 28 junk rows on the pre-W1 parser.
 
 The W3a run is identical, page for page, to the ordinary stateless replay on **every** field — that identity is the gate,
 and `benchmark.py --learning-loop` exits non-zero if it ever stops holding. The replacement is the voted, tenant-scoped,
@@ -78,8 +97,8 @@ production answers with 0 model calls (§12 of that plan has the table and the g
 | **W1a** value from below a mid-line label | A value taken from a line **under** a mid-line label is flagged — the answer changed shape, so the assignment is a guess. |
 | **W1b** marks are not values | A free-text answer (name, hotel) with no letter in it at all — a tick, a box glyph, a lone slash — keeps its `raw`, gets `value: null`, `confidence` 0.3 and `needsReview`. |
 | **W1c** nationality tokens | After the whole-string master match fails, each token is matched **exactly** against the master aliases; one distinct entry among them wins, **always flagged** (`中國 China`, `China People`). Two entries or none: unresolved, as before. `master_data.json` also gains the country codes `CHN` and `GBR`. |
-| **W1d** STAFF text | A bracketed model note is dropped when the note word is anywhere in the bracket, not only first; a **trailing** bracketed Thai restatement (≥ 3 Thai consonants, no digits) is dropped, so `(2 คน)`, `(5)` and `( ชม. )` are untouched; a one-character leftover of a written unit (`90 นที` → `90 นท` + `ี`) merges into its item instead of becoming one; a printed tick box in front of a room number is skipped (`Room No. ☐ 7`). |
-| **W1e** hour units and totals | `visualAliases.hourUnit` gains `5M`, `57` and `会`. A written total with **no unit** that cannot be a session length (< 30 or > 240 min) but starts with an hour count 1–4 is read as that many hours, with a warning, and **every item on the page is flagged**. |
+| **W1d** STAFF text | A bracketed model note is dropped when the note word is anywhere in the bracket, not only first. A **trailing** bracketed Thai group is dropped only when it *proves* it restates the line in front of it (≥ 3 Thai consonants **and** `similarity` ≥ 0.55 to that line), the drop is reported in `evidence.treatmentWarnings` and every item on the page is flagged — a bracketed second treatment, a master name above all, must never disappear together with the review flag it carried. A leftover of a written unit (`90 นที` → `90 นท` + `ี`) merges into its item, reported the same way, and only for the characters a truncated `ชม.` / `นาที` / `hours` / `mins` can actually leave: any other single character stays its own flagged item. A printed tick box in front of a room number is skipped (`Room No. ☐ 7`); a **row** of boxes (`Room No. ☐1 ☐2 ☒3`) is a choice the model transcribed, so the room stays unread and flagged rather than being resolved by position. |
+| **W1e** hour units and totals | `visualAliases.hourUnit` gains `5M`, `57` and `会`. A written total with **no unit** that cannot be a session length (< 30 or > 240 min — the shortest and longest the treatment master list offers, not a window fitted to one batch) but starts with an hour count 1–4 is read as that many hours, with a warning, and **every item on the page is flagged**. A short total that is itself a multiple of 5 (`= 20`, `= 25`) is never rewritten: every duration the master list offers is a multiple of 5, so that shape is a plausible written add-on, and `staffOnly.totalMinutes` is a bare integer with no `needsReview` carrier — a wrong rewrite there would be silent by construction. |
 | **W1f** treatment suggestions | The master-match threshold for a treatment name is 0.60, not 0.72. Everything below `REVIEW_BELOW` (0.85) is flagged, so a suggestion cannot go out silently; the stop at 0.60 rather than 0.50 is precautionary, not measured. |
 
 Measured against `tools/baseline-v3.2-prod-95.txt`, 95 pages, **0 pages broke on any field**: name 41 → 51,
@@ -103,7 +122,7 @@ combined variants last (room 9-10/16).
 | Model confidence (`ocr_confidence.py`) | rule confidences only | `call_ocr` asks for token logprobs (`logprobs: true, top_logprobs: 1`; `OCR_MODEL_LOGPROBS=0` turns it off) and returns `ModelText` (a `str` with `.tokens`; `call_ocr_text` returns a plain `str`). Each model-read field's value is found in its own answer (after its label; whitespace/separators and Thai digits tolerated) and mapped to the tokens that produced it. Ollama takes a token's `bytes` from its text, and in front of llama-server that text has lost a Thai character split over two tokens (`""` + `"\ufffd"`); such tokens are aligned by UTF-8 structure (linear time), so one split character no longer leaves the whole answer unmapped. modelConfidence = exp(mean token logprob) over the value's tokens, or for the digit fields (room, formNumber, date, time: one wrong digit is a wrong value) the probability of the weakest token. Field confidence = min(rule confidence, modelConfidence) for name, nationality, hotelName, formNumber, date, time, each treatment item, therapist and room; `needsReview` when modelConfidence is below the field type's threshold (`ocr_confidence.REVIEW_BELOW`: 0.85 name/nationality/hotel, 0.80 treatment/therapist, 0.90 room/formNumber/date/time, W6 then moving nationality to 0.80 and date to 0.85 in `calibration.json`) **or** any of the value's tokens is below the token floor 0.50 (a mean over a long name hides one doubtful letter: one 30 % letter in 18 tokens still averages 0.93). `calibration.json` moves one on recorded evidence and `OCR_MODEL_CONFIDENCE_<TYPE>` overrides both, e.g. `OCR_MODEL_CONFIDENCE_HOTEL_NAME`, `OCR_MODEL_CONFIDENCE_TOKEN`. `evidence.tokenConfidence` = `{"customerInformation.name": {"mean", "min", "tokens"}, …}` (`null`: value not found in an answer that had logprobs). No logprobs (older Ollama, a stub) or no span: the v3.1 rule confidences stand. |
 | Model errors | any failed call -> HTTP 500 for the page | A call that hits an HTTP 5xx or a dropped/refused connection is retried once (after 1 s); a timed-out call is not (it already waited `OCR_MODEL_TIMEOUT`, 600 s, twice the worker's 300 s, and Ollama serves one request at a time). If it still fails, the page is answered from the other call: the failed section's fields are all `needsReview` (staff: every STAFF ONLY field; header+customer: the header fields and name/nationality/hotel; checkbox and body-map fields are not affected), `layout.warnings` gets `model call <name> failed after N attempt(s) (…); its fields need review`, `evidence.modelErrors` lists it and its `timings.sections` entry has `"failed": true` (`"attempts": 2` on any retried call). Only when **every** call failed is the page an HTTP 500 (the worker retries it). Other errors (a 4xx, a malformed answer) are not retried and still fail the page. |
 
-Response: unchanged shape (`version` `"3.2"`, `schemaVersion` 3); field `source` may now be `"visual-alias"`; `evidence` gains
+Response: unchanged shape (`version` `"3.3"` since this release, `schemaVersion` 3); field `source` may now be `"visual-alias"`; `evidence` gains
 `tokenConfidence` and `modelErrors`; `timings.sections` entries may carry `attempts` / `failed`.
 
 **Cost:** ~2 model calls per page. Ollama on the CPU-only host serialises requests and every image costs ~1,070 tokens
@@ -172,7 +191,7 @@ header ink counts in `textInk`; `layoutOffset` now reports the fitted shift and 
 
 Extra, additive keys (not in the spec example, safe to ignore):
 - `evidence`: `checkboxNotes` (`stroke-through` / `faint` / `mark-beside-box`), `bodyMap` (shape features), `textInk` (ink pixels per handwriting box), `layoutOffset` (registration shift), `treatmentWarnings`, `treatmentTotalMinutes`.
-- `/health`: `engine`, `schemaVersion`, `model`, `pdfSupport`, `masterData`, `calibration`. `status` is `"degraded"` (HTTP 200) while master data does not load or the calibration file is refused (`"default"` = no calibration file, the code thresholds).
+- `/health`: `engine`, `schemaVersion`, `model`, `pdfSupport`, `masterData`, `calibration`. `status` is `"degraded"` (HTTP 200) while **master data** does not load; a refused calibration file shows only in `calibration` (`"rejected: …"`; `"default"` = no calibration file, the code thresholds) because it changes review load, not whether the page can be read.
 - `evidence.customerCropRaw` is `null` when the customer call was skipped.
 
 ## Files
@@ -189,7 +208,7 @@ Extra, additive keys (not in the spec example, safe to ignore):
 | `master_data.json` | Editable masters (treatments + allowed durations, therapists with branch/seed, branches, nationalities, visual aliases) |
 | `calibration.json` | Review thresholds moved off `REVIEW_BELOW` on measured evidence, one entry per field type (`reviewBelow`, `movedFrom`, `acceptedBecause`); refused whole unless every entry is evidenced and within ±0.05 |
 | `tests/` | pytest suite, `synthetic_form.py` (draws the template; scaled/rotated pages, PAID-like stamps), `fake_ollama.py`, `bench_deterministic.py` |
-| `tools/` | Offline reading-accuracy benchmark: `replay.py` (rebuild a stored answer through today's parsers), `scoring.py` (the one scorer), `benchmark.py` (CLI + §4 gates), `learning_loop.py` (the page-ordered confirm replay), `thresholds.py` (what each review threshold costs and catches), `baseline-v3.2-prod-95.txt` (frozen baseline). Not imported by the service. |
+| `tools/` | Offline reading-accuracy benchmark: `replay.py` (rebuild a stored answer through today's parsers; reports `staleGate` when a field's `raw` moved out from under the stored token statistics and `staleRoute` when today's parser would change the page's model-CALL graph), `scoring.py` (the one scorer), `benchmark.py` (CLI + §4 gates), `learning_loop.py` (the page-ordered confirm replay), `thresholds.py` (what each review threshold costs and catches), `baseline-v3.2-prod-95.txt` (frozen baseline, whose gate documentation is emitted by `freeze()` so it cannot drift from the code). Not imported by the service. |
 | `Dockerfile.test` | Throwaway python:3.11 test image |
 
 Runtime dependencies: fastapi, uvicorn, python-multipart, Pillow and **numpy** (new in v3.1, for the registration and stamp

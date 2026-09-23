@@ -60,13 +60,19 @@ staffOnly.therapistName wrongFlagged 1,2,3,4,5,6,7,8,9,10,11,12,13,14,16,17,19,2
 staffOnly.therapistName wrongUnflagged -
 staffOnly.totalMinutes wrongFlagged -
 staffOnly.totalMinutes wrongUnflagged 9,46,47,48,49,52,56,59,73,79,89,90
+[totals] name value
+wrongUnflagged 9
 
 # Gate thresholds this file freezes (plan §4). `benchmark.py --baseline <this file>` checks G1, G1b, G2, G3, G6.
-#   G1  no field's wrongUnflagged may exceed the number above. 0 new silent errors is the release condition.
+# This block is EMITTED BY freeze(), so it cannot drift from the code that enforces it.
+#   G1  no field's wrongUnflagged may exceed the number above, no page may be NEWLY in a field's
+#       wrongUnflagged page list, the cross-field [totals] wrongUnflagged may not rise, and every scored
+#       field must have a baseline row (--allow-new-field to score one that does not).
 #   G1b no list field's `hit` may fall or `missed` may rise: a missed item has no entry and so no flag, and
 #       v3.2 has no possibleMissedMark carrier (plan W2f), so every miss is silent by construction.
 #   G2  every page that flips right<->wrong must be named and explained; the page lists above are what it diffs.
-#   G3  rightFlagged may rise by at most +5 per field unless that field's wrongUnflagged falls.
+#   G3  flagged pages (rightFlagged + wrongFlagged, the review budget) may rise by at most +5 per
+#       field unless that field's wrongUnflagged falls.
 #   G6  the replay and the scorer must be deterministic across two runs of the same inputs.
 #   G0, G4, G5, G7 are NOT computable from stored answers: they need the archived 1610 px production renders
 #       (G0/G5/G7) or the full deterministic image pipeline (G4, tests/bench_deterministic.py).

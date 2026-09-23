@@ -751,9 +751,13 @@ def test_w1d_a_bracketed_english_note_anywhere_in_the_bracket_is_not_a_treatment
 
 
 def test_w1d_a_trailing_bracketed_thai_restatement_is_dropped():
-    items, _, _, total = N.parse_treatments("เท้า + ออย 2 ชม. (ไทยหน้า)")
+    """The bracket body must RESTATE the line in front of it -- here the model's second reading of 'เท้า + ออย'."""
+    items, _, warnings, total = N.parse_treatments("เท้า + ออย 2 ชม. (เท้าอ้อย)")
     assert [(i["value"], i["durationMinutes"]) for i in items] == [("นวดเท้า", None), ("นวดน้ำมัน", None)]
     assert total == 120  # and the hour figure after the last of two names is their total again
+    # ...and a deletion is never silent: it is reported and it puts the page in the review queue.
+    assert any("dropped" in w and "เท้าอ้อย" in w for w in warnings)
+    assert all(i["needsReview"] for i in items)
 
 
 @pytest.mark.parametrize("text, values", [
@@ -766,10 +770,33 @@ def test_w1d_brackets_that_are_not_restatements_are_left_exactly_as_v32_read_the
     assert [(i["value"], i["durationMinutes"]) for i in items] == values
 
 
+@pytest.mark.parametrize("text, count", [
+    ("ไทย 2 ชม. (ประคบ)", 2),                  # a bracketed MASTER treatment is a second treatment, not a restatement
+    ("ไทย 1 ชม. + เท้า 1 ชม. (ประคบ)", 3),
+    ("เท้า + ออย 2 ชม. (ไทยหน้า)", 3),          # Thai, three consonants, but it restates nothing on the line
+])
+def test_w1d_a_bracketed_group_that_restates_nothing_stays_an_item_and_keeps_its_flag(text, count):
+    """Dropping any trailing bracketed Thai group deleted a second treatment together with the review flag it carried --
+    the unflagged error §4 G1 forbids (adversarial review, 2026-09-23)."""
+    items, durations, _, _ = N.parse_treatments(text)
+    assert len(items) == count and items[-1]["needsReview"]
+    assert N.legacy_treatment(text, items, durations)["needsReview"]
+
+
 @pytest.mark.parametrize("text", ["ออย 90 นที", "ไทย 90 นทท"])
 def test_w1d_a_one_character_leftover_of_a_unit_is_not_a_treatment(text):
-    items, _, _, _ = N.parse_treatments(text)
+    items, _, warnings, _ = N.parse_treatments(text)
     assert len(items) == 1 and items[0]["durationMinutes"] == 90 and items[0]["raw"] == text
+    assert any("leftover of a written unit" in w for w in warnings)  # the merge is reported, never invisible
+
+
+@pytest.mark.parametrize("text", ["ไทย 60 นาที ก", "ไทย 1 ชม. A", "ไทย 60 นาที 会"])
+def test_w1d_a_single_character_that_no_written_unit_can_leave_stays_a_flagged_item(text):
+    """"any single letter in any script" absorbed a truncated second treatment or a stray initial, and with it the only
+    review flag the page had (adversarial review, 2026-09-23)."""
+    items, durations, _, _ = N.parse_treatments(text)
+    assert len(items) == 2 and items[1]["value"] is None and items[1]["needsReview"]
+    assert N.legacy_treatment(text, items, durations)["needsReview"]
 
 
 @pytest.mark.parametrize("line, room", [
@@ -777,6 +804,7 @@ def test_w1d_a_one_character_leftover_of_a_unit_is_not_a_treatment(text):
     ("Room No.: ☑ 7", "7"),
     ("Room No. 5", "5"),      # unchanged
     ("Room No.: ☑", None),    # a tick with no number is still no room number
+    ("Room No. ☐1 ☐2 ☒3", None),   # a ROW of boxes is a choice, not one swallowed number: unread and flagged
 ])
 def test_w1d_a_box_glyph_before_the_room_number_is_skipped(line, room):
     assert N.extract_staff_fields(f"Treatment: ไทย 1 ชม.\nTherapist Name: พิพี\n{line}")[2] == room
@@ -797,6 +825,15 @@ def test_w1e_an_hour_unit_look_alike_is_read_as_an_hour():
     ("ไทย + ประคบ = 600", 600),   # 6 is not an hour count 1-4: reported as written, never invented
 ])
 def test_w1e_an_impossible_written_total_is_read_as_hours(text, total):
+    _, _, _, written = N.parse_treatments(text)
+    assert written == total
+
+
+@pytest.mark.parametrize("text, total", [("ไทย + ประคบ = 20", 20), ("ไทย + ประคบ = 25", 25), ("ไทย + ประคบ = 15", 15)])
+def test_w1e_a_short_total_that_could_be_a_written_duration_is_never_rewritten(text, total):
+    """`staffOnly.totalMinutes` is a bare integer with no `needsReview` carrier, so a wrong rewrite there is silent by
+    construction. Every duration the master list offers is a multiple of 5, so a short multiple of 5 is a plausible
+    written add-on and stays exactly as read -- tripling it would be the unflagged error §4 G1 forbids."""
     _, _, _, written = N.parse_treatments(text)
     assert written == total
 

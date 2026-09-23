@@ -16,6 +16,12 @@ The confidence gate is replayed from `evidence.tokenConfidence` rather than from
 per-field statistics and not the tokens. That is exact while a variant leaves the field's `raw` string unchanged: the stored
 statistics were measured over the span of that exact string. `replay_page` therefore reports `staleGate` for every field
 whose replayed `raw` differs from production's, so a caller never scores a gate decision that no longer has evidence.
+
+The THIRD limit of the method, and the one that is easiest to miss: the stored response also froze production's
+model-CALL GRAPH. `api.process_image` decides its two re-reads (`staffOnlyFallback`, `customerInformationFallback`) from
+`N.extract_staff_fields` and `N.parse_customer_text`, and a parser change moves those predicates. `replay_page` re-runs
+them with today's parser and reports every page whose route would change as `staleRoute`, so a page is never scored from
+an answer the shipped code would not have asked for.
 """
 
 import sys
@@ -48,23 +54,50 @@ def section_mode(result):
     return "staff-separate" if "headerCustomer" in names else "separate"
 
 
-def _answers(result, mode):
-    """The parsers' inputs, as `api._read_answers` built them for this page: (staffRaw, headerRaw, customerRaw)."""
+def _stale_route(result, mode, staff_raw, customer_raw_before, expected):
+    """The sections whose MODEL ANSWER today's code would not be given for this page.
+
+    `api.process_image:493-496` decides its two re-reads from `N.extract_staff_fields` and `N.parse_customer_text` --
+    predicates the parser changes of W1 rewrote. The stored response froze PRODUCTION's decision, so a page where the two
+    disagree is scored from an answer the shipped code would never receive. That is the third limit of this method,
+    beside the copied image-derived fields and the gate replayed from stored statistics, and it is why `benchmark.py`
+    keeps these pages out of the G1/G2 verdict instead of quietly scoring them.
+    """
+    if mode == "separate":  # v3.0's two calls take no fallback at all
+        return []
+    names = [s["name"] for s in result["timings"]["sections"]]
+    out = []
+    # STAFF: `evidence.staffCropRaw` is the answer AFTER any re-read, so when production re-read, the original answer
+    # today's predicate would see is not in the file at all -- the route cannot be confirmed either way.
+    if "staffOnlyFallback" in names or (staff_raw is not None and not any(N.extract_staff_fields(staff_raw))):
+        out.append("staffOnly")
+    # CUSTOMER: the pre-fallback answer survives in `evidence.combinedRaw`, so today's predicate can be re-evaluated.
+    if result["evidence"]["combinedRaw"] is not None and expected:
+        fires_today = customer_raw_before is None or not any(N.parse_customer_text(customer_raw_before, expected)[0].values())
+        if fires_today != ("customerInformationFallback" in names):
+            out.append("customerInformation")
+    return out
+
+
+def _answers(result, mode, expected=()):
+    """The parsers' inputs, as `api._read_answers` built them for this page: (staffRaw, headerRaw, customerRaw,
+    staleRoute). `staleRoute` is `_stale_route`'s list."""
     ev = result["evidence"]
     names = [s["name"] for s in result["timings"]["sections"]]
     empty_header = dict.fromkeys(N.HEADER_FIELDS)
     if mode == "combined":
         if ev["combinedRaw"] is None:
-            return ev["staffCropRaw"], empty_header, None
+            return ev["staffCropRaw"], empty_header, None, _stale_route(result, mode, ev["staffCropRaw"], None, expected)
         customer_part, staff_part = N.split_combined_text(ev["combinedRaw"])
         header_raw, customer_raw = N.extract_header_fields(customer_part)
-        return staff_part, header_raw, customer_raw
+        return staff_part, header_raw, customer_raw, _stale_route(result, mode, staff_part, customer_raw, expected)
     if mode == "separate":
-        return ev["staffCropRaw"], empty_header, ev["customerCropRaw"]
+        return ev["staffCropRaw"], empty_header, ev["customerCropRaw"], []
     header_raw, customer_raw = N.extract_header_fields(ev["combinedRaw"]) if ev["combinedRaw"] is not None else (empty_header, None)
+    stale = _stale_route(result, mode, ev["staffCropRaw"], customer_raw, expected)
     if "customerInformationFallback" in names:  # the re-read answer replaced both `customer` and `customerRaw`
         customer_raw = ev["customerCropRaw"]
-    return ev["staffCropRaw"], header_raw, customer_raw
+    return ev["staffCropRaw"], header_raw, customer_raw, stale
 
 
 def _gate(field, kind, stats):
@@ -91,15 +124,17 @@ def replay_page(result):
     """Stored response -> ({header, customerInformation, recommendationCard, staffOnly}, notes).
 
     `notes.staleGate` lists the confidence keys whose stored statistics no longer describe the replayed value (the field's
-    `raw` changed, or the treatment item count changed, so the span the statistics were measured over is gone). `notes.gate`
-    records what the gate did per key. Nothing in here consults a page image or the model.
+    `raw` changed, or the treatment item count changed, so the span the statistics were measured over is gone).
+    `notes.staleRoute` lists the sections whose model answer today's code would not be given at all (`_stale_route`).
+    `notes.ruleFlag` records each scalar field's `needsReview` BEFORE the gate ran. `notes.gate` records what the gate
+    did per key. Nothing in here consults a page image or the model.
     """
     ev, mode = result["evidence"], section_mode(result)
-    staff_raw, header_raw, customer_raw = _answers(result, mode)
     ink = ev["textInk"]
     states = {key: M.text_state(ink[key]) for key in N.CUSTOMER_FIELDS}
     header_states = {key: M.text_state(ink[key]) for key in ("date", "time") if key in ink}
     expected = tuple(key for key in N.CUSTOMER_FIELDS if states[key] != "empty")
+    staff_raw, header_raw, customer_raw, stale_route = _answers(result, mode, expected)
     if not expected:
         customer_raw = None
 
@@ -116,12 +151,17 @@ def replay_page(result):
         sections[section][key] = result[section][key]
 
     token_confidence = ev.get("tokenConfidence") or {}
-    notes = {"mode": mode, "gate": {}, "staleGate": [], "treatmentCountChanged": False}
+    notes = {"mode": mode, "gate": {}, "staleGate": [], "staleRoute": stale_route, "ruleFlag": {},
+             "treatmentCountChanged": False}
     for path, kind in SCALAR_KINDS:
         section, name = path.split(".")
         field = sections[section][name]
         if (field.get("raw") or None) != (_stored(result, path).get("raw") or None):
             notes["staleGate"].append(path)
+        # The parser's own flag, recorded BEFORE the gate: `_gate` sets `needsReview` in place, so afterwards a field
+        # flagged by both a rule and the gate is indistinguishable from one the gate alone flagged. `tools/thresholds.py`
+        # sweeps thresholds and must never pretend it can unflag a rule (adversarial review, 2026-09-23).
+        notes["ruleFlag"][path] = bool(field.get("needsReview"))
         notes["gate"][path] = _gate(field, kind, token_confidence.get(path))
     stored_items = result["staffOnly"]["treatments"]
     notes["treatmentCountChanged"] = len(stored_items) != len(treatments)

@@ -316,10 +316,13 @@ def extract_staff_fields(text):
     # "(5)": a circled room number. The value may be on the next line ("Room No.\n11"), but a label is never the value
     # ("Room No. 房号\nTreatment ...": its echoed Chinese label was dropped): the search moves on to the next "Room No.".
     # W1d: the printed tick box in front of the number is transcribed as a box glyph ("Room No. ☐ 11") and used to
-    # swallow the whole answer -- the number after it is still the room number.
+    # swallow the whole answer -- the number after it is still the room number. A RUN of box glyphs is something else:
+    # a row of numbered choices the model transcribed ("Room No. ☐1 ☐2 ☒3"), where taking the first digit would pick
+    # the first UNTICKED box and answer at confidence 0.95 with no flag. More than one glyph on the line therefore
+    # leaves the room unread, which is what v3.2 did and the safe direction (adversarial review, 2026-09-23).
     m = re.search(rf"Room\s*No\.?\s*:?\s*(?:{_BOX_GLYPH}\s*)*[(（\[]?\s*"
                   r"(?!(?:treatments?|therapist|room|staff|no|name|date|time)\b)([A-Za-z0-9ก-๙]+)", text, re.I)
-    if m:
+    if m and len(re.findall(_BOX_GLYPH, text[m.start():].split("\n", 1)[0])) <= 1:
         room = m.group(1).strip()
     return treatment, therapist, room
 
@@ -552,15 +555,27 @@ SEPARATOR_RE = re.compile(r"\s*(?:\+|＋|/|\n|;|、|，|(?<!\d),|,(?!\d)|\s&\s|\
 TOTAL_MARK_RE = re.compile(r"\s*(?:=+>?|＝|->|→|>|รวม|\btotal\b)\s*", re.I)
 # Leading guest count: "4 ไทย 1 ชม." (4 guests, one hour each), "2 คน ออย 90 นาที".
 GUESTS_RE = re.compile(r"^\s*(?P<n>[1-9]|1\d|20)\s*(?:คน|ท่าน|pax|persons?|guests?|x|×)?\s+(?=[^\W\d_])", re.I)
-# W1d: a trailing bracketed Thai restatement of the line just read ("เท้า + ออย 2 ชม. (ไทยหน้า)") -- the model's own
-# second transcription, not a treatment. Digits (a guest count "(2 คน)", a circled number "(5)") and anything shorter than
-# three Thai consonants (the unit "( ชม. )") are not restatements and stay.
+# W1d: a trailing bracketed Thai restatement of the line just read -- the model's own second transcription, not a
+# treatment. Digits (a guest count "(2 คน)", a circled number "(5)") and anything shorter than three Thai consonants
+# (the unit "( ชม. )") are not restatements and stay.
 _THAI_RESTATEMENT = re.compile(r"\s*[(（\[][^\S\n]*(?P<body>[฀-๿\s]+)[)）\]]\s*$")
+# ...and it must PROVE it restates the text in front of it. Without this the rule deleted any trailing bracketed Thai
+# group, so a bracketed second treatment -- a master treatment name is the dangerous shape -- disappeared together with
+# the review flag it carried: exactly the unflagged error §4 G1 forbids (adversarial review, 2026-09-23). The threshold
+# is on the same `similarity` the master matcher uses; the one page of the 95 where the rule fires scores 0.74.
+RESTATEMENT_SIMILAR_ABOVE = 0.55
 
 
 def _strip_restatement(text):
+    """-> (text without a trailing bracketed Thai restatement, the dropped body) or (text, None). Every drop is
+    reported by the caller as a warning and flags the page's items: a deletion must never be silent."""
     m = _THAI_RESTATEMENT.search(text)
-    return text[:m.start()] if m and len(re.findall(r"[ก-ฮ]", m.group("body"))) >= 3 else text
+    if not m or len(re.findall(r"[ก-ฮ]", m.group("body"))) < 3:
+        return text, None
+    head, body = text[:m.start()], m.group("body").strip()
+    if similarity(_key(head), _key(body)) < RESTATEMENT_SIMILAR_ABOVE:
+        return text, None  # not a second reading of the same line: it stays an item, with its own review flag
+    return head, body
 
 
 # Trailing guest count: "ไทย 90 นาที 2 ท่าน", "(2 คน)", "= 2 ท่าน", "x 2" / "× 2". A bare trailing number stays a duration.
@@ -694,8 +709,12 @@ def _minutes(match):
 
 
 # W1d: what is left of a written unit after the duration regex matched a prefix of it ("90 นที" -> "90 นท" + "ี",
-# "90 นทท" -> "90 นท" + "ท"). One character, or Thai vowel/tone marks only, is never a treatment name.
-_UNIT_FRAGMENT = re.compile(r"[^\W\d_]|[ัิ-ฺ็-๎]+")
+# "90 นทท" -> "90 นท" + "ท"). ONLY the characters a truncated `_HOUR` / `_MIN` can leave behind count: a consonant of
+# ชั่วโมง / ชม / ซม / นาที / นท, a doubled last letter of hours / hrs / minutes / mins, or Thai vowel/tone marks alone.
+# "Any single letter" (the first draft of this rule) absorbed a truncated second treatment or a stray initial together
+# with the only review flag the page had -- the unflagged error §4 G1 forbids (adversarial review, 2026-09-23). Every
+# merge is reported in the warnings so it is never invisible.
+_UNIT_FRAGMENT = re.compile(r"[ชมซนทวโง]|[hms]|[ัิ-ฺ็-๎]+", re.I)
 
 
 def _clean_name(text):
@@ -704,10 +723,10 @@ def _clean_name(text):
     return text or None
 
 
-def _segment_groups(segment):
+def _segment_groups(segment, unit_fragments=None):
     """Split one segment into (name, raw, [(duration_text, minutes, bare)], leftover numbers, (start, end) in the segment)
     groups. Leftover numbers are numbers that no duration (and no bare-number fallback) used: they are reported instead of
-    silently dropped."""
+    silently dropped, and so is every unit fragment merged into the item before it (`unit_fragments`)."""
     groups, pos, used = [], 0, []
     for m in DURATION_RE.finditer(segment):
         name = _clean_name(segment[pos:m.start()])
@@ -721,6 +740,8 @@ def _segment_groups(segment):
     tail_name = _clean_name(tail)
     if tail_name and groups and _UNIT_FRAGMENT.fullmatch(tail_name):
         groups[-1][2] = len(segment)  # "ออย 90 นที": the unit match ate "นท" and left "ี" -- a leftover of the unit, not an item
+        if unit_fragments is not None:
+            unit_fragments.append(tail_name)
     elif tail_name:
         groups.append([tail_name, pos, len(segment), []])
     elif groups and BARE_NUMBER_RE.search(tail):  # "ไทย 90 นาที 15": the stray number belongs to the last item
@@ -801,13 +822,24 @@ def _split_total(text):
     return text, None, None, False
 
 
-TOTAL_MIN, TOTAL_MAX = 30, 240  # no session in this batch is shorter or longer; outside it a bare total is not minutes
+# The window a bare written total must fall in to be read as minutes. Taken from the TREATMENT MASTER LIST, not from
+# any one batch of pages: 30 is the shortest duration the menu offers (`master_data.json` "durations"), 240 the longest
+# single session (180) plus one more hour of add-ons.
+TOTAL_MIN, TOTAL_MAX = 30, 240
 
 
 def _total_as_hours(total, has_unit):
-    """W1e: a written total with NO unit that is impossible as minutes ("= 27", "= 285") but starts with an hour count
-    1-4 is the hour figure with the unit lost or a digit doubled ("= 2 ชม." read as "= 27"). -> (minutes, re-read?)."""
+    """W1e: a written total with NO unit that cannot be a session length ("= 27", "= 285") but starts with an hour count
+    1-4 is the hour figure with the unit lost or a digit doubled ("= 2 ชม." read as "= 27"). -> (minutes, re-read?).
+
+    A short total that is itself a MULTIPLE OF 5 ("= 20", "= 25") is left exactly as read: every duration the master
+    list offers is a multiple of 5, so such a number is a plausible written add-on rather than a garbled hour count, and
+    `staffOnly.totalMinutes` is a bare integer with no `needsReview` carrier -- a rewrite that is wrong there is silent
+    by construction, which is what §4 G1 forbids (adversarial review, 2026-09-23). Ambiguous shapes are not rewritten.
+    """
     if total is None or has_unit or TOTAL_MIN <= total <= TOTAL_MAX:
+        return total, False
+    if total < TOTAL_MIN and total % 5 == 0:
         return total, False
     hours = int(str(total)[0])
     return (hours * 60, True) if 1 <= hours <= 4 else (total, False)
@@ -838,7 +870,7 @@ def parse_treatments(raw, visual_aliases=True):
     VISUAL_ALIAS_CONFIDENCE and always needsReview; each replacement is reported in the warnings."""
     if not raw:
         return [], [], [], None
-    text = _strip_restatement(raw.translate(THAI_DIGITS))
+    text, restated = _strip_restatement(raw.translate(THAI_DIGITS))
     text, alias_spans, alias_notes = apply_visual_aliases(text) if visual_aliases else (text, [], [])
     trailing = TRAILING_GUESTS_RE.search(text)
     trailing_guests = None
@@ -851,14 +883,19 @@ def parse_treatments(raw, visual_aliases=True):
     body, guests = _split_guests(text, written_total is not None)
     base = len(text) - len(body)  # ...except the leading guest count: positions below are offset by it
     guests = guests if guests is not None else trailing_guests
-    groups, pos = [], 0
+    groups, pos, unit_fragments = [], 0, []
     for separator in [*SEPARATOR_RE.finditer(body), None]:
         segment = body[pos:separator.start() if separator else len(body)]
         if segment.strip():
-            groups.extend((*group[:4], (base + pos + group[4][0], base + pos + group[4][1])) for group in _segment_groups(segment))
+            groups.extend((*group[:4], (base + pos + group[4][0], base + pos + group[4][1]))
+                          for group in _segment_groups(segment, unit_fragments))
         pos = separator.end() if separator else pos
     durations_all = [d[0] for _, _, ds, _, _ in groups for d in ds if not d[2]] + ([total_text] if total_unit else [])
     total, warnings, items, review_next = None, [f"visual alias: '{w}' read as '{r}'" for w, r in alias_notes], [], False
+    if restated:  # W1d: never delete text without a trace -- the warning and the item flags below are that trace
+        warnings.append(f"bracketed text '{restated}' dropped: it restates the line in front of it")
+    warnings += [f"'{fragment}' after a duration read as the leftover of a written unit, not as a treatment"
+                 for fragment in unit_fragments]
     named_minutes = [ds[0][1] for name, _, ds, _, _ in groups if name and ds]
     for index, (name, seg_raw, durs, leftover, span) in enumerate(groups):
         last = index == len(groups) - 1
@@ -934,6 +971,8 @@ def parse_treatments(raw, visual_aliases=True):
     for item in items:
         reasons = item.pop("_review")
         item.pop("_bare")
+        if restated:
+            reasons.add("restatement")  # a reviewer must see the page whose bracketed text this parser deleted
         value = item["value"]
         allowed = _allowed_durations(value) if value else []
         if allowed and item["durationMinutes"] is not None and item["durationMinutes"] not in allowed:

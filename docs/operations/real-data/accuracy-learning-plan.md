@@ -668,11 +668,16 @@ counts, page numbers, field names and error categories only, so a run can be pas
 (`api._customer_text_fields`, `N.header_fields`, `N.parse_treatments`, `N.normalize_therapist`, `N.normalize_room`) and re-applies
 the token gate from the stored `evidence.tokenConfidence`. With the code unchanged it reproduces **95/95 pages exactly on
 `value`, `raw` and `needsReview`**; 91/95 also on `source` and `confidence`, the four exceptions (pages 26-29) being treatment
-items production served from the `verified-memory` hook, which the stored response does not carry and W3a removes. Two limits
+items production served from the `verified-memory` hook, which the stored response does not carry and W3a removes. **Three** limits
 that are properties of the method, not bugs: the **image-derived fields are copied through** from the stored response (no page
-pixels offline, so no checkbox or body-map *change* is scorable here — G0 stands), and the gate is replayed from the stored
+pixels offline, so no checkbox or body-map *change* is scorable here — G0 stands); the gate is replayed from the stored
 per-field statistics, which describe the field's exact `raw` string, so a variant that changes a `raw` gets an explicit
-`staleGate` warning instead of an unbacked flag. Round-trip tests on synthetic pages (`tests/test_benchmark_replay.py`) hold the
+`staleGate` warning instead of an unbacked flag; and the stored response also froze production's **model-call graph** —
+`api.process_image:493-496` decides its two re-reads from `extract_staff_fields` and `parse_customer_text`, which a parser
+change moves, so `replay_page` re-evaluates both predicates with today's parser and reports every page whose route would
+change as **`staleRoute`**. `benchmark.py` names those pages and keeps them out of the per-page checks of G1 and G2
+(symmetrically on both sides of the comparison) instead of scoring them from an answer the shipped code would never be
+given. *(Third limit added 2026-09-23 by the adversarial review of §15; on this file it is page 5 alone.)* Round-trip tests on synthetic pages (`tests/test_benchmark_replay.py`) hold the
 replay to `api.process_image` in both section modes. Consequence: W1, W2, W3, W5 and W6 are scored with **zero model calls**, and
 any future parser, dictionary or threshold change is scored the same way on every reviewed document.
 
@@ -698,6 +703,10 @@ below are superseded where the frozen file differs — the file is the baseline,
   and freezing the higher number would have silently authorised two new silent errors. The per-list numbers are frozen
   **as well as** the unit number, because W2's measured regression is per-list (avoid 4 → 9 on `sim-1610`) and the merge hides
   it. **0 new unflagged errors** is the release condition, not a target.
+  *(Enforcement corrected 2026-09-23, §15: `benchmark.py` compared only the COUNT, so a silent error that merely moved
+  from one page to another — or slid from wrong-but-flagged to wrong-and-unflagged on the same page — passed G1, G2 and
+  G3 and exited 0. It now diffs the frozen **page lists** and fails on any newly-silent page by name, gates the
+  cross-field total, and refuses a scored field that has no baseline row unless `--allow-new-field` is given.)*
 * **G1b misses (blocking, separate):** §4's scorer counts a **miss** as an unflagged error unless the group carries
   `possibleMissedMark`. That redefinition changes the body-map baseline by an order of magnitude (production item recall is
   272/384 preferred and 14/30 avoid — about 112 + 16 missed items against a page-level W&U of 0), so misses are gated here on
@@ -1026,12 +1035,26 @@ What shipped, against §1A's five rows:
   moved together — which is exactly why §1E forbids teaching the scorer an alias the reader lacks.
 * **W1d** — a bracketed model note is dropped when the note word is anywhere inside the bracket, not only first
   (`(with a handwritten note '…')` was becoming a treatment); a **trailing** bracketed Thai restatement of the line just
-  read is dropped (≥ 3 Thai consonants, no digits, so `(2 คน)`, `(5)` and `( ชม. )` are untouched); a one-character
-  leftover of a written unit (`90 นที` → `90 นท` + `ี`) merges into the item instead of becoming one; and the printed
-  tick box in front of a room number is skipped (page 11).
+  read is dropped; a leftover of a written unit (`90 นที` → `90 นท` + `ี`) merges into the item instead of becoming one;
+  and the printed tick box in front of a room number is skipped (page 11).
+  *(Tightened 2026-09-23, §15. As first shipped all three rules deleted text with no proof and no trace: any trailing
+  bracketed Thai group went, including a bracketed master treatment; any single letter in any script was absorbed as a
+  "unit fragment"; and the box-glyph skip was unbounded, so a transcribed row of numbered boxes answered with the first,
+  unticked one at confidence 0.95. Each deleted the page's review flag with the text. Now the bracket body must be
+  `similarity` ≥ 0.55 to the line in front of it, the fragment class is limited to what a truncated `ชม.` / `นาที` /
+  `hours` / `mins` can leave, more than one box glyph leaves the room unread, and every merge or drop is reported in
+  `evidence.treatmentWarnings` and flags the page. All five W1d pages are unchanged; the one page of 95 where the
+  restatement rule fires scores 0.74.)*
 * **W1e** — `visualAliases.hourUnit` gains the three observed shapes `5M`, `57`, `会`; and a written total with **no
   unit** that cannot be a session length (< 30 or > 240 min) but starts with an hour count 1–4 is read as that many
   hours, with a warning, and every item on the page is flagged. Pages 48, 49, 73.
+  *(Narrowed 2026-09-23, §15. The window was justified as "no session in this batch is shorter or longer", i.e. fitted to
+  these 95 pages, and it writes into `staffOnly.totalMinutes`, the one field with no `needsReview` carrier — so an
+  out-of-window but correctly read total became a silent error by construction. 30 and 240 are now anchored to the
+  treatment master list (its shortest offered duration; its longest single session plus one hour), and a short total that
+  is itself a **multiple of 5** — `= 20`, `= 25`, the shapes the review named — is never rewritten, because every
+  duration the menu offers is a multiple of 5 and such a number is a plausible written add-on. Pages 48, 49 and 73 are
+  unchanged: their totals are 285, 27 and 26.)*
 * **W1f** — the treatment master threshold 0.72 → **0.60**. Everything below `REVIEW_BELOW` (0.85) is flagged, so a
   suggestion cannot go out silently; the stop at 0.60 rather than 0.50 stays precautionary, not measured.
 
@@ -1075,8 +1098,14 @@ block every W2 number.
 * **The weight-0 rule** (`document-view.ts:305,362`, §2.5.2): `changed ⇒ weight 1`, `flagged-but-unchanged ⇒ weight 0`.
   A flagged field the reviewer merely accepted now produces **no `ocr_corrections` row and no outbox row at all**, which
   is stricter than "a row with weight 0" — the vote ledger that would hold a weight-0 row is W3b and does not exist yet.
-  Nothing is lost from the audit: `documents.reviewed_by` / `reviewed_at`, the merged `structured_result` with the flag
-  cleared, and the `document.reviewed` audit row all still record that a human went through the page.
+  Nothing is lost from the audit **per page**: `documents.reviewed_by` / `reviewed_at`, the merged `structured_result`
+  with the flag cleared, and the `document.reviewed` audit row all still record that a human went through it.
+  *(Corrected 2026-09-23, §15: per FIELD something is. The record that a reviewer looked at one specific flagged
+  suggestion and accepted it now exists nowhere, and that is exactly the datum W3b's weight-0 votes are built from — so
+  **W3b cannot be back-filled from the review traffic of this interval**. It was not kept because `ocr_corrections` has
+  no weight column, so a weight-0 row there would be indistinguishable from a real correction and would inflate the
+  `corrections` count the API and the `document.reviewed` audit detail return. The carrier is W3b's ledger, not this
+  table.)*
 
 ### Measured, 95 stored production answers, 0 model calls
 
@@ -1087,17 +1116,24 @@ script. Three runs: `stateless` (the ordinary benchmark), `v3.2` (pre-W3a weight
 | | therapist right / W&U | treatment names right / W&U | treatments+durations right / W&U |
 |---|---|---|---|
 | stateless (= the frozen benchmark) | 6 / **0** | 52 / **2** | 47 / **2** |
-| v3.2, the loop as production runs it | 7 / **8** | 54 / **3** | 48 / **3** |
+| pre-W3a **rules**, today's parser | 7 / **8** | 54 / **3** | 48 / **3** |
 | **W3a** | 6 / **0** | 52 / **2** | 47 / **2** |
+
+> **The middle row is the pre-W3a RULES, not the v3.2 binary** (label corrected 2026-09-23, §15). `learning_loop.run`
+> always reads the pages through `replay.replay_page`, i.e. today's parser, and reverts only `VERIFIED_MEMORY_ENABLED`
+> and the weight rule. The accuracy columns are an honest measurement of the loop's harm because both sides share one
+> parser; the confirmation VOLUME below is a post-W1 count and is not what production posted. `MODE_LABELS` now prints
+> the row as "pre-W3a rules" and `--learning-loop` says so above the table.
 
 **Therapist wrong-and-unflagged 8 → 0, exactly the W3 target.** Treatment names came out **3 → 2**, not the "6 → 5" of
 §3 W3: the −1 is the same defect, but §1E's scorer fixes move the absolute number (the ad-hoc script that produced
 "6 → 5" scored treatments before the marker and value-set fixes). The gain is the avoided regression, as W3 says: the
 memory *added* 8 therapist and 1 treatment silent errors per 95 pages, and W3a is what stops them being added.
 
-**Confirmation volume and junk rows.** v3.2 posts **200** confirmations for these 95 pages, **75** of them weight-0
-(therapist 94 posted / 7 weight-0; treatment 106 / 68), which is **26 distinct junk rows** — §1D's 13 + 15 = 28 measured
-on the pre-W1 parser, so the two agree within the parser change. W3a posts **128**, **0** of them weight-0, and **0**
+**Confirmation volume and junk rows.** The pre-W3a rules post **200** confirmations for these 95 pages **on today's
+parser**, **75** of them weight-0 (therapist 94 posted / 7 weight-0; treatment 106 / 68), which is **26 distinct junk
+rows** — §1D's 13 + 15 = 28 measured on the pre-W1 parser, so the two agree within the parser change. Neither figure is
+production's own volume, and neither should be quoted as one. W3a posts **128**, **0** of them weight-0, and **0**
 are read back. The memory served **84** fields under v3.2 and **0** under W3a.
 
 **The invariant is the gate, not the score.** The `w3a` run is identical to the stateless replay on every field, page
@@ -1159,10 +1195,23 @@ inputs and the label-hygiene hour are still outstanding** and still block every 
 * **The thresholds became configurable where §8.6 and G6 say they should be.** `ocr_confidence.REVIEW_BELOW` is now the
   fallback; a moved threshold lives in `calibration.json` as `{reviewBelow, movedFrom, acceptedBecause, …}`. The loader
   **refuses the whole file** unless every entry names a known field type, carries a non-empty `acceptedBecause` and moves
-  its threshold by at most **±0.05** from the value it replaces — G6's two conditions, now mechanical rather than
-  editorial. A refused file falls back to `REVIEW_BELOW` (which always flags *more*, never less), the pages keep being
-  read, and `/health` reports `status:"degraded"`, `calibration:"rejected: …"`. `OCR_MODEL_CONFIDENCE_<TYPE>` still
-  overrides one field type for one deployment, and deleting an entry restores its code default.
+  its threshold by at most **±0.05** from `ocr_confidence.REVIEW_BELOW`, the value actually in force in the code (and
+  `movedFrom` must equal that value) — G6's two conditions, mechanical rather than editorial.
+  *(Corrected 2026-09-23, §15. As first shipped the clamp compared `reviewBelow` with the file's own `movedFrom`, which
+  made it **self-declared and therefore vacuous**: a file of `{"date": {"reviewBelow": 0.00, "movedFrom": 0.05}}` loaded
+  clean, put 0.00 in force against a code default of 0.90 and left `/health` saying "ok" — and §14's own sweep shows this
+  path can add silent errors while every gate stays green. The consequence of clamping against `REVIEW_BELOW` is
+  deliberate: this file cannot walk a threshold further than ±0.05 from its code default by being edited again, so a
+  second release's move is a change to `REVIEW_BELOW`, reviewed as code.)*
+  A refused file falls back to `REVIEW_BELOW` (which always flags *more*, never less), the pages keep being read, and
+  `/health` reports `calibration:"rejected: …"` — in that key alone, **not** in `status`.
+  *(Also corrected 2026-09-23, §15: degrading `status` broke the contract `OcrClient.healthCheck()` was written against
+  (`packages/ocr-client/src/index.ts:163` accepts `degraded` only for `masterData: "stale:"`), and the ocr-worker uses
+  that call as the half-open probe of a gate only a completed job can reset (`services/ocr-worker/src/index.ts:333,372`).
+  A refused config file would therefore have stalled every job loop after any OCR blip — while, as api.py's own comment
+  says, the pages keep being read.)*
+  `OCR_MODEL_CONFIDENCE_<TYPE>` still overrides one field type for one deployment, and deleting an entry restores its
+  code default.
 * **`benchmark.py --thresholds`** (`tools/thresholds.py`): per model-read scalar field, the sweep of right-but-flagged /
   wrong-but-flagged / wrong-and-unflagged across a threshold grid, the margin between the threshold in force and the most
   confident **wrong** page, the all-data argmin, and what that *refit procedure* scores leave-one-out and odd/even. A
@@ -1180,8 +1229,8 @@ override, so nothing but the two numbers differs.
 | `header.date` 0.90 → 0.85 | 84 → **84** | 20 → **19** | 11 → 11 | **0 → 0** |
 
 **Every other number in the benchmark is byte-identical** — the two frozen runs differ in exactly those two cells. No
-page changed right ↔ wrong, no field's wrong-and-unflagged *page list* moved (G1 and G2 can miss a silent error that
-merely moves; the diff of the two `--freeze` files cannot). Three right pages left the review queue: nationality 15 and
+page changed right ↔ wrong, no field's wrong-and-unflagged *page list* moved (as of §15 that is no longer a manual
+`--freeze` diff: G1 fails on a newly-silent page by name). Three right pages left the review queue: nationality 15 and
 74, date 75. None of them is a stale-gate page, so all three flags were evidence-backed before they were cleared.
 `--learning-loop` re-run: the W3a invariant and the loop's determinism both still PASS, and its 200/128 confirmation
 counts are unchanged (the loop confirms therapist and treatment, whose thresholds did not move).
@@ -1230,3 +1279,173 @@ counts are unchanged (the loop confirms therapist and treatment, whose threshold
    the Local AI (`full-document-batch-deploy.md` §C copies the directory, so this is only a risk for a hand-picked file
    list). A missing file is fail-safe and visible: the v3.2 thresholds stand and `/health` answers
    `calibration:"default"` rather than `"ok"`.
+
+---
+
+## 15. Implementation record — the W1 + W3a + W6 branch, after adversarial review (2026-09-23)
+
+Branch `feature/accuracy-w1` off `main` (`edb503e`, the code production runs). Four feature commits (§§11–14) plus one
+correction commit that answers a three-lens adversarial review (measurement honesty, Local AI correctness, app safety).
+Everything below is measured with `tools/benchmark.py --data <operator dir>` on the **95 stored production answers**,
+**0 model calls**, no production access, no customer data in the repository.
+
+### What shipped
+
+**The harness (§11).** `local-ai/tools/{replay,scoring,benchmark,learning_loop,thresholds}.py` and the frozen baseline
+`tools/baseline-v3.2-prod-95.txt`. One scorer, one baseline, the §4 gates computed rather than asserted, and the four
+gates that *cannot* be computed from stored answers (G0, G4, G5, G7) printed as NOT MEASURABLE with the reason on every
+run.
+
+**W1 parser and vocabulary (§12), W3a the confirm route made audit-only (§13), W6 two clamped review-threshold moves
+(§14).** Unchanged in substance by the review; the rules that delete text or move a threshold were tightened (below).
+
+**`VERSION` 3.2 → 3.3** (`local-ai/api.py`, `SCHEMA_VERSION` still 3). The schema, prompts, crops and model are v3.2's,
+but the reader now returns different `value`, `raw` and `needsReview` on dozens of pages. `documents.ocr_version` is the
+app's only record of which reader produced a stored answer and §2.5.6 keys kind-B learned entries by it, so the string
+had to move. Declared in `full-document-batch-spec.md` §1 and in `local-ai/README.md`.
+
+**Seven review findings fixed** (two of them things that could put a wrong value in front of no one):
+
+| # | What was wrong | Fix | Cost on the 95 pages |
+|---|---|---|---|
+| 1 | `_strip_restatement` deleted **any** trailing bracketed Thai group — including a bracketed master treatment — with no similarity check, no warning and no flag. `'ไทย 2 ชม. (ประคบ)'`: 2 items, flagged → 1 item, **unflagged**. | The body must prove it restates the line in front of it (`similarity ≥ 0.55`); every drop is reported in `evidence.treatmentWarnings` and flags the page's items. | 0 — the one page of 95 where the rule fires scores 0.74 |
+| 2 | The §4 G6 ±0.05 clamp was checked against the calibration file's **own** `movedFrom`, so it was self-declared and vacuous: `{"date": {"reviewBelow": 0.00, "movedFrom": 0.05}}` loaded clean, put 0.00 in force against a code default of 0.90, and `/health` still said "ok". | Clamp against `REVIEW_BELOW[kind]`, the value in force, and refuse an entry whose `movedFrom` is not that value. | 0 — the shipped file already declares the true baselines |
+| 3 | The W1d "unit fragment" merge matched **any single letter in any script**, absorbing a truncated second treatment or a stray initial together with the only review flag the page had. `'ไทย 60 นาที ก'`: 2 items, flagged → 1 item, unflagged. | The class is limited to what a truncated `ชม.` / `ซม.` / `ชั่วโมง` / `นาที` / `นท` / `hours` / `mins` can leave; every merge is reported in the warnings. | 0 — the two pages where it fires leave `ี` and `ท` |
+| 4 | `benchmark.py` gated only the **count** of wrong-and-unflagged, so a silent error that moved between pages — or slid from wrong-but-flagged to wrong-and-unflagged on one page — passed G1, G2 and G3 and exited 0. | G1 diffs the frozen **page lists** and fails by page number; it also gates the cross-field total (now a `[totals]` line in the frozen file) and refuses a scored field with no baseline row unless `--allow-new-field` is given. | 0 — `benchmark.py` still exits 0 |
+| 5 | The replay froze production's **model-call graph**: W1 changed the predicates at `api.py:493-496`, so on page 5 the shipped parser would no longer trigger the customer re-read, yet the page was scored from the re-read answer. Neither `replay.py`'s documented limits nor §4 mentioned it. | `replay_page` re-evaluates both fallback predicates with today's parser and emits `staleRoute`; `benchmark.py` names those pages and removes them from the per-page checks of G1 and G2 on **both** sides of the comparison. Round-trip tests drive both fallbacks. | page 5, named; it is in no G2 flip list and changes no verdict |
+| 6 | W1e's `_total_as_hours` used a window "fitted to this batch" and writes into `staffOnly.totalMinutes`, the one field with no `needsReview` carrier — so a correctly read 20- or 25-minute add-on total would have been silently tripled. | 30 / 240 are re-anchored to the treatment master list, and a short total that is itself a multiple of 5 is never rewritten (every duration the menu offers is a multiple of 5, so that shape is a plausible add-on). | 0 — pages 48/49/73 carry 285, 27 and 26 |
+| 7 | A refused `calibration.json` made `/health` report `status:"degraded"` with `masterData:"ok"`. `OcrClient.healthCheck()` reads that as down, and the worker uses it as the half-open probe of a gate only a completed job resets — so a configuration typo would have stalled every job loop after any OCR blip, while reading was unaffected. | `status` tracks master data alone; the rejection is reported in the `calibration` key. Declared in `full-document-batch-spec.md` §1. | none; `packages/ocr-client` is untouched |
+
+**Four smaller findings fixed.** The room-number box-glyph skip was unbounded, so a transcribed row of numbered boxes
+(`Room No. ☐1 ☐2 ☒3`) answered with the first, **unticked** one at confidence 0.95 — more than one glyph now leaves the
+room unread and flagged, which is what v3.2 did. `tools/thresholds.py` inferred "flagged by a parser rule" as
+"needsReview and not gated", which mislabelled every field flagged by **both** a rule and the gate as rule-free (measured:
+nationality 6 of 9, date 2 of 13, hotelName 2 of 7, therapist 71 of 95) — `replay_page` now records the parser's flag
+*before* the gate runs and the sweep reads that. The frozen baseline file documented the superseded G3 rule; its comment
+block is now emitted by `freeze()`, so it cannot drift from the code again. And the learning-loop report's middle row is
+relabelled **"pre-W3a rules"**, with the report, §13 and the README all stating that its 200/128/26 confirmation counts
+are post-W1 counts and not production's volume.
+
+**One test gap closed.** The PostgreSQL suite is skipped unless `OCR_TEST_DATABASE_URL_BOOTSTRAP` is set, so W3a's one
+change to what is **stored** had never run against the real schema and RLS roles. `batch.db.test.ts` now saves a document
+whose flagged `staffOnly.therapistName` and flagged treatment item are echoed back unchanged and asserts 0
+`ocr_corrections` rows, 0 `ocr_confirm_outbox` rows, `confirm_status` NULL and `deliveryStatus` `"NONE"`. It was run
+against a disposable PostgreSQL 17.6 (**432 tests pass, all 43 database tests included**) and it fails on the pre-W3a
+condition, so it measures the change rather than asserting it.
+
+### One finding rejected
+
+*"Keep pushing the `ReviewChange` for a flagged-but-unedited field and omit only `provider`, so the acceptance can still
+be stored."* The intent is right and is recorded in §13 above — W3b cannot be back-filled from this interval's review
+traffic. The implementation is not: `ocr_corrections` has **no weight column**, so a weight-0 row there would be
+indistinguishable from a real correction, and `changes.length` is what `saveReview` returns as `corrections` and writes
+into the `document.reviewed` audit detail. The carrier for a weight-0 vote is W3b's ledger; inventing one in a table that
+cannot express it would make the audit less honest, not more. §13 now states the loss explicitly instead.
+
+### Measured, before → after (95 stored production answers, 0 model calls, exit 0)
+
+"Before" is `tools/baseline-v3.2-prod-95.txt`, production v3.2. Every row not listed is **byte-identical**.
+
+| Field | right | right-but-flagged | wrong-but-flagged | wrong-and-UNFLAGGED |
+|---|---|---|---|---|
+| `header.date` | 84 → **84** | 20 → **19** | 11 → 11 | 0 → **0** |
+| `customerInformation.name` | 41 → **51** | 25 → 35 | 51 → 41 | 3 → **3** |
+| `customerInformation.nationality` | 83 → **90** | 8 → 9 | 12 → 5 | 0 → **0** |
+| `customerInformation.hotelName` | 73 → **76** | 9 → 11 | 21 → 19 | **1 → 0** |
+| `staffOnly.treatmentNames` | 46 → **52** | 31 → 37 | 47 → 41 | 2 → **2** |
+| `staffOnly.treatmentsWithDuration` | 42 → **47** | 27 → 32 | 51 → 46 | 2 → **2** |
+| `staffOnly.roomNo` | 73 → **74** | 12 → 12 | 21 → 20 | 1 → **1** |
+| `staffOnly.totalMinutes` (31 pages) | 19 → **24** | — | — | **12 → 7**, all unflaggable |
+| body map (preferred / avoid / one unit) | 38 / 55 / 35 unchanged | unchanged | unchanged | 3 / 1 / **0** unchanged |
+| therapist, form number, gender, referral, health, pressure, oil | unchanged | unchanged | unchanged | 0 |
+
+* **Cross-field wrong-and-unflagged: 9 → 8.** The one removed is §1A's hotel parser fault (page 31, the customer's name
+  served as the hotel name, unflagged). The remaining 8 are name 3, treatment 2, body-map preferred 3 / avoid 1, room 1 —
+  none a parser fault. `staffOnly.totalMinutes`'s 7 are silent by construction and outside that total.
+* **0 pages broke on any field.** G2 flips, all fixes: name 8/18/31/36/39/51/65/76/82/85, nationality 31/37/51/76/82/88/89,
+  hotel 24/48/51, treatment names 1/56/61/78/81/93, treatments+durations 56/61/81/85/93, room 11, written total
+  46/48/49/56/73.
+* **Item recall (G1b)** rose or held everywhere: treatment names 81 → **84** of 129 found, 48 → **45** missed, 47 → **41**
+  extra; body map, oils, referral and health unchanged.
+* **Review budget (G3), flagged pages per field:** date 31 → **30**, name 76 → 76, nationality 20 → **14**, hotel 30 → 30,
+  treatment names 78 → 78, treatments+durations 78 → 78, room 33 → **32**. No field pays for any of this.
+* **Learning loop (§4 G6):** therapist wrong-and-unflagged **8 → 0**, treatment names 3 → 2, treatments+durations 3 → 2;
+  confirmations 200 → 128 with **0** weight-0 and **0** read back. The W3a invariant (the `w3a` run identical to the
+  stateless replay, field for field) and the loop's determinism across two runs both PASS.
+* **Gates:** G1, G1b, G2, G3, G6 **PASS**, exit 0. G0, G4, G5, G7 printed as NOT MEASURABLE with the reason.
+  One `staleRoute` page (5) and 6 `staleGate` keys are named on every run.
+
+### Suites
+
+| Suite | Result |
+|---|---|
+| `local-ai` pytest, in `Dockerfile.test` (`--network none`) | **558 pass** (529 before this round; +29 regression tests) |
+| `pnpm run typecheck` | clean |
+| `pnpm run test` | **389 pass** without a database; **432 pass** with `OCR_TEST_DATABASE_URL_BOOTSTRAP` on a disposable PostgreSQL 17.6 |
+| `pnpm run lint` | clean |
+| `tools/benchmark.py` (plain, `--learning-loop`, `--thresholds`, `--freeze`) | exit 0 on all four |
+
+### Deviations from the plan
+
+1. **`VERSION` moved to 3.3**, which §§12–14 had not declared. §2.5.6's demotion rule applies to that bump when W3b
+   lands; no learned entries exist yet, so nothing is demoted today.
+2. **The ±0.05 clamp is now measured from `REVIEW_BELOW`, not from the previous calibrated value.** §8.6's recalibration
+   job will therefore need a place to hold the previously *active* value outside the editable file before it can move a
+   threshold twice; until then a second move is a code change to `REVIEW_BELOW`, reviewed as code. This is stricter than
+   §4 G6 asks for and is deliberate.
+3. **W1d and W1e are narrower than §12 first described them.** Each rule now has to earn its deletion, and every deletion
+   is reported. The measured gain is unchanged.
+4. **`/health`'s `status` does not move for a refused calibration file**, against §14's original wording. The rejection is
+   in the `calibration` key, which is what monitoring should read.
+5. **The re-frozen baseline is byte-identical to the committed one** on every count and every page list; only the
+   `[totals]` line and the gate-documentation comment are new. Re-freezing was done on a worktree of `main`, so the
+   baseline is still production v3.2's numbers and not this branch's.
+
+### Still pending — what this branch does NOT do
+
+* **W2 (body map, checkboxes) is blocked on G0.** The archived **1610 px** production renders plus a `sha256` manifest do
+  not exist yet; the operator's page images are 1400 px, and the two renders disagree on 30/95 pages. Every W2 figure
+  stays `sim-1610` and none of them is a release target. Nothing in this branch touches image-derived fields.
+* **The learning store (W3b–W3e) does not exist.** No `0021_learned_values`, no votes, no admin surface, no
+  `evidence.learned`. W3a only *removes*; and because no weight-0 row is written anywhere, the acceptance evidence of
+  every page reviewed between now and W3b is **not** being collected.
+* **W3f outbox hygiene** — the ~30 s backoff, the un-redriven DEAD rows, the double delivery — is untouched. Harmless
+  while nothing a confirmation delivers is applied; it matters again the day W3b writes votes.
+* **§2.5.9's auth precondition is unverified.** `OCR_WEB_AUTO_AUTH`, the unauthenticated Local AI write routes and the
+  public gateway are exactly as §2.5.9 describes them.
+* **W4, W5, W7 need model runs** on the eval container and are not started. §6's R1 image-first probe is still the
+  highest-value single experiment in this plan.
+* **The two carrier gaps are still unowned.** `staffOnly.totalMinutes` has no `needsReview` carrier (7 of 31 errors
+  silent by construction), and the body map has no `possibleMissedMark` carrier (128 missed items of 414).
+* **The client's master lists** (therapist roster per branch, treatment + allowed-duration list, room list, the struck-oil
+  rule, the 3 unprinted body areas, 300 dpi scans, the training-data DPA) block W8 and most of W4 — see §5. `therapist`
+  remains unmeasurable: labels are uncertain on 91/95.
+* **The §9 label-hygiene hour** (hot-oil naming, ≈ +4 treatment-name pages, and the explanation of page 23's silent
+  treatment error) is still the cheapest work left.
+* **Stale gates carry over.** On 6 confidence keys / 21 pages W1 changed a field's `raw`, so the FLAG on those pages is
+  not evidence-backed (the value is). No wrong-and-unflagged page coincides with one. Re-measuring needs a model run
+  (W4).
+
+### Deploy verdict
+
+**GO for `local-ai` v3.3, with the four checks below.** The change is deterministic text parsing plus two clamped
+thresholds; it adds no model call, no migration, no schema change and no RLS change; it is gated against production's own
+frozen answers with 0 new silent errors, 0 broken pages and no field paying review budget.
+
+1. **Copy the whole `local-ai/` directory**, not a hand-picked file list: `calibration.json` is new and must land in
+   `/opt/innovera-ocr/`. If it is missing the service is fail-safe (the v3.2 thresholds stand) and says so —
+   `/health` answers `calibration:"default"`.
+2. **Check `/health` after the swap**: `version: "3.3"`, `status: "ok"`, `masterData: "ok"`, `calibration: "ok"`.
+   `"default"` means the file did not get copied; `"rejected: …"` means it was hand-edited into breaking §4 G6.
+3. **Expect `documents.ocr_version` to change to `3.3`** for everything read after the swap. Nothing in the app branches
+   on it today; it is the provenance key §2.5.6 will need.
+4. **The reviewer-facing change is that slightly fewer pages are flagged, and many more carry the right value.** Flagged
+   pages per field, production → v3.3: nationality 20 → 14, date 31 → 30, room 33 → 32; name, hotel and treatments are
+   unchanged at 76 / 30 / 78. Of those 8 pages, 3 are W6 clearing an evidence-backed flag (nationality 15 and 74, date
+   75); the rest are W1 resolving a value the parser could not read before. Everything else is a page that was already
+   being reviewed and now shows the right value beside the raw reading. **95/95 pages still need review** — this release
+   buys accuracy, not review load.
+
+The **app side needs no deploy for accuracy**: the only app change is the W3a weight rule in
+`packages/ocr-persistence/src/document-view.ts`, whose sole caller is its own tests today. Ship it with the next app
+release; it is what stops junk confirmations the moment the review route is wired up.

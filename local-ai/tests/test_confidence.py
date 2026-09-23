@@ -215,6 +215,8 @@ def test_the_calibration_file_moves_a_threshold_and_an_env_override_still_wins(t
     ({"reviewBelow": 0.50, "movedFrom": 0.85, "acceptedBecause": "the all-data argmin"}, "moves further than ±0.05"),
     ({"reviewBelow": 0.80, "acceptedBecause": "no previous value to clamp against"}, "no movedFrom"),
     ({"reviewBelow": "0.80", "movedFrom": 0.85, "acceptedBecause": "a string"}, "not a number"),
+    ({"reviewBelow": 0.50, "movedFrom": 0.55, "acceptedBecause": "a self-declared baseline"}, "movedFrom is not the value in force"),
+    ({"reviewBelow": 0.00, "movedFrom": 0.05, "acceptedBecause": "a self-declared baseline"}, "movedFrom is not the value in force"),
 ])
 def test_a_threshold_move_without_evidence_or_beyond_the_clamp_is_refused(tmp_path, monkeypatch, entry, why):
     """§4 G6: no threshold moves without recorded held-out evidence, and none further than ±0.05 per release. A refused
@@ -222,6 +224,19 @@ def test_a_threshold_move_without_evidence_or_beyond_the_clamp_is_refused(tmp_pa
     calibration_file(tmp_path, monkeypatch, {"hotelName": entry})
     assert C.threshold("hotelName") == 0.85, why
     assert C.calibration_state().startswith("rejected: "), why
+
+
+def test_the_clamp_is_measured_against_the_threshold_in_force_not_against_the_files_own_claim(tmp_path, monkeypatch):
+    """The first implementation compared `reviewBelow` with the file's own `movedFrom`, which made the ±0.05 clamp
+    self-declared and therefore vacuous: a file could put any value in force in one step while /health said "ok"
+    (adversarial review, 2026-09-23). For `date` that threshold is the ONLY thing between a wrong date and a silent
+    error, because a digit field's modelConfidence already IS its weakest token and the 0.50 token floor adds nothing."""
+    calibration_file(tmp_path, monkeypatch, {
+        "date": {"reviewBelow": 0.00, "movedFrom": 0.05, "acceptedBecause": "x"},
+        "name": {"reviewBelow": 0.30, "movedFrom": 0.35, "acceptedBecause": "x"},
+        "nationality": {"reviewBelow": 0.50, "movedFrom": 0.55, "acceptedBecause": "x"}})
+    assert C.calibration_state().startswith("rejected: ")  # refused WHOLE: not one entry of it applies
+    assert (C.threshold("date"), C.threshold("name"), C.threshold("nationality")) == (0.90, 0.85, 0.85)
 
 
 def test_an_unknown_field_type_is_refused(tmp_path, monkeypatch):

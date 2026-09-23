@@ -547,6 +547,26 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     assert.deepEqual([saved.corrections, saved.delivery], [0, "NOT_REQUIRED"], "the therapist v2.2 already confirmed is not re-sent to verified memory");
   });
 
+  test("W3a weight 0: a flagged field the reviewer only accepted writes no correction, no outbox row and no confirm status", async () => {
+    // The workbench posts the WHOLE draft, so every flagged field comes back with a value whether the reviewer touched
+    // it or not. Before W3a that wrote a verified row for a suggestion nobody edited (accuracy-learning-plan.md §1D:
+    // 13 therapist + 15 treatment junk rows on 95 pages). This is the one behaviour W3a changed in what is STORED, and
+    // the pure-function tests of document-view.test.ts cannot see the schema, the RLS roles or the audit detail.
+    const response = { ...reviewResponse, documentId: `local-${randomUUID()}`, staffOnly: { ...reviewResponse.staffOnly,
+      therapistName: field("พิพิ", "พีพี", 0.5, true, "master-fuzzy"),
+      treatments: [treatment("ไทย 90 นาที", "ไทย", "นวดไทย", "90 นาที", 0.95), treatment("ฟุต 60 นาที", "ฟุต", "นวดเท้า", "60 นาที", 0.41, true)] } };
+    const doc = await processed("weight-zero.png", response);
+    const review = (await app.getReviewDocument(TENANT_A, doc.documentId))!;
+    assert.equal(hasReviewFields(review.structuredResult), true, "the fixture must carry a flagged field that already has a value");
+    const saved = await app.saveReview(TENANT_A, doc.documentId, { structuredResult: review.structuredResult, reviewedBy: "user-a" });
+    assert.deepEqual([saved.corrections, saved.delivery, saved.document.confirmStatus, saved.document.deliveryStatus], [0, "NOT_REQUIRED", null, "NONE"]);
+    assert.equal(saved.document.needsReview, false, "the flags are still cleared and the merged view is still stored");
+    const rows = await superDb.query<{ count: string }>(
+      `SELECT ((SELECT count(*) FROM ocr_corrections WHERE document_id = $1)
+             + (SELECT count(*) FROM ocr_confirm_outbox o JOIN ocr_corrections c ON c.id = o.correction_id WHERE c.document_id = $1))::text AS count`, [doc.documentId]);
+    assert.equal(rows.rows[0]!.count, "0", "confirmed-unchanged is not a correction (accuracy-learning-plan.md §2.5.2)");
+  });
+
   test("delivery status is not hidden when one review deletes an item and edits the item that moves into its place", async () => {
     const response = { ...reviewResponse, documentId: `local-${randomUUID()}`, staffOnly: { ...reviewResponse.staffOnly, therapistName: field("พีพี", "พีพี", 1),
       treatments: [treatment("ไทย 90 นาที", "ไทย", null, "90 นาที", 0.4, true), treatment("ฟุต 60 นาที", "ฟุต", "นวดเท้า", "60 นาที", 0.95)] } };

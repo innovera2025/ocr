@@ -1,4 +1,4 @@
-"""INNOVERA Local AI OCR service — schema v3, version 3.2 ("typhoon-sections").
+"""INNOVERA Local AI OCR service — schema v3, version 3.3 ("typhoon-sections").
 
 Full-document extraction for the Makkha intake form: fitted registration and template verdict, deterministic checkbox /
 body-map / empty-box detection, and two concurrent Typhoon OCR calls (OCR_SECTION_MODE=staff-separate, the default): the
@@ -32,7 +32,12 @@ import ocr_model
 import ocr_normalize as N
 import ocr_register as R
 
-VERSION, ENGINE, SCHEMA_VERSION = "3.2", "typhoon-sections", 3
+# 3.3 (2026-09-23): same schema, same prompts, same crops, same model as 3.2 -- but W1/W3a/W6 changed what the READER
+# returns for `value`, `raw` and `needsReview` on dozens of pages (parser rules, `visualAliases`, the treatment match
+# threshold, two review thresholds, and the retired raw->value memory). `documents.ocr_version` is the app's only record
+# of which reader produced a stored answer, and plan §2.5.6 keys kind-B learned entries by it, so the string has to move
+# even though `SCHEMA_VERSION` does not (adversarial review, 2026-09-23).
+VERSION, ENGINE, SCHEMA_VERSION = "3.3", "typhoon-sections", 3
 app = FastAPI(title="INNOVERA OCR API", version=VERSION)
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
@@ -444,7 +449,7 @@ def _read_answers(mode, outputs):
 
 
 def process_image(image, document_id, source_file, started, extra_warnings=()):
-    """Full-document OCR of one decoded RGB page -> schema v3 (version 3.2) response dict."""
+    """Full-document OCR of one decoded RGB page -> schema v3 (version 3.3) response dict."""
     t_pre = time.perf_counter()
     width, height = image.size
     layout = L.describe_layout(width, height)
@@ -564,9 +569,12 @@ def process_image(image, document_id, source_file, started, extra_warnings=()):
 def health():
     master_state = N.master_state()  # never raises: /health must answer
     calibration_state = C.calibration_state()  # likewise; "rejected: ..." = the review thresholds are the code defaults
-    # Not "ok" while master data or the calibration file is broken, so OcrClient.healthCheck and monitoring see it
-    # (HTTP stays 200). A rejected calibration file only flags MORE fields, so it degrades review load, not accuracy.
-    return {"status": "ok" if master_state == "ok" and not calibration_state.startswith("rejected") else "degraded",
+    # `status` tracks MASTER DATA ONLY, so OcrClient.healthCheck and monitoring see broken master data (HTTP stays 200).
+    # A rejected calibration file is reported in `calibration` and never in `status`: it only flags MORE fields, the
+    # pages keep being read, and `healthCheck` false is what trips the worker's OCR gate -- whose half-open probe calls
+    # `healthCheck` again, so a "degraded" here would stall the whole document pipeline on a configuration typo
+    # (packages/ocr-client/src/index.ts:163, services/ocr-worker/src/index.ts:333,372; adversarial review 2026-09-23).
+    return {"status": "ok" if master_state == "ok" else "degraded",
             "service": "innovera-ocr", "version": VERSION, "engine": ENGINE,
             "schemaVersion": SCHEMA_VERSION, "model": ocr_model.model_name(), "pdfSupport": _pdf_renderer() is not None,
             "masterData": master_state, "calibration": calibration_state}

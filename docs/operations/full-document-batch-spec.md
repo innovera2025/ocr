@@ -22,7 +22,10 @@ migration 0016 grants, Prometheus config, the legacy single-field confirm endpoi
 
 ## 1. Local AI response — schema v3 (`local-ai/`, served at `POST /v1/ocr`)
 
-Engine `typhoon-sections`, version `3.0`. Backward compatible with v2.2 clients: `staffOnly.treatment`,
+Engine `typhoon-sections`, version `3.0`; **`3.3` since 2026-09-23** (`accuracy-learning-plan.md` §15: same schema,
+same prompts, same crops, same model, but W1/W3a/W6 changed what the reader returns for `value`, `raw` and `needsReview`;
+`documents.ocr_version` is the app's only reader provenance and plan §2.5.6 keys learned entries by it). Backward
+compatible with v2.2 clients: `staffOnly.treatment`,
 `staffOnly.therapistName`, `staffOnly.roomNo`, `evidence.staffCropRaw` keep their v2.2 shapes.
 
 ```jsonc
@@ -78,6 +81,11 @@ Engine `typhoon-sections`, version `3.0`. Backward compatible with v2.2 clients:
   phone photos). `GET /health` answers `status:"degraded"` (HTTP 200) while `master_data.json` does not load:
   `masterData:"stale: …"` while the last good master data keeps being served (OCR works), `"error: …"` when it never loaded
   (every OCR request fails). A missing master section or `"durations": null` reads as an empty list.
+  **Added 2026-09-23 (W6):** a `calibration` key — `"ok"` (`calibration.json` loaded), `"default"` (no such file, the code
+  thresholds are in force) or `"rejected: …"` (the file broke §4 G6 and was refused whole; the code thresholds are in
+  force, which always flags MORE). `status` deliberately does **not** move for `calibration`: only `masterData` decides it,
+  because `OcrClient.healthCheck()` reads any other `degraded` body as down and the worker uses that as the half-open
+  probe of a gate only a completed job resets (§7), so a refused config file would stall every loop while reading works.
 
 ## 2. Canonical structured result stored by the app (`documents.structured_result`)
 

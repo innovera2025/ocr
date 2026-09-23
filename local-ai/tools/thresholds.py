@@ -41,7 +41,10 @@ def rows(labels, pages):
 
     `conf` is the modelConfidence the gate compares against the threshold (the weakest token for the digit fields, the
     mean otherwise), None when the page carries no statistics for that field. `rule` is True when the field is flagged
-    for a reason the threshold cannot clear (a parser rule): the sweep must never pretend to unflag those.
+    for a reason the threshold cannot clear (a parser rule): the sweep must never pretend to unflag those. It is read
+    from `notes["ruleFlag"]`, which `replay_page` records BEFORE the gate runs -- inferring it as "needsReview and not
+    gated at the threshold in force" mislabelled every field flagged by BOTH a rule and the gate as rule-free, and so
+    modelled those pages as un-flaggable below the threshold in force (adversarial review, 2026-09-23).
     """
     out = {path: [] for path, _ in FIELDS}
     for page in sorted(pages):
@@ -49,13 +52,11 @@ def rows(labels, pages):
         scored = scoring.score_page(sections, labels[page])
         stored = pages[page]["evidence"].get("tokenConfidence") or {}
         for path, kind in FIELDS:
-            section, name = path.split(".")
-            field, stats = sections[section][name], stored.get(path)
+            stats = stored.get(path)
             conf = None if stats is None else (stats["min"] if kind in C.DIGIT_KINDS else stats["mean"])
             token_min = None if stats is None else stats["min"]
-            gated = conf is not None and (conf < C.threshold(kind) or token_min < C.threshold("token"))
             out[path].append({"page": page, "conf": conf, "tokenMin": token_min,
-                              "rule": bool(field.get("needsReview")) and not gated,
+                              "rule": bool(notes["ruleFlag"].get(path)),
                               "right": scored[path]["right"], "stale": path in notes["staleGate"],
                               "uncertain": scored[path]["uncertain"]})
     return out
