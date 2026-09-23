@@ -1,5 +1,8 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
+export * from "./password.js";
+export * from "./session.js";
+
 export type Principal = Readonly<{ userId: string; tenantId: string; claims: Readonly<Record<string, unknown>> }>;
 export type JwtPolicy = Readonly<{ issuer?: string; audience?: string }>;
 

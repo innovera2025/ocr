@@ -1679,3 +1679,33 @@ write the deviation down instead of diverging silently.
 - **`deploy/sql/verify-release2-grants.sql` shape.** A2 says what it must check and §15 Deploy A step 6 says it must
   print `FAIL=0`. It is one read-only `WITH checks(...) VALUES` query that prints `PASS <name>` / `FAIL <name>` per
   check and a final `SUMMARY PASS=n FAIL=m`, so `psql -AtX -f -` needs no wrapper script inside the container.
+
+**C2 (`packages/auth` password and session, `loadWebConfig`, unit tests)**
+
+- **`maxmem` for an older in-bounds hash.** §2 D3 fixes `maxmem` at 64 MiB while §4 B1 accepts N up to 2^17 and r up
+  to 16 on verify. Those two cannot both hold: scrypt needs `128·N·r` bytes, which is 256 MiB at the top of the
+  accepted bounds, so a hash near it would make `crypto.scrypt` throw instead of verifying. `derive` therefore uses
+  `max(64 MiB, 128·N·r·2)`. Hashing with `SCRYPT_PARAMS` gets exactly the 64 MiB the plan names (it needs 32 MiB), and
+  only a stored hash we wrote ourselves with heavier parameters can ask for more. `verifyPassword` also treats a
+  throw from the derivation as `false`, so no input can turn a bad hash into a 500.
+- **`DUMMY_HASH` is built from random bytes, not derived from a placeholder password.** B1 asks for a constant
+  computed once at start-up with exactly the parameters every stored hash uses, so that an unknown username costs the
+  same as a known one. What makes the cost equal is the parameters the constant carries, not where its 32 key bytes
+  came from: `verifyPassword` runs the identical derivation either way, and no password can match 32 random bytes.
+  Formatting the constant instead of deriving it keeps `import` free, which matters because the CLI and every test
+  process that touches the package would otherwise pay one full 250 ms hash at load.
+- **`checkPasswordPolicy` throws a `PasswordPolicyError`.** B1 says a violation throws `WEAK_PASSWORD`; the error
+  carries that exact message, so `errorCode`/`errorStatus` still map it to 400 with no change. It adds a `reason`
+  field (`too_short`, `contains_username`, …) so the CLI (E1) and the workbench can say which rule failed without
+  parsing prose. The denylist is matched for equality against the normalized, lower-cased password, which is what
+  "must not appear on a denylist" means; the short context words in the list cannot match on their own under the
+  12 code-point minimum, and they stay in it as documentation of what the list is for.
+- **The 512-byte limit cannot bite.** B1 asks for at most 128 code points *and* at most 512 UTF-8 bytes. 128 code
+  points are at most 512 bytes, so the byte check is a bound that the code-point check already implies. It is
+  implemented and tested anyway, because it is the limit that has to move first if the code-point maximum ever rises.
+- **`loadWebConfig` returns only the web settings.** B6 says `loadConfig` and the worker are unchanged and that
+  `trustedProxyHops` keeps coming from `loadConfig`, so `loadWebConfig` is a second, independent loader returning
+  `WebConfig` rather than an extended `AppConfig`; the web calls both. It also returns `publicOrigin` beside
+  `publicBaseUrl`, since C2 step 2 compares the request `Origin` against the origin while the export `review_url`
+  needs the full base URL. Error codes: `PRODUCTION_WEB_CONFIG_INVALID` for a production config missing the tenant or
+  the https base URL, `INVALID_WEB_TENANT_ID` and `INVALID_PUBLIC_BASE_URL` for a malformed value in any environment.
