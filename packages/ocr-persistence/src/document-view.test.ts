@@ -149,11 +149,16 @@ test("applyReviewEdits: value edits become human, keep raw, and clear every need
   assert.equal(merged.schemaVersion, 3);
 });
 
-test("applyReviewEdits: therapistName maps to provider field 'therapist' when changed or when it needed review", () => {
+// W3a weight rule (accuracy-learning-plan.md §2.5.2, §3 W3a): only an EDITED field confirms. The workbench posts the
+// whole draft, so a flagged field the reviewer merely accepted arrives looking exactly like one they approved, and
+// v3.2 turned each one into a verified row (§1D: 13 therapist + 15 treatment junk rows on 95 pages).
+test("applyReviewEdits: therapistName maps to provider field 'therapist' only when the reviewer changed it", () => {
   const current = v3View();
   const unchanged = applyReviewEdits(current, structuredClone(current));
-  assert.deepEqual(unchanged.changes.find((change) => change.path === "staffOnly.therapistName"),
-    { path: "staffOnly.therapistName", oldRaw: "พิพิ", oldValue: "พิพิม", newValue: "พิพิม", provider: { field: "therapist", raw: "พิพิ", verifiedValue: "พิพิม" } });
+  assert.equal(unchanged.changes.find((change) => change.path === "staffOnly.therapistName"), undefined,
+    "flagged-but-unedited is weight 0: neither a correction row nor a confirmation");
+  assert.equal((unchanged.merged.staffOnly.therapistName as Record<string, unknown>).needsReview, false,
+    "the reviewer still cleared the flag; only the learning row is withheld");
   const edited = structuredClone(current);
   (edited.staffOnly.therapistName as Record<string, unknown>).value = "พิมพ์";
   const changed = applyReviewEdits(current, edited).changes.find((change) => change.path === "staffOnly.therapistName");
@@ -165,6 +170,18 @@ test("applyReviewEdits: therapistName maps to provider field 'therapist' when ch
   const clearedChange = applyReviewEdits(current, cleared).changes.find((change) => change.path === "staffOnly.therapistName");
   assert.equal(clearedChange?.newValue, null);
   assert.equal(clearedChange?.provider, undefined);
+});
+
+test("applyReviewEdits: a flagged treatment the reviewer only accepted is weight 0, and a duration edit confirms no name", () => {
+  const current = normalizeStructuredResult({ staffOnly: { treatments: [treatment("ไทย 90 นาที", "ไทย", "นวดไทย", "90 นาที", 0.62, true)] } });
+  const accepted = applyReviewEdits(current, structuredClone(current));
+  assert.deepEqual(accepted.changes, [], "W3a: a suggestion nobody edited never becomes a confirmed value");
+  assert.equal((accepted.merged.staffOnly.treatments as Array<Record<string, unknown>>)[0]!.needsReview, false);
+  const durationOnly = structuredClone(current);
+  (durationOnly.staffOnly.treatments as Array<Record<string, unknown>>)[0]!.duration = "120 นาที";
+  const { changes } = applyReviewEdits(current, durationOnly);
+  assert.deepEqual(changes.map((change) => change.path), ["staffOnly.treatments[0].duration"]);
+  assert.equal(changes.every((change) => change.provider === undefined), true, "the name was not edited, so it is not confirmed");
 });
 
 test("applyReviewEdits: treatments support edit, removal and addition without mixing up raw text", () => {
@@ -411,7 +428,7 @@ test("v3.1 contract: the review editor's round trip keeps the struck-out marker 
   assert.equal(merged.staffOnly.totalMinutes, 90);
   assert.deepEqual((merged.staffOnly.treatments as Array<Record<string, unknown>>).map((t) => t.guests), [2, 2]);
   assert.deepEqual(merged.header.date, { ...(v31Real.header.date as Record<string, unknown>), needsReview: false });
-  assert.deepEqual(changes.map((c) => c.path), ["staffOnly.therapistName"], "only the flagged therapist is confirmed (verified memory); header and branch are not");
+  assert.deepEqual(changes, [], "W3a: the reviewer changed nothing, so nothing is recorded as a correction or a confirmation");
   assert.equal(hasReviewFields(merged), false);
 });
 

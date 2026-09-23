@@ -6,6 +6,37 @@ FastAPI service that reads a scanned **Makkha Health & Spa intake form** and ret
 on port 5000, with `/app = /opt/innovera-ocr`, and talks to Ollama (`scb10x/typhoon-ocr1.5-3b`) through the
 OpenAI-compatible endpoint.
 
+## The confirm route is audit-only (W3a, 2026-09-23)
+
+`POST /v1/ocr/confirm` still accepts `treatment` and `therapist`, still appends the same six-field record to
+`corrections.jsonl` and still returns 200 with that record — **nothing about the file, its format or its history
+changes**. What changed is that nothing reads it back: `ocr_normalize.VERIFIED_MEMORY_ENABLED` is `False`, so
+`verified_match` always returns `None` and no confirmation can set a value, raise a confidence or clear a
+`needsReview`. The response now carries `"applied": false, "mode": "audit-only"` so a caller can see it.
+
+Why (`accuracy-learning-plan.md` §1D, §2.1, §2.5, §3 W3a): the key was `(field, exact raw string)` and **the last row
+written won**. A model reading is not an identity, so keys collide — and the app confirmed every *flagged* field whether
+the reviewer had edited it or not. Measured on the 95 labelled pages, page-ordered, staff confirming each page to its
+label before the next is read (`tools/benchmark.py --learning-loop`, 0 model calls):
+
+| | therapist W&U | treatment-name W&U | confirmations posted | of which weight-0 |
+|---|---|---|---|---|
+| v3.2 (memory applied) | **8** | 3 | 200 | 75 (26 distinct junk rows) |
+| W3a (audit-only) | **0** | 2 | 128 | **0** |
+
+The W3a run is identical, page for page, to the ordinary stateless replay on **every** field — that identity is the gate,
+and `benchmark.py --learning-loop` exits non-zero if it ever stops holding. The replacement is the voted, tenant-scoped,
+retirable learning store of plan W3b–W3e, which is **not** built yet.
+
+The switch is a module constant, deliberately **not** an environment variable: no deployment, compose file or env entry
+can turn the raw→value memory back on. Only code can — `tools/learning_loop.py` flips it in-process to keep the "v3.2"
+comparison measurable, and `benchmark.py --verified` does the same for archaeology on the four production pages where the
+hook actually fired (it prints a warning, and its gate verdicts are then not a verdict on the current code).
+
+The same step fixed the app's weight rule in `packages/ocr-persistence/src/document-view.ts`: a field the reviewer
+**changed** is weight 1 and confirms; a flagged field they merely accepted is weight 0 and records nothing (plan §2.5.2).
+The workbench posts the whole draft, so the two cases were indistinguishable before.
+
 ## Parser and vocabulary fixes on top of v3.2 (W1, 2026-09-23)
 
 `accuracy-learning-plan.md` §3 W1 and the whole §1A error taxonomy, measured with `tools/benchmark.py` on the 95 stored
@@ -107,7 +138,7 @@ header ink counts in `textInk`; `layoutOffset` now reports the fitted shift and 
 | STAFF ONLY | crop `(410,485,710,570)` + prompt | Same crop and the same prompt, word for word, so the model gets pixel-identical input for an 805×569 scan (other sizes: same region, scaled). |
 | Treatments | durations paired **by index** | Split on `+ , / ; newline &`. Each name is paired with **its own** duration, normalised to `durationMinutes` (`นาที/min`, `ชม./ชั่วโมง/hr`, `1.5 ชม.`=90, `1 ชม. 30 นาที`=90, `1 ชม. 30`/`1h30`=90, `1:30`=90, `ชม.ครึ่ง`, Thai digits). A duration not allowed for that treatment ⇒ `needsReview`. A number that no duration used (`ไทย 90 นาที 15`, also after a separator: `ไทย 90 นาที + 30`) ⇒ warning + `needsReview`, never silently dropped. A trailing total equal to the sum (`… + หน้า 1 ชม. 2.5 ชม.`) is recognised as a total, not a treatment. |
 | Masters | hard-coded lists | `master_data.json` (editable; reloaded when the file changes; an edit that does not load, e.g. a JSON typo, keeps the last good masters in use and `/health` answers `status:"degraded"` with `masterData:"stale: …"` until the file is fixed; the worker keeps processing in that state; a missing section or `"durations": null` reads as an empty list). Treatments with aliases (`ไทย`⇒`นวดไทย`, `หน้า`⇒`นวดหน้า`, English names) and allowed durations, therapists (`ฟ้า`, `พีพี`, `เอี้ยง`), and nationalities. |
-| Verified memory | re-read `corrections.jsonl` on every lookup | Cached by file mtime and size. Treatment lookup tries `nameRaw`, then `raw`. `POST /v1/ocr/confirm` is unchanged (same body, same 400 for a bad `field`). |
+| Verified memory | re-read `corrections.jsonl` on every lookup | Cached by file mtime and size. Treatment lookup tries `nameRaw`, then `raw`. `POST /v1/ocr/confirm` is unchanged (same body, same 400 for a bad `field`). **Superseded by W3a above: the lookup is off and the route is audit-only.** |
 | Concurrency | `async def` endpoint doing blocking I/O on the event loop | Plain `def` endpoint (FastAPI threadpool). Section calls run concurrently in a `ThreadPoolExecutor`, and checkbox/body-map detection runs while the model works. Crops are sent as in-memory PNG; only the uploaded original is saved (as before). |
 | Inputs | PNG/JPG/JPEG | Adds WebP, EXIF rotation, alpha→white and any resolution (coordinates scale by width/805 and height/569; aspect mismatch ⇒ warning + `needsReview`). PDF (first page) works when `pypdfium2` or `PyMuPDF` is importable (the production base image has `pypdfium2` through `paddleocr` → `paddlex[ocr-core]`), otherwise **415**. Renders are serialised by a process-wide lock (neither library is thread-safe), the long side is rendered at 1610 px, and pages larger than 14400 pt are **400**. Raster images over 89.5 MP are **400**, except JPEGs (e.g. 108 MP phone modes), which are decoded at 1/2–1/8 scale first (at least 4096 px on both sides). Other types **400**, undecodable files **400**, internal/model errors **500**, too large **413**. |
 
@@ -148,7 +179,7 @@ removal; the production base image has it through `paddlepaddle`/`paddleocr`). O
 | `OCR_SECTION_PARALLELISM` | `2` | Concurrent section calls per document (1–8); `1` = sequential |
 | `OCR_CUSTOMER_CROP_SCALE` | `1.0` | Upscale factor for the customer crop (0.5–4); tuning knob for the real model |
 | `OCR_UPLOAD_DIR` | `/app/uploads` | Where the uploaded original is saved |
-| `OCR_VERIFIED_FILE` | `/app/verified_dataset/corrections.jsonl` | Verified memory (human confirmations) |
+| `OCR_VERIFIED_FILE` | `/app/verified_dataset/corrections.jsonl` | Where `POST /v1/ocr/confirm` appends. Audit trail only since W3a — written, never read back into a reading |
 | `OCR_MASTER_DATA` | `<module dir>/master_data.json` | Masters file |
 | `OCR_MAX_UPLOAD_BYTES` | `31457280` (30 MiB) | Larger uploads ⇒ 413 |
 
@@ -215,6 +246,7 @@ docker run --rm --network none -v "$PWD/local-ai":/app -w /app -e PYTHONDONTWRIT
   -v /path/to/realdata:/data:ro ocr-local-ai-test:py311 python tools/benchmark.py --data /data
 docker run ... python tools/benchmark.py --data /data --results results-v32       # any other stored run
 docker run ... python tools/benchmark.py --data /data --freeze tools/baseline-v3.2-prod-95.txt   # re-freeze
+docker run ... python tools/benchmark.py --data /data --learning-loop             # + the page-ordered confirm replay (W3a)
 ```
 
 Only counts, page numbers, field names and error categories are printed, so the output is safe to paste into a report or a
@@ -227,7 +259,13 @@ body map) are therefore production's own stored answers, copied through — the 
 Fidelity, 95 stored production pages, code unchanged: **95/95 reproduce `value`, `raw` and `needsReview` exactly**. Four
 pages (26-29) differ in `source` and two of them in `confidence`, because production served those treatment items from the
 `verified-memory` hook (`corrections.jsonl`), which the stored response does not carry; pass `--verified <operator copy>`
-to reproduce those too. Plan W3a removes that hook.
+to reproduce those too. That hook is off since W3a — and on exactly those four pages it changed no `value` and no
+`needsReview`, only the `source` label and two confidences, because the master list already knew the answer.
+
+`--learning-loop` adds the page-ordered run the stateless benchmark cannot do: the same pages replayed **in order** with
+the confirm route live, a reviewer confirming each page to its label before the next is read. It reports the `v3.2` and
+`w3a` weight rules side by side and gates on the W3a invariant (the `w3a` run must equal the stateless run, field for
+field) and on the loop's determinism (§4 G6). It writes to a throwaway `corrections.jsonl`, never to the configured one.
 
 ## Testing
 

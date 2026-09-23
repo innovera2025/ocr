@@ -10,6 +10,9 @@ export type DocumentView = { schemaVersion: 3; header: Record<string, unknown>; 
 export type DocumentSummary = { customerName: string | null; gender: string | null; nationality: string | null;
   treatments: Array<{ name: string | null; duration: string | null }>; therapist: string | null; room: string | null;
   formNumber: string | null; branch: string | null; minConfidence: number | null; reviewFieldCount: number };
+/** One recorded edit. `provider` (the payload `POST /v1/ocr/confirm` receives) is present only for a field the reviewer
+ * actually CHANGED — a flagged field merely accepted in the posted draft is weight 0 and produces no change at all
+ * (accuracy-learning-plan.md §2.5.2, §3 W3a). */
 export type ReviewChange = { path: string; oldRaw: string | null; oldValue: string | null; newValue: string | null;
   provider?: { field: "treatment" | "therapist"; raw: string; verifiedValue: string } };
 
@@ -302,8 +305,12 @@ function mergeField(path: string, current: unknown, edited: unknown, provider: "
   const oldValue = text(current.value);
   const changed = newValue !== oldValue;
   const next: Json = changed ? { ...current, value: newValue, source: "human", needsReview: false } : { ...current, needsReview: false };
-  const confirm = provider !== undefined && (changed || current.needsReview === true) && nonEmpty(oldRaw) && nonEmpty(newValue);
-  if (changed || confirm) changes.push({ path, oldRaw, oldValue, newValue, ...(confirm ? { provider: { field: provider, raw: oldRaw, verifiedValue: newValue } } : {}) });
+  // W3a weight rule (accuracy-learning-plan.md §2.5.2): confirmed-unchanged is NOT a correction. The workbench posts
+  // the whole draft, so every flagged field comes back with a value whether the reviewer touched it or not; treating
+  // that as a confirmation wrote a verified row for a suggestion nobody edited (§1D: 13 therapist + 15 treatment junk
+  // rows on 95 pages). Only an edited field confirms (weight 1); flagged-but-unedited is weight 0 and records nothing.
+  const confirm = provider !== undefined && changed && nonEmpty(oldRaw) && nonEmpty(newValue);
+  if (changed) changes.push({ path, oldRaw, oldValue, newValue, ...(confirm ? { provider: { field: provider, raw: oldRaw, verifiedValue: newValue } } : {}) });
   return next;
 }
 
@@ -359,8 +366,10 @@ function mergeArray(section: Section, key: string, current: readonly Json[], edi
     const finalValue = text(next.value);
     const nameRaw = text(original.nameRaw);
     const providerRaw = nonEmpty(nameRaw) ? nameRaw : oldRaw;
-    const confirm = treatment && (valueChanged || original.needsReview === true) && nonEmpty(providerRaw) && nonEmpty(finalValue);
-    if (valueChanged || confirm) changes.push({ path, oldRaw, oldValue, newValue: finalValue, ...(confirm ? { provider: { field: "treatment" as const, raw: providerRaw, verifiedValue: finalValue } } : {}) });
+    // W3a weight rule, as in `mergeField` above: a treatment item the reviewer only accepted is weight 0, not a
+    // confirmation. A duration-only edit still records its own `.duration` change below but confirms no name.
+    const confirm = treatment && valueChanged && nonEmpty(providerRaw) && nonEmpty(finalValue);
+    if (valueChanged) changes.push({ path, oldRaw, oldValue, newValue: finalValue, ...(confirm ? { provider: { field: "treatment" as const, raw: providerRaw, verifiedValue: finalValue } } : {}) });
     if (durationChanged) changes.push({ path: `${path}.duration`, oldRaw, oldValue: oldDuration, newValue: newDuration });
     result.push(next);
   }

@@ -64,6 +64,10 @@ Engine `typhoon-sections`, version `3.0`. Backward compatible with v2.2 clients:
 - Empty but confidently blank field: `{raw:null, value:null, confidence:≥0.9, source:"ink-mark", needsReview:false}`.
 - Confirm API unchanged: `POST /v1/ocr/confirm {documentId, field: "treatment"|"therapist", raw, verifiedValue}`.
   Verified memory lookup for treatments tries `nameRaw` first, then `raw`.
+  **Superseded 2026-09-23 by `accuracy-learning-plan.md` §3 W3a:** the route still accepts the same body and still
+  appends the same record to `corrections.jsonl`, but the lookup is off (`ocr_normalize.VERIFIED_MEMORY_ENABLED = False`),
+  so a confirmation changes no later reading and clears no flag; the response adds `"applied": false, "mode": "audit-only"`.
+  `verified-memory` stays in `Source` because documents stored before that date carry it.
 - Model calls: by default one call per document (`OCR_SECTION_MODE=combined`: the customer rows stacked above the
   unchanged STAFF crop, `timings.sections = [{name: "combined"}]`, answer in `evidence.combinedRaw`); a STAFF-only
   re-read (`staffOnlyFallback`) runs only when that answer has no staff label. `separate` keeps two calls. No model
@@ -225,6 +229,8 @@ saveReview(tenantId, documentId, { structuredResult: unknown; reviewedBy: string
 // confirm_status 'PENDING' for provider changes else 'NOT_REQUIRED'; ON CONFLICT (organization_id, document_id, field, verified_value) DO UPDATE);
 // one ocr_confirm_outbox row per provider change, payload {documentId: ocr_document_id, field, raw, verifiedValue}
 // (delivery is asynchronous through the worker's outbox dispatcher; no synchronous Local AI call)
+// W3a weight rule (accuracy-learning-plan.md §2.5.2): a change is recorded only for a field the reviewer actually
+// EDITED. A flagged field merely accepted in the posted draft yields no ocr_corrections row and no outbox row.
 markRetrying(tenantId, documentId, message): Promise<void>   // status CLEAN, error_message 'RETRYING: …'
 ```
 

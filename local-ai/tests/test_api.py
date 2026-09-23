@@ -192,28 +192,29 @@ def test_section_calls_run_concurrently(client, monkeypatch):
     assert timings["inferenceWallMs"] >= 0.95 * timings["inferenceMs"]
 
 
-def test_therapist_verified_memory_round_trip(client, monkeypatch):
+def test_therapist_confirmation_is_recorded_and_changes_nothing(client, monkeypatch):
+    """W3a (plan §3 W3a, §2.5.1-2): the confirm route is audit-only. The record is written; the next reading is identical."""
     import ocr_model
     monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(staff="Treatment : ไทย 90 นาที\nTherapist Name : พิพิ\nRoom No. : 3"))
     first = post(client, png_of(S.filled_form())).json()
     therapist = first["staffOnly"]["therapistName"]
-    # vowel-mark confusion: the master name is suggested, but only human memory makes it confident
     assert therapist["raw"] == "พิพิ" and therapist["value"] == "พีพี" and therapist["needsReview"] and therapist["source"] == "master-fuzzy"
     confirm = client.post("/v1/ocr/confirm", json={"documentId": first["documentId"], "field": "therapist", "raw": "พิพิ", "verifiedValue": "พีพี"})
     assert confirm.status_code == 200 and confirm.json()["status"] == "saved"
+    assert confirm.json()["applied"] is False and confirm.json()["mode"] == "audit-only"
     assert confirm.json()["record"]["verifiedByHuman"] is True
-    second = post(client, png_of(S.filled_form())).json()["staffOnly"]["therapistName"]
-    assert second == {"raw": "พิพิ", "value": "พีพี", "confidence": 1.0, "source": "verified-memory", "needsReview": False}
+    assert os.path.getsize(os.environ["OCR_VERIFIED_FILE"]) > 0, "the audit trail is still written to corrections.jsonl"
+    assert post(client, png_of(S.filled_form())).json()["staffOnly"]["therapistName"] == therapist
 
 
-def test_treatment_verified_memory_round_trip_uses_name_raw(client, monkeypatch):
+def test_treatment_confirmation_is_recorded_and_changes_nothing(client, monkeypatch):
     import ocr_model
     monkeypatch.setattr(ocr_model, "call_ocr", FakeModel(staff="Treatment : ใทบ 90 นาที + หน้า 1 ชม.\nTherapist Name : พีพี\nRoom No. : 3"))
     first = post(client, png_of(S.filled_form())).json()["staffOnly"]["treatments"][0]
-    assert first["nameRaw"] == "ใทบ" and first["value"] is None and first["needsReview"]
+    assert first["nameRaw"] == "ใทบ" and first["needsReview"]
     assert client.post("/v1/ocr/confirm", json={"documentId": "d", "field": "treatment", "raw": first["nameRaw"], "verifiedValue": "นวดไทย"}).status_code == 200
     again = post(client, png_of(S.filled_form())).json()["staffOnly"]["treatments"][0]
-    assert again["value"] == "นวดไทย" and again["source"] == "verified-memory" and again["durationMinutes"] == 90 and not again["needsReview"]
+    assert again == first and again["source"] != "verified-memory"
 
 
 def test_confirm_field_validation(client):

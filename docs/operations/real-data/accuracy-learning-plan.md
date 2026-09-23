@@ -476,6 +476,7 @@ counts a miss as an unflagged error "unless the group carries an explicit possib
 ### W3 — Learning store, and switching off the one that exists (app + `local-ai/`)
 W3a **Stop the bleeding.** Make `POST /v1/ocr/confirm` audit-only so `verified_match` can no longer serve anything
 (`api.py:610`, `ocr_normalize.py:121`), and fix `document-view.ts:305,362` so a flagged-but-unedited suggestion is weight 0.
+**DONE 2026-09-23 — §13 has the measurement and the two numbers that came out differently from the target below.**
 W3b Migration `0019_learned_values` (with the RLS, policies, grants and foreign keys of §2.3) +
 `packages/ocr-persistence/src/learning.ts`; `saveReview` (`index.ts:839-880`) writes votes in the same transaction — **but the
 vote writer refuses the auto-auth subject id, so nothing is written until Release 2 deletes `OCR_WEB_AUTO_AUTH`** (§2.5.9);
@@ -863,7 +864,7 @@ now      §4 scorer fix + replay harness                          DONE 2026-09-2
 then     W1 parser/vocabulary (incl. W1f)                    DONE 2026-09-23 (§12), 0 calls  ← biggest measured gain
          W2 body-map/checkbox geometry, re-measured on the frozen PNGs;
             W2f's possibleMissedMark carrier ships BEFORE W2b/W2d          0 calls ~3 d
-         W3a stop the bleeding (confirm audit-only, weight-0 rule)         0 calls ~1 d  ← must precede any new volume
+         W3a stop the bleeding (confirm audit-only, weight-0 rule)   DONE 2026-09-23 (§13), 0 calls
          W3b-d learning store + snapshot, schema with RLS, outbox          0 calls ~1 w  (no votes written yet)
          W6 the two CLAMPED threshold moves (±0.05)                        config  ~0 d
 parallel R0 instrumentation, R1 image-first probe                                  2 probes
@@ -1049,3 +1050,95 @@ Two honesty notes this step owes the reader:
    3). Mapping one master treatment onto the other in the reader would delete a real menu distinction to match a label
    defect: the §1E inversion this plan forbids. The +4 pages (and page 23, one of the two remaining silent treatment
    errors) belong to the label-hygiene hour of §4, which is still outstanding.
+
+---
+
+## 13. Step 3 — W3a, the harmful learning loop switched off (2026-09-23)
+
+`local-ai/ocr_normalize.py` + `local-ai/api.py` + `packages/ocr-persistence/src/document-view.ts`, plus a new
+page-ordered harness (`local-ai/tools/learning_loop.py`, `benchmark.py --learning-loop`) and 12 new local-ai tests
+(**505 local-ai pass**) and 1 new app test (**389 app tests pass**; `typecheck` and `lint` clean). §9's
+"W3a stop the bleeding" line is done. **G0 frozen inputs and the label-hygiene hour are still outstanding** and still
+block every W2 number.
+
+### What shipped
+
+* **`POST /v1/ocr/confirm` is audit-only.** The route, its body, its 400 for a bad `field` and the `corrections.jsonl`
+  record are unchanged — the file keeps being written and keeps its whole history. `ocr_normalize.verified_match` now
+  returns `None` unconditionally, so no confirmation can set a value, raise a confidence or clear a `needsReview`. The
+  response gained `"applied": false, "mode": "audit-only"`.
+* **The switch is a module constant, not an environment variable** (`ocr_normalize.VERIFIED_MEMORY_ENABLED = False`).
+  §2.5.10's kill switch restores v3.2 *behaviour*; this is the opposite direction, so making it configurable would hand
+  a deployment the power to re-enable a defect the plan calls non-negotiable. Only code flips it, and only two callers
+  do: `tools/learning_loop.py` (to keep the "v3.2" comparison measurable) and `benchmark.py --verified` (archaeology,
+  which now prints a warning that its gate verdicts are not a verdict on the current code).
+* **The weight-0 rule** (`document-view.ts:305,362`, §2.5.2): `changed ⇒ weight 1`, `flagged-but-unchanged ⇒ weight 0`.
+  A flagged field the reviewer merely accepted now produces **no `ocr_corrections` row and no outbox row at all**, which
+  is stricter than "a row with weight 0" — the vote ledger that would hold a weight-0 row is W3b and does not exist yet.
+  Nothing is lost from the audit: `documents.reviewed_by` / `reviewed_at`, the merged `structured_result` with the flag
+  cleared, and the `document.reviewed` audit row all still record that a human went through the page.
+
+### Measured, 95 stored production answers, 0 model calls
+
+`benchmark.py --learning-loop` replays the same pages **in page order** with the confirm route live and a reviewer
+confirming every page to its label before the next is read — §1D's method, now in the repository instead of a one-off
+script. Three runs: `stateless` (the ordinary benchmark), `v3.2` (pre-W3a weight rule + memory applied) and `w3a`.
+
+| | therapist right / W&U | treatment names right / W&U | treatments+durations right / W&U |
+|---|---|---|---|
+| stateless (= the frozen benchmark) | 6 / **0** | 52 / **2** | 47 / **2** |
+| v3.2, the loop as production runs it | 7 / **8** | 54 / **3** | 48 / **3** |
+| **W3a** | 6 / **0** | 52 / **2** | 47 / **2** |
+
+**Therapist wrong-and-unflagged 8 → 0, exactly the W3 target.** Treatment names came out **3 → 2**, not the "6 → 5" of
+§3 W3: the −1 is the same defect, but §1E's scorer fixes move the absolute number (the ad-hoc script that produced
+"6 → 5" scored treatments before the marker and value-set fixes). The gain is the avoided regression, as W3 says: the
+memory *added* 8 therapist and 1 treatment silent errors per 95 pages, and W3a is what stops them being added.
+
+**Confirmation volume and junk rows.** v3.2 posts **200** confirmations for these 95 pages, **75** of them weight-0
+(therapist 94 posted / 7 weight-0; treatment 106 / 68), which is **26 distinct junk rows** — §1D's 13 + 15 = 28 measured
+on the pre-W1 parser, so the two agree within the parser change. W3a posts **128**, **0** of them weight-0, and **0**
+are read back. The memory served **84** fields under v3.2 and **0** under W3a.
+
+**The invariant is the gate, not the score.** The `w3a` run is identical to the stateless replay on every field, page
+for page (`learning_loop.verdict`), and `benchmark.py --learning-loop` exits non-zero if that ever stops holding. The
+loop is also checked for determinism across two runs (§4 G6, which names the page-ordered replay explicitly). The
+ordinary run is unchanged and still exits 0: G1, G1b, G2, G3, G6 PASS, total silent errors **8**, and no page flipped
+relative to the post-W1 state.
+
+**What production's memory actually did on this file.** Replay fidelity names the pages: `staffOnly.treatments.1.source`
+`rule <- was verified-memory` on pages **26, 27, 28, 29** and nowhere else, with no `value` and no `needsReview`
+mismatch on those four. On the only pages where the hook fired in production, the master list already knew the answer;
+the memory changed the `source` label and two confidences. The harm it did was measured in the *loop*, not in the
+stored answers — which is precisely why the loop had to be built.
+
+### What this step does NOT do, and must not be read as doing
+
+1. **Room W&U 1 → 0 (a §3 W3 target) is untouched.** The confirm route only ever accepted `treatment` and `therapist`;
+   the room number is fixed by kind-C validation in **W3d**, not here. It is still 1 silent error on page 5.
+2. **No learning store.** W3b–W3e are not started: no `0021_learned_values`, no votes, no admin surface, no
+   `evidence.learned`. This step only removes; the replacement is still to be designed against §2.2–§2.5.
+3. **Outbox hygiene (W3f) is untouched**: the ~30 s backoff, the un-redriven DEAD rows and the double delivery (legacy
+   route + outbox loop) of §1D are all still there. They are now harmless — nothing a confirmation delivers is applied —
+   but they will matter again the moment W3b starts writing votes.
+4. **The auth precondition (§2.5.9) is unverified.** `OCR_WEB_AUTO_AUTH`, the unauthenticated Local AI write routes and
+   the public gateway are exactly as §2.5.9 describes them. W3a *reduces* the damage an unauthenticated confirm can do
+   to zero, which is a side benefit, not the fix; the shared secret and the allow-list are still a W3 precondition.
+5. **`verified-memory` stays in the app's `Source` union and in the workbench's Thai label table.** Documents already
+   stored in production carry that source and must keep rendering.
+6. **The loop is a simulation of staff behaviour, and an upper bound.** It assumes every page is reviewed and confirmed
+   to a perfect label, which is the worst case for confirmation volume and therefore the right case for measuring a
+   feedback defect — but the 200/128 counts are not a forecast of real traffic.
+7. **W1's stale-gate caveat carries over unchanged**: the loop uses the same replay, so on the 21 pages where W1 changed
+   a field's `raw` the FLAG is still not evidence-backed (the value is). No wrong-and-unflagged page coincides with one.
+
+### Still blocking, unchanged by this step
+
+**G0 frozen inputs** — the archived 1610 px production PNGs from `OCR_UPLOAD_DIR` plus a sha256 manifest; every W2
+body-map number stays `sim-1610` until they exist. **The §9 label-hygiene hour** — worth about +4 treatment-name pages
+(15/16/23/24, the hot-oil convention) and the explanation of page 23's silent treatment error. Both are one-day,
+zero-model-call jobs and both remain the cheapest work left.
+
+**The two carrier gaps are still unowned.** `staffOnly.totalMinutes` has no `needsReview` carrier at all, so its 7
+remaining errors of 31 pages are silent by construction (W4b fixes the cause, not the carrier), and body-map item
+recall is 286/414 with 128 misses that nothing can flag until W2f's `possibleMissedMark` exists.

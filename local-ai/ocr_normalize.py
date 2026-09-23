@@ -16,6 +16,19 @@ THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
 REVIEW_BELOW = 0.85  # fuzzy master matches below this similarity need review (v2.2 rule)
 VISUAL_ALIAS_CONFIDENCE = 0.6  # a value read through a visual alias is at most this confident and always needs review
 
+# W3a (accuracy-learning-plan.md §3 W3a, §2.1, §2.5). `POST /v1/ocr/confirm` is AUDIT-ONLY: corrections.jsonl is still
+# written, still parseable and still the audit trail of what staff confirmed, but nothing read out of it may reach a
+# value, a confidence or a review flag. The v2.2 rule it replaces was `(field, exact raw string) -> value at confidence
+# 1.0, needsReview false`, last row wins (`_load_verified`): a model reading is not an identity, so the key collides and
+# the last writer decides. Measured on the 95 labelled pages, page-ordered, with staff confirming every page to its
+# label: therapist wrong-and-unflagged 0 -> 8 and treatment names 5 -> 6 CAUSED by the memory (§1D).
+#
+# This switch is a module constant and deliberately NOT an environment variable: no deployment, env file or compose
+# override can turn the raw->value memory back on -- only code can, and only `tools/benchmark.py --learning-loop`
+# flips it in-process to keep measuring what W3a removed. The replacement is the voted, tenant-scoped, retirable
+# learning store of W3b-W3e, which is NOT built in this step.
+VERIFIED_MEMORY_ENABLED = False
+
 
 def field(raw, value, confidence, source, needs_review):
     return {"raw": raw, "value": value, "confidence": round(float(confidence), 3), "source": source, "needsReview": bool(needs_review)}
@@ -119,7 +132,9 @@ _append_lock = threading.Lock()
 
 
 def verified_match(field_name, raw):
-    if not raw:
+    """The v2.2 raw->value confirmation memory. Always None while `VERIFIED_MEMORY_ENABLED` is False (W3a): the file is
+    still appended to and still readable, it simply no longer decides anything a reader returns."""
+    if not VERIFIED_MEMORY_ENABLED or not raw:
         return None
     memory = _verified_cache.get(verified_path())
     return memory.get((field_name, raw)) or memory.get((field_name, raw.strip()))

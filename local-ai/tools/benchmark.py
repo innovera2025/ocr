@@ -3,6 +3,7 @@
     python tools/benchmark.py --data <operator data dir>                    # report + gates against the frozen baseline
     python tools/benchmark.py --data <dir> --results results-v32            # any other stored run
     python tools/benchmark.py --data <dir> --freeze tools/baseline-....txt  # re-freeze after a scorer change
+    python tools/benchmark.py --data <dir> --learning-loop                  # + the page-ordered confirmation replay (W3a)
 
 No customer data lives in this repository. `--data` points at the operator's own directory, which must contain
 `labels.json` and a results directory of stored v3 responses (`pNNN.json`). Nothing but counts, page numbers, field names
@@ -24,7 +25,7 @@ HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE.parent)]
 sys.dont_write_bytecode = True
 
-from tools import replay, scoring  # noqa: E402
+from tools import learning_loop, replay, scoring  # noqa: E402
 
 DEFAULT_BASELINE = HERE / "baseline-v3.2-prod-95.txt"
 COLUMNS = ("n", "right", "rightFlagged", "wrongFlagged", "wrongUnflagged", "markers", "uncertain", "want", "hit", "missed", "extra")
@@ -217,12 +218,18 @@ def main(argv=None):
     parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE, help="frozen baseline to gate against")
     parser.add_argument("--freeze", type=Path, help="write the run's counts to this file as the new frozen baseline")
     parser.add_argument("--no-baseline", action="store_true", help="report only, do not gate")
-    parser.add_argument("--verified", type=Path, help="operator copy of the production corrections.jsonl, only to reproduce the "
-                                                      "`verified-memory` source on the pages where that hook fired (W3a removes it)")
+    parser.add_argument("--learning-loop", action="store_true", help="also replay the pages IN ORDER with the confirm route "
+                                                                     "live (plan §1D, §3 W3a); the W3a invariant joins the gates")
+    parser.add_argument("--verified", type=Path, help="operator copy of the production corrections.jsonl. W3a made the confirm "
+                                                      "route audit-only, so this ALSO re-enables the retired raw->value memory "
+                                                      "in-process: archaeology only, never a candidate run")
     args = parser.parse_args(argv)
 
     if args.verified:
         os.environ["OCR_VERIFIED_FILE"] = str(args.verified)
+        replay.N.VERIFIED_MEMORY_ENABLED = True
+        print("WARNING: --verified re-enables the raw->value memory W3a retired. This run scores the PRE-W3a reader and "
+              "its gate verdicts are not a verdict on the current code.")
     labels, pages = load(args.data, args.results)
     totals, mismatches, notes = run(labels, pages)
     again, _, _ = run(labels, pages)
@@ -234,6 +241,15 @@ def main(argv=None):
     if not args.no_baseline and args.baseline and args.baseline.exists():
         frozen_fields, frozen_wrong = read_frozen(args.baseline)
     ok = print_gates(totals, frozen_fields, frozen_wrong, deterministic)
+
+    if args.learning_loop:
+        runs = {mode: learning_loop.run(labels, pages, mode) for mode in learning_loop.MODES}
+        # §4 G6 covers the page-ordered replay too: a loop whose result depends on the run is not a measurement.
+        repeat = {mode: learning_loop.run(labels, pages, mode) for mode in learning_loop.MODES}
+        stable = all([(f, {k: r[k] for k in COLUMNS}) for f, r in runs[m][0].ordered()]
+                     == [(f, {k: r[k] for k in COLUMNS}) for f, r in repeat[m][0].ordered()] for m in learning_loop.MODES)
+        ok = learning_loop.print_report(runs) and stable and ok
+        print(f"       {'PASS' if stable else 'FAIL'}  the page-ordered loop is deterministic across two runs (§4 G6)")
 
     if args.freeze:
         scored_bad = {p for p, bad in mismatches.items() if any(b[1] not in ("source", "confidence") for b in bad)}

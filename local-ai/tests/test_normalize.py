@@ -156,7 +156,26 @@ def test_nationality_master_english_thai_chinese_and_fuzzy():
     assert unknown["value"] == "Uzbek" and unknown["needsReview"]
 
 
-def test_verified_memory_is_cached_and_reloaded_on_change(tmp_path):
+@pytest.fixture
+def retired_memory(monkeypatch):
+    """Flips W3a's audit-only switch back, the way `tools/learning_loop.py` does to keep measuring what it removed.
+    Nothing but a measurement may do this: the constant is not settable from the environment (plan §3 W3a)."""
+    monkeypatch.setattr(N, "VERIFIED_MEMORY_ENABLED", True)
+
+
+def test_a_confirmation_is_recorded_but_never_read_back(tmp_path):
+    """W3a (plan §2.5.1-2, §3 W3a): the confirm route stays an audit trail and stops being a memory."""
+    N.append_verified({"field": "treatment", "ocrRaw": "ใทย", "verifiedValue": "นวดไทย", "verifiedByHuman": True})
+    N.append_verified({"field": "therapist", "ocrRaw": "พิพิ", "verifiedValue": "ฟ้า", "verifiedByHuman": True})
+    assert N.verified_path().read_text(encoding="utf-8").count("\n") == 2, "the audit trail is still written"
+    assert N.verified_match("treatment", "ใทย") is None and N.verified_match("therapist", "พิพิ") is None
+    items, _, _, _ = N.parse_treatments("ใทย 60 นาที")
+    assert items[0]["source"] != "verified-memory"
+    therapist = N.normalize_therapist("พิพิ", "SUKHUMVIT 33")
+    assert therapist["value"] != "ฟ้า" and therapist["needsReview"], "a confirmation may not clear a review flag"
+
+
+def test_verified_memory_is_cached_and_reloaded_on_change(tmp_path, retired_memory):
     assert N.verified_match("treatment", "ใทย") is None
     N.append_verified({"field": "treatment", "ocrRaw": "ใทย", "verifiedValue": "นวดไทย", "verifiedByHuman": True})
     assert N.verified_match("treatment", "ใทย") == "นวดไทย"
@@ -168,7 +187,7 @@ def test_verified_memory_is_cached_and_reloaded_on_change(tmp_path):
     assert N.verified_match("therapist", "x") is None
 
 
-def test_treatment_verified_memory_tries_name_raw_then_raw():
+def test_treatment_verified_memory_tries_name_raw_then_raw(retired_memory):
     N.append_verified({"field": "treatment", "ocrRaw": "สปาร้อน", "verifiedValue": "Hot Stone Spa", "verifiedByHuman": True})
     items, _, _, _ = N.parse_treatments("สปาร้อน 60 นาที")
     assert items[0]["value"] == "Hot Stone Spa" and items[0]["source"] == "verified-memory"
@@ -349,7 +368,7 @@ def test_seed_therapists_never_auto_confirm_and_belong_to_their_branch():
     assert N.normalize_therapist("ฟ้า", "PLOENCHIT") == {"raw": "ฟ้า", "value": "ฟ้า", "confidence": 1.0, "source": "master-fuzzy",
                                                       "needsReview": False}  # branch-less masters serve every branch
     N.append_verified({"field": "therapist", "ocrRaw": "เพ็ญ", "verifiedValue": "เพ็ญ", "verifiedByHuman": True})
-    assert not N.normalize_therapist("เพ็ญ", "SUKHUMVIT 33")["needsReview"]  # a human confirmation is confident
+    assert N.normalize_therapist("เพ็ญ", "SUKHUMVIT 33")["needsReview"]  # W3a: a confirmation no longer clears the flag
 
 
 @pytest.mark.parametrize("text", [

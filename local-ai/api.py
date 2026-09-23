@@ -608,9 +608,14 @@ class ConfirmRequest(BaseModel):
 
 @app.post("/v1/ocr/confirm")
 def confirm_ocr(data: ConfirmRequest):
+    """AUDIT-ONLY since W3a (accuracy-learning-plan.md §3 W3a, §2.5). The confirmation is appended to
+    `corrections.jsonl` exactly as before -- the file, its format and the whole history stay -- but
+    `ocr_normalize.VERIFIED_MEMORY_ENABLED` is False, so nothing written here can change a later reading, a confidence
+    or a review flag. `applied: false` in the response says so to the caller; the app's outbox still treats a 200 as
+    delivered, which is correct: the record IS stored. Re-applying confirmations is W3b-W3e's voted store, not this."""
     if data.field not in ("treatment", "therapist"):
         raise HTTPException(400, "field must be treatment or therapist")
     record = {"timestamp": datetime.now(timezone.utc).isoformat(), "documentId": data.documentId, "field": data.field,
               "ocrRaw": data.raw, "verifiedValue": data.verifiedValue, "verifiedByHuman": True}
     N.append_verified(record)
-    return {"status": "saved", "record": record}
+    return {"status": "saved", "applied": False, "mode": "audit-only", "record": record}
