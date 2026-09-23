@@ -952,11 +952,14 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     assert.deepEqual(after, { hash: FAKE_REHASH, consumed: true, last_login: true }, "the rehash is stored and the temporary password is single-use");
     await store.recordLoginSuccess(user.id);
     assert.equal((await store.findLoginUser("lock.me"))!.passwordHash, FAKE_REHASH, "a login without a rehash keeps the stored hash");
-    await store.resetPassword(user.id, FAKE_HASH, audit);
+    await store.resetPassword(user.id, FAKE_HASH, audit, { via: "cli" });
     const reset = (await asApp<{ status: string; failed_logins: number }>(TENANT_A,
       `SELECT ${"CASE WHEN locked_until > now() THEN 'locked' WHEN must_change_password THEN 'must_change' ELSE 'active' END AS status"}, failed_logins FROM users WHERE id=$1::uuid`, [user.id]))[0]!;
     assert.deepEqual(reset, { status: "must_change", failed_logins: 0 }, "a reset clears the lock and asks for a new password");
     assert.ok((await auditActions(TENANT_A, user.id)).includes("user.password_reset"));
+    const resetAudit = await asApp<{ detail: unknown }>(TENANT_A,
+      "SELECT detail FROM audit_events WHERE action='user.password_reset' AND target_id=$1::uuid", [user.id]);
+    assert.deepEqual(resetAudit[0]!.detail, { via: "cli" }, "a break-glass CLI reset is told apart from an admin's reset by its detail");
   });
 
   test("sessions: create, resolve, touch at most once a minute, idle and absolute expiry, revoke, and a disabled user", async () => {

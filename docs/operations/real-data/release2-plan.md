@@ -1864,3 +1864,55 @@ write the deviation down instead of diverging silently.
   `headers.get`, a controllable clock) the harness also records each fetch's headers and body, each XHR's headers and
   `abort()`, and can make one upload hang — without which "no request is sent after B's login", "the same
   `Idempotency-Key`", "the new `X-CSRF-Token`" and "the XHR is aborted" cannot be observed at all.
+
+**C7 (the users CLI, `ocr-users.sh`, `auth-smoke.sh`, the e2e login, compose, preflight, alerts and the docs)**
+
+- **`reset-password` gains an audit detail on the store, not a second audit row.** E1 wants
+  `user.password_reset {via:'cli'}`, but C3's `resetPassword(userId, hash, audit)` writes that row itself with no
+  detail. `PostgresUserStore.resetPassword` therefore takes an optional fourth argument, `detail?: AuditDetail`,
+  which only the CLI passes. The alternative — letting the CLI append a second `user.password_reset` row — would
+  double every reset in `SELECT action, count(*) FROM audit_events`, the query §13 gives the operator. `UserStore`
+  (the server's interface) is unchanged, so no route is affected; the DB case in `batch.db.test.ts` now asserts the
+  detail.
+- **The CLI's break-glass password is still a must-change password.** E1 says `reset-password` "sets the typed
+  password, clears the lock and revokes the user's sessions", and the store method that does all three also sets
+  `must_change_password` and a 72-hour expiry (D6). The CLI reuses it as-is and prints the consequence in Thai,
+  rather than growing a second reset path: a password read out over the phone during an emergency should not outlive
+  the emergency. `create-admin` is the opposite case and passes `temporary: false`, exactly as E1 requires.
+- **`create-admin` writes two audit rows.** `user.created` comes from the shared `createUser` (it is what every
+  account creation records) and `user.bootstrap` is appended by the CLI, as E1 asks. Both carry
+  `actor_user_id = NULL`, which `audit.ts` documents as the CLI's own case, and a live run against a throwaway
+  database confirms the composite FK and the RLS policies accept it.
+- **`--username` / `--display-name` are the only flags, and anything else is a usage error (exit 2).** E1 says
+  "unknown flags are rejected" but names no code; 2 is what `TTY_REQUIRED` already uses, so a misuse and a
+  non-terminal both exit 2 while a real failure exits 1. `deploy/ocr-users.sh` cannot preserve that: `pnpm run`
+  collapses a non-zero child status to 1 (`ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL`). The message the operator reads is
+  the CLI's own and is unaffected.
+- **The e2e script keeps the login answer out of shell variables entirely.** E3 says the CSRF token is "parsed from
+  the login JSON and written straight into" the header file. The login response is therefore piped
+  `curl → python3 → $hdr`; it is never assigned, so no later `echo`, `set -x` or error path can print it. The script
+  also refuses to run on curl < 7.55 instead of carrying the `-K "$cfg"` fallback E3 offers, because a fallback that
+  is never exercised is the one that leaks the token.
+- **`auth-smoke.sh` prints nine checks, not eight.** E4's list ends with "`GET /` gives 200 with a
+  `content-security-policy` header", which is two different failures (a 500 page, and a page with no CSP), so it is
+  two lines in the output. The set of requests is exactly E4's.
+- **`deploy/README.md:15` still names 0018 as the worker gate.** E6 asks for ":15 for the 0020 worker gate", but
+  `REQUIRED_SCHEMA_VERSION` only moves to `0020_batch_round_clock` in C8 (G2), and Deploy A leaves the worker alone.
+  The sentence names 0018 as today's gate and says Deploy B raises it to 0020, so the README is true at every commit
+  between here and C8.
+- **`production-preflight.sh` grew a `WARN` count.** E6 asks for two warnings, and `check` can only pass or fail.
+  `warn_if` prints `WARN <name>`, counts separately and never changes the exit code; the summary line is now
+  `SUMMARY PASS=n FAIL=n WARN=n`. The two warnings are E6's, plus `web:public-https` as a real check (the session
+  cookie is only as good as the origin it is bound to, and `loadWebConfig` refuses a non-https origin in production
+  anyway — failing here explains it before the container does).
+- **`release2-deploy.md` covers Deploy A only.** §14 lists the file under C11 as well; this commit writes the Deploy A
+  runbook, the rollback and a short "a staff member cannot log in" section, and C11 appends Deploy B.
+- **The env example lists the new keys with empty values.** E6 says "key names only, no values", so
+  `OCR_PUBLIC_BASE_URL` is empty there even though compose carries the same origin as a default: an example file that
+  is copied blindly should fail the preflight rather than point a session cookie at someone else's origin.
+- **`test/deploy-scripts.test.ts` is a new file.** §12 asks for "a static test that `deploy/e2e-production.sh`
+  contains no `-H "X-CSRF-Token: $` and no `Authorization: Bearer`" without saying where it lives. It sits next to
+  the other static tests and also pins the rest of C7's deploy surface (the credential-free smoke script, the CLI's
+  refusal of password flags and files, the compose keys, the preflight checks and the alert rules). Its
+  forbidden-text assertions run against comment-stripped sources, exactly as `test/batch-migration.test.ts:8` does
+  for SQL, because these files explain in prose why they take no password.

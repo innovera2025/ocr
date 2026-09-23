@@ -16,7 +16,8 @@ Application VPS `72.61.123.78` (`/opt/innovera-ocr-app/ocr`):
 - Database, as `ocr_bootstrap`: table owners (`pg_tables`), `documents` grants for `ocr_app`/`ocr_worker`
   (table-level UPDATE), owners of the 8 `ocr_*` functions, `ocr_queue_definer` privileges on
   `ocr_confirm_outbox`, `schema_migrations` (0001–0016), document counts by status and structured_result shape.
-- Compose env keys only (never values): `OCR_API_BASE_URL`, `OCR_WEB_AUTO_AUTH`, worker settings.
+- Compose env keys only (never values): `OCR_API_BASE_URL`, `OCR_WEB_TENANT_ID`, `OCR_PUBLIC_BASE_URL`, worker
+  settings. `OCR_WEB_AUTO_AUTH` was deleted in Release 2 (`real-data/release2-deploy.md`).
 - Gateway routing for the worker's health probe: `curl -s -o /dev/null -w '%{http_code}' <OCR_API_BASE_URL>/health`
   (404 is tolerated by the worker, 200 preferred).
 

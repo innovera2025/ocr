@@ -46,3 +46,25 @@ groups:
         for: 10m
         labels: { severity: warning }
         annotations: { summary: "OCR storage free space is below 15 percent" }
+      # Release 2 login (release2-plan §13). auth_logins_total is labelled by result only, so no alert here can
+      # carry a username, an IP address or any other identifier.
+      - alert: OcrLoginFailuresHigh
+        expr: increase(auth_logins_total{result="invalid"}[15m]) > 20
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "OCR login failures are elevated (password guessing or a locked-out user)" }
+      - alert: OcrLoginBusy
+        expr: increase(auth_logins_total{result="busy"}[15m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "OCR login hash gate is saturated: a flood, not bad typing" }
+      - alert: OcrCsrfRejected
+        expr: increase(auth_csrf_rejected_total[15m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "OCR requests are being rejected by the CSRF guard" }
+      - alert: OcrBulkRead
+        expr: increase(documents_read_total[1h]) > 5000
+        for: 15m
+        labels: { severity: warning }
+        annotations: { summary: "One hour of OCR document reads is unusually large" }

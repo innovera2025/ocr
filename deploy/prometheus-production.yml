@@ -2,6 +2,11 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# Mounted by deploy/docker-compose.yml from deploy/prometheus-alerts.yml. Without this line the release 2 login
+# alerts are never evaluated, which is what made go-live-check report "critical alerts loaded" as NOT_RUN.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: ocr-web
     metrics_path: /metrics

@@ -15,7 +15,7 @@ pnpm --config.engine-strict=false test
 
 Existing production behaviour that MUST survive: queue SECURITY DEFINER model (`ocr_queue_definer`),
 tenant RLS on every table (`app.current_org`), worker heartbeat, ClamAV `zPING` readiness,
-`/api/web-token` server-side auto-auth (`OCR_WEB_AUTO_AUTH`), therapistName→therapist provider mapping,
+therapistName→therapist provider mapping,
 migration 0016 grants, Prometheus config, the legacy single-field confirm endpoint.
 
 ---
@@ -250,8 +250,9 @@ column already returned by `ocr_finish_retry_v1`. Keep `finish()`.
 
 ## 5. HTTP API — `apps/ocr-web/src/server.ts`
 
-All `/api/*` routes except `/api/web-token` authenticate with the Bearer JWT (`principalFor`); tenant is
-always `principal.tenantId` (headers such as `x-tenant-id` are ignored). Error body `{ error: CODE }`.
+All `/api/*` routes except `POST /api/auth/login` and `POST /api/auth/logout` authenticate with the session cookie
+(Release 2; `docs/operations/real-data/release2-plan.md` §5). Tenant is always the server's own `OCR_WEB_TENANT_ID`
+(headers such as `x-tenant-id` are ignored). Error body `{ error: CODE }`.
 Status mapping: auth errors 401; `*_NOT_FOUND` 404; `BATCH_FULL`, `IDEMPOTENCY_CONFLICT`,
 `DOCUMENT_NOT_RETRYABLE`, `DOCUMENT_NOT_REVIEWABLE`, `REVIEW_CONFLICT`, `DOCUMENT_QUARANTINED`, `DOCUMENT_NOT_SCANNED`,
 `CONFIRMATION_TARGET_AMBIGUOUS`, `UPLOAD_IN_PROGRESS` 409; `PAYLOAD_TOO_LARGE` 413;
@@ -262,7 +263,7 @@ confirmation → `INVALID_CONFIRMATION`).
 |---|---|---|---|
 | GET | `/` | – | workbench HTML (`workbench.ts`), CSP with per-response script nonce |
 | GET | `/review/:id` | – | 302 → `/?document=:id` (the old page prompted for a token) |
-| GET | `/api/web-token` | – | unchanged |
+| GET | `/api/web-token` | – | removed in Release 2 (404); the browser logs in at `POST /api/auth/login` |
 | POST | `/api/batches` | `{ total: 1..500, label?: string≤200 }` | 201 `BatchSummary` |
 | GET | `/api/batches` | `?limit` | 200 `{ batches: BatchSummary[] }` |
 | GET | `/api/batches/:id` | – | 200 `BatchSummary` / 404 |
@@ -315,7 +316,8 @@ always paired with a text label), Geist + Geist Mono with Thai fallback (Noto Sa
 display tracking −0.04em, body 14px, inputs ≥16px, 150 ms motion, `prefers-reduced-motion`, visible
 `:focus-visible` rings. Thai UI copy.
 
-Behaviour: header with connection status (auto-auth via `/api/web-token`, token kept in memory only);
+Behaviour: header with the signed-in user and a user menu (Release 2 login; the session cookie is `__Host-`-scoped
+and never readable by the script);
 multi-file picker + drag/drop (≤100 files per selection, accept PNG/JPEG/WebP/PDF); `POST /api/batches`
 then per-file raw uploads (3 concurrent, XHR progress, `X-Batch-Id`, URI-encoded filename, per-file
 Idempotency-Key, per-file retry; one failure never blocks siblings; files the server always rejects — 0 bytes, over

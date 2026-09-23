@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from "pg";
-import { insertAudit, type AuditContext, type AuditEvent } from "./audit.js";
+import { insertAudit, type AuditContext, type AuditDetail, type AuditEvent } from "./audit.js";
 import { isUuid, withTenant } from "./tenant.js";
 
 export type UserRole = "admin" | "staff";
@@ -309,8 +309,11 @@ export class PostgresUserStore {
     });
   }
 
-  /** A new temporary password: the lock is cleared, every session of the user dies and the next login must change it. */
-  async resetPassword(userId: string, newHash: string, audit: AuditContext): Promise<void> {
+  /**
+   * A new temporary password: the lock is cleared, every session of the user dies and the next login must change it.
+   * `detail` is what tells the break-glass CLI reset (`{via:'cli'}`, §7 E1) from an admin's reset in the browser.
+   */
+  async resetPassword(userId: string, newHash: string, audit: AuditContext, detail?: AuditDetail): Promise<void> {
     assertUserId(userId);
     const hash = assertPasswordHash(newHash);
     await this.run(async (client) => {
@@ -320,7 +323,7 @@ export class PostgresUserStore {
          WHERE id = $1::uuid AND organization_id = $2::uuid`, [userId, this.tenantId, hash, TEMPORARY_PASSWORD_HOURS]);
       if (result.rowCount !== 1) throw new Error("USER_NOT_FOUND");
       await revokeSessionsOn(client, this.tenantId, userId, "admin_reset");
-      await this.audit(client, audit, { action: "user.password_reset", targetType: "user", targetId: userId });
+      await this.audit(client, audit, { action: "user.password_reset", targetType: "user", targetId: userId, ...(detail ? { detail } : {}) });
     });
   }
 

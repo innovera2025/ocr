@@ -33,7 +33,9 @@ services:
       LETSENCRYPT_HOST: ocr.innoveraappcenter.com
       OCR_ENV: production
       OCR_PORT: 3100
-      OCR_TRUSTED_PROXY_HOPS: 0
+      # 0 keeps the per-IP login limiter off. The production host sets 1 once nginx-proxy is confirmed to append the
+      # client IP to X-Forwarded-For (release2-plan §15.1); a wrong value here would let a client forge its own IP.
+      OCR_TRUSTED_PROXY_HOPS: ${OCR_TRUSTED_PROXY_HOPS:-0}
       OCR_STORAGE_ROOT: /var/lib/ocr
       OCR_API_BASE_URL: ${OCR_API_BASE_URL:-https://ai.innoveraappcenter.com/ocr}
       OCR_REQUEST_TIMEOUT: ${OCR_REQUEST_TIMEOUT:-300}
@@ -41,15 +43,24 @@ services:
       AUTH_JWT_SECRETS: ${AUTH_JWT_SECRETS:?set AUTH_JWT_SECRETS}
       AUTH_JWT_ISSUER: ${AUTH_JWT_ISSUER:?set AUTH_JWT_ISSUER}
       AUTH_JWT_AUDIENCE: ${AUTH_JWT_AUDIENCE:?set AUTH_JWT_AUDIENCE}
-      OCR_WEB_AUTO_AUTH: ${OCR_WEB_AUTO_AUTH:-0}
-      OCR_WEB_TENANT_ID: ${OCR_WEB_TENANT_ID:-}
-      OCR_WEB_SUBJECT_ID: ${OCR_WEB_SUBJECT_ID:-}
+      # Release 2: the workbench authenticates with a session cookie. AUTH_JWT_* above is reserved (the startup policy
+      # still requires it, the worker still reads it) but no browser request uses it.
+      OCR_WEB_TENANT_ID: ${OCR_WEB_TENANT_ID:?set OCR_WEB_TENANT_ID}
+      OCR_PUBLIC_BASE_URL: ${OCR_PUBLIC_BASE_URL:-https://ocr.innoveraappcenter.com}
+      OCR_SESSION_IDLE_MINUTES: ${OCR_SESSION_IDLE_MINUTES:-30}
+      OCR_SESSION_ABSOLUTE_HOURS: ${OCR_SESSION_ABSOLUTE_HOURS:-12}
+      OCR_EXPORT_MAX_ROWS: ${OCR_EXPORT_MAX_ROWS:-50000}
       DATABASE_URL: ${DATABASE_URL_APP:?set DATABASE_URL_APP}
       DATABASE_URL_MIGRATOR: ${DATABASE_URL_MIGRATOR:?set DATABASE_URL_MIGRATOR}
       DATABASE_URL_QUEUE: ${DATABASE_URL_QUEUE:?set DATABASE_URL_QUEUE}
       OCR_CLAMAV_HOST: clamav
       OCR_CLAMAV_PORT: 3310
     ports: ["127.0.0.1:53100:3100"]
+    # A login flood runs one 32 MiB scrypt job per attempt. The cap keeps that inside this project's share of a host
+    # it does not own; the hash gates (§4 B1) keep it inside one core's worth of work.
+    deploy:
+      resources:
+        limits: { cpus: "1.5" }
     depends_on:
       postgres: { condition: service_healthy }
       clamav: { condition: service_healthy }
@@ -96,6 +107,8 @@ services:
       - --storage.tsdb.retention.time=15d
     volumes:
       - ./prometheus-production.yml:/etc/prometheus/prometheus.yml:ro
+      # Without this mount (and the rule_files line in the config) the §13 login alerts never load.
+      - ./prometheus-alerts.yml:/etc/prometheus/alerts.yml:ro
       - ocr_prometheus_data:/prometheus
     ports:
       - "127.0.0.1:59090:9090"
