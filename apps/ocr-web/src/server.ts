@@ -13,9 +13,11 @@ import { AuthenticationError } from "@innovera/ocr-auth";
 import { AuditRateLimiter, PostgresUserStore } from "@innovera/ocr-persistence";
 import {
   assertCsrfToken, assertOrigin, assertSecFetchSite, hasRight, headerValue, LoginThrottle, PASSWORD_CHANGE_ROUTES,
-  PUBLIC_API_ROUTES, readJson, requiredRight, respond, sessionAuthenticator, type UserStore, type WebAuthContext
+  PUBLIC_API_ROUTES, readJson, requiredRight, respond, sessionAuthenticator, SlidingWindow, type UserStore,
+  type WebAuthContext
 } from "./auth.js";
 import { handleAuthRoutes, LOGIN_BUSY_RETRY_SECONDS, type AuthRouteDeps } from "./auth-routes.js";
+import { ExportGate, handleExportRoutes, PREVIEW_LIMIT, PREVIEW_WINDOW_MS, type ExportStore } from "./export.js";
 import { logEvent, metrics, requestId } from "@innovera/ocr-observability";
 import { clamAvHealthCheck } from "@innovera/ocr-ingest/clamav";
 import type { LocalStorage } from "@innovera/ocr-storage/local";
@@ -39,6 +41,7 @@ export type AppDependencies = Readonly<{
   reviewStore?: ReviewStore;
   workbenchStore?: WorkbenchStore;
   userStore?: UserStore;
+  exportStore?: ExportStore;
   storage?: LocalStorage;
   ocrClient?: OcrClient;
 }>;
@@ -56,7 +59,8 @@ const AUTH_ERRORS = new Set(["UNAUTHENTICATED", "AUTH_NOT_CONFIGURED", "INVALID_
   "INVALID_PRINCIPAL", "INVALID_CREDENTIALS", "PASSWORD_EXPIRED"]);
 const FORBIDDEN_ERRORS = new Set(["CSRF_REJECTED", "FORBIDDEN", "PASSWORD_CHANGE_REQUIRED"]);
 /** Every 429 carries `Retry-After`; the login route computes its own from the window that is spent. */
-const THROTTLED_ERRORS: ReadonlyMap<string, number> = new Map([["LOGIN_THROTTLED", 900], ["LOGIN_BUSY", LOGIN_BUSY_RETRY_SECONDS], ["EXPORT_BUSY", 30]]);
+const THROTTLED_ERRORS: ReadonlyMap<string, number> = new Map([["LOGIN_THROTTLED", 900], ["LOGIN_BUSY", LOGIN_BUSY_RETRY_SECONDS],
+  ["EXPORT_BUSY", 30], ["EXPORT_THROTTLED", Math.round(PREVIEW_WINDOW_MS / 1000)]]);
 const CONFLICT_ERRORS = new Set(["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT",
   "DOCUMENT_QUARANTINED", "DOCUMENT_NOT_SCANNED", "CONFIRMATION_TARGET_AMBIGUOUS", "UPLOAD_IN_PROGRESS",
   "USERNAME_TAKEN", "LAST_ADMIN", "CANNOT_CHANGE_SELF"]);
@@ -212,6 +216,10 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
   if (app?.userStore && config.trustedProxyHops < 1) logEvent("login_ip_throttle_disabled", { level: "warn", trusted_proxy_hops: config.trustedProxyHops });
 
   const authDeps = (traceId: string): AuthRouteDeps => ({ store: users(), webConfig, env, throttle, hops: config.trustedProxyHops, now: clock, traceId });
+  /** §10 H5: one open download per user, and 60 previews per user per 15 minutes (the preview pages the same data). */
+  const exportGate = new ExportGate();
+  const previewLimit = new SlidingWindow(PREVIEW_LIMIT, PREVIEW_WINDOW_MS);
+  const exportStore = (): ExportStore => { if (!app?.exportStore) throw new Error("EXPORT_NOT_CONFIGURED"); return app.exportStore; };
 
   /**
    * §5 C2.7 and §4 B4: a denied request is audited once, at most 5 times a minute. The budget is keyed on the **user**,
@@ -411,6 +419,11 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
           if (await handleAuthRoutes(request, response, pathname, method, ctx, authDeps(traceId))) return;
         }
         if (!ctx) throw new AuthenticationError("UNAUTHENTICATED");
+        if (pathname.startsWith("/api/exports/")) {
+          const deps = { store: exportStore(), users: users(), gate: exportGate, previewLimit, maxRows: webConfig.exportMaxRows,
+            publicBaseUrl: webConfig.publicBaseUrl, traceId, now: clock };
+          if (await handleExportRoutes(response, url, method, ctx, deps)) return;
+        }
         if (await handleApi(request, response, url, method, reqId, traceId, ctx)) return;
       }
       const result = healthResponse(pathname);
@@ -427,10 +440,13 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
 }
 
 export async function createProductionAppServer(): Promise<{ server: ReturnType<typeof createAppServer>; close: () => Promise<void> }> {
-  const migrationPool = createDatabasePool(process.env.DATABASE_URL_MIGRATOR || process.env.DATABASE_URL);
+  // D10: a pool 'error' is fatal in Node when nothing listens. The handler keeps the process alive; this callback is
+  // what makes the failure visible in `docker logs web` — the pool's name and pg's message, never the DSN.
+  const poolError = (name: string) => (error: Error): void => logEvent("db_pool_error", { pool: name, error: error.message.slice(0, 200) });
+  const migrationPool = createDatabasePool(process.env.DATABASE_URL_MIGRATOR || process.env.DATABASE_URL, poolError("migrator"));
   await runMigrationsWithPool(migrationPool, resolve(process.cwd(), "../../prisma/migrations"));
   await migrationPool.end();
-  const pool = createDatabasePool(process.env.DATABASE_URL);
+  const pool = createDatabasePool(process.env.DATABASE_URL, poolError("app"));
   await assertDatabaseReady(pool);
   const reviewStore = new PostgresOcrDocumentStore(pool);
   const ocrClient = OcrClient.fromConfig();
@@ -439,7 +455,7 @@ export async function createProductionAppServer(): Promise<{ server: ReturnType<
   const userStore = new PostgresUserStore(pool, webConfig.tenantId);
   // A missing login tenant fails startup loudly, instead of every login answering "wrong password" (§4 B5).
   await userStore.assertTenant();
-  const server = createAppServer({ ingest: { stage: async () => { throw new Error("TENANT_REQUIRED"); }, scan: async () => "QUARANTINED", enqueue: async () => { throw new Error("QUEUE_RUNTIME_NOT_CONFIGURED"); } }, ingestForTenant: (tenantId, idempotencyKey, batchId, actor) => createRuntimeIngest(pool, tenantId, idempotencyKey, batchId, actor), reviewStore, workbenchStore: reviewStore, userStore, storage, ocrClient }, { webConfig, readiness: async () => { await assertDatabaseReady(pool); return clamAvHealthCheck({ host: process.env.OCR_CLAMAV_HOST ?? "clamav", port: Number(process.env.OCR_CLAMAV_PORT ?? 3310) }); } });
+  const server = createAppServer({ ingest: { stage: async () => { throw new Error("TENANT_REQUIRED"); }, scan: async () => "QUARANTINED", enqueue: async () => { throw new Error("QUEUE_RUNTIME_NOT_CONFIGURED"); } }, ingestForTenant: (tenantId, idempotencyKey, batchId, actor) => createRuntimeIngest(pool, tenantId, idempotencyKey, batchId, actor), reviewStore, workbenchStore: reviewStore, userStore, exportStore: reviewStore, storage, ocrClient }, { webConfig, readiness: async () => { await assertDatabaseReady(pool); return clamAvHealthCheck({ host: process.env.OCR_CLAMAV_HOST ?? "clamav", port: Number(process.env.OCR_CLAMAV_PORT ?? 3310) }); } });
   return { server, close: async () => { await new Promise<void>((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose())); await pool.end(); } };
 }
 

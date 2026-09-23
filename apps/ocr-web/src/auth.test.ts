@@ -8,6 +8,7 @@ import { csrfTokenFor, DUMMY_HASH, hashPassword, loginGate, SCRYPT_PARAMS, type 
 import type { WebConfig } from "@innovera/ocr-config";
 import type { AuditEvent, CreateSessionInput, CreateUserInput, LoginFailureInput, LoginUser, ResolvedSession, SessionRevokeReason, UpdateUserChanges, UserListItem, UserRole } from "@innovera/ocr-persistence";
 import { clientIp, LoginThrottle, SlidingWindow, type UserStore } from "./auth.js";
+import type { ExportStore } from "./export.js";
 import { createAppServer, errorStatus, routeLabel, type WorkbenchStore } from "./server.js";
 
 // ---- stdout capture (the whole file: no secret may ever reach a log line) ----------------------
@@ -253,6 +254,12 @@ function recordingWorkbenchStore(): WorkbenchStore & { readonly batches: unknown
   return { ...workbenchStore, batches, createBatch: async (_tenantId, input) => { batches.push(input); return { batchId: "10000000-0000-4000-8000-000000000001" }; } };
 }
 
+/** An empty tenant: enough for the permission cases, which are about who reaches the routes, not what comes back. */
+const emptyExportStore: ExportStore = {
+  previewExport: async () => ({ total: 0, documents: [] }),
+  openExport: async () => ({ total: 0, rows: async function* () { /* no rows */ }, close: async () => undefined })
+};
+
 const baseWebConfig: WebConfig = { tenantId: tenant, publicBaseUrl: "", publicOrigin: "", sessionIdleMinutes: 30, sessionAbsoluteHours: 12, exportMaxRows: 50_000 };
 
 type HarnessOptions = Readonly<{
@@ -263,6 +270,7 @@ type HarnessOptions = Readonly<{
   seed?: (store: FakeUserStore) => void;
   clerkHash?: string;
   workbenchStore?: WorkbenchStore;
+  exportStore?: ExportStore;
 }>;
 
 type Harness = Readonly<{ app: Server; store: FakeUserStore; clock: { now: number }; throttle: LoginThrottle }>;
@@ -285,7 +293,7 @@ function harness(options: HarnessOptions = {}): Harness {
   }
   try {
     const app = createAppServer(
-      { ingest: { stage: async () => "key", scan: async () => "CLEAN", enqueue: async () => "job" }, workbenchStore: options.workbenchStore ?? workbenchStore, userStore: store },
+      { ingest: { stage: async () => "key", scan: async () => "CLEAN", enqueue: async () => "job" }, workbenchStore: options.workbenchStore ?? workbenchStore, userStore: store, exportStore: options.exportStore ?? emptyExportStore },
       {
         webConfig: { ...baseWebConfig, ...(options.production ? { publicBaseUrl: "https://ocr.test", publicOrigin: "https://ocr.test" } : {}), ...options.webConfig },
         loginThrottle: throttle, clock: () => clock.now
@@ -774,10 +782,10 @@ test("staff are refused the admin and export routes, and the denial is audited a
       await expectError(await fetch(`${base}${path}`, { headers: authHeaders(clerk) }), 403, "FORBIDDEN");
     }
     const exporter = await signedIn(base, "clerk2", CLERK_PASSWORD);
-    // `can_export` lets the request past the permission gate; the handlers themselves ship in Deploy B.
+    // `can_export` lets a staff member past the permission gate and through to the handler.
     const preview = await fetch(`${base}/api/exports/preview`, { headers: authHeaders(exporter) });
-    assert.equal(preview.status, 404);
-    assert.deepEqual(await body(preview), { status: "not_found" });
+    assert.equal(preview.status, 200);
+    assert.equal((await body(preview)).total, 0);
     await expectError(await fetch(`${base}/api/users`, { headers: authHeaders(exporter) }), 403, "FORBIDDEN");
     await tick();
     for (let attempt = 0; attempt < 5; attempt += 1) await fetch(`${base}/api/users`, { headers: authHeaders(clerk) });
@@ -803,11 +811,11 @@ test("the admin role carries export by itself, and can_export is not one of the 
     assert.equal(h.store.users.find((user) => user.id === ownerId)!.canExport, false);
     const owner = await signedIn(base, "owner1", OWNER_PASSWORD);
     // D8: the flag gates the export file for STAFF. An admin passes the gate on the role alone, so the only admin of a
-    // fresh tenant is never locked out of the export. Past the gate the Deploy B handlers are still missing: 404, not 403.
+    // fresh tenant is never locked out of the export — with can_export still false, all three routes answer.
     for (const path of ["/api/exports/preview", "/api/exports/documents.csv", "/api/exports/documents.jsonl"]) {
       const response = await fetch(`${base}${path}`, { headers: authHeaders(owner) });
-      assert.equal(response.status, 404, path);
-      assert.deepEqual(await body(response), { status: "not_found" });
+      assert.equal(response.status, 200, path);
+      await response.arrayBuffer();
     }
     // §5 C6 guards your own role and your own disabled state — not your own flags — so an admin can still turn it on.
     const granted = await fetch(`${base}/api/users/${ownerId}`, { method: "POST", headers: { ...authHeaders(owner), "content-type": "application/json" }, body: JSON.stringify({ canExport: true }) });
