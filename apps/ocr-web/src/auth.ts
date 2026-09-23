@@ -21,7 +21,7 @@ export type UserStore = Readonly<{
   createSession(input: CreateSessionInput): Promise<{ sessionId: string; createdAt: string; expiresAt: string }>;
   resolveSession(tokenHash: Buffer, idleMinutes: number): Promise<ResolvedSession | null>;
   touchSession(sessionId: string): Promise<void>;
-  revokeSession(tokenHash: Buffer, reason: SessionRevokeReason, audit?: AuditContext): Promise<{ revoked: boolean }>;
+  revokeSession(tokenHash: Buffer, reason: SessionRevokeReason, requestId?: string): Promise<{ revoked: boolean; userId: string | null }>;
   changeOwnPassword(userId: string, newHash: string, audit: AuditContext): Promise<{ revoked: number }>;
   listUsers(): Promise<UserListItem[]>;
   createUser(input: CreateUserInput): Promise<UserListItem>;

@@ -1720,12 +1720,25 @@ write the deviation down instead of diverging silently.
 - **Which method writes `login.succeeded`.** B5 gives `recordLoginSuccess(userId, rehash?)` no audit argument and
   `createSession(…, audit)` one, so `createSession` writes the row: it is the only one that knows the session id, and
   `audit_events.session_id` is the column that joins a login to everything that session later did.
+  **`CreateSessionInput.auditLogin: false` opts out** (added after review): a password change also opens a session, and
+  §5 C5 makes its outcome `password.changed` alone. Without the opt-out every change wrote a second `login.succeeded`
+  row — and a `login_succeeded` stdout line — for a login that never happened, while
+  `auth_logins_total{result="success"}` correctly did not move, so §13's audit query and the metric disagreed.
 - **`resolveSession` also selects `s.created_at`.** §5 C5 lets a forced-change session omit `currentPassword` within
   5 minutes of `auth_sessions.created_at`, which the C4 query does not return. Adding the column keeps it one query
   per request instead of a second round trip on every password change.
-- **`revokeSession` audits a logout only.** The action list in §6 has `session.logout` and no other session verb, and
-  the `relogin`, `password_changed`, `admin_reset` and `disabled` revocations already ride along with the action that
-  caused them (`login.succeeded`, `password.changed`, `user.password_reset`, `user.updated`).
+- **`revokeSession` audits a logout only, and takes a `requestId` rather than a whole audit context.** The action
+  list in §6 has `session.logout` and no other session verb, and the `relogin`, `password_changed`, `admin_reset` and
+  `disabled` revocations already ride along with the action that caused them (`login.succeeded`, `password.changed`,
+  `user.password_reset`, `user.updated`). The revoking UPDATE already returns `id, user_id`, so the actor of a logout
+  is the session's own user and the method returns it; after review the route stopped calling `resolveSession` first
+  (one transaction and one pool checkout instead of two on the only route that touches the database with no session,
+  no CSRF token and no throttle).
+- **`PostgresUserStore.run` applies B3's timeouts.** `tenant.ts` says the timeouts exist "for the export cursor … and
+  for the auth queries, which must never hold a connection open behind a stalled client", but the store passed none.
+  Every auth query now runs with `statement_timeout = 5 s` and `idle_in_transaction_session_timeout = 10 s`; each is
+  one small indexed statement, and the only wait that queues is the last-admin guard's row lock, which queues behind
+  another request rather than behind a human.
 - **`CANNOT_CHANGE_SELF` is not enforced in the store.** B5 puts only the last-admin guard inside the transaction, and
   §5 C6 describes the self-guards in terms of the caller's own id, which the route holds; the store keeps
   `LAST_ADMIN`, `USER_NOT_FOUND` and `USERNAME_TAKEN`. The admins are locked with `ORDER BY id` so two concurrent
@@ -1750,6 +1763,23 @@ write the deviation down instead of diverging silently.
   only knowable after the lookup. The order implemented is: throttle pre-check → `findLoginUser` → budget → one
   `loginGate.run` covering the verify **and** the optional rehash. The gate therefore never holds a database query,
   which B1 also asks for, and one acquisition serves a login that rehashes.
+- **The windows are spent before the hash, not after the answer** (fixed after review). C3 step 7 counts the failure,
+  which read as "count it when you answer" — and the answer is ~250 ms of scrypt later, so every attempt that arrived
+  in that window read a zero counter: one name bought the gate's whole in-flight capacity (2 running + 16 queued)
+  instead of D5.2's 10. `countUsername` now runs in the **same synchronous step as the `retryAfter` pre-check**, so the
+  limit is exact, and `countUnknown` runs before the gate, so a `LOGIN_BUSY` on a made-up name counts against D5.3 too.
+  The failure path no longer counts them a second time; step 9's `resetUsername` still clears the window, so a staff
+  member who finally types the right password is unaffected.
+- **`PASSWORD_EXPIRED` counts toward the in-memory windows** (fixed after review). C3 step 8 says it "does not count
+  as a failure", which the database counter still honours — the account is never locked by it. But the branch is
+  reached only **after** a correct password, and D6 deliberately leaves a consumed temporary password in the row: the
+  credential that is read out loud, photographed or pasted into chat would otherwise buy an unlimited number of 32 MiB
+  hashes. It is counted on the username window (spent on entry) and on the per-IP window.
+- **The `access.denied` budget is keyed on the user, not the session.** B4 says "5 rows per session per minute", but
+  nothing limits how many sessions one account may open, so a re-login handed out a fresh budget and B4's actual
+  promise — that a staff account cannot flood a table nothing may delete from — did not hold. The session id is still
+  written into the row; only the key changed. It also bounds `AuditRateLimiter`'s key set by the number of accounts
+  rather than the number of logins.
 - **`WebAuthContext` at the seam.** C5's five-minute forced-change window needs `auth_sessions.created_at` and
   `GET /api/auth/session` needs `expires_at`; C3's `resolveSession` already returns both. Rather than a second query
   per request, `apps/ocr-web/src/auth.ts` extends B2's `AuthContext` with two optional fields (`sessionCreatedAt`,

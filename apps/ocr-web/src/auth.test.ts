@@ -123,7 +123,7 @@ class FakeUserStore implements UserStore {
       expiresAt: this.clock.now + input.absoluteHours * 3_600_000, revokedAt: null, reason: null
     };
     this.sessions.set(input.tokenHash.toString("hex"), session);
-    this.#record({ ...input.audit, sessionId: id, action: "login.succeeded", targetType: "user", targetId: input.userId });
+    if (input.auditLogin !== false) this.#record({ ...input.audit, sessionId: id, action: "login.succeeded", targetType: "user", targetId: input.userId });
     return { sessionId: id, createdAt: iso(session.createdAt), expiresAt: iso(session.expiresAt) };
   }
 
@@ -146,13 +146,15 @@ class FakeUserStore implements UserStore {
     }
   }
 
-  async revokeSession(tokenHash: Buffer, reason: SessionRevokeReason, audit?: { actorUserId: string | null; sessionId?: string | null | undefined; requestId?: string | undefined }): Promise<{ revoked: boolean }> {
+  async revokeSession(tokenHash: Buffer, reason: SessionRevokeReason, requestId?: string): Promise<{ revoked: boolean; userId: string | null }> {
     const session = this.sessions.get(tokenHash.toString("hex"));
-    if (!session || session.revokedAt !== null) return { revoked: false };
+    if (!session || session.revokedAt !== null) return { revoked: false, userId: null };
     session.revokedAt = this.clock.now;
     session.reason = reason;
-    if (reason === "logout" && audit) this.#record({ ...audit, sessionId: session.id, action: "session.logout", targetType: "user", targetId: session.userId });
-    return { revoked: true };
+    if (reason === "logout") {
+      this.#record({ actorUserId: session.userId, sessionId: session.id, requestId, action: "session.logout", targetType: "user", targetId: session.userId });
+    }
+    return { revoked: true, userId: session.userId };
   }
 
   #revokeAll(userId: string, reason: SessionRevokeReason): number {
@@ -491,6 +493,35 @@ test("the username window throttles any name alike and a success clears it", asy
   });
 });
 
+test("the username window is spent before the hash, so concurrent guesses cannot all slip past it", async () => {
+  // Every one of these reads the counter before the first ~40 ms verify returns. Counting the attempt only after the
+  // answer was written let the gate's in-flight capacity (2 running + 16 queued) over-run D5.2 by ~8x.
+  const h = harness({ throttle: new LoginThrottle({ usernameLimit: 3 }) });
+  await withServer(h, async (base) => {
+    const answers = await Promise.all(Array.from({ length: 8 }, () => login(base, "clerk1", "wrong-pass-entirely")));
+    const statuses = await Promise.all(answers.map(async (response) => { await response.text(); return response.status; }));
+    assert.equal(statuses.filter((status) => status === 401).length, 3, "exactly the budget is hashed");
+    assert.equal(statuses.filter((status) => status === 429).length, 5);
+  });
+});
+
+test("a consumed temporary password is counted like any other attempt", async () => {
+  // D6 leaves the expired credential in the row on purpose, and it is the one that gets read out loud or photographed.
+  // C3.8 keeps it out of the database failure counter, but it must not buy an unlimited number of 32 MiB hashes.
+  const h = harness({
+    throttle: new LoginThrottle({ usernameLimit: 3 }),
+    seed: (store) => { store.find(clerkId).mustChangePassword = true; store.find(clerkId).passwordExpiresAt = START + 72 * 3_600_000; }
+  });
+  await withServer(h, async (base) => {
+    assert.equal((await login(base, "clerk1", CLERK_PASSWORD)).status, 200, "the first login consumes it and clears the window");
+    for (let attempt = 0; attempt < 3; attempt += 1) await expectError(await login(base, "clerk1", CLERK_PASSWORD), 401, "PASSWORD_EXPIRED");
+    const throttled = await login(base, "clerk1", CLERK_PASSWORD);
+    await expectError(throttled, 429, "LOGIN_THROTTLED");
+    assert.equal(throttled.headers.get("retry-after"), "900");
+    assert.equal(h.store.find(clerkId).failedLogins, 0, "and still not a failure: the account is not locked by it");
+  });
+});
+
 test("the per-IP window needs a trusted hop, ignores a forged left-hand entry and counts LOGIN_BUSY", async () => {
   const request = { socket: { remoteAddress: "10.0.0.9" }, headers: { "x-forwarded-for": "9.9.9.9, 203.0.113.7" } } as never;
   assert.equal(clientIp(request, 0), "10.0.0.9");
@@ -638,7 +669,13 @@ test("logout revokes the session, clears the cookie and is idempotent", async ()
     const out = await fetch(`${base}/api/auth/logout`, { method: "POST", headers: { cookie: `ocr_session=${token}`, ...sameOrigin } });
     assert.equal(out.status, 204);
     assert.equal(out.headers.getSetCookie()[0], "ocr_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
-    assert.ok(h.store.actions().includes("session.logout"));
+    // One statement does it: the revoking UPDATE returns the session and its user, so the row is attributed without a
+    // second query on a route that runs with no session, no CSRF token and no throttle.
+    const logoutRows = h.store.audits.filter((event) => event.action === "session.logout");
+    assert.equal(logoutRows.length, 1);
+    assert.equal(logoutRows[0]?.actorUserId, clerkId);
+    assert.equal(logoutRows[0]?.targetId, clerkId);
+    assert.ok(logoutRows[0]?.sessionId, "the closed session is named in the row");
     await expectError(await fetch(`${base}/api/documents`, { headers: authHeaders(token) }), 401, "UNAUTHENTICATED");
     assert.equal((await fetch(`${base}/api/auth/logout`, { method: "POST", headers: { cookie: `ocr_session=${token}`, ...sameOrigin } })).status, 204);
     assert.equal((await fetch(`${base}/api/auth/logout`, { method: "POST", headers: sameOrigin })).status, 204);
@@ -668,6 +705,7 @@ test("a password change rotates this session and revokes every other one", async
   await withServer(h, async (base) => {
     const first = await signedIn(base, "clerk1", CLERK_PASSWORD);
     const second = await signedIn(base, "clerk1", CLERK_PASSWORD);
+    const logsBefore = captured.length;
     const changed = await fetch(`${base}/api/auth/password`, {
       method: "POST", headers: { ...authHeaders(second), "content-type": "application/json" },
       body: JSON.stringify({ currentPassword: CLERK_PASSWORD, newPassword: NEW_PASSWORD })
@@ -677,7 +715,13 @@ test("a password change rotates this session and revokes every other one", async
     assert.notEqual(rotated, second);
     for (const dead of [first, second]) await expectError(await fetch(`${base}/api/documents`, { headers: authHeaders(dead) }), 401, "UNAUTHENTICATED");
     assert.equal((await fetch(`${base}/api/documents`, { headers: authHeaders(rotated) })).status, 200);
-    assert.ok(h.store.actions().includes("password.changed"));
+    // §5 C5's outcome is `password.changed` alone. The rotated session is not a login: no `login.succeeded` row (which
+    // would make §13's `SELECT action, count(*)` over-count logins) and no `login_succeeded` line in the stdout mirror,
+    // which §6 D9 keeps as the second trail precisely so the two can be compared.
+    const actions = h.store.actions();
+    assert.equal(actions.filter((action) => action === "password.changed").length, 1);
+    assert.equal(actions.filter((action) => action === "login.succeeded").length, 2, "the two logins above, and none for the rotation");
+    assert.equal(captured.slice(logsBefore).join("").includes("login_succeeded"), false);
     // The old password is gone and the new one works.
     await expectError(await login(base, "clerk1", CLERK_PASSWORD), 401, "INVALID_CREDENTIALS");
     assert.equal((await login(base, "clerk1", NEW_PASSWORD)).status, 200);
@@ -739,7 +783,13 @@ test("staff are refused the admin and export routes, and the denial is audited a
     for (let attempt = 0; attempt < 5; attempt += 1) await fetch(`${base}/api/users`, { headers: authHeaders(clerk) });
     await tick();
     const denied = h.store.audits.filter((event) => event.action === "access.denied" && event.actorUserId === clerkId);
-    assert.equal(denied.length, 5, "the budget is five rows per session per minute");
+    assert.equal(denied.length, 5, "the budget is five rows a minute");
+    // A new session is not a new budget: nothing limits how many sessions one account may open, so keying the budget
+    // on the session would let a staff account fill a table nothing is allowed to delete from, five rows per login.
+    const again = await signedIn(base, "clerk1", CLERK_PASSWORD);
+    await expectError(await fetch(`${base}/api/users`, { headers: authHeaders(again) }), 403, "FORBIDDEN");
+    await tick();
+    assert.equal(h.store.audits.filter((event) => event.action === "access.denied" && event.actorUserId === clerkId).length, 5);
     assert.deepEqual(denied[0]?.outcome, "denied");
     assert.deepEqual(denied[0]?.detail, { route: "/api/users" });
     assert.match((await (await fetch(`${base}/metrics`)).text()), /access_denied_suppressed_total/);

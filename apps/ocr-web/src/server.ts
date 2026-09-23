@@ -213,11 +213,16 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
 
   const authDeps = (traceId: string): AuthRouteDeps => ({ store: users(), webConfig, env, throttle, hops: config.trustedProxyHops, now: clock, traceId });
 
-  /** §5 C2.7 and §4 B4: a denied request is audited once, at most 5 times per session per minute. */
+  /**
+   * §5 C2.7 and §4 B4: a denied request is audited once, at most 5 times a minute. The budget is keyed on the **user**,
+   * not the session: nothing limits how many sessions one account may open, so a per-session key would hand a fresh
+   * budget to every re-login, and B4's promise is that a staff account cannot flood a table nothing may delete from.
+   * The session id still goes into the row.
+   */
   const recordDenied = (ctx: WebAuthContext, route: string, traceId: string): void => {
     logEvent("access_denied", { trace_id: traceId, user_id: ctx.userId, route });
     if (!app?.userStore) return;
-    if (!deniedAudits.allow(ctx.sessionId, clock())) { metrics.increment("access_denied_suppressed_total"); return; }
+    if (!deniedAudits.allow(ctx.userId, clock())) { metrics.increment("access_denied_suppressed_total"); return; }
     void app.userStore.recordAudit({ actorUserId: ctx.userId, sessionId: ctx.sessionId, requestId: traceId, action: "access.denied", outcome: "denied", detail: { route } })
       .catch((error: unknown) => { logEvent("audit_write_failed", { trace_id: traceId, action: "access.denied", error: error instanceof Error ? error.message.slice(0, 120) : "unknown" }); });
   };

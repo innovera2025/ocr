@@ -994,11 +994,14 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     // The CHECK keeps expires_at after created_at, so an aged-out session is backdated as a whole.
     await superDb.query("UPDATE auth_sessions SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 second' WHERE id=$1", [expiring.sessionId]);
     assert.equal(await store.resolveSession(tokenHash("sess-expired"), 30), null, "past the absolute deadline too");
-    assert.deepEqual(await store.revokeSession(tokenHash("sess-live"), "logout", audit), { revoked: true });
+    // One statement does the whole logout: the actor of the audit row comes from the revoked row, not a second query.
+    assert.deepEqual(await store.revokeSession(tokenHash("sess-live"), "logout", randomUUID()), { revoked: true, userId: user.id });
     assert.equal(await store.resolveSession(tokenHash("sess-live"), 30), null, "revocation is immediate");
-    assert.deepEqual(await store.revokeSession(tokenHash("sess-live"), "logout", audit), { revoked: false }, "logout is idempotent");
-    assert.ok((await auditActions(TENANT_A, user.id)).includes("session.logout"));
-    await assert.rejects(store.revokeSession(tokenHash("sess-live"), "expired" as SessionRevokeReason, audit), /SESSION_REASON_INVALID/);
+    assert.deepEqual(await store.revokeSession(tokenHash("sess-live"), "logout", randomUUID()), { revoked: false, userId: null }, "logout is idempotent");
+    const logoutRow = await asApp<{ actor_user_id: string; session_id: string }>(TENANT_A,
+      "SELECT actor_user_id, session_id FROM audit_events WHERE action='session.logout' AND target_id=$1::uuid", [user.id]);
+    assert.deepEqual(logoutRow, [{ actor_user_id: user.id, session_id: session.sessionId }], "the logout is attributed to the session it closed");
+    await assert.rejects(store.revokeSession(tokenHash("sess-live"), "expired" as SessionRevokeReason, randomUUID()), /SESSION_REASON_INVALID/);
     await store.createSession({ userId: user.id, tokenHash: tokenHash("sess-disabled"), absoluteHours: 8, audit: auditAs(user.id) });
     await store.updateUser(user.id, { disabled: true }, audit);
     assert.equal(await store.resolveSession(tokenHash("sess-disabled"), 30), null, "disabling a user ends their sessions");

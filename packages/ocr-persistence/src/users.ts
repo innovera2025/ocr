@@ -21,7 +21,20 @@ export type CreateUserInput = Readonly<{ username: string; displayName: string; 
   audit: AuditContext }>;
 export type UpdateUserChanges = Readonly<{ displayName?: string | undefined; role?: UserRole | undefined; canExport?: boolean | undefined; disabled?: boolean | undefined }>;
 export type LoginFailureInput = Readonly<{ reason: string; audit: AuditContext; max?: number | undefined; lockMinutes?: number | undefined }>;
-export type CreateSessionInput = Readonly<{ userId: string; tokenHash: Buffer; absoluteHours: number; audit: AuditContext }>;
+/**
+ * `auditLogin: false` opens a session that is **not** a login: a password change rotates the session (§5 C5) and its
+ * outcome is `password.changed` alone, so a `login.succeeded` row here too would make §13's operator query count
+ * logins that never happened.
+ */
+export type CreateSessionInput = Readonly<{ userId: string; tokenHash: Buffer; absoluteHours: number; audit: AuditContext;
+  auditLogin?: boolean | undefined }>;
+
+/**
+ * Every auth query is one small indexed statement, and `POST /api/auth/logout` runs without a session, a CSRF token or
+ * a throttle, so none of them may hold a pooled connection open behind a stalled client or a lock (B3). The lock wait
+ * of the last-admin guard is the only one that ever queues, and it queues behind another request, not behind a human.
+ */
+const AUTH_TIMEOUTS = { statementTimeoutMs: 5_000, idleInTransactionTimeoutMs: 10_000 } as const;
 
 /** D5.4: ten consecutive failures lock an account for fifteen minutes. The lock is invisible to the client (§5 C3.5). */
 export const LOGIN_MAX_FAILURES = 10;
@@ -86,7 +99,7 @@ export class PostgresUserStore {
   constructor(private readonly pool: Pool, readonly tenantId: string) {}
 
   private run<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
-    return withTenant(this.pool, this.tenantId, work);
+    return withTenant(this.pool, this.tenantId, work, AUTH_TIMEOUTS);
   }
 
   private audit(client: PoolClient, audit: AuditContext, event: Omit<AuditEvent, "tenantId" | keyof AuditContext>): Promise<void> {
@@ -169,7 +182,9 @@ export class PostgresUserStore {
         [this.tenantId, input.userId, input.tokenHash, input.absoluteHours]);
       const row = result.rows[0]!;
       const sessionId = String(row.id);
-      await this.audit(client, { ...input.audit, sessionId }, { action: "login.succeeded", targetType: "user", targetId: input.userId });
+      if (input.auditLogin !== false) {
+        await this.audit(client, { ...input.audit, sessionId }, { action: "login.succeeded", targetType: "user", targetId: input.userId });
+      }
       return { sessionId, createdAt: iso(row.created_at) ?? "", expiresAt: iso(row.expires_at) ?? "" };
     });
   }
@@ -206,21 +221,28 @@ export class PostgresUserStore {
       [sessionId, this.tenantId]));
   }
 
-  /** Revocation is immediate: the next request resolves nothing. Only a logout is an action worth auditing on its own. */
-  async revokeSession(tokenHash: Buffer, reason: SessionRevokeReason, audit?: AuditContext): Promise<{ revoked: boolean }> {
+  /**
+   * Revocation is immediate: the next request resolves nothing. Only a logout is an action worth auditing on its own,
+   * and the UPDATE already returns the session and its user, so the logout route needs no `resolveSession` first —
+   * which halves what an unauthenticated `POST /api/auth/logout` costs the pool. `requestId` is the only thing the
+   * caller can add: the actor of a logout is always the session's own user.
+   */
+  async revokeSession(tokenHash: Buffer, reason: SessionRevokeReason, requestId?: string): Promise<{ revoked: boolean; userId: string | null }> {
     if (!REVOKE_REASONS.has(reason)) throw new Error("SESSION_REASON_INVALID");
-    if (!Buffer.isBuffer(tokenHash) || tokenHash.length !== SESSION_TOKEN_HASH_BYTES) return { revoked: false };
+    if (!Buffer.isBuffer(tokenHash) || tokenHash.length !== SESSION_TOKEN_HASH_BYTES) return { revoked: false, userId: null };
     return this.run(async (client) => {
       const result = await client.query<Row>(
         `UPDATE auth_sessions SET revoked_at = now(), revoked_reason = $3
          WHERE organization_id = $1::uuid AND token_hash = $2 AND revoked_at IS NULL RETURNING id, user_id`,
         [this.tenantId, tokenHash, reason]);
       const row = result.rows[0];
-      if (!row) return { revoked: false };
-      if (reason === "logout" && audit) {
-        await this.audit(client, { ...audit, sessionId: String(row.id) }, { action: "session.logout", targetType: "user", targetId: String(row.user_id) });
+      if (!row) return { revoked: false, userId: null };
+      const userId = String(row.user_id);
+      if (reason === "logout") {
+        await this.audit(client, { actorUserId: userId, sessionId: String(row.id), requestId },
+          { action: "session.logout", targetType: "user", targetId: userId });
       }
-      return { revoked: true };
+      return { revoked: true, userId };
     });
   }
 

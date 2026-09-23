@@ -41,15 +41,20 @@ function sessionPayload(user: SessionUser, token: string, deps: AuthRouteDeps, e
   return { user, csrfToken: csrfTokenFor(token), idleMinutes: deps.webConfig.sessionIdleMinutes, expiresAt };
 }
 
-/** Opens a session for an already-authenticated user (login and password change), so neither path can forget a step. */
-async function openSession(response: ServerResponse, user: SessionUser, deps: AuthRouteDeps, status = 200): Promise<void> {
+/**
+ * Opens a session for an already-authenticated user (login and password change), so neither path can forget a step.
+ * `login` is false for the password change: its outcome is `password.changed` alone (§5 C5), it moves no
+ * `auth_logins_total{result="success"}`, and neither the audit row nor the stdout mirror (§6 D9) may claim a login
+ * that never happened — the two trails have to agree for either to be worth reading.
+ */
+async function openSession(response: ServerResponse, user: SessionUser, deps: AuthRouteDeps, login: boolean): Promise<void> {
   const token = newSessionToken();
   const session = await deps.store.createSession({
     userId: user.id, tokenHash: hashSessionToken(token), absoluteHours: deps.webConfig.sessionAbsoluteHours,
-    audit: { actorUserId: user.id, requestId: deps.traceId }
+    audit: { actorUserId: user.id, requestId: deps.traceId }, auditLogin: login
   });
-  logEvent("login_succeeded", { trace_id: deps.traceId, user_id: user.id, session_id: session.sessionId });
-  respond(response, status, sessionPayload(user, token, deps, session.expiresAt), { "set-cookie": serializeSessionCookie(deps.env, token) });
+  if (login) logEvent("login_succeeded", { trace_id: deps.traceId, user_id: user.id, session_id: session.sessionId });
+  respond(response, 200, sessionPayload(user, token, deps, session.expiresAt), { "set-cookie": serializeSessionCookie(deps.env, token) });
 }
 
 async function revokeCookieSession(request: IncomingMessage, deps: AuthRouteDeps, reason: "relogin"): Promise<void> {
@@ -85,10 +90,19 @@ async function login(request: IncomingMessage, response: ServerResponse, deps: A
     return;
   }
 
+  // D5.2, **before** the ~250 ms verify and before the gate: `retryAfter` above and this `record` are one synchronous
+  // step, so concurrent attempts on one name cannot all read a zero counter while the first hash is still running.
+  // A success clears the window again (step 9), so a staff member who finally types the right password is unaffected.
+  throttle.countUsername(username, at);
+
   const user = await store.findLoginUser(username);
   let verified = false;
   let rehash: string | undefined;
-  if (user === null && throttle.unknownBudgetSpent(at)) {
+  const budgetSpent = user === null && throttle.unknownBudgetSpent(at);
+  // D5.3 is read before it is spent, so the budget still buys exactly `unknownLimit` hashes; counting it here rather
+  // than on the failure path means a `LOGIN_BUSY` on a made-up name also counts against it.
+  if (user === null) throttle.countUnknown(at);
+  if (budgetSpent) {
     // The budget sits in front of `loginGate` (§4 B1), so a flood of made-up names stops costing a hash each.
     await delay(UNKNOWN_NAME_DELAY_MS);
   } else {
@@ -114,8 +128,6 @@ async function login(request: IncomingMessage, response: ServerResponse, deps: A
   const reason = user === null ? "unknown_user" : !verified ? "bad_password" : locked ? "locked" : user.disabledAt !== null ? "disabled" : null;
   if (user === null || reason !== null) {
     throttle.countIp(ip, at);
-    throttle.countUsername(username, at);
-    if (user === null) throttle.countUnknown(at);
     metrics.increment("auth_logins_total", { result: "invalid" });
     respond(response, 401, { error: "INVALID_CREDENTIALS" });
     if (user === null) {
@@ -131,8 +143,11 @@ async function login(request: IncomingMessage, response: ServerResponse, deps: A
     return;
   }
 
-  // Revealed only after a correct password, and it does not count as a failure (§5 C3.8).
+  // Revealed only after a correct password, and it does not count as a failure (§5 C3.8) — but it is not a success
+  // either: the username window keeps the attempt it counted above and the IP window counts it too, so a consumed
+  // temporary password (D6 leaves it in the row on purpose) cannot buy an unlimited number of 32 MiB hashes.
   if (user.passwordExpiresAt !== null && Date.parse(user.passwordExpiresAt) <= at) {
+    throttle.countIp(ip, at);
     metrics.increment("auth_logins_total", { result: "expired" });
     respond(response, 401, { error: "PASSWORD_EXPIRED" });
     return;
@@ -145,21 +160,21 @@ async function login(request: IncomingMessage, response: ServerResponse, deps: A
   await openSession(response, {
     id: user.id, username: user.username, displayName: user.displayName, role: user.role, canExport: user.canExport,
     mustChangePassword: user.mustChangePassword
-  }, deps);
+  }, deps, true);
 }
 
-/** §5 C5: idempotent, needs no CSRF token, and always answers 204 with the clearing cookie. */
+/**
+ * §5 C5: idempotent, needs no CSRF token, and always answers 204 with the clearing cookie. It is the one route that
+ * touches the database with no session, so it is **one** statement: the revoking UPDATE returns the session and its
+ * user, which is everything the audit row and the log line need.
+ */
 async function logout(request: IncomingMessage, response: ServerResponse, deps: AuthRouteDeps): Promise<void> {
   const token = readSessionCookie(headerValue(request.headers.cookie), deps.env);
   if (token) {
-    const tokenHash = hashSessionToken(token);
-    const session = await deps.store.resolveSession(tokenHash, deps.webConfig.sessionIdleMinutes);
-    const audit: AuditContext | undefined = session === null ? undefined
-      : { actorUserId: session.userId, sessionId: session.sessionId, requestId: deps.traceId };
-    const { revoked } = await deps.store.revokeSession(tokenHash, "logout", audit);
+    const { revoked, userId } = await deps.store.revokeSession(hashSessionToken(token), "logout", deps.traceId);
     if (revoked) {
       metrics.increment("auth_sessions_revoked_total", { reason: "logout" });
-      logEvent("logout", { trace_id: deps.traceId, ...(session ? { user_id: session.userId } : {}) });
+      logEvent("logout", { trace_id: deps.traceId, ...(userId ? { user_id: userId } : {}) });
     }
   }
   respondNoContent(response, { "set-cookie": clearSessionCookie(deps.env) });
@@ -210,7 +225,7 @@ async function changePassword(request: IncomingMessage, response: ServerResponse
   const { revoked } = await deps.store.changeOwnPassword(user.id, outcome.hash, { actorUserId: user.id, sessionId: ctx.sessionId, requestId: deps.traceId });
   if (revoked > 0) metrics.increment("auth_sessions_revoked_total", { reason: "password_changed" }, revoked);
   logEvent("password_changed", { trace_id: deps.traceId, user_id: user.id, revoked });
-  await openSession(response, { ...contextUser(ctx), displayName: user.displayName, role: user.role, canExport: user.canExport, mustChangePassword: false }, deps);
+  await openSession(response, { ...contextUser(ctx), displayName: user.displayName, role: user.role, canExport: user.canExport, mustChangePassword: false }, deps, false);
 }
 
 const CREATE_KEYS: ReadonlySet<string> = new Set(["username", "displayName", "role", "canExport"]);

@@ -63,14 +63,15 @@ export async function insertAudit(client: PoolClient, event: AuditEvent): Promis
       auditDetailJson(event.detail)]);
 }
 
-/** `access.denied`: at most 5 rows per session per minute (§4 B4). */
+/** `access.denied`: at most 5 rows a minute for the key the caller chooses — the user, since sessions are free (§4 B4). */
 export const ACCESS_DENIED_AUDIT_LIMIT = 5;
 export const ACCESS_DENIED_AUDIT_WINDOW_MS = 60_000;
 
 /**
  * A per-key sliding budget for audit rows a client can provoke. Nothing may delete from `audit_events`, so a staff
- * session that keeps hitting an admin route must not be able to fill the table: past the budget the caller increments
- * `access_denied_suppressed_total` instead of writing. Keys are bounded (oldest first) so they cannot grow the process.
+ * account that keeps hitting an admin route must not be able to fill the table: past the budget the caller increments
+ * `access_denied_suppressed_total` instead of writing. Keys are bounded (oldest first) so they cannot grow the
+ * process, which is why the caller keys on the user (finite) rather than the session (one per login).
  */
 export class AuditRateLimiter {
   private readonly windows = new Map<string, { count: number; resetAt: number }>();
