@@ -321,8 +321,11 @@ async function download(response: ServerResponse, ctx: WebAuthContext, query: Ex
     // Step 2: the audit row is committed BEFORE the first byte. Only `export.started` is guaranteed — a crash, a
     // redeploy or an OOM kill during the stream would otherwise let the data leave with no audit row at all.
     await audit(deps, ctx, "export.started", "success", { ...filterDetail(query), format, rows: open.total });
-    // The gate's wall clock. `rows()` honours close(), so this ends a stalled download instead of only refusing new ones.
-    const timer = setTimeout(() => { void open.close(); }, EXPORT_WALL_CLOCK_MS);
+    // The gate's wall clock. `rows()` honours close(), so this ends a stalled download instead of only refusing new
+    // ones — but a closed cursor ends the loop QUIETLY, so the flag is what stops a truncated file being sent as a
+    // complete one with a 200. (The cursor enforces the same budget itself; this half ends a download stuck on drain.)
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; void open.close(); }, EXPORT_WALL_CLOCK_MS);
     timer.unref?.();
     try {
       const columns = exportColumns(query.columns);
@@ -340,6 +343,11 @@ async function download(response: ServerResponse, ctx: WebAuthContext, query: Ex
         await write(response, chunk);
         rows += page.length;
       }
+      if (timedOut) throw new Error("EXPORT_TIMEOUT");
+      // The count and the cursor read the same REPEATABLE READ snapshot through the same WHERE, so they agree on how
+      // many rows exist. A short stream means something ended the cursor early, and a truncated file must never be
+      // handed over as a complete one with a 200 — the socket is destroyed instead and the browser's blob() rejects.
+      if (rows !== open.total) throw new Error("EXPORT_TRUNCATED");
       complete = true;
       response.end();
     } finally { clearTimeout(timer); }

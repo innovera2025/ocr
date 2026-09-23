@@ -2204,3 +2204,13 @@ write the deviation down instead of diverging silently.
   log and the session table rather than from Prometheus. If per-user attribution is wanted it belongs in
   `audit_events` (a `document.read` row above a per-session threshold), which is a schema-free change for a later
   release — not a label.
+
+**C10 addendum (found while reviewing C10 itself)**
+
+- **A short stream is an error, not a finished file.** The gate's wall clock ends a stuck download by closing the
+  cursor, and `rows()` now honours `closed` — which means the loop ends *quietly*. Left alone, a timed-out export
+  would have been sent as a complete file with a 200 and a matching `export.completed` row. The route therefore checks
+  the invariant the snapshot gives it: `count(*)` and the cursor read the same `REPEATABLE READ` snapshot through the
+  same WHERE, so the rows written must equal `cursor.total`. Anything less raises `EXPORT_TRUNCATED` (and a wall-clock
+  stop raises `EXPORT_TIMEOUT` first, to name the cause), the socket is destroyed, the browser's `blob()` rejects and
+  nothing is saved. `export.failed` records how many rows did leave.

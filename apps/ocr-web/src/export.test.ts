@@ -49,7 +49,7 @@ function deferred(): Deferred {
 
 type StoreOptions = Readonly<{
   total?: number; pageSize?: number; failAfter?: number; gateBeforePage?: number; gate?: Deferred;
-  openError?: string; previewTotal?: number;
+  openError?: string; previewTotal?: number; stopAfter?: number;
 }>;
 type FakeStore = ExportStore & { closed: number; opened: number; filters: DocumentFilter[]; maxRows: number[] };
 
@@ -74,6 +74,9 @@ function fakeStore(documents: readonly ExportDocument[], options: StoreOptions =
         try {
           for (let sent = 0, page = 0; sent < total; page += 1) {
             if (options.gate && options.gateBeforePage === page) await options.gate.promise;
+            // What the gate's 10-minute timer does: it closes the cursor while the generator is suspended, and the
+            // loop then ends QUIETLY on the next turn.
+            if (options.stopAfter !== undefined && sent >= options.stopAfter) { await close(); return; }
             if (options.failAfter !== undefined && sent >= options.failAfter) throw new Error("PG_STREAM_DIED");
             const size = Math.min(pageSize, total - sent);
             yield Array.from({ length: size }, (_unused, index) => documents[(sent + index) % documents.length]!);
@@ -256,6 +259,18 @@ test("export.started is committed before the first byte, and survives a stream t
     assert.deepEqual([failed?.detail?.complete, failed?.detail?.rows], [false, 3]);
     assert.equal(instance.store.closed, 1, "the connection goes back whatever happened");
     assert.ok(!instance.audits.some((event) => event.action === "export.completed"));
+  });
+});
+
+test("a cursor that ends early never hands over a truncated file with a 200", async () => {
+  const instance = app(fakeStore([document()], { total: 10, pageSize: 1, stopAfter: 4 }));
+  await withServer(instance, async (base) => {
+    await assert.rejects(fetch(`${base}/api/exports/documents.csv`).then((response) => response.arrayBuffer()),
+      "the socket is destroyed, so the browser saves nothing");
+    const failed = instance.audits.find((event) => event.action === "export.failed");
+    assert.deepEqual([failed?.detail?.rows, failed?.detail?.complete], [4, false]);
+    assert.ok(!instance.audits.some((event) => event.action === "export.completed"),
+      "the count and the cursor share one snapshot: 4 of 10 rows means something ended it early");
   });
 });
 
