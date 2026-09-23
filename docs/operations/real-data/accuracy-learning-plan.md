@@ -415,6 +415,7 @@ Cost key: **0 calls** = scored offline on stored answers, no model time, no per-
 frozen set unless stated.
 
 ### W1 — Parser and vocabulary fixes (`local-ai/`, 0 calls) — **do first**
+> **SHIPPED 2026-09-23. The measured result, and where it differs from the targets below, is §12.**
 W1a Accept `Nationality` / `Hotel Name` anywhere in a line, including glued to their Chinese label, and assign the
 "labels block then values block" answer shape in form order, flagged (`ocr_normalize.py:907-914,938-948`).
 W1b Drop values that contain no letters (`:966-968`).
@@ -702,9 +703,14 @@ below are superseded where the frozen file differs — the file is the baseline,
   their own **recall** baseline and are deliberately **not** folded into G1's page counts, which would otherwise be
   incomputable.
 * **G2 accuracy:** paired page-flip accounting; every flip named. A deterministic change must explain **all** of them.
-* **G3 review budget:** right-but-flagged may rise by at most +5 per field unless wrong-and-unflagged falls. Room validation
+* **G3 review budget:** the **flagged pages** of a field (right-but-flagged **+** wrong-but-flagged — the pages a reviewer
+  must actually open) may rise by at most +5 per field unless wrong-and-unflagged falls. Room validation
   (12 → **21** at ≥ 1 vote, or 12 → 31 at ≥ 2 — both remove the same one silent error, see §8.3) and the body-map work are the
   two pre-agreed exceptions; they need the decision in §8.
+  *(Corrected 2026-09-23 while measuring W1, §12. The gate was written and first implemented as "right-but-flagged alone",
+  which calls a **fix** a regression: correcting the value on a page that was already flagged moves it from wrong-flagged to
+  right-flagged at identical review cost, and W1 does that on 10 name pages with the field's flagged total unchanged at 76.
+  Counting both buckets is also the wider guard — the old form could not see a rise in wrong-but-flagged at all.)*
 * **G4 runtime:** deterministic **median ≤ 120 ms/page and max ≤ 200 ms/page**, model-stubbed — a single "≤ 150 ms" figure is
   not computable against a baseline whose max is already 152 ms and whose W2 configuration peaks at 174 ms (`final.txt`,
   `base`/`P3 source=prod`). Includes the learned-lookup budget: `_best` with its prefilter, measured at the entry cap (W3).
@@ -854,7 +860,7 @@ a variant must beat the baseline by more than that to earn a full run. Raw respo
 now      §4 scorer fix + replay harness                          DONE 2026-09-23 (§11), local-ai/tools/
          FROZEN INPUTS (G0), label hygiene                      0 calls ~1 d  ← still blocks every W2 measurement
          verify Local AI auth on the host (§2.5.9)                         0 calls ~0 d  ← precondition for W3
-then     W1 parser/vocabulary (incl. W1f)                                  0 calls ~2 d  ← biggest measured gain per day
+then     W1 parser/vocabulary (incl. W1f)                    DONE 2026-09-23 (§12), 0 calls  ← biggest measured gain
          W2 body-map/checkbox geometry, re-measured on the frozen PNGs;
             W2f's possibleMissedMark carrier ships BEFORE W2b/W2d          0 calls ~3 d
          W3a stop the bleeding (confirm audit-only, weight-0 rule)         0 calls ~1 d  ← must precede any new volume
@@ -971,3 +977,75 @@ Three things the harness proved about itself, because a benchmark nobody has che
 One rule the harness now enforces and the old scripts did not: **the scorer uses the reader's own normalisers and never carries
 an alias the reader lacks.** The old `natkey` hard-coded two country codes the master list is missing, which would have made
 W1c's master-list fix score as +0 while genuinely improving the product.
+
+---
+
+## 12. Step 2 — W1 parser and vocabulary fixes shipped (2026-09-23)
+
+`local-ai/ocr_normalize.py` + `local-ai/master_data.json` + 44 new synthetic-text cases in `tests/test_normalize.py`
+(493 local-ai tests pass; app `typecheck`/`test` 388/`lint` unchanged). §9's "W1 parser/vocabulary (incl. W1f)" line is
+done. **G0 frozen inputs and the label-hygiene hour are still outstanding** and still block every W2 number.
+
+Every figure below is `tools/benchmark.py --data <operator dir>` against `tools/baseline-v3.2-prod-95.txt`, 95 stored
+production answers, **0 model calls**, exit 0 (G1, G1b, G2, G3, G6 all PASS).
+
+| Field | Frozen v3.2 | After W1 | W1 target in §3 | Pages fixed (G2) |
+|---|---|---|---|---|
+| customer name | 41, W&U 1+2 = **3** | **51**, W&U 3 | 51 | 8, 18, 31, 36, 39, 51, 65, 76, 82, 85 |
+| nationality | 83, W&U 0 | **90**, W&U 0 | 90 (on the old, asymmetric key) | 31, 37, 51, 76, 82, 88, 89 |
+| hotel | 73, W&U **1** | **76**, W&U **0** | 76, W&U 0 | 24, 48, 51 (+ page 31's silent error) |
+| room | 73, W&U 1 | **74**, W&U 1 | 74 | 11 |
+| treatment names | 46, W&U 2 | **52**, W&U 2 | 49 (W1a–e) → 52 (W1f) | 56, 81, 93 (W1d) · 1, 61, 78 (W1f) |
+| treatments + durations | 42, W&U 2 | **47**, W&U 2 | 45 | 56, 81, 93 · 85 (W1e) · 61 (W1f) |
+| written total (31 pages) | 19, **12 unflaggable** | **24**, **7 unflaggable** | not a W1 target | 46, 56 (W1d) · 48, 49, 73 (W1e) |
+
+**0 pages broke, on any field.** Total wrong-and-unflagged 9 → **8** (the hotel silent error of §1A is gone; the
+remaining 8 are name 3, treatment 2, body map preferred 3 / avoid 1, room 1 — none of them a parser fault).
+`staffOnly.totalMinutes` still has no `needsReview` carrier, so its remaining 7 errors are silent by construction.
+
+**Review budget: not one field pays for this.** Flagged pages per field (right-flagged + wrong-flagged), before → after:
+name 76 → 76, hotel 30 → 30, treatment names 78 → 78, treatments+durations 78 → 78, nationality 20 → **16**,
+room 33 → **32**. The gains are pages that were already being reviewed and now carry the right value.
+
+What shipped, against §1A's five rows:
+
+* **W1a** — each customer label is matched together with the CJK twin printed next to it (`Nationality国籍`,
+  `Hotel Name 酒店`), so a label written in the middle of a row-shaped answer is a label and not part of the previous
+  value. `\b` could not do this: CJK is a word character, so `\bnationality\b` never matched `Nationality国籍`.
+  Plus the **labels-block / values-block** shape: when no value stands between two labels and the block after the last
+  one has exactly one line per label, the lines are read in **form order, every one flagged**. That is page 31, where
+  v3.2 served the customer's **name** as the hotel, unflagged — the plan's named parser fault.
+  And a guard the measurement forced: a value taken from a line **below** a mid-line label is flagged, because without
+  it the fix simply moved page 31's silent error onto page 8 (a whole row of values landing in the hotel field).
+* **W1b** — a free-text answer with no letter in it (a tick, a box glyph, a lone slash) is a mark, not a value: `raw`
+  is kept, `value` is null, flagged. Pages 24 and 48.
+* **W1c** — nationality now also matches **token by token** against exact master aliases (`中國 China`, `China People`),
+  always flagged when it does, and the two missing country codes **CHN** and **GBR** are in `master_data.json`.
+  The codes are worth 0 pages and −2 flags: the scorer uses the reader's own `normalize_nationality`, so both sides
+  moved together — which is exactly why §1E forbids teaching the scorer an alias the reader lacks.
+* **W1d** — a bracketed model note is dropped when the note word is anywhere inside the bracket, not only first
+  (`(with a handwritten note '…')` was becoming a treatment); a **trailing** bracketed Thai restatement of the line just
+  read is dropped (≥ 3 Thai consonants, no digits, so `(2 คน)`, `(5)` and `( ชม. )` are untouched); a one-character
+  leftover of a written unit (`90 นที` → `90 นท` + `ี`) merges into the item instead of becoming one; and the printed
+  tick box in front of a room number is skipped (page 11).
+* **W1e** — `visualAliases.hourUnit` gains the three observed shapes `5M`, `57`, `会`; and a written total with **no
+  unit** that cannot be a session length (< 30 or > 240 min) but starts with an hour count 1–4 is read as that many
+  hours, with a warning, and every item on the page is flagged. Pages 48, 49, 73.
+* **W1f** — the treatment master threshold 0.72 → **0.60**. Everything below `REVIEW_BELOW` (0.85) is flagged, so a
+  suggestion cannot go out silently; the stop at 0.60 rather than 0.50 stays precautionary, not measured.
+
+Two honesty notes this step owes the reader:
+
+1. **Stale gates.** W1 changes what the parser extracts, so on 21 pages a field's `raw` no longer matches the span the
+   stored token statistics were measured over, and the benchmark prints them: `customerInformation.name` 13 pages,
+   `nationality` 6, `hotelName` 3, `staffOnly.treatments` 8, `roomNo` 1. On those pages the **flag** is not
+   evidence-backed (the **value** is — it needs no logprobs). This does not touch the G1 verdict: no wrong-and-unflagged
+   page of any flaggable field coincides with a stale key (name W&U 24/29/75, room 5, treatment 23/88 are all outside
+   the stale lists), and all 10 recovered name pages came out **flagged**, which is the safe direction. Re-measuring the
+   flags needs a model run and belongs with W4.
+2. **Hot-oil naming is NOT a reader fix and was deliberately not made.** On pages 15, 16, 23 and 24 the reader reads
+   *hot oil* (`ออยร้อน`, its own master entry with a `Hot Oil` alias) and the label says plain oil (`นวดน้ำมัน`) —
+   §4's own label-hygiene note records that the labels themselves use both conventions (plain oil on 6 pages, hot oil on
+   3). Mapping one master treatment onto the other in the reader would delete a real menu distinction to match a label
+   defect: the §1E inversion this plan forbids. The +4 pages (and page 23, one of the two remaining silent treatment
+   errors) belong to the label-hygiene hour of §4, which is still outstanding.

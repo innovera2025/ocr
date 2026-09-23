@@ -634,3 +634,168 @@ def test_words_after_an_empty_time_label_stay_for_the_customer_parser():
     assert found["formNumber"] == "07904" and found["time"] is None
     assert "Anna Bell" in rest
     assert N.extract_header_fields("DATE 日期: 16 Aug 2026 TIME: 14:30")[0] == {"formNumber": None, "date": "16 Aug 2026", "time": "14:30"}
+
+
+# ---------------------------------------------------------------- W1 parser and vocabulary fixes (plan §1A, §3 W1)
+#
+# Every string below is synthetic: made-up names, the form's own printed labels and the master treatment words. The real
+# pages these rules were measured on stay in the operator's data directory and never enter this repository.
+
+
+@pytest.mark.parametrize("text, expected", [
+    # W1a: the second and third labels are written in the MIDDLE of the line, glued to their Chinese twin.
+    ("Name 姓名: Bram Volkers Nationality国籍 Belgian Hotel Name酒店 Riverside Lodge",
+     {"name": "Bram Volkers", "nationality": "Belgian", "hotelName": "Riverside Lodge"}),
+    ("Name 姓名: Anna Nationality 国籍: Thai Hotel Name 酒店:",
+     {"name": "Anna", "nationality": "Thai", "hotelName": None}),
+    ("Name 姓名 Chun Nationality国籍 Hotel Name酒店",      # only the name was written
+     {"name": "Chun", "nationality": None, "hotelName": None}),
+    ("Name姓名: Chun Nationality国籍: 中國 Hotel Name酒店:",
+     {"name": "Chun", "nationality": "中國", "hotelName": None}),
+])
+def test_w1a_a_bilingual_label_is_a_label_anywhere_on_the_line(text, expected):
+    parsed, fallback = N.parse_customer_text(text)
+    assert parsed == expected and fallback == frozenset()
+
+
+@pytest.mark.parametrize("text, expected", [
+    # ...but an English label word alone in mid-line is still part of the value (the v3.2 guard, unchanged).
+    ("Name: Anna Hotelling", {"name": "Anna Hotelling", "nationality": None, "hotelName": None}),
+    ("Hotel Name 酒店: Riverside Lodge Hotel", {"name": None, "nationality": None, "hotelName": "Riverside Lodge Hotel"}),
+    ("Name: Mary Nationality Unknown", {"name": "Mary Nationality Unknown", "nationality": None, "hotelName": None}),
+])
+def test_w1a_an_english_label_word_without_its_twin_stays_inside_the_value(text, expected):
+    assert N.parse_customer_text(text) == (expected, frozenset())
+
+
+def test_w1a_labels_block_then_values_block_is_read_in_form_order_and_flagged():
+    """The model echoes the three printed labels first and puts all the handwriting after the last one. v3.2 gave the
+    whole block to the hotel field UNFLAGGED, so the customer's name was served as the hotel (plan §1A, page 31)."""
+    parsed, fallback = N.parse_customer_text("Name 姓名\nNationality 国籍\nHotel Name 酒店\n\n\nDevika\n\n\nIndian\n\n\nRiverside")
+    assert parsed == {"name": "Devika", "nationality": "Indian", "hotelName": "Riverside"}
+    assert fallback == {"name", "nationality", "hotelName"}  # nothing in the answer says which line is which
+
+
+def test_w1a_labels_block_with_fewer_values_than_labels_is_not_guessed():
+    parsed, fallback = N.parse_customer_text("Name 姓名\nNationality 国籍\nHotel Name 酒店\n\nRiverside")
+    assert parsed["name"] is None and parsed["hotelName"] == "Riverside" and fallback == frozenset()
+
+
+def test_w1a_a_value_taken_from_below_a_mid_line_label_is_flagged():
+    """The model writes the labels with the first value inline and then repeats the whole row underneath: the row is not
+    the hotel name. Without the flag, W1a's fix for the labels-block shape simply moved a silent error onto this one."""
+    parsed, fallback = N.parse_customer_text("Name 姓名: Mina Nationality国籍 Hotel Name酒店\nMina HK Riverside")
+    assert parsed["name"] == "Mina" and parsed["hotelName"] == "Mina HK Riverside" and fallback == {"hotelName"}
+
+
+@pytest.mark.parametrize("raw", ["☑", "/", "□", "-- --", "123"])
+def test_w1b_an_answer_with_no_letters_is_a_mark_not_a_value(raw):
+    found = N.normalize_free_text(raw, False)
+    assert found["value"] is None and found["raw"] == raw and found["needsReview"]
+
+
+def test_w1b_a_normal_value_is_unchanged():
+    found = N.normalize_free_text("Riverside Lodge", False)
+    assert found["value"] == "Riverside Lodge" and not found["needsReview"]
+
+
+@pytest.mark.parametrize("raw, value", [
+    ("CHN", "Chinese"),          # W1c: the two country codes the master list was missing
+    ("GBR", "British"),
+])
+def test_w1c_country_codes_are_master_aliases(raw, value):
+    found = N.normalize_nationality(raw)
+    assert found["value"] == value and found["source"] == "master-fuzzy" and not found["needsReview"]
+
+
+@pytest.mark.parametrize("raw, value", [
+    ("中國 China", "Chinese"),     # the same nationality written twice
+    ("China People", "Chinese"),  # one exact alias plus a word the master list does not know
+    ("Thai ไทย", "Thai"),
+])
+def test_w1c_one_exact_alias_among_the_tokens_wins_and_is_flagged(raw, value):
+    found = N.normalize_nationality(raw)
+    assert found["value"] == value and found["source"] == "master-fuzzy" and found["needsReview"]
+
+
+@pytest.mark.parametrize("raw", ["China Japan", "Qwerty Zxcvb"])
+def test_w1c_two_nationalities_or_none_stay_unresolved(raw):
+    found = N.normalize_nationality(raw)
+    assert found["value"] == raw and found["source"] == "ocr" and found["needsReview"]
+
+
+def test_w1d_a_bracketed_english_note_anywhere_in_the_bracket_is_not_a_treatment():
+    """v3.2 only dropped a bracket whose FIRST word was a note word, so a whole sentence about the page became an item."""
+    treatment, _, _ = N.extract_staff_fields("Treatment: ไทย 1 ชม. (with a handwritten note 'total')\nRoom No. 5")
+    items, _, _, _ = N.parse_treatments(treatment)
+    assert [(i["value"], i["durationMinutes"]) for i in items] == [("นวดไทย", 60)]
+
+
+def test_w1d_a_trailing_bracketed_thai_restatement_is_dropped():
+    items, _, _, total = N.parse_treatments("เท้า + ออย 2 ชม. (ไทยหน้า)")
+    assert [(i["value"], i["durationMinutes"]) for i in items] == [("นวดเท้า", None), ("นวดน้ำมัน", None)]
+    assert total == 120  # and the hour figure after the last of two names is their total again
+
+
+@pytest.mark.parametrize("text, values", [
+    ("ไทย 1 ชม. (2 คน)", [("นวดไทย", 60)]),               # a guest count in brackets is a value, not a note
+    ("ไทย 1 ชม. (5)", [("นวดไทย", 60), (None, 5)]),       # a bracketed number is a value: reported, as in v3.2
+    ("ไทย 1 ชม. (ชม.)", [("นวดไทย", 60), (None, None)]),  # two Thai letters is too short to be a restatement
+])
+def test_w1d_brackets_that_are_not_restatements_are_left_exactly_as_v32_read_them(text, values):
+    items, _, _, _ = N.parse_treatments(text)
+    assert [(i["value"], i["durationMinutes"]) for i in items] == values
+
+
+@pytest.mark.parametrize("text", ["ออย 90 นที", "ไทย 90 นทท"])
+def test_w1d_a_one_character_leftover_of_a_unit_is_not_a_treatment(text):
+    items, _, _, _ = N.parse_treatments(text)
+    assert len(items) == 1 and items[0]["durationMinutes"] == 90 and items[0]["raw"] == text
+
+
+@pytest.mark.parametrize("line, room", [
+    ("Room No. ☐7", "7"),
+    ("Room No.: ☑ 7", "7"),
+    ("Room No. 5", "5"),      # unchanged
+    ("Room No.: ☑", None),    # a tick with no number is still no room number
+])
+def test_w1d_a_box_glyph_before_the_room_number_is_skipped(line, room):
+    assert N.extract_staff_fields(f"Treatment: ไทย 1 ชม.\nTherapist Name: พิพี\n{line}")[2] == room
+
+
+def test_w1e_an_hour_unit_look_alike_is_read_as_an_hour():
+    items, _, warnings, _ = N.parse_treatments("ไทย 2 5M")
+    assert [(i["value"], i["durationMinutes"], i["needsReview"]) for i in items] == [("นวดไทย", 120, True)]
+    assert any("5M" in w for w in warnings)
+
+
+@pytest.mark.parametrize("text, total", [
+    ("ไทย + ประคบ = 27", 120),    # "= 2 ชม." with the unit lost: 27 minutes is not a session
+    ("ไทย + ประคบ = 285", 120),   # ...or a doubled digit
+    ("ไทย + ประคบ = 26", 120),
+    ("ไทย + ประคบ = 90", 90),     # a possible session length is left alone
+    ("ไทย + ประคบ = 2 ชม.", 120),  # so is a total that carries its own unit
+    ("ไทย + ประคบ = 600", 600),   # 6 is not an hour count 1-4: reported as written, never invented
+])
+def test_w1e_an_impossible_written_total_is_read_as_hours(text, total):
+    _, _, _, written = N.parse_treatments(text)
+    assert written == total
+
+
+def test_w1e_a_re_read_total_flags_every_item_on_the_page():
+    items, _, warnings, total = N.parse_treatments("ไทย + ประคบ = 27")
+    assert total == 120 and all(i["needsReview"] for i in items)
+    assert any("not a possible session length" in w for w in warnings)
+
+
+def test_w1f_a_treatment_name_above_060_is_a_flagged_suggestion():
+    """0.72 -> 0.60 for suggestions only: everything below REVIEW_BELOW is flagged, so a suggestion cannot go out
+    silently, and a reviewer sees it next to the raw reading."""
+    assert N.similarity("ท่า", "นวดเท้า") < 0.72
+    items, _, _, _ = N.parse_treatments("ท่า 30")
+    assert [(i["value"], i["confidence"] < N.REVIEW_BELOW, i["needsReview"]) for i in items] == [("นวดเท้า", True, True)]
+
+
+def test_w1f_a_name_below_060_is_still_no_value():
+    items, _, _, _ = N.parse_treatments("Qwerty 30")
+    assert [(i["value"], i["needsReview"]) for i in items] == [(None, True)]

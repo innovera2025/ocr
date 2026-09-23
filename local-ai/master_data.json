@@ -36,7 +36,7 @@
       { "reading": "ออย", "lookalikes": ["004", "002", "00ย", "00Y", "OOW", "oow", "oo", "อยู่", "คอย"] },
       { "reading": "ไทย", "lookalikes": ["Inw", "lnw", "Thw"] }
     ],
-    "hourUnit": ["6M", "2M", "T2", "62", "5ม", "Ø2"],
+    "hourUnit": ["6M", "2M", "5M", "T2", "62", "57", "5ม", "Ø2", "会"],
     "digitOne": ["I", "l", "|", "/"]
   },
   "branches": [
@@ -45,7 +45,7 @@
   ],
   "nationalities": [
     { "value": "Thai", "aliases": ["Thailand", "ไทย", "คนไทย", "泰国"] },
-    { "value": "Chinese", "aliases": ["China", "PRC", "จีน", "ชาวจีน", "中国", "中國", "中国人"] },
+    { "value": "Chinese", "aliases": ["China", "PRC", "CHN", "จีน", "ชาวจีน", "中国", "中國", "中国人"] },
     { "value": "Taiwanese", "aliases": ["Taiwan", "ไต้หวัน", "台湾", "台灣"] },
     { "value": "Hong Konger", "aliases": ["Hong Kong", "HK", "ฮ่องกง", "香港"] },
     { "value": "Japanese", "aliases": ["Japan", "ญี่ปุ่น", "日本"] },
@@ -71,7 +71,7 @@
     { "value": "Canadian", "aliases": ["Canada", "แคนาดา", "加拿大"] },
     { "value": "Mexican", "aliases": ["Mexico", "เม็กซิโก"] },
     { "value": "Brazilian", "aliases": ["Brazil", "บราซิล"] },
-    { "value": "British", "aliases": ["UK", "United Kingdom", "England", "English", "อังกฤษ", "英国"] },
+    { "value": "British", "aliases": ["UK", "GBR", "United Kingdom", "England", "English", "อังกฤษ", "英国"] },
     { "value": "Irish", "aliases": ["Ireland", "ไอร์แลนด์"] },
     { "value": "French", "aliases": ["France", "ฝรั่งเศส", "法国"] },
     { "value": "German", "aliases": ["Germany", "เยอรมัน", "เยอรมนี", "德国"] },

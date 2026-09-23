@@ -233,11 +233,13 @@ _TABLE_CELL_JOIN = re.compile(r"</t[dh]\s*>\s*<t[dh](?:\s[^>]*)?>", re.I)
 _BLOCK_TAG = re.compile(r"</?(?:table|thead|tbody|tfoot|tr|p|div|li|ul|ol|h[1-6])(?:\s[^>]*)?/?>|<br\s*/?>", re.I)
 _INLINE_TAG = re.compile(r"</?(?:b|i|u|s|em|strong|span|sup|sub|font|mark|small|del|ins|code)(?:\s[^>]*)?>", re.I)
 _ANY_TAG = re.compile(r"</?[A-Za-z][^<>]*>")
-# A bracketed note that starts with a note word; "(5)" (a circled room number) or "(2 คน)" (guests) are values, not notes.
+# A bracketed note CONTAINING a note word; "(5)" (a circled room number) or "(2 คน)" (guests) are values, not notes.
+# W1d: the note word no longer has to be the first word, because the model also writes whole sentences about the page
+# ("(with a handwritten note 'total')"), and such a sentence became a treatment item.
 # Doubt notes ("(unclear)", "(illegible)", "(crossed out)") stay: they are the model's own doubt about the reading next to
 # them, and left in the text they keep that reading from matching a master confidently (it is flagged, as in v3.1).
 _MODEL_NOTE = re.compile(r"[(（\[](?![^()（）\[\]\n]*(?:unclear|illegible|crossed[\s-]*out))"
-                         r"[^\S\n]*(?:(?:hand[\s-]*written|handwriting|treatments?|therapists?|circled|signature)(?![A-Za-z])"
+                         r"[^()（）\[\]\n]*?(?:(?:hand[\s-]*written|handwriting|treatments?|therapists?|circled|signature)(?![A-Za-z])"
                          r"|ลายมือ|เขียนด้วยลายมือ)[^()（）\[\]\n]*[)）\]]", re.I)
 _CJK_LABEL_ECHO = re.compile(r"治療師名稱|治疗师名称|理疗师名称|理療師名稱|理疗师名|治療師|治疗师|理疗师|理療師|房間號|房间号|房號|房号|治療|治疗|疗法|療法")
 
@@ -272,6 +274,8 @@ def split_combined_text(text):
 
 
 _LABEL_LINE = re.compile(r"^(?:treatments?|therapist\s*name|room\s*no\.?)\b", re.I)
+# The form's printed tick boxes and the ticks drawn in them, as a model transcribes them.
+_BOX_GLYPH = r"[☐-☒■-□▪-▫◻-◾✓✔✗✘❏-❒⬛⬜]"
 
 
 def extract_staff_fields(text):
@@ -296,7 +300,10 @@ def extract_staff_fields(text):
         therapist = lines[0] if lines else None
     # "(5)": a circled room number. The value may be on the next line ("Room No.\n11"), but a label is never the value
     # ("Room No. 房号\nTreatment ...": its echoed Chinese label was dropped): the search moves on to the next "Room No.".
-    m = re.search(r"Room\s*No\.?\s*:?\s*[(（\[]?\s*(?!(?:treatments?|therapist|room|staff|no|name|date|time)\b)([A-Za-z0-9ก-๙]+)", text, re.I)
+    # W1d: the printed tick box in front of the number is transcribed as a box glyph ("Room No. ☐ 11") and used to
+    # swallow the whole answer -- the number after it is still the room number.
+    m = re.search(rf"Room\s*No\.?\s*:?\s*(?:{_BOX_GLYPH}\s*)*[(（\[]?\s*"
+                  r"(?!(?:treatments?|therapist|room|staff|no|name|date|time)\b)([A-Za-z0-9ก-๙]+)", text, re.I)
     if m:
         room = m.group(1).strip()
     return treatment, therapist, room
@@ -530,6 +537,17 @@ SEPARATOR_RE = re.compile(r"\s*(?:\+|＋|/|\n|;|、|，|(?<!\d),|,(?!\d)|\s&\s|\
 TOTAL_MARK_RE = re.compile(r"\s*(?:=+>?|＝|->|→|>|รวม|\btotal\b)\s*", re.I)
 # Leading guest count: "4 ไทย 1 ชม." (4 guests, one hour each), "2 คน ออย 90 นาที".
 GUESTS_RE = re.compile(r"^\s*(?P<n>[1-9]|1\d|20)\s*(?:คน|ท่าน|pax|persons?|guests?|x|×)?\s+(?=[^\W\d_])", re.I)
+# W1d: a trailing bracketed Thai restatement of the line just read ("เท้า + ออย 2 ชม. (ไทยหน้า)") -- the model's own
+# second transcription, not a treatment. Digits (a guest count "(2 คน)", a circled number "(5)") and anything shorter than
+# three Thai consonants (the unit "( ชม. )") are not restatements and stay.
+_THAI_RESTATEMENT = re.compile(r"\s*[(（\[][^\S\n]*(?P<body>[฀-๿\s]+)[)）\]]\s*$")
+
+
+def _strip_restatement(text):
+    m = _THAI_RESTATEMENT.search(text)
+    return text[:m.start()] if m and len(re.findall(r"[ก-ฮ]", m.group("body"))) >= 3 else text
+
+
 # Trailing guest count: "ไทย 90 นาที 2 ท่าน", "(2 คน)", "= 2 ท่าน", "x 2" / "× 2". A bare trailing number stays a duration.
 TRAILING_GUESTS_RE = re.compile(r"\s*(?:(?:[=x×]\s*)?[(（]?\s*(?P<n>[1-9]|1\d|20)\s*(?:คน|ท่าน|pax|persons?|guests?)\s*[)）]?"
                                 r"|(?<![a-z])[x×]\s*(?P<m>[1-9]|1\d|20))\s*$", re.I)
@@ -660,6 +678,11 @@ def _minutes(match):
     return int(round(minutes))
 
 
+# W1d: what is left of a written unit after the duration regex matched a prefix of it ("90 นที" -> "90 นท" + "ี",
+# "90 นทท" -> "90 นท" + "ท"). One character, or Thai vowel/tone marks only, is never a treatment name.
+_UNIT_FRAGMENT = re.compile(r"[^\W\d_]|[ัิ-ฺ็-๎]+")
+
+
 def _clean_name(text):
     text = BARE_NUMBER_RE.sub(" ", text)
     text = re.sub(r"^[\s.:;,*×\-–]+|[\s.:;,*×\-–]+$", "", re.sub(r"\s+", " ", text))
@@ -681,7 +704,9 @@ def _segment_groups(segment):
         pos = m.end()
     tail = segment[pos:]
     tail_name = _clean_name(tail)
-    if tail_name:
+    if tail_name and groups and _UNIT_FRAGMENT.fullmatch(tail_name):
+        groups[-1][2] = len(segment)  # "ออย 90 นที": the unit match ate "นท" and left "ี" -- a leftover of the unit, not an item
+    elif tail_name:
         groups.append([tail_name, pos, len(segment), []])
     elif groups and BARE_NUMBER_RE.search(tail):  # "ไทย 90 นาที 15": the stray number belongs to the last item
         groups[-1][2] = len(segment)
@@ -708,6 +733,13 @@ def _segment_groups(segment):
     return [(g[0], segment[g[1]:g[2]].strip(), g[3], g[4], (g[1], g[2])) for g in merged]
 
 
+# W1f: a treatment name is a SUGGESTION below REVIEW_BELOW (0.85) -- it is always flagged and a reviewer sees it next to
+# the raw reading -- so the match threshold buys pages at no risk of a silent error. 0.72 -> 0.60. The stop at 0.60 rather
+# than 0.50 is precautionary, not measured: 0.50 costs nothing on the 95 labelled pages either, but 95 pages are not
+# enough to rule out a coincidence at that similarity. Revisit on held-out evidence (plan W1f).
+TREATMENT_SUGGEST_ABOVE = 0.60
+
+
 def _match_treatment(name_raw, raw):
     for candidate in (name_raw, raw):
         verified = verified_match("treatment", candidate)
@@ -716,7 +748,7 @@ def _match_treatment(name_raw, raw):
     entry, score, alias = _best(name_raw, master().get("treatments", []), "name")
     if entry and score == 1.0:
         return entry["name"], 0.95 if alias else 1.0, "rule" if alias else "master-fuzzy"
-    if entry and score >= 0.72:
+    if entry and score >= TREATMENT_SUGGEST_ABOVE:
         return entry["name"], score, "master-fuzzy"
     return None, score, "master-fuzzy"
 
@@ -754,6 +786,18 @@ def _split_total(text):
     return text, None, None, False
 
 
+TOTAL_MIN, TOTAL_MAX = 30, 240  # no session in this batch is shorter or longer; outside it a bare total is not minutes
+
+
+def _total_as_hours(total, has_unit):
+    """W1e: a written total with NO unit that is impossible as minutes ("= 27", "= 285") but starts with an hour count
+    1-4 is the hour figure with the unit lost or a digit doubled ("= 2 ชม." read as "= 27"). -> (minutes, re-read?)."""
+    if total is None or has_unit or TOTAL_MIN <= total <= TOTAL_MAX:
+        return total, False
+    hours = int(str(total)[0])
+    return (hours * 60, True) if 1 <= hours <= 4 else (total, False)
+
+
 def _split_guests(text, has_total=False):
     """Leading guest count, only when the line has a duration of its own after it or a written total ("4 ไทย 1 ชม.",
     "4 ไทย + เท้า 30 = 90"): -> (text, guests). A lone "2 ไทย" stays a duration (v3.0 reading)."""
@@ -779,7 +823,7 @@ def parse_treatments(raw, visual_aliases=True):
     VISUAL_ALIAS_CONFIDENCE and always needsReview; each replacement is reported in the warnings."""
     if not raw:
         return [], [], [], None
-    text = raw.translate(THAI_DIGITS)
+    text = _strip_restatement(raw.translate(THAI_DIGITS))
     text, alias_spans, alias_notes = apply_visual_aliases(text) if visual_aliases else (text, [], [])
     trailing = TRAILING_GUESTS_RE.search(text)
     trailing_guests = None
@@ -787,6 +831,7 @@ def parse_treatments(raw, visual_aliases=True):
         text, trailing_guests = text[:trailing.start()], int(trailing.group("n") or trailing.group("m"))
     before_total = len(text)
     text, written_total, total_text, total_unit = _split_total(text)
+    written_total, total_as_hours = _total_as_hours(written_total, total_unit)
     total_span = (len(text), before_total) if written_total is not None else None  # every split keeps a prefix...
     body, guests = _split_guests(text, written_total is not None)
     base = len(text) - len(body)  # ...except the leading guest count: positions below are offset by it
@@ -841,6 +886,10 @@ def parse_treatments(raw, visual_aliases=True):
     named = [item for item in items if item["nameRaw"]]
     if written_total is not None:
         total = written_total
+        if total_as_hours:  # every item on the page was read against a total this parser re-interpreted
+            warnings.append(f"written total '{total_text}' is not a possible session length; read as {total} min")
+            for item in named:
+                item["_review"].add("total")
         missing = [item for item in named if item["durationMinutes"] is None]
         known = sum(item["durationMinutes"] for item in named if item["durationMinutes"] is not None)
         if len(missing) == 1:
@@ -894,10 +943,16 @@ def legacy_treatment(raw, items, durations):
 
 # ---------------------------------------------------------------- CUSTOMER INFORMATION
 
+# Each label is matched together with the CJK/Thai twin printed next to it ("Nationality国籍", "Hotel Name 酒店"), because
+# a model that transcribes the whole customer block as one line writes the second and third labels in the MIDDLE of it
+# ("Name 姓名: X Nationality国籍 Y Hotel Name酒店 Z"). A bilingual pair is a printed label wherever it stands (W1a).
 _CUSTOMER_LABELS = re.compile(
-    r"(?P<hotelName>\bhotel\s*name\b|\bhotel\b|酒店|โรงแรม)|(?P<nationality>\bnationality\b|国籍|國籍|สัญชาติ)|(?P<name>\bname\b|姓名|ชื่อ)",
-    re.I)
+    # `(?![A-Za-z])` and not `\b`: CJK is a word character, so "Nationality国籍" has no word boundary after the "y".
+    r"(?P<hotelName>\b(?:hotel\s*name|hotel)(?![A-Za-z])[^\S\n]*(?:酒店|โรงแรม)?|酒店|โรงแรม)"
+    r"|(?P<nationality>\bnationality(?![A-Za-z])[^\S\n]*(?:国籍|國籍|สัญชาติ)?|国籍|國籍|สัญชาติ)"
+    r"|(?P<name>\bname(?![A-Za-z])[^\S\n]*(?:姓名|ชื่อ)?|姓名|ชื่อ)", re.I)
 _CJK_LABELS = ("姓名", "国籍", "國籍", "酒店")
+_BILINGUAL_LABEL = re.compile(r"[A-Za-z][^\S\n]*(?:姓名|国籍|國籍|酒店|ชื่อ|สัญชาติ|โรงแรม)$")
 # The printed labels are bilingual ("Name 姓名"); a model may echo the second one in brackets ("Name (姓名): Chun") or
 # number its lines ("1. Name Chun"). Both are removed before label matching so they never end up in a value.
 _ECHOED_LABEL = re.compile(r"[(\[（【][^\S\n]*(?:姓名|国籍|國籍|酒店|ชื่อ|สัญชาติ|โรงแรม)[^\S\n]*[)\]）】]")
@@ -907,9 +962,12 @@ _LIST_MARKER = re.compile(r"(?m)^[^\S\n]*(?:\d+[.)]|[-*•])[^\S\n]+")
 def _is_label(text, m):
     """A label word only counts at the start of a line / table cell or right before a colon, so "Kaname", "Hotel Nikko"
     or "Anna Hotelling" inside a value never start a new field. Chinese labels also count as separate words
-    ("姓名 Chun 国籍 Chinese 酒店 Hilton"), but not inside a name ("曼谷洲际酒店")."""
+    ("姓名 Chun 国籍 Chinese 酒店 Hilton"), but not inside a name ("曼谷洲际酒店"). An English label written together with
+    its CJK/Thai twin ("Nationality国籍") is the printed label itself and counts anywhere on the line (W1a)."""
     before, after = text[:m.start()], text[m.end():]
     if re.search(r"(?:^|[\n|])[^\S\n]*$", before) or re.match(r"[^\S\n]*[:：]", after):
+        return True
+    if _BILINGUAL_LABEL.search(m.group(0)):
         return True
     return m.group(0) in _CJK_LABELS and (not before or before[-1].isspace()) and (not after or after[0].isspace())
 
@@ -927,6 +985,11 @@ def _clean_value(text):
     return None
 
 
+def _same_line(text):
+    """The value in `text` stands on the first line of it (the label's own line)."""
+    return _clean_value(text.replace("|", "\n").split("\n", 1)[0]) is not None
+
+
 def _not_a_name(line):
     """A line before the first customer label that is not the name: a date, clock time or session length (header / TIME
     box leftovers), a number, a header label, or no letters at all."""
@@ -940,13 +1003,32 @@ def parse_customer_text(text, expected=CUSTOMER_FIELDS):
     fallback fields (a frozenset) were not read under their own label and need review."""
     text = _LIST_MARKER.sub("", _ECHOED_LABEL.sub(" ", _clean_model_text(text)))
     found, matches = {}, [m for m in _CUSTOMER_LABELS.finditer(text) if _is_label(text, m)]
+    inline, offline = False, set()  # a value between two labels says which line belongs to which field; `offline`: see below
     for i, m in enumerate(matches):
-        key = m.lastgroup
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        value = _clean_value(text[m.end():end])
+        key, last = m.lastgroup, i + 1 == len(matches)
+        end = len(text) if last else matches[i + 1].start()
+        segment = text[m.end():end]
+        value = _clean_value(segment)
+        if value and not last:
+            inline = True
         if value and not found.get(key):
             found[key] = value
-    fallback = set()
+            # A label written mid-line belongs to a row-shaped answer ("Name 姓名: X Nationality国籍 Y"), so its value is on
+            # its own line. Text taken from a line BELOW such a label is a different answer shape and the assignment is a
+            # guess: keep it, flag it (without this, "Name 姓名: X Nationality国籍 Hotel Name酒店\nX Y Z" hands the hotel
+            # field a whole row of values unflagged).
+            if not re.search(r"(?:^|[\n|])[^\S\n]*$", text[:m.start()]) and not _same_line(segment):
+                offline.add(key)
+    if matches and not inline:
+        # "Labels block, then values block": the model echoed every printed label first and put all the handwriting after
+        # the last one ("Name 姓名\nNationality 国籍\nHotel Name 酒店\n\nA\n\nB\n\nC"). Giving that block to the last label
+        # alone puts the customer's NAME in the hotel field, unflagged (plan §1A). Read the lines in form order instead,
+        # every one of them flagged: the answer never said which line is which.
+        keys = [k for k in CUSTOMER_FIELDS if any(m.lastgroup == k for m in matches)]
+        lines = [v for v in (_clean_value(line) for line in text[matches[-1].end():].replace("|", "\n").splitlines()) if v]
+        if len(keys) >= 2 and len(lines) == len(keys):
+            return {k: (lines[keys.index(k)] if k in keys else None) for k in CUSTOMER_FIELDS}, frozenset(keys)
+    fallback = set(offline)
     if matches and not found.get("name") and "name" in expected:
         # The Name row is the top row of the crop and sits right above Nationality: real output sometimes drops only its
         # label ("Cynthia De La Cruz-Eikanter\nNationality:\nHotel Name:"), so the last real line before the first label is
@@ -964,12 +1046,38 @@ def parse_customer_text(text, expected=CUSTOMER_FIELDS):
 
 
 def normalize_free_text(raw, fallback):
-    suspicious = len(raw) > 80 or not re.search(r"[^\W\d_]", raw)
-    return field(raw, raw, 0.5 if (fallback or suspicious) else 0.8, "ocr", fallback or suspicious)
+    """A free-text customer field (name, hotel). W1b: an answer with no letter in it at all -- a tick, a box glyph, a
+    slash for "nothing written" -- is a mark, not a value: it is reported as raw with no value, flagged, instead of being
+    served as the customer's hotel."""
+    if not re.search(r"[^\W\d_]", raw):
+        return field(raw, None, 0.3, "ocr", True)
+    return field(raw, raw, 0.5 if (fallback or len(raw) > 80) else 0.8, "ocr", fallback or len(raw) > 80)
+
+
+_NAT_TOKENS = re.compile(r"[\s,;/|()\[\]]+")
+
+
+def _nationality_tokens(raw, entries):
+    """W1c: the distinct master entries that an individual token of `raw` matches EXACTLY ("中國 China" writes the same
+    nationality twice; "China People" is one alias plus a word the master list does not know). Fuzzy matching is
+    deliberately not used per token -- a 3-letter token is too short for a similarity score to mean anything."""
+    hits = set()
+    for token in _NAT_TOKENS.split(raw):
+        key = _key(token)
+        if not key:
+            continue
+        for entry in entries:
+            if any(_key(c) == key for c in (entry["value"], *entry.get("aliases", []))):
+                hits.add(entry["value"])
+    return hits
 
 
 def normalize_nationality(raw, fallback=False):
-    entry, score, _ = _best(raw, master().get("nationalities", []), "value")
+    entries = master().get("nationalities", [])
+    entry, score, _ = _best(raw, entries, "value")
     if entry and score >= 0.8:
         return field(raw, entry["value"], score, "master-fuzzy", fallback or score < 0.9)
+    hits = _nationality_tokens(raw, entries)
+    if len(hits) == 1:  # always flagged: the answer carried text the master list does not explain
+        return field(raw, hits.pop(), 0.8, "master-fuzzy", True)
     return field(raw, raw, 0.5, "ocr", True)

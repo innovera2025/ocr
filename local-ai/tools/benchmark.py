@@ -28,7 +28,7 @@ from tools import replay, scoring  # noqa: E402
 
 DEFAULT_BASELINE = HERE / "baseline-v3.2-prod-95.txt"
 COLUMNS = ("n", "right", "rightFlagged", "wrongFlagged", "wrongUnflagged", "markers", "uncertain", "want", "hit", "missed", "extra")
-REVIEW_BUDGET = 5  # §4 G3: right-but-flagged may rise by at most this per field unless wrong-and-unflagged falls
+REVIEW_BUDGET = 5  # §4 G3: flagged pages (right+wrong) may rise by at most this per field unless wrong-and-unflagged falls
 
 
 def load(data_dir, results):
@@ -73,7 +73,8 @@ def freeze(totals, path, meta):
               "#   G1b no list field's `hit` may fall or `missed` may rise: a missed item has no entry and so no flag, and",
               "#       v3.2 has no possibleMissedMark carrier (plan W2f), so every miss is silent by construction.",
               "#   G2  every page that flips right<->wrong must be named and explained; the page lists above are what it diffs.",
-              f"#   G3  rightFlagged may rise by at most +{REVIEW_BUDGET} per field unless that field's wrongUnflagged falls.",
+              f"#   G3  flagged pages (rightFlagged + wrongFlagged, the review budget) may rise by at most +{REVIEW_BUDGET} per",
+              "#       field unless that field's wrongUnflagged falls.",
               "#   G6  the replay and the scorer must be deterministic across two runs of the same inputs.",
               "#   G0, G4, G5, G7 are NOT computable from stored answers: they need the archived 1610 px production renders",
               "#       (G0/G5/G7) or the full deterministic image pipeline (G4, tests/bench_deterministic.py)."]
@@ -178,14 +179,18 @@ def print_gates(totals, frozen_fields, frozen_wrong, deterministic):
             if row["missed"] > base["missed"] or row["hit"] < base["hit"]:
                 g1b = False
                 print(f"  G1b  FAIL {field}: items found {base['hit']} -> {row['hit']}, missed {base['missed']} -> {row['missed']}")
-            rise = row["rightFlagged"] - base["rightFlagged"]
+            # The review budget is the number of pages a reviewer must open: rightFlagged + wrongFlagged. Counting
+            # rightFlagged alone would call a fix a regression -- correcting the value on an already-flagged page moves
+            # it from wrongFlagged to rightFlagged at identical review cost (W1: name 76 -> 76 flagged pages).
+            flagged, base_flagged = row["rightFlagged"] + row["wrongFlagged"], base["rightFlagged"] + base["wrongFlagged"]
+            rise = flagged - base_flagged
             if rise > REVIEW_BUDGET and row["wrongUnflagged"] >= base["wrongUnflagged"]:
                 g3 = False
-                print(f"  G3   FAIL {field}: right-but-flagged {base['rightFlagged']} -> {row['rightFlagged']} (+{rise}, budget "
-                      f"+{REVIEW_BUDGET}) with no fall in silent errors")
+                print(f"  G3   FAIL {field}: flagged pages {base_flagged} -> {flagged} (+{rise}, budget +{REVIEW_BUDGET}) with no "
+                      f"fall in silent errors; right-but-flagged {base['rightFlagged']} -> {row['rightFlagged']}")
         print(f"  G1   {'PASS' if g1 else 'FAIL'}  no field raised its wrong-and-unflagged count above the frozen baseline")
         print(f"  G1b  {'PASS' if g1b else 'FAIL'}  no list field lost item recall")
-        print(f"  G3   {'PASS' if g3 else 'FAIL'}  review budget (right-but-flagged +{REVIEW_BUDGET}/field unless silent errors fall)")
+        print(f"  G3   {'PASS' if g3 else 'FAIL'}  review budget (flagged pages +{REVIEW_BUDGET}/field unless silent errors fall)")
         print("  G2   paired page flips (a deterministic change must explain all of them):")
         flips = 0
         for field, row in totals.ordered():
