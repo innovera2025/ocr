@@ -217,7 +217,9 @@ dialog.modal{width:100%;max-width:none;height:100%;max-height:none;margin:0;padd
 dialog.modal::backdrop{background:rgba(250,250,250,.92)}
 dialog.modal.auth::backdrop{background:var(--canvas)}
 .m-wrap{min-height:100%;display:grid;place-items:center;padding:32px 16px}
-.m-card{width:min(440px,100%);padding:24px;border-radius:12px;background:var(--card);box-shadow:var(--float)}
+/* min-width:0 is what makes .x-scroll the scroll container: without it a grid item's automatic minimum size is the
+   min-content of the nowrap users table, so the whole card grew past the viewport and the admin had to pan sideways. */
+.m-card{width:min(440px,100%);min-width:0;padding:24px;border-radius:12px;background:var(--card);box-shadow:var(--float)}
 .m-card.wide{width:min(1060px,100%)}
 .m-card h1{font-size:32px;line-height:1.25;font-weight:600;letter-spacing:-.04em}
 .m-card h2{font-size:20px;line-height:1.35;font-weight:600;letter-spacing:-.02em}
@@ -260,12 +262,17 @@ body[data-auth="checking"] main,body[data-auth="checking"] .top-right{visibility
 body[data-auth="out"] #me,body[data-auth="out"] #me-open{display:none!important}
 @media (max-width:1180px){.stats{grid-template-columns:repeat(5,minmax(0,1fr))}}
 @media (max-width:860px){.d-body{display:block;overflow:auto}.d-preview{height:42vh;height:42dvh;box-shadow:inset 0 -1px 0 var(--line)}.d-editor{overflow:visible;padding:16px}.d-head{padding:12px 16px}.d-alert{padding:10px 16px}.d-foot{flex-direction:column;align-items:stretch;gap:8px;padding:10px 16px}.d-foot .draft{font-size:12px}.d-foot .draft:empty{display:none}.d-foot .acts{flex-wrap:wrap}.d-foot #d-cancel{order:1}.d-foot #d-save{order:2;flex:1}.d-foot #d-next{order:3;flex:1 1 100%}.p-content iframe{min-height:0}}
-@media (max-width:720px){main{padding:24px 16px 80px}.top{padding:0 16px}.brand .crumb,.brand .here{display:none}.hero{flex-direction:column;align-items:stretch;gap:16px}.hero h1{font-size:32px}.drop-inner{flex-direction:column;align-items:stretch;padding:16px}.up-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"name act" "state act" "bar bar";row-gap:4px;padding:8px 12px}.up-name{grid-area:name}.up-size{display:none}.up-state{grid-area:state}.bar{grid-area:bar}.up-act{grid-area:act}.batch{padding:16px}.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.stat dd{font-size:20px}.fld,.fld.grow{flex:1 1 100%;max-width:none;min-width:0}.toolbar .btn{flex:1}.t-grid{grid-template-columns:1fr}.notice{left:16px;right:16px;bottom:16px}th:first-child,td:first-child{width:168px;min-width:168px;max-width:168px}.c-file .m-only{display:inline-flex!important;margin-top:6px}}
+@media (max-width:720px){main{padding:24px 16px 80px}.top{padding:0 16px}.brand .crumb,.brand .here{display:none}.hero{flex-direction:column;align-items:stretch;gap:16px}.hero h1{font-size:32px}.drop-inner{flex-direction:column;align-items:stretch;padding:16px}.up-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"name act" "state act" "bar bar";row-gap:4px;padding:8px 12px}.up-name{grid-area:name}.up-size{display:none}.up-state{grid-area:state}.bar{grid-area:bar}.up-act{grid-area:act}.batch{padding:16px}.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.stat dd{font-size:20px}.fld,.fld.grow{flex:1 1 100%;max-width:none;min-width:0}.toolbar .btn{flex:1}.t-grid{grid-template-columns:1fr}.notice{left:16px;right:16px;bottom:16px}th:first-child,td:first-child{width:168px;min-width:168px;max-width:168px}.c-file .m-only{display:inline-flex!important;margin-top:6px}
+/* The 56px header must fit 375px: the brand, the connection chip and the one #me-open pill. The pill carries the whole
+   display name, and .btn is nowrap, so without a cap a long Thai name gives the page a horizontal scrollbar. The
+   connection text keeps its live region (it is only taken out of the flow), so its state is still announced. */
+.me-name{max-width:min(30vw,120px)}
+#conn-text{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);border:0}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 `;
 
 const BODY = String.raw`<a class="skip" href="#docs-title">ข้ามไปที่รายการเอกสาร</a>
-<header class="top"><div class="brand"><span class="mark" aria-hidden="true"></span><strong>INNOVERA</strong><span class="crumb" aria-hidden="true">/</span><span class="here">เอกสาร OCR</span></div><div class="top-right"><div id="conn" class="conn c-wait" role="status"><span class="dot" aria-hidden="true"></span><span id="conn-text">กำลังเชื่อมต่อ…</span></div><div id="me" class="me" hidden><span id="me-name" class="me-name"></span><span id="me-role" class="badge"></span><button id="users-open" class="btn sm" type="button" hidden>ผู้ใช้งาน</button><button id="pw-open" class="btn sm" type="button">เปลี่ยนรหัสผ่าน</button><button id="logout" class="btn sm ghost" type="button">ออกจากระบบ</button></div><button id="me-open" class="btn sm" type="button" hidden></button></div></header>
+<header class="top"><div class="brand"><span class="mark" aria-hidden="true"></span><strong>INNOVERA</strong><span class="crumb" aria-hidden="true">/</span><span class="here">เอกสาร OCR</span></div><div class="top-right"><div id="conn" class="conn c-wait" role="status"><span class="dot" aria-hidden="true"></span><span id="conn-text">กำลังเชื่อมต่อ…</span></div><div id="me" class="me" hidden><span id="me-name" class="me-name"></span><span id="me-role" class="badge"></span><button id="users-open" class="btn sm" type="button" hidden>ผู้ใช้งาน</button><button id="pw-open" class="btn sm" type="button">เปลี่ยนรหัสผ่าน</button><button id="logout" class="btn sm ghost" type="button">ออกจากระบบ</button></div><button id="me-open" class="btn sm" type="button" hidden><span id="me-open-name" class="me-name"></span></button></div></header>
 <main>
 <section class="hero"><div><h1>เอกสาร OCR</h1><p class="lede">อัปโหลดแบบฟอร์มลูกค้า ตรวจทานผลการอ่าน และยืนยันข้อมูลในที่เดียว</p></div><button id="pick" class="btn primary" type="button">อัปโหลดเอกสาร</button></section>
 <section id="drop" class="drop card" aria-labelledby="drop-title"><div class="drop-inner"><div class="drop-copy"><span class="drop-icon" aria-hidden="true">+</span><div><h2 id="drop-title" class="h-sm">ลากไฟล์มาวางที่นี่ หรือเลือกไฟล์จากเครื่อง</h2><p class="sub">PNG, JPG, WebP หรือ PDF · ครั้งละไม่เกิน 100 ไฟล์ · PDF หลายหน้าจะถูกแยกเป็นหนึ่งแถวต่อหน้า · ระบบอ่านแต่ละไฟล์แยกกัน ไฟล์ที่ผิดพลาดไม่กระทบไฟล์อื่น</p></div></div><button id="pick2" class="btn" type="button">เลือกไฟล์</button><input id="files" class="sr-only" type="file" multiple accept="image/png,image/jpeg,image/webp,application/pdf,.png,.jpg,.jpeg,.webp,.pdf" tabindex="-1" aria-hidden="true"></div>
@@ -470,14 +477,17 @@ function restoreAfterLogin(){if(!state.started||state.leaving)return;
 state.listSig='';
 if(!state.listAbort)loadDocuments();
 loadBatches();if(state.batchId)loadBatch();
-if($('drawer').open&&state.current&&state.current.documentId){const seq=state.openSeq;state.pdfView=false;renderHead();renderEditor();loadPreview(seq,state.current.documentId);loadReview(seq);}}
+/* clearPhi() blanked the drawer head, and loadReview() keeps its hands off a dirty drawer — which is exactly the case
+   this release exists for — so the head is restored from state here instead of waiting for a load that will not come. */
+if($('drawer').open&&state.current&&state.current.documentId){const seq=state.openSeq;state.pdfView=false;
+$('d-title').textContent=titleOf(state.current);pageLink();setDirty(state.dirty);renderHead();renderEditor();loadPreview(seq,state.current.documentId);loadReview(seq);}}
 function narrow(){return window.matchMedia('(max-width: 720px)').matches;}
 /* Below 720px a name, a badge and three pills would push the 56px header past 375px, so they collapse into one pill. */
 function showMenu(on){const small=narrow();$('me').hidden=!on||small;$('me-open').hidden=!on||!small;}
 function applyUser(){const u=state.user;if(!u)return;
 const name=str(u.displayName)||str(u.username),admin=u.role==='admin',role=ROLE[u.role]||ROLE.staff;
 document.body.dataset.auth='in';document.body.dataset.role=admin?'admin':'staff';
-$('me-name').textContent=name;$('me-role').textContent=role;$('me-open').textContent=name;$('me-who').textContent=name+' · '+role;
+$('me-name').textContent=name;$('me-role').textContent=role;$('me-open-name').textContent=name;$('me-who').textContent=name+' · '+role;
 $('users-open').hidden=!admin;$('me-users').hidden=!admin;
 showMenu(true);}
 /* Everything rendered from customer data. Only state.draft and the id of the open document survive, so an interrupted

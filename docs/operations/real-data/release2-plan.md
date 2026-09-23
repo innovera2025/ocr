@@ -1880,6 +1880,23 @@ write the deviation down instead of diverging silently.
   the existing five-state vocabulary (`waiting`/`uploading`/`done`/`failed`/`rejected`) cannot express without lying
   to `pump()` (a `waiting` row would be picked up again) or to the retry button (a `failed` row offers one). Both are
   counted in the upload summary, and `beforeunload` and the logout confirmation treat `authwait` like `waiting`.
+- **The collapsed pill's name sits in its own `.me-name` span, and `#conn-text` is visually hidden at ≤720px**
+  (fixed after review). F1 collapses four controls into one pill, but the pill carried the display name as its own
+  text and `.btn` is `white-space:nowrap`, so at 375px a normal Thai name pushed the 56px header past the viewport and
+  gave the whole page a horizontal scrollbar — which is exactly what the collapse and §12's manual check exist to
+  prevent. `text-overflow` does not apply to a flex container's anonymous text, so the name moved into
+  `<span id="me-open-name" class="me-name">`, which the ≤720px block caps at `min(30vw,120px)`; the connection chip
+  shrinks to its dot with `#conn-text` taken out of the flow (not `display:none`, so `role="status"` still announces
+  the state, and the chip keeps its `title`).
+- **`.m-card` gets `min-width:0`** (fixed after review). The users dialog is a grid item whose automatic minimum size
+  is the min-content of the nowrap users table, so `width:min(1060px,100%)` never bound it: the card rendered about
+  1025px wide at a 375px viewport and `.x-scroll` never became a scroll container, leaving the admin to pan the whole
+  dialog sideways to reach the heading, the close button and every form field.
+- **`restoreAfterLogin` repairs the drawer head itself** (fixed after review). F2 says the drawer is "re-rendered from
+  a fresh load" after a same-user login, and `clearPhi()` blanks `#d-title` and `#d-draft` — but `loadReview()`, the
+  only caller of `applyDocument()`, returns early while `state.dirty` is set, which is precisely the headline case.
+  The restore therefore sets `#d-title` from `titleOf(state.current)`, re-runs `pageLink()` (it also reset
+  `state.pdfView`) and re-renders the draft indicator before the load.
 - **The `≤720px` header collapse is driven by `matchMedia`, not by CSS alone.** §12 asks for a test that at phone
   width the header renders one `#me-open` pill "and no separate action pills", which no CSS rule can prove in the
   fake DOM. `showMenu()` sets `hidden` on `#me` and `#me-open` from `window.matchMedia('(max-width: 720px)')` (and on
@@ -1896,6 +1913,11 @@ write the deviation down instead of diverging silently.
   input in one case (a password input outside a form is a property of that input), and the banned-text rule
   (`Authorization`, `Bearer`, `/api/web-token`, `HS256`, `createHmac`, `AUTH_JWT`, `jwtSecrets`, `subtle.sign`) moved
   into the case that already owned the storage and cookie bans.
+- **Three cases were added after review**: the drawer head after a same-user login with a dirty draft (the head, the
+  `หน้า 12/95` page label and the parent-PDF button, none of which §12's headline case looked at); one tick asserting
+  that **every** call it makes carries `X-OCR-Background: 1` while the same function called by hand carries none (the
+  only check was a static needle, and the whole mechanism rests on those three loads reaching `fetch` synchronously);
+  and a static case pinning the phone-width rules above, since the fake DOM has no layout to measure.
 - **`load()`'s fakes.** Beyond §12's list (`replace`, `showModal`/`close`/`open`, `value`/`checked`, form submit,
   `headers.get`, a controllable clock) the harness also records each fetch's headers and body, each XHR's headers and
   `abort()`, and can make one upload hang — without which "no request is sent after B's login", "the same

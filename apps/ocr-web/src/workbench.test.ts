@@ -90,6 +90,19 @@ test("the drawer's label for pre-login reviews is the one the export and the sto
   assert.ok(inlineScript.includes(`const LEGACY_REVIEWER='${LEGACY_REVIEWER_LABEL}'`), LEGACY_REVIEWER_LABEL);
 });
 
+test("nothing in the header or the dialogs can outgrow a 375px viewport", () => {
+  // The collapsed pill carries the whole display name and `.btn` is nowrap, so the name must sit in the one element
+  // the ≤720px rules cap; otherwise a long Thai name gives the page a horizontal scrollbar (§12's manual check).
+  assert.match(markup, /<button id="me-open"[^>]*><span id="me-open-name" class="me-name"><\/span><\/button>/);
+  const phone = /@media \(max-width:720px\)\{([^@]*)\}/.exec(html)?.[1] ?? "";
+  assert.match(phone, /\.me-name\{max-width:min\(/, "the pill's name is capped again at phone width");
+  assert.match(phone, /#conn-text\{position:absolute/, "the connection chip shrinks to its dot, keeping its live region");
+  // A grid item's automatic minimum size is its min-content, which for the nowrap users table is about 1000px: without
+  // min-width:0 the wide card grows past the viewport instead of letting .x-scroll scroll the table inside it.
+  assert.match(html, /\.m-card\{[^}]*min-width:0/);
+  assert.match(html, /\.x-scroll\{overflow:auto/);
+});
+
 test("search box never exceeds the server's q limit (100 characters → otherwise 400 INVALID_QUERY)", () => {
   assert.match(markup, /<input id="q"[^>]*maxlength="100"/);
   assert.doesNotMatch(inlineScript, /\$\('q'\)\.value\.trim\(\)\.slice\(0,(?!100\))/);

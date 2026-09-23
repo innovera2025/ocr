@@ -397,6 +397,27 @@ test("polling re-arms after a login: an armed tick that fires during the wait do
   assert.ok(ctx.clock.timers.has(ctx.wb.state.timer), "the list keeps refreshing itself after the re-login");
 });
 
+test("only polling marks its calls X-OCR-Background; a user action never does", async () => {
+  // The header decides whether the request moves the idle deadline (§5 C4). If a user action ever carried it, staff
+  // would be logged out 30 minutes into a shift no matter how hard they were working.
+  const state: Server = { user: STAFF, csrf: "csrf-1", sessionStatus: 200 };
+  const ctx = await bootedIn(state, (url) => url.startsWith("/api/documents/") ? json(200, { document: { documentId: ID, filename: "a.png", status: "QUEUED", statusCategory: "queued" } }) : null);
+  ctx.wb.state.batchId = ID;
+  ctx.$("drawer").open = true;
+  ctx.wb.state.current = { documentId: ID, filename: "a.png", status: "QUEUED", statusCategory: "queued" };
+  ctx.clock.run(ctx.wb.state.timer);
+  await settle();
+  const polled = ctx.calls.filter((call) => call.url.startsWith("/api/"));
+  assert.equal(polled.length, 3, "the list, the batch and the open drawer");
+  for (const call of polled) assert.equal(call.headers["X-OCR-Background"], "1", call.url);
+  ctx.calls.length = 0;
+  await ctx.wb.loadDocuments();
+  await settle();
+  const byHand = ctx.calls.filter((call) => call.url.startsWith("/api/"));
+  assert.equal(byHand.length, 1);
+  assert.equal(byHand[0]?.headers["X-OCR-Background"], undefined, "the same function, called by a user, keeps the session alive");
+});
+
 test("the login overlay holds no customer data, and the draft behind it comes back", async () => {
   const state: Server = { user: STAFF, csrf: "csrf-1", sessionStatus: 200 };
   let listStatus = 200;
@@ -419,6 +440,32 @@ test("the login overlay holds no customer data, and the draft behind it comes ba
   await settle();
   await pending;
   assert.match(ctx.dom(), /สมหญิง ใจดี/, "the same user gets the rows and the draft back");
+});
+
+test("after a re-login the drawer head comes back even though the dirty draft blocks the reload", async () => {
+  const state: Server = { user: STAFF, csrf: "csrf-1", sessionStatus: 200 };
+  let listStatus = 200;
+  const ctx = await bootedIn(state, (url) => url.startsWith("/api/documents?") && listStatus === 401 ? json(401, { error: "UNAUTHENTICATED" }) : null);
+  ctx.$("drawer").open = true;
+  ctx.wb.applyDocument({ documentId: ID, filename: "intake-p12.png", parentDocumentId: "20000000-0000-4000-8000-000000000002",
+    parentFilename: "intake.pdf", pageNumber: 12, pageCount: 95, status: "NEEDS_REVIEW", statusCategory: "review",
+    structuredResult: { schemaVersion: 3, header: {}, customerInformation: {}, recommendationCard: {}, staffOnly: {} } });
+  assert.equal(ctx.$("d-title").textContent, "intake.pdf · หน้า 12/95");
+  ctx.wb.state.dirty = true;
+  listStatus = 401;
+  const pending = ctx.wb.loadDocuments();
+  await settle();
+  assert.equal(ctx.$("auth-dlg").open, true);
+  assert.equal(ctx.$("d-title").textContent, "กำลังโหลด…", "the head is cleared with the rest of the customer data");
+  listStatus = 200;
+  signIn(ctx);
+  await settle();
+  await pending;
+  // loadReview() returns early while the draft is dirty, so nothing else would ever repair the head.
+  assert.equal(ctx.$("d-title").textContent, "intake.pdf · หน้า 12/95", "the reviewer sees which page they are editing");
+  assert.equal(ctx.$("d-draft").textContent, "มีการแก้ไขที่ยังไม่ได้บันทึก");
+  assert.equal(ctx.$("p-pdf").hidden, false);
+  assert.equal(ctx.$("p-pdf").textContent, "เปิด PDF ต้นฉบับ (หน้า 12)", "the preview is the page image again, so the link offers the parent");
 });
 
 test("logging out with an upload in flight asks first, then revokes the session and reloads", async () => {
@@ -580,7 +627,9 @@ test("at phone width the header collapses to one pill instead of a name, a badge
   small.wb.applyUser();
   assert.equal(small.$("me").hidden, true, "a name, a badge and three pills would push the 56px header past 375px");
   assert.equal(small.$("me-open").hidden, false);
-  assert.equal(small.$("me-open").textContent, "บอส");
+  // The name goes into the element the ≤720px rules cap, not into the nowrap button itself: a long Thai display name
+  // would otherwise widen the 56px header past the viewport and give the whole page a horizontal scrollbar.
+  assert.equal(small.$("me-open-name").textContent, "บอส");
 });
 
 // ---- attribution in the drawer ---------------------------------------------------------------------------------------
