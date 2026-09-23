@@ -2021,3 +2021,58 @@ write the deviation down instead of diverging silently.
   `lines.length === checks.length` meaning "every check is a `check_sql` line". Their exact SQL is pinned in the new
   `test/batch-round-migration.test.ts`, next to the migration that grants them, and the DB suite proves the grant
   itself (`ocr_app` may write `round_opened_at`, may not write `label`, and `ocr_worker` may write neither).
+
+**C9 (the export data layer: `export.ts`, `documentFilterSql`, `openExport`/`previewExport` and their tests)**
+
+- **`flattenDocument` returns typed values, and the display rules sit beside it.** H3 names `flattenExportRow(row, set,
+  …)`; the function is `flattenDocument` (design §3.4 and the C9 brief) and it returns one **typed** value per column —
+  numbers stay numbers, a `datetime` stays the ISO UTC instant — because the same flattening has to serve three
+  readers whose rules differ: the CSV renders Bangkok wall-clock and truncates at 32,000 characters, JSONL must keep
+  the instant and must **not** truncate (H5), and the preview must show the CSV's strings exactly. `formatCell` and
+  `exportCells` hold those display rules, so the file and the preview cannot drift, and the JSONL writer in C10 can
+  emit `values` as they are. Truncation and the formula guard therefore never touch JSONL, which is the H5 rule.
+- **`export.ts` takes an `ExportDocument`, not a pg row.** H3 puts the flattening in a pure module; the row mapper
+  (`toExportDocument`) stays in `index.ts` next to `toListItem`, so `export.ts` imports no driver type and every cell
+  rule — the `" (?)"` fallback, the joined lists, the five-and-up treatments, the detailed columns — is a unit test
+  with no database. It also keeps the import direction one-way: `export.ts` never imports its own barrel.
+- **`openExport` resolves to an `ExportCursor`, rather than a generator whose first step is the count.** H5 step 1
+  says to await the count before `writeHead` and step 2 to audit the total before it. `await store.openExport(…)`
+  does exactly that: it throws `EXPORT_TOO_LARGE` (a clean 400) before a byte, and hands back `{ total, rows(),
+  close() }`, so `total` is a plain field for the `export.started` row and `X-Export-Rows`. `rows()` is the async
+  generator H4 describes and its `finally` calls `close()`, which is what runs on `generator.return()` when the
+  browser disconnects.
+- **A refused export closes without a `CLOSE`.** H4 step 5 closes the cursor, commits and releases. When the row-count
+  pre-check refuses the export no cursor was ever declared, so `CLOSE export_cur` would raise 34000, mark the client
+  broken and destroy a healthy pooled connection on **every** `EXPORT_TOO_LARGE`. `close()` therefore only closes a
+  cursor it declared; the transaction still ends and the client goes back to the pool.
+- **The 2-exports-per-process cap lives in the store.** §3.3 and H5 both name it, and H5 puts `ExportGate` (per user,
+  plus the 10-minute wall clock) in the web. The reason for the cap is that each open export pins a pooled
+  connection, which only the store knows, so `MAX_CONCURRENT_EXPORTS` is enforced in `openExport` (`EXPORT_BUSY`) and
+  C10's gate adds the per-user limit and the clock on top.
+- **`documentFilterSql(tenantId, filter, params)` owns the tenant clause.** H2 extracts the list's WHERE builder; it
+  takes the tenant as its first argument and pushes `$1` itself, so no caller can build a filter without the
+  organization predicate, and `VISIBLE_SQL` is in every call. `ListDocumentsQuery` is now `DocumentFilter & {limit,
+  offset}`: one filter shape for the list and the export. The list's existing error codes are unchanged
+  (`INVALID_QUERY`, `BATCH_NOT_FOUND`, `DOCUMENT_NOT_FOUND`); a malformed or inverted date range and an unknown
+  `dateField` raise `INVALID_EXPORT_FILTER` **in the store as well** as in C10's parser, because those values reach a
+  `::date` cast and a pg error there would be a 500 quoting the input.
+- **The shared Thai vocabulary moved into `labels.ts`, and its parity test into `workbench.test.ts`.**
+  `DocumentStatusCategory`, `DeliveryStatus` and `DOCUMENT_STATUS_CATEGORIES` moved there from `index.ts` (the barrel
+  still re-exports them, so no import anywhere changed) so the pure export module can read the category and delivery
+  labels without importing the barrel. §12 puts "the Thai labels equal the workbench copies" in `export.test.ts`;
+  the assertion is in `workbench.test.ts` instead, beside the identical `LEGACY_REVIEWER` pin and where the inline
+  script is already parsed — it is the workbench's copies of `CATEGORY`, `DELIVERY` and `LABEL` that are being pinned.
+- **`reviewed_by`, `total_minutes` and the `" (?)"` marker.** The reviewer falls back to the latest
+  `ocr_corrections.verified_by` through a `LEFT JOIN LATERAL` (H3's "or else … for legacy field confirmations"), and
+  the cell is empty unless the row is confirmed. `total_minutes` is v3.1's `staffOnly.totalMinutes` and nothing else:
+  no sum is invented for older rows, which would be a number no one wrote. The `" (?)"` marker is applied to any
+  still-flagged reading, not only to one with no value — H3's "items still flagged get `" (?)"`" read the other way
+  would export an unreviewed guess as if it were confirmed. A confirmed row carries no flags (`markReviewed`).
+- **Read-only proof of the download's own transaction.** §12 asks for "an INSERT inside the export transaction fails
+  with 25006". `previewExport` runs through `withTenant(readOnly)`, which the DB suite already proves; the
+  download's own `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` plus both `set_config` timeouts are asserted
+  verbatim in the `index.test.ts` unit case, together with the cursor, the `FETCH` pages, `CLOSE`/`COMMIT`, the
+  release of the client, and a client `'error'` event that rejects the export instead of ending the process.
+- **`createDatabasePool` takes an optional `onError` (D10).** H4 asks for `pool.on('error')`; the handler is always
+  attached — an unhandled `'error'` is fatal in Node — and the callback is optional so the worker and the CLI are
+  unchanged. The web passes its logger when the export routes land in C10.

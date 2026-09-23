@@ -3,12 +3,15 @@ import type { OcrResponse } from "@innovera/ocr-client";
 import { applyReviewEdits, legacyTreatmentIndex, markReviewed, normalizeStructuredResult, summarizeDocument, type DocumentSummary, type DocumentView } from "./document-view.js";
 import { insertAudit, type AuditContext } from "./audit.js";
 import { isUuid, withTenant } from "./tenant.js";
+import { DOCUMENT_STATUS_CATEGORIES, type DeliveryStatus, type DocumentStatusCategory } from "./labels.js";
+import type { DocumentFilter, ExportDocument } from "./export.js";
 
 export * from "./document-view.js";
 export * from "./tenant.js";
 export * from "./audit.js";
 export * from "./labels.js";
 export * from "./users.js";
+export * from "./export.js";
 
 export type OcrDocumentStatus = "PROCESSING" | "SUCCEEDED" | "NEEDS_REVIEW" | "FAILED";
 export type ConfirmStatus = "PENDING" | "SUCCEEDED" | "RETRY";
@@ -49,11 +52,6 @@ export type DocumentStore = Readonly<{
   saveCorrection(tenantId: string, documentId: string, field: string, value: string, confirmStatus: ConfirmStatus, confirmError?: string, remainingNeedsReview?: boolean, audit?: CorrectionAudit): Promise<void>;
 }>;
 
-/** Derived from the document's `ocr_confirm_outbox` rows (latest correction per field). */
-export type DeliveryStatus = "NONE" | "PENDING" | "DELIVERED" | "RETRYING" | "FAILED";
-/** Categories of visible rows (the list filter). A `SPLIT` PDF parent is never a row: its category is "split". */
-export type DocumentStatusCategory = "queued" | "processing" | "review" | "succeeded" | "confirmed" | "failed";
-export const DOCUMENT_STATUS_CATEGORIES: readonly DocumentStatusCategory[] = ["queued", "processing", "review", "succeeded", "confirmed", "failed"];
 /** Page documents of a split PDF are created with this queue priority: page order, and fair against other uploads. */
 export function pageJobPriority(pageNumber: number): number { return Math.min(10_000, 100 + Math.max(0, Math.trunc(pageNumber) - 1)); }
 export const MAX_PDF_PAGES = 1000;
@@ -125,9 +123,17 @@ export type DocumentListItem = { documentId: string; batchId: string | null; fil
   status: string; statusCategory: DocumentStatusCategory; needsReview: boolean; errorMessage: string | null; createdAt: string;
   processedAt: string | null; reviewedAt: string | null; deliveryStatus: DeliveryStatus; summary: DocumentSummary;
   parentDocumentId: string | null; pageNumber: number | null; pageCount: number | null; parentFilename: string | null };
-/** `parentId`: only the pages of that (split) PDF. */
-export type ListDocumentsQuery = { limit?: number | undefined; offset?: number | undefined; status?: DocumentStatusCategory | undefined; q?: string | undefined;
-  batchId?: string | undefined; parentId?: string | undefined };
+/** `parentId`: only the pages of that (split) PDF. The filters themselves are `DocumentFilter`, shared with the export. */
+export type ListDocumentsQuery = DocumentFilter & { limit?: number | undefined; offset?: number | undefined };
+/** `maxRows` is `OCR_EXPORT_MAX_ROWS`: above it the export is refused with EXPORT_TOO_LARGE before anything is read. */
+export type OpenExportOptions = { maxRows: number; batchSize?: number | undefined };
+/**
+ * A streaming export in progress. `total` is the exact row count of the snapshot the rows come from (the audit row and
+ * the `X-Export-Rows` header quote it). `rows()` may be consumed once; `close()` is idempotent and releases the
+ * connection, whether the stream finished, threw or was abandoned by a disconnected browser.
+ */
+export type ExportCursor = Readonly<{ total: number; rows: () => AsyncGenerator<ExportDocument[], void, undefined>; close: () => Promise<void> }>;
+export type ExportPreview = { total: number; documents: ExportDocument[] };
 /** `reviewedBy` is `users.id` (§6 D9); `audit` writes `document.reviewed` in the same transaction. */
 export type SaveReviewInput = { structuredResult: unknown; reviewedBy: string; expectedUpdatedAt?: string | undefined; audit?: AuditContext | undefined };
 export type SaveReviewResult = { corrections: number; delivery: "PENDING" | "NOT_REQUIRED"; document: ReviewDocument };
@@ -208,6 +214,58 @@ const VISIBLE_SQL = "d.deleted_at IS NULL AND d.status NOT IN ('DELETED','SPLIT'
 const PARENT_JOIN = "LEFT JOIN documents p ON p.id = d.parent_document_id AND p.organization_id = d.organization_id";
 const PAGE_COLUMNS = "d.parent_document_id, d.page_number, d.page_count, p.filename AS parent_filename";
 
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+/** A `YYYY-MM-DD` Bangkok day, or null when the caller passed nothing. Anything else is INVALID_EXPORT_FILTER. */
+function exportDate(value: string | undefined): string | null {
+  if (value === undefined || value === "") return null;
+  if (!ISO_DATE.test(value) || Number.isNaN(Date.parse(`${value}T00:00:00Z`))) throw new Error("INVALID_EXPORT_FILTER");
+  return value;
+}
+
+/**
+ * The WHERE of both the document list and the export (§10 H2), so a preview, a download and the table on screen can
+ * never disagree about which rows exist. Pushes its values onto `params` (starting with the tenant) and returns the
+ * condition; `VISIBLE_SQL` always applies, so SPLIT parents and deleted rows are excluded from every caller.
+ * Errors: INVALID_QUERY (status), BATCH_NOT_FOUND / DOCUMENT_NOT_FOUND (ids, as the list has always reported them)
+ * and INVALID_EXPORT_FILTER for a malformed or inverted date range.
+ */
+export function documentFilterSql(tenantId: string, filter: DocumentFilter, params: unknown[]): string {
+  params.push(tenantId);
+  const where = [`d.organization_id = $${params.length}::uuid`, VISIBLE_SQL];
+  const statuses = filter.status === undefined ? [] : typeof filter.status === "string" ? [filter.status] : [...filter.status];
+  for (const status of statuses) if (!DOCUMENT_STATUS_CATEGORIES.includes(status)) throw new Error("INVALID_QUERY");
+  if (statuses.length > 0) where.push(`(${statuses.map((status) => `(${CATEGORY_SQL[status]})`).join(" OR ")})`);
+  if (filter.confirmedOnly === true) where.push(`(${CATEGORY_SQL.confirmed})`);
+  if (filter.batchId !== undefined) {
+    if (!isUuid(filter.batchId)) throw new Error("BATCH_NOT_FOUND");
+    params.push(filter.batchId);
+    where.push(`d.batch_id = $${params.length}::uuid`);
+  }
+  if (filter.parentId !== undefined) {
+    if (!isUuid(filter.parentId)) throw new Error("DOCUMENT_NOT_FOUND");
+    params.push(filter.parentId);
+    where.push(`d.parent_document_id = $${params.length}::uuid`);
+  }
+  const q = typeof filter.q === "string" ? filter.q.trim().slice(0, 200) : "";
+  if (q) {
+    params.push(`%${escapeLike(q)}%`);
+    const p = `$${params.length}`;
+    where.push(`(d.filename ILIKE ${p} ESCAPE '\\' OR (d.structured_result #>> '{customerInformation,name,value}') ILIKE ${p} ESCAPE '\\'
+      OR (d.structured_result #>> '{staffOnly,therapistName,value}') ILIKE ${p} ESCAPE '\\' OR (d.structured_result #>> '{therapistName,value}') ILIKE ${p} ESCAPE '\\'
+      OR (d.structured_result #>> '{header,formNumber,value}') ILIKE ${p} ESCAPE '\\')`);
+  }
+  const dateField = filter.dateField ?? "created_at";
+  if (dateField !== "created_at" && dateField !== "reviewed_at") throw new Error("INVALID_EXPORT_FILTER");
+  // A date range on the confirmation implies the row IS confirmed — "confirmed today" is the daily hand-off (§10 H2).
+  const column = dateField === "reviewed_at" ? REVIEWED_AT_SQL : "d.created_at";
+  if (dateField === "reviewed_at") where.push(`${REVIEWED_AT_SQL} IS NOT NULL`);
+  const from = exportDate(filter.from), to = exportDate(filter.to);
+  if (from !== null && to !== null && from > to) throw new Error("INVALID_EXPORT_FILTER");
+  if (from !== null) { params.push(from); where.push(`${column} >= ($${params.length}::date::timestamp AT TIME ZONE 'Asia/Bangkok')`); }
+  if (to !== null) { params.push(to); where.push(`${column} < (($${params.length}::date + 1)::timestamp AT TIME ZONE 'Asia/Bangkok')`); }
+  return where.join(" AND ");
+}
+
 /**
  * §6 D9: names come from a join, nothing is retyped or backfilled. `reviewed_by` is a varchar that holds `users.id`
  * since login exists and free text before it, so the comparison is text-to-text: a legacy value simply matches no row
@@ -220,6 +278,29 @@ const REVIEW_SELECT = `SELECT d.id, d.organization_id, d.batch_id, d.filename, d
   ${REVIEWER_NAME_SQL} AS reviewed_by_name, d.updated_at, d.error_message,
   d.created_at, d.processed_at, ${DELIVERY_SQL} AS delivery_status, ${PAGE_COLUMNS}
 FROM documents d ${PARENT_JOIN} WHERE d.id = $1::uuid AND d.organization_id = $2::uuid AND d.deleted_at IS NULL`;
+
+/**
+ * The export's reviewer (§10 H3): `documents.reviewed_by` for a workbench review, or else the actor of the latest
+ * `ocr_corrections` row — rows confirmed field by field through the legacy endpoint never set `reviewed_by`. The name
+ * comes from the same text-to-text join as everywhere else, so a legacy actor yields null and reads as the shared
+ * pre-login account.
+ */
+const CORRECTION_ACTOR_JOIN = `LEFT JOIN LATERAL (SELECT c.verified_by FROM ocr_corrections c
+    WHERE c.organization_id = d.organization_id AND c.document_id = d.id ORDER BY c.verified_at DESC, c.id DESC LIMIT 1) lc ON true`;
+const EXPORT_ACTOR_SQL = "COALESCE(d.reviewed_by, lc.verified_by)";
+/** One row per exported document. `template` is one text path out of `raw_response`, never the whole jsonb (§10 H3). */
+const EXPORT_SELECT = `SELECT d.id, d.batch_id, b.label AS batch_label, d.filename, d.status::text AS status, d.needs_review, d.error_message,
+  d.created_at, d.processed_at, ${REVIEWED_AT_SQL} AS reviewed_at, ${EXPORT_ACTOR_SQL} AS reviewed_by,
+  (SELECT u.display_name FROM users u WHERE u.organization_id = d.organization_id AND u.id::text = ${EXPORT_ACTOR_SQL}) AS reviewed_by_name,
+  d.structured_result, ${DELIVERY_SQL} AS delivery_status, (d.raw_response #>> '{layout,detection,verdict}') AS template, ${PAGE_COLUMNS}
+FROM documents d ${PARENT_JOIN}
+LEFT JOIN ocr_batches b ON b.id = d.batch_id AND b.organization_id = d.organization_id
+${CORRECTION_ACTOR_JOIN}`;
+/**
+ * Oldest first and every key ascending, so the pages of one PDF stay together and in page order under their parent's
+ * upload time. `d.id` makes the order total, which is what lets a cursor page through it without a gap or a repeat.
+ */
+const EXPORT_ORDER = "ORDER BY d.created_at, COALESCE(d.parent_document_id, d.id), d.page_number ASC NULLS FIRST, d.id";
 
 /**
  * Counters are derived from document rows on every read (nothing stored, nothing to drift). `uploaded` counts files
@@ -254,6 +335,14 @@ const RESUME_AFTER = "2 minutes";
 /** A short batch with nothing queued/processing stops its clock only after this long without a new document or completion
  * (a file may still be uploading: its row exists only once the whole body arrived). */
 const BATCH_IDLE_AFTER_MS = 5 * 60_000;
+/** Export bounds (§10 H4). One statement of an export may run for a minute; the transaction may idle for two between
+ * FETCHes while the socket drains, after which PostgreSQL terminates the backend rather than pin a connection forever. */
+const EXPORT_STATEMENT_TIMEOUT_MS = 60_000;
+const EXPORT_IDLE_TIMEOUT_MS = 120_000;
+const EXPORT_FETCH_SIZE = 500;
+/** Each open export pins one pooled connection for as long as the browser takes to receive the file. */
+const MAX_CONCURRENT_EXPORTS = 2;
+const EXPORT_PREVIEW_ROWS = 20;
 function iso(value: unknown): string | null { return value instanceof Date ? value.toISOString() : typeof value === "string" ? new Date(value).toISOString() : null; }
 function ms(value: unknown): number | null { return value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : null; }
 function str(value: unknown): string | null { return typeof value === "string" ? value : null; }
@@ -336,6 +425,16 @@ function toListItem(row: Row): DocumentListItem {
     summary: summarizeDocument(viewOf(row)), ...pageFields(row) };
 }
 
+/** An EXPORT_SELECT row → the flat document `export.ts` renders. The view is canonical, and cleared on a confirmed row. */
+function toExportDocument(row: Row): ExportDocument {
+  const status = String(row.status);
+  return { documentId: String(row.id), batchId: str(row.batch_id), batchLabel: str(row.batch_label), filename: String(row.filename),
+    status, statusCategory: statusCategoryOf(status, row.reviewed_at), needsReview: row.needs_review === true, errorMessage: str(row.error_message),
+    createdAt: iso(row.created_at) ?? "", processedAt: iso(row.processed_at), reviewedAt: iso(row.reviewed_at), reviewedBy: str(row.reviewed_by),
+    reviewedByName: str(row.reviewed_by_name), deliveryStatus: delivery(row.delivery_status), template: str(row.template),
+    structuredResult: viewOf(row), ...pageFields(row) };
+}
+
 function isRow(value: unknown): value is Row { return typeof value === "object" && value !== null && !Array.isArray(value); }
 
 /**
@@ -376,6 +475,8 @@ export function legacyFieldPath(structuredResult: unknown, field: string, raw = 
 
 export class PostgresOcrDocumentStore implements ReviewStore {
   readonly pool: Pool;
+  /** Exports holding a pooled connection right now (`openExport`); `MAX_CONCURRENT_EXPORTS` is the cap. */
+  private openExports = 0;
 
   constructor(config: Pool | PoolConfig | string) {
     this.pool = config instanceof Pool ? config : new Pool(typeof config === "string" ? { connectionString: config } : config);
@@ -825,23 +926,8 @@ export class PostgresOcrDocumentStore implements ReviewStore {
   async listDocuments(tenantId: string, query: ListDocumentsQuery = {}): Promise<{ total: number; documents: DocumentListItem[] }> {
     const limit = clampInt(query.limit, 50, 1, 200);
     const offset = clampInt(query.offset, 0, 0, 1_000_000);
-    if (query.status !== undefined && !DOCUMENT_STATUS_CATEGORIES.includes(query.status)) throw new Error("INVALID_QUERY");
-    if (query.batchId !== undefined && !isUuid(query.batchId)) throw new Error("BATCH_NOT_FOUND");
-    if (query.parentId !== undefined && !isUuid(query.parentId)) throw new Error("DOCUMENT_NOT_FOUND");
-    const params: unknown[] = [tenantId];
-    const where = ["d.organization_id = $1::uuid", VISIBLE_SQL];
-    if (query.status) where.push(CATEGORY_SQL[query.status]);
-    if (query.batchId) { params.push(query.batchId); where.push(`d.batch_id = $${params.length}::uuid`); }
-    if (query.parentId) { params.push(query.parentId); where.push(`d.parent_document_id = $${params.length}::uuid`); }
-    const q = typeof query.q === "string" ? query.q.trim().slice(0, 200) : "";
-    if (q) {
-      params.push(`%${escapeLike(q)}%`);
-      const p = `$${params.length}`;
-      where.push(`(d.filename ILIKE ${p} ESCAPE '\\' OR (d.structured_result #>> '{customerInformation,name,value}') ILIKE ${p} ESCAPE '\\'
-        OR (d.structured_result #>> '{staffOnly,therapistName,value}') ILIKE ${p} ESCAPE '\\' OR (d.structured_result #>> '{therapistName,value}') ILIKE ${p} ESCAPE '\\'
-        OR (d.structured_result #>> '{header,formNumber,value}') ILIKE ${p} ESCAPE '\\')`);
-    }
-    const condition = where.join(" AND ");
+    const params: unknown[] = [];
+    const condition = documentFilterSql(tenantId, query, params);
     return this.tenantTransaction(tenantId, async (client) => {
       const total = await client.query<{ total: number }>(`SELECT count(*)::int AS total FROM documents d WHERE ${condition}`, params);
       const rows = await client.query<Row>(
@@ -853,6 +939,90 @@ export class PostgresOcrDocumentStore implements ReviewStore {
         [...params, limit, offset]);
       return { total: total.rows[0]?.total ?? 0, documents: rows.rows.map(toListItem) };
     });
+  }
+
+  /**
+   * The export's first 20 rows and the exact row count behind them (§10 H1), in the same kind of snapshot the download
+   * uses, so the preview a staff member reads and the file they then download are the same data. Read-only, bounded by
+   * the same timeouts, and it holds no cursor.
+   */
+  async previewExport(tenantId: string, filter: DocumentFilter = {}, options: { limit?: number | undefined } = {}): Promise<ExportPreview> {
+    const limit = clampInt(options.limit, EXPORT_PREVIEW_ROWS, 1, EXPORT_PREVIEW_ROWS);
+    const params: unknown[] = [];
+    const condition = documentFilterSql(tenantId, filter, params);
+    return withTenant(this.pool, tenantId, async (client) => {
+      const total = await client.query<{ total: number }>(`SELECT count(*)::int AS total FROM documents d WHERE ${condition}`, params);
+      const rows = await client.query<Row>(`${EXPORT_SELECT} WHERE ${condition} ${EXPORT_ORDER} LIMIT $${params.length + 1}`, [...params, limit]);
+      return { total: total.rows[0]?.total ?? 0, documents: rows.rows.map(toExportDocument) };
+    }, { readOnly: true, isolation: "REPEATABLE READ", statementTimeoutMs: EXPORT_STATEMENT_TIMEOUT_MS, idleInTransactionTimeoutMs: EXPORT_IDLE_TIMEOUT_MS });
+  }
+
+  /**
+   * Opens a streaming export (§10 H4): ONE pooled client held for the whole download, inside one
+   * `REPEATABLE READ READ ONLY` transaction — one consistent snapshot, RLS through `app.current_org`, and a
+   * transaction that can write nothing whatever the caller does. The row count runs first, so `EXPORT_TOO_LARGE` is
+   * raised before a single byte is yielded (the route can still answer 400 cleanly); then a server-side cursor is
+   * declared and `rows()` yields pages of `FETCH 500`.
+   *
+   * `close()` closes the cursor, commits and releases the client, and runs from `rows()`'s `finally` — so a browser
+   * that disconnects mid-download releases the connection through the generator's `return()`. At most
+   * `MAX_CONCURRENT_EXPORTS` may be open per store (each pins a pooled connection), beyond which it is EXPORT_BUSY.
+   *
+   * The client keeps an `'error'` listener for exactly as long as it is checked out: if the backend is terminated
+   * while the stream waits for `'drain'`, node-postgres emits `'error'` on the client and pg-pool has already removed
+   * its own idle listener — with no listener at all, that event would take the whole web process down and cut every
+   * in-flight upload.
+   */
+  async openExport(tenantId: string, filter: DocumentFilter = {}, options: OpenExportOptions): Promise<ExportCursor> {
+    const maxRows = Math.max(1, Math.trunc(options.maxRows));
+    const batchSize = clampInt(options.batchSize, EXPORT_FETCH_SIZE, 1, EXPORT_FETCH_SIZE);
+    const params: unknown[] = [];
+    const condition = documentFilterSql(tenantId, filter, params);
+    if (this.openExports >= MAX_CONCURRENT_EXPORTS) throw new Error("EXPORT_BUSY");
+    // The slot is taken before the checkout, so two requests arriving together cannot both pass the check; a pool
+    // that hands out no client must give it straight back, or the cap would leak one slot per failed checkout.
+    this.openExports += 1;
+    let client: PoolClient;
+    try { client = await this.pool.connect(); }
+    catch (error) { this.openExports -= 1; throw error; }
+    let broken: Error | null = null;
+    const onError = (error: Error): void => { broken = error; };
+    client.on("error", onError);
+    let closed = false;
+    let declared = false;
+    const close = async (): Promise<void> => {
+      if (closed) return;
+      closed = true;
+      client.removeListener("error", onError);
+      this.openExports -= 1;
+      let failed = broken !== null;
+      // Nothing is CLOSEd when the pre-check refused the export: a cursor that was never declared would raise 34000
+      // and cost us a healthy pooled connection on every EXPORT_TOO_LARGE.
+      try { if (declared) await client.query("CLOSE export_cur"); await client.query("COMMIT"); }
+      catch { failed = true; await client.query("ROLLBACK").catch(() => undefined); }
+      finally { client.release(failed); }
+    };
+    try {
+      await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      await client.query("SELECT set_config('app.current_org', $1, true)", [tenantId]);
+      await client.query("SELECT set_config('statement_timeout', $1, true)", [String(EXPORT_STATEMENT_TIMEOUT_MS)]);
+      await client.query("SELECT set_config('idle_in_transaction_session_timeout', $1, true)", [String(EXPORT_IDLE_TIMEOUT_MS)]);
+      const count = await client.query<{ total: number }>(`SELECT count(*)::int AS total FROM documents d WHERE ${condition}`, params);
+      const total = count.rows[0]?.total ?? 0;
+      if (total > maxRows) throw new Error("EXPORT_TOO_LARGE");
+      await client.query(`DECLARE export_cur NO SCROLL CURSOR FOR ${EXPORT_SELECT} WHERE ${condition} ${EXPORT_ORDER}`, params);
+      declared = true;
+      async function* rows(): AsyncGenerator<ExportDocument[], void, undefined> {
+        try {
+          for (;;) {
+            const page = await client.query<Row>(`FETCH ${batchSize} FROM export_cur`);
+            if (page.rows.length > 0) yield page.rows.map(toExportDocument);
+            if (page.rows.length < batchSize) return;
+          }
+        } finally { await close(); }
+      }
+      return { total, rows, close };
+    } catch (error) { await close(); throw error; }
   }
 
   /**

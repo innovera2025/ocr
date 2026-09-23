@@ -51,9 +51,18 @@ export async function runMigrations(options: MigrationRunnerOptions): Promise<st
   }
 }
 
-export function createDatabasePool(config: PoolConfig | string = process.env.DATABASE_URL ?? ""): Pool {
+/**
+ * A pool that cannot take the process down (plan §10 H4, D10). When the backend behind an IDLE pooled client dies —
+ * a restart, an admin `pg_terminate_backend`, or `idle_in_transaction_session_timeout` firing on a stalled export —
+ * node-postgres emits `'error'` on the pool, and an unhandled `'error'` event is a fatal exception in Node: the web
+ * would exit mid-upload and reset every in-memory login throttle. pg discards the broken client itself, so `onError`
+ * only gets to record it.
+ */
+export function createDatabasePool(config: PoolConfig | string = process.env.DATABASE_URL ?? "", onError?: (error: Error) => void): Pool {
   if (!config || (typeof config === "string" && config.length === 0)) throw new Error("DATABASE_URL_REQUIRED");
-  return new Pool(typeof config === "string" ? { connectionString: config } : config);
+  const pool = new Pool(typeof config === "string" ? { connectionString: config } : config);
+  pool.on("error", (error: unknown) => { onError?.(error instanceof Error ? error : new Error(String(error))); });
+  return pool;
 }
 
 export async function assertDatabaseReady(pool: Pool): Promise<void> {

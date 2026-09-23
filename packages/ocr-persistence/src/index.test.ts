@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Pool } from "pg";
-import { hasReviewFields, isUuid, legacyFieldPath, pageJobPriority, PostgresOcrDocumentStore, statusCategoryOf, structuredStaffResult, structuredDocumentResult, toBatchSummary, toStructuredResult } from "./index.js";
+import { documentFilterSql, hasReviewFields, isUuid, legacyFieldPath, pageJobPriority, PostgresOcrDocumentStore, statusCategoryOf, structuredStaffResult, structuredDocumentResult, toBatchSummary, toStructuredResult } from "./index.js";
 
 test("needsReview mapping detects any staff field requiring review", () => {
   const response = { documentId: "d", staffOnly: { therapistName: { needsReview: false }, treatment: { needsReview: true } } };
@@ -161,4 +161,162 @@ test("batch clock (D11): a retried batch counts from the round's first claim, no
   assert.deepEqual([running.finished, running.durationMs], [true, 2 * 60_000]);
   assert.equal(running.throughputPerMinute, 0.5, "only the round's completions count: the all-time 2 would read as 1/min");
   assert.deepEqual([running.completed, running.roundCompleted], [2, 1], "the all-time counter is still reported beside it");
+});
+
+// ---- the export store (§10 H4): one snapshot, one cursor, one connection --------------------------------------
+
+type FakeQuery = { text: string; values: readonly unknown[] };
+/** A pooled client that answers the export's statements from a script, and records what was asked and how it ended. */
+class FakeExportClient {
+  readonly queries: FakeQuery[] = [];
+  readonly released: (boolean | Error | undefined)[] = [];
+  private readonly listeners = new Set<(error: Error) => void>();
+  constructor(private readonly pages: Row[][], private readonly total: number, private readonly fetchFails?: Error) {}
+  async query(text: string, values: readonly unknown[] = []): Promise<{ rows: unknown[] }> {
+    this.queries.push({ text, values });
+    if (text.startsWith("FETCH")) {
+      if (this.fetchFails) throw this.fetchFails;
+      return { rows: this.pages.shift() ?? [] };
+    }
+    return { rows: text.includes("count(*)") ? [{ total: this.total }] : [] };
+  }
+  on(event: string, listener: (error: Error) => void): this { if (event === "error") this.listeners.add(listener); return this; }
+  removeListener(_event: string, listener: (error: Error) => void): this { this.listeners.delete(listener); return this; }
+  release(error?: boolean | Error): void { this.released.push(error); }
+  /** What node-postgres does when the backend dies: with no listener this event takes the whole process down. */
+  emitError(error: Error): void {
+    if (this.listeners.size === 0) throw new Error("no 'error' listener: this event would have crashed the web process");
+    for (const listener of this.listeners) listener(error);
+  }
+  get texts(): string[] { return this.queries.map((query) => query.text.replace(/\s+/g, " ").trim()); }
+}
+type Row = Record<string, unknown>;
+
+function exportStore(clients: FakeExportClient[]): { store: PostgresOcrDocumentStore; pool: Pool } {
+  const pool = new Pool();
+  const queue = [...clients];
+  Object.assign(pool, { connect: async () => (queue.shift() ?? clients.at(-1)) as never });
+  return { store: new PostgresOcrDocumentStore(pool), pool };
+}
+const documentRow = (id: string): Row => ({ id, batch_id: null, batch_label: null, filename: `${id}.png`, status: "SUCCEEDED", needs_review: false,
+  error_message: null, created_at: new Date("2026-09-22T01:00:00Z"), processed_at: null, reviewed_at: null, reviewed_by: null, reviewed_by_name: null,
+  structured_result: {}, delivery_status: "NONE", template: null, parent_document_id: null, page_number: null, page_count: null, parent_filename: null });
+
+test("openExport streams one REPEATABLE READ READ ONLY snapshot through a cursor and always releases the client", async () => {
+  const client = new FakeExportClient([[documentRow("a"), documentRow("b")], [documentRow("c")]], 3);
+  const { store, pool } = exportStore([client]);
+  const cursor = await store.openExport("11111111-1111-4111-8111-111111111111", { status: "confirmed" }, { maxRows: 10, batchSize: 2 });
+  assert.equal(cursor.total, 3, "the count is known before a single row is yielded, so EXPORT_TOO_LARGE stays a clean 400");
+  const seen: string[] = [];
+  for await (const page of cursor.rows()) seen.push(...page.map((document) => document.documentId));
+  assert.deepEqual(seen, ["a", "b", "c"]);
+  assert.deepEqual(client.texts.slice(0, 4), ["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+    "SELECT set_config('app.current_org', $1, true)", "SELECT set_config('statement_timeout', $1, true)",
+    "SELECT set_config('idle_in_transaction_session_timeout', $1, true)"]);
+  assert.deepEqual(client.queries[1]!.values, ["11111111-1111-4111-8111-111111111111"]);
+  assert.deepEqual(client.queries.slice(2, 4).map((query) => query.values), [["60000"], ["120000"]]);
+  const declare = client.texts.find((text) => text.startsWith("DECLARE"))!;
+  assert.match(declare, /^DECLARE export_cur NO SCROLL CURSOR FOR SELECT /);
+  assert.match(declare, /ORDER BY d\.created_at, COALESCE\(d\.parent_document_id, d\.id\), d\.page_number ASC NULLS FIRST, d\.id$/);
+  assert.deepEqual(client.texts.filter((text) => text.startsWith("FETCH")), ["FETCH 2 FROM export_cur", "FETCH 2 FROM export_cur"],
+    "a short page ends the stream: no wasted round trip");
+  assert.deepEqual(client.texts.slice(-2), ["CLOSE export_cur", "COMMIT"]);
+  assert.deepEqual(client.released, [false], "the connection goes back to the pool intact");
+  await cursor.close();
+  assert.deepEqual(client.released, [false], "close() is idempotent");
+  await pool.end();
+});
+
+test("openExport refuses a too-large export before it reads anything, and never declares a cursor", async () => {
+  const client = new FakeExportClient([], 50_001);
+  const { store, pool } = exportStore([client]);
+  await assert.rejects(store.openExport("t", {}, { maxRows: 50_000 }), { message: "EXPORT_TOO_LARGE" });
+  assert.ok(!client.texts.some((text) => text.startsWith("DECLARE")));
+  assert.deepEqual(client.texts.slice(-1), ["COMMIT"], "no cursor was declared, so none is closed; the transaction still ends");
+  assert.deepEqual(client.released, [false], "a refused export costs no pooled connection");
+  const second = new FakeExportClient([], 50_000);
+  const ok = await exportStore([second]).store.openExport("t", {}, { maxRows: 50_000 });
+  assert.equal(ok.total, 50_000, "exactly at the limit still runs");
+  await ok.close();
+  await pool.end();
+});
+
+test("at most two exports hold a connection at once; an abandoned download frees its slot", async () => {
+  const clients = [new FakeExportClient([], 0), new FakeExportClient([], 0), new FakeExportClient([], 0)];
+  const { store, pool } = exportStore(clients);
+  const first = await store.openExport("t", {}, { maxRows: 10 });
+  const second = await store.openExport("t", {}, { maxRows: 10 });
+  await assert.rejects(store.openExport("t", {}, { maxRows: 10 }), { message: "EXPORT_BUSY" });
+  await first.close();
+  const third = await store.openExport("t", {}, { maxRows: 10 });
+  await Promise.all([second.close(), third.close()]);
+  // A checkout that fails must give its slot straight back, or two of them would wedge the export for good.
+  Object.assign(pool, { connect: async () => { throw new Error("pool exhausted"); } });
+  for (let attempt = 0; attempt < 3; attempt += 1) await assert.rejects(store.openExport("t", {}, { maxRows: 10 }), { message: "pool exhausted" });
+  Object.assign(pool, { connect: async () => clients[2] as never });
+  await store.openExport("t", {}, { maxRows: 10 }).then((cursor) => cursor.close());
+  await pool.end();
+});
+
+test("a browser that disconnects mid-download closes the cursor through the generator's return()", async () => {
+  const client = new FakeExportClient([[documentRow("a")], [documentRow("b")]], 2);
+  const { store, pool } = exportStore([client]);
+  const cursor = await store.openExport("t", {}, { maxRows: 10, batchSize: 1 });
+  const rows = cursor.rows();
+  await rows.next();
+  await rows.return(undefined);
+  assert.deepEqual(client.texts.slice(-2), ["CLOSE export_cur", "COMMIT"]);
+  assert.deepEqual(client.released, [false]);
+  await store.openExport("t", {}, { maxRows: 10 }).then((next) => next.close(), () => assert.fail("the slot was not freed"));
+  await pool.end();
+});
+
+test("a backend killed mid-stream rejects the export instead of crashing the process, and the client is destroyed", async () => {
+  const dead = new Error("terminating connection due to idle-in-transaction timeout");
+  const client = new FakeExportClient([[documentRow("a")]], 2, dead);
+  const { store, pool } = exportStore([client]);
+  const cursor = await store.openExport("t", {}, { maxRows: 10 });
+  client.emitError(dead); // pg-pool removed its own idle listener at checkout: ours is the only one left.
+  await assert.rejects((async () => { for await (const page of cursor.rows()) void page; })(), dead);
+  assert.deepEqual(client.released, [true], "a client whose backend died is destroyed, not returned to the pool");
+  await pool.end();
+});
+
+test("previewExport reads the same snapshot the download would, bounded to 20 rows", async () => {
+  const client = new FakeExportClient([], 7);
+  const { store, pool } = exportStore([client]);
+  const preview = await store.previewExport("t", { q: "  somchai  " }, { limit: 99 });
+  assert.equal(preview.total, 7);
+  assert.equal(client.texts[0], "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  const select = client.queries.at(-2)!;
+  assert.match(select.text.replace(/\s+/g, " "), / ORDER BY d\.created_at, .* LIMIT \$3$/);
+  assert.deepEqual(select.values, ["t", "%somchai%", 20], "the preview is capped at 20 rows whatever the caller asks");
+  assert.equal(client.texts.at(-1), "COMMIT");
+  await pool.end();
+});
+
+test("documentFilterSql is the one WHERE the list and the export share", () => {
+  const params: unknown[] = [];
+  const tenant = "11111111-1111-4111-8111-111111111111";
+  const batch = "22222222-2222-4222-8222-222222222222";
+  const sql = documentFilterSql(tenant, { status: ["review", "failed"], batchId: batch, from: "2026-09-01", to: "2026-09-22" }, params);
+  assert.match(sql, /^d\.organization_id = \$1::uuid AND d\.deleted_at IS NULL AND d\.status NOT IN \('DELETED','SPLIT'\)/,
+    "SPLIT parents and deleted rows are excluded for every caller");
+  assert.match(sql, /\(\(d\.status = 'NEEDS_REVIEW'\) OR \(d\.status IN \('FAILED','QUARANTINED'\)\)\)/, "several statuses are OR-ed");
+  assert.match(sql, /d\.batch_id = \$2::uuid/);
+  assert.match(sql, /d\.created_at >= \(\$3::date::timestamp AT TIME ZONE 'Asia\/Bangkok'\)/);
+  assert.match(sql, /d\.created_at < \(\(\$4::date \+ 1\)::timestamp AT TIME ZONE 'Asia\/Bangkok'\)/, "the whole of the 'to' day is included");
+  assert.deepEqual(params, [tenant, batch, "2026-09-01", "2026-09-22"]);
+  const reviewed: unknown[] = [];
+  const confirmed = documentFilterSql(tenant, { dateField: "reviewed_at", from: "2026-09-22", confirmedOnly: true }, reviewed);
+  assert.ok(confirmed.includes("d.confirmed_at"), "the confirmation date is the read-side REVIEWED_AT_SQL, not just reviewed_at");
+  assert.ok(confirmed.includes("IS NOT NULL"), "a confirmation-date filter implies the row IS confirmed");
+  assert.deepEqual(reviewed, [tenant, "2026-09-22"]);
+  assert.equal(documentFilterSql(tenant, {}, []).includes("status"), true, "the visibility clause is always there");
+  for (const bad of [{ from: "22-09-2026" }, { to: "2026-13-01" }, { from: "2026-09-22", to: "2026-09-21" }, { dateField: "id" as never }]) {
+    assert.throws(() => documentFilterSql(tenant, bad, []), { message: "INVALID_EXPORT_FILTER" }, JSON.stringify(bad));
+  }
+  assert.throws(() => documentFilterSql(tenant, { status: ["nope" as never] }, []), { message: "INVALID_QUERY" });
+  assert.throws(() => documentFilterSql(tenant, { batchId: "x" }, []), { message: "BATCH_NOT_FOUND" });
+  assert.throws(() => documentFilterSql(tenant, { parentId: "x" }, []), { message: "DOCUMENT_NOT_FOUND" });
 });

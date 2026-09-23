@@ -13,8 +13,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { Pool } from "pg";
-import { hasReviewFields, LEGACY_REVIEWER_LABEL, PostgresOcrDocumentStore, PostgresUserStore, reviewerLabel, toStructuredResult, withTenant,
-  type AuditContext, type DocumentView, type PageDocumentInput, type SessionRevokeReason, type UserRole } from "./index.js";
+import { flattenDocument, hasReviewFields, LEGACY_REVIEWER_LABEL, PostgresOcrDocumentStore, PostgresUserStore, reviewerLabel, toStructuredResult, withTenant,
+  type AuditContext, type DocumentFilter, type DocumentView, type ExportDocument, type PageDocumentInput, type SessionRevokeReason, type UserRole } from "./index.js";
 
 type Claimed = { jobId: string; organizationId: string; runId: string; kind: string; leaseToken: string };
 type Queue = {
@@ -1203,5 +1203,102 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     await worker.markFailure(TENANT_A, bad.documentId, "HTTP 503 again");
     await app.retryDocument(TENANT_A, bad.documentId);
     assert.deepEqual(await round(), opened, "a retry into a busy batch joins the running round");
+  });
+
+  // ---- the export (§10 Workstream H): one snapshot, one cursor, the original file name first --------------------
+
+  const exportBatch: Record<string, string> = {};
+  /** Drains an export the way the CSV writer will, and always releases the pooled connection behind it. */
+  async function exported(tenantId: string, filter: DocumentFilter, maxRows = 1000): Promise<{ total: number; documents: ExportDocument[] }> {
+    const cursor = await app.openExport(tenantId, filter, { maxRows });
+    const documents: ExportDocument[] = [];
+    try { for await (const page of cursor.rows()) documents.push(...page); } finally { await cursor.close(); }
+    return { total: cursor.total, documents };
+  }
+  const bangkokDay = async (offsetDays = 0) => (await superDb.query<{ day: string }>(
+    "SELECT to_char((now() AT TIME ZONE 'Asia/Bangkok')::date + $1::int, 'YYYY-MM-DD') AS day", [offsetDays])).rows[0]!.day;
+
+  test("the export yields one tenant's visible rows oldest first, pages under their PDF, with the original file name", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3 });
+    const image = await uploadFile(TENANT_A, "single-form.png", "image/png", batch.batchId);
+    const pdf = await uploadFile(TENANT_A, "ใบลูกค้า 22-09-2026.pdf", "application/pdf", batch.batchId);
+    await worker.markProcessing(TENANT_A, pdf.documentId);
+    await worker.setPageCount(TENANT_A, pdf.documentId, 3);
+    await worker.createPageDocuments(TENANT_A, pdf.documentId, 3, pageInputs(TENANT_A, pdf.documentId, [1, 2, 3]));
+    await worker.markSplit(TENANT_A, pdf.documentId, 3);
+    const removed = await uploadFile(TENANT_A, "deleted.png", "image/png", batch.batchId);
+    await asApp(TENANT_A, "UPDATE documents SET status='DELETED', deleted_at=now() WHERE id=$1::uuid", [removed.documentId]);
+    Object.assign(exportBatch, { batchId: batch.batchId, imageId: image.documentId, pdfId: pdf.documentId });
+
+    const rows = await exported(TENANT_A, { batchId: batch.batchId });
+    assert.equal(rows.total, 4, "the SPLIT parent is no row of its own and the deleted row is gone (VISIBLE_SQL)");
+    assert.deepEqual(rows.documents.map((document) => [document.filename, document.pageNumber]),
+      [["single-form.png", null], ["ใบลูกค้า 22-09-2026.pdf", 1], ["ใบลูกค้า 22-09-2026.pdf", 2], ["ใบลูกค้า 22-09-2026.pdf", 3]],
+      "oldest upload first, and the pages of one PDF stay together in page order");
+    assert.ok(!rows.documents.some((document) => document.documentId === pdf.documentId || document.documentId === removed.documentId));
+    const [first, page1] = [rows.documents[0]!, rows.documents[1]!];
+    assert.deepEqual([page1.parentDocumentId, page1.parentFilename, page1.pageCount], [pdf.documentId, "ใบลูกค้า 22-09-2026.pdf", 3]);
+    assert.equal(flattenDocument(page1).original_file_name, "ใบลูกค้า 22-09-2026.pdf", "a page is exported under the file the staff member uploaded");
+    assert.deepEqual(rows.documents.slice(1).map((document) => document.createdAt), [page1.createdAt, page1.createdAt, page1.createdAt]);
+    assert.ok(Date.parse(first.createdAt) <= Date.parse(page1.createdAt));
+    assert.deepEqual([flattenDocument(first).page, flattenDocument(first).page_count], [null, null], "a single image has no page number");
+    assert.equal(flattenDocument(page1).batch_label, null);
+
+    // Tenant scope: the export only ever reads `app.current_org`, so another tenant's batch id yields nothing.
+    assert.deepEqual(await exported(TENANT_B, { batchId: batch.batchId }), { total: 0, documents: [] });
+    const theirs = await exported(TENANT_B, {});
+    assert.ok(theirs.documents.every((document) => !rows.documents.some((mine) => mine.documentId === document.documentId)));
+    await assert.rejects(app.openExport(TENANT_A, { batchId: batch.batchId }, { maxRows: 1 }), { message: "EXPORT_TOO_LARGE" });
+
+    const preview = await app.previewExport(TENANT_A, { batchId: batch.batchId });
+    assert.equal(preview.total, rows.total);
+    assert.deepEqual(preview.documents.map((document) => document.documentId), rows.documents.map((document) => document.documentId),
+      "the preview shows the head of exactly the file the download would produce");
+  });
+
+  test("export filters: statuses are OR-ed, confirmedOnly matches the list, and a Bangkok confirmation date selects the day", async () => {
+    const reviewer = await createUser(TENANT_A, "export.reviewer");
+    const batchId = exportBatch.batchId!, imageId = exportBatch.imageId!;
+    await worker.markProcessing(TENANT_A, imageId);
+    await saveResult(TENANT_A, imageId, { ...cleanResponse, documentId: `local-${randomUUID()}` });
+    const stored = (await app.getReviewDocument(TENANT_A, imageId))!;
+    await app.saveReview(TENANT_A, imageId, { structuredResult: stored.structuredResult, reviewedBy: reviewer,
+      audit: { actorUserId: reviewer, requestId: randomUUID() } });
+
+    const confirmedOnly = await exported(TENANT_A, { batchId, confirmedOnly: true });
+    assert.deepEqual(confirmedOnly.documents.map((document) => document.documentId), [imageId]);
+    assert.equal(confirmedOnly.total, (await app.listDocuments(TENANT_A, { batchId, status: "confirmed" })).total, "one WHERE builder: the list and the export agree");
+    const flat = flattenDocument(confirmedOnly.documents[0]!, "compact", { publicBaseUrl: "https://ocr.example.test" });
+    assert.deepEqual([flat.reviewed, flat.reviewed_by, flat.status], [true, "Staff export.reviewer", "ยืนยันแล้ว"]);
+    assert.equal(flat.review_url, `https://ocr.example.test/review/${imageId}`);
+    assert.equal(flat.customer_name, "Somchai");
+
+    const queued = await exported(TENANT_A, { batchId, status: ["queued", "confirmed"] });
+    assert.equal(queued.total, 4, "the three queued pages OR the one confirmed image");
+    assert.equal((await exported(TENANT_A, { batchId, status: ["failed"] })).total, 0);
+
+    const today = await bangkokDay();
+    assert.deepEqual((await exported(TENANT_A, { batchId, dateField: "reviewed_at", from: today, to: today })).documents.map((document) => document.documentId), [imageId],
+      "the confirmation date is the daily hand-off filter: unconfirmed rows are not in it at all");
+    assert.equal((await exported(TENANT_A, { batchId, dateField: "reviewed_at", from: await bangkokDay(1) })).total, 0, "confirmed before tomorrow");
+    assert.equal((await exported(TENANT_A, { batchId, dateField: "created_at", from: today, to: today })).total, 4, "uploaded today, in Bangkok");
+    assert.equal((await exported(TENANT_A, { batchId, from: await bangkokDay(1), to: await bangkokDay(2) })).total, 0);
+    assert.equal((await exported(TENANT_A, { batchId, q: "somchai" })).total, 1, "the same search the table runs");
+    await assert.rejects(app.openExport(TENANT_A, { from: "22-09-2026" }, { maxRows: 10 }), { message: "INVALID_EXPORT_FILTER" });
+  });
+
+  test("the cursor pages through 600 rows that share one created_at without a repeat or a gap", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 1 });
+    // Straight into the table as the superuser: 600 rows with the SAME created_at, which is what an offset pager
+    // reorders between pages. The cursor's order (created_at, group, page, id) is total, so every row appears once.
+    await superDb.query(`INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, batch_id, created_at)
+      SELECT gen_random_uuid(), $1::uuid, md5(random()::text || g::text), 'SUCCEEDED', 'bulk-' || g || '.png', 'image/png', 1, repeat('b', 64), $2::uuid, $3::timestamptz
+      FROM generate_series(1, 600) g`, [TENANT_A, batch.batchId, new Date("2026-09-20T02:00:00Z").toISOString()]);
+    const rows = await exported(TENANT_A, { batchId: batch.batchId });
+    assert.equal(rows.total, 600);
+    assert.equal(rows.documents.length, 600, "two FETCHes of 500 and 100: nothing repeated, nothing missed");
+    assert.equal(new Set(rows.documents.map((document) => document.documentId)).size, 600);
+    const ids = rows.documents.map((document) => document.documentId);
+    assert.deepEqual(ids, [...ids].sort(), "the tie-break on d.id is what makes the paging order total");
   });
 });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Script } from "node:vm";
-import { LEGACY_REVIEWER_LABEL } from "@innovera/ocr-persistence";
+import { CATEGORY_LABELS_TH, DELIVERY_LABELS_TH, FIELD_LABELS_TH, LEGACY_REVIEWER_LABEL } from "@innovera/ocr-persistence";
 import { workbenchPage } from "./workbench.js";
 
 const html = workbenchPage({ nonce: "test-nonce-123" });
@@ -88,6 +88,18 @@ test("script follows the HTTP contract of spec §5", () => {
 test("the drawer's label for pre-login reviews is the one the export and the store share", () => {
   // The inline script cannot import a module, so it carries its own copy; this pins the two together.
   assert.ok(inlineScript.includes(`const LEGACY_REVIEWER='${LEGACY_REVIEWER_LABEL}'`), LEGACY_REVIEWER_LABEL);
+});
+
+test("the Thai vocabulary of the table and of the export file is one vocabulary (§10 H3)", () => {
+  // Same reason as above: the script carries copies of the maps `labels.ts` exports, and an export column headed
+  // "รอตรวจสอบ" must mean exactly what the row badge on screen means.
+  const literal = (name: string): Record<string, string> => {
+    const source = new RegExp(`const ${name}=\\{([^}]*)\\}`).exec(inlineScript)?.[1] ?? "";
+    return Object.fromEntries([...source.matchAll(/(\w+):'([^']*)'/g)].map((entry) => [entry[1]!, entry[2]!]));
+  };
+  assert.deepEqual(literal("CATEGORY"), CATEGORY_LABELS_TH);
+  assert.deepEqual(literal("DELIVERY"), DELIVERY_LABELS_TH);
+  assert.deepEqual(literal("LABEL"), FIELD_LABELS_TH);
 });
 
 test("nothing in the header or the dialogs can outgrow a 375px viewport", () => {
