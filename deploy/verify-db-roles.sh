@@ -24,5 +24,28 @@ check_sql "worker:insert-extraction-jobs" "$DATABASE_URL_WORKER" "SELECT has_tab
 check_sql "worker:no-update-extraction-jobs" "$DATABASE_URL_WORKER" "SELECT has_table_privilege(current_user,'public.extraction_jobs','UPDATE')::int" 0
 check_sql "worker:no-select-extraction-jobs" "$DATABASE_URL_WORKER" "SELECT has_any_column_privilege(current_user,'public.extraction_jobs','SELECT')::int" 0
 check_sql "worker:no-delete-documents" "$DATABASE_URL_WORKER" "SELECT has_table_privilege(current_user,'public.documents','DELETE')::int" 0
+# 0019: only the web runtime touches staff accounts, sessions and the append-only audit log. Every role is named
+# explicitly (not current_user), so one bootstrap connection answers for all of them and deploy/sql/verify-release2-grants.sql
+# can ask the same questions inside the database container, with no role password and no host-reachable DSN.
+check_sql "app:select-users" "$DATABASE_URL_BOOTSTRAP" "SELECT has_table_privilege('ocr_app','public.users','SELECT')::int" 1
+check_sql "app:no-delete-users" "$DATABASE_URL_BOOTSTRAP" "SELECT has_table_privilege('ocr_app','public.users','DELETE')::int" 0
+check_sql "app:no-delete-auth-sessions" "$DATABASE_URL_BOOTSTRAP" "SELECT has_table_privilege('ocr_app','public.auth_sessions','DELETE')::int" 0
+check_sql "app:no-delete-audit" "$DATABASE_URL_BOOTSTRAP" "SELECT has_table_privilege('ocr_app','public.audit_events','DELETE')::int" 0
+check_sql "app:no-update-users-org" "$DATABASE_URL_BOOTSTRAP" "SELECT has_column_privilege('ocr_app','public.users','organization_id','UPDATE')::int" 0
+check_sql "app:no-update-users-username" "$DATABASE_URL_BOOTSTRAP" "SELECT has_column_privilege('ocr_app','public.users','username','UPDATE')::int" 0
+check_sql "app:no-update-audit" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_app','public.audit_events','UPDATE')::int" 0
+check_sql "app:no-update-session-identity" "$DATABASE_URL_BOOTSTRAP" "SELECT bool_or(has_column_privilege('ocr_app','public.auth_sessions',c,'UPDATE'))::int FROM unnest(ARRAY['token_hash','user_id','expires_at','organization_id']) c" 0
+check_sql "worker:no-select-users" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_worker','public.users','SELECT')::int" 0
+check_sql "worker:no-select-sessions" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_worker','public.auth_sessions','SELECT')::int" 0
+check_sql "worker:no-select-audit" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_worker','public.audit_events','SELECT')::int" 0
+check_sql "queue:no-select-users" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_queue','public.users','SELECT')::int" 0
+check_sql "queue:no-select-sessions" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_queue','public.auth_sessions','SELECT')::int" 0
+check_sql "queue:no-select-audit" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_queue','public.audit_events','SELECT')::int" 0
+# ocr_queue_definer is the one BYPASSRLS role: a grant drifting onto it would make hashes, sessions and audit rows
+# readable across tenants through a SECURITY DEFINER function, and nothing else in production would notice.
+check_sql "definer:no-users" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_queue_definer','public.users','SELECT')::int" 0
+check_sql "definer:no-sessions" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_queue_definer','public.auth_sessions','SELECT')::int" 0
+check_sql "definer:no-audit" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_queue_definer','public.audit_events','SELECT')::int" 0
+check_sql "force-rls:release2" "$DATABASE_URL_BOOTSTRAP" "SELECT bool_and(relforcerowsecurity) FROM pg_class WHERE relname IN ('users','auth_sessions','audit_events')" t
 printf 'SUMMARY PASS=%s FAIL=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

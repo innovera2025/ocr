@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { Pool } from "pg";
@@ -28,6 +28,9 @@ type Outbox = { dispatchOnce(sender: (payload: Readonly<Record<string, unknown>>
 
 const bootstrapUrl = process.env.OCR_TEST_DATABASE_URL_BOOTSTRAP;
 const repo = new URL("../../../", import.meta.url);
+/** The last migration directory on disk: the runner must end there, whatever number the newest release carries. */
+const NEWEST_MIGRATION = readdirSync(new URL("prisma/migrations/", repo), { withFileTypes: true })
+  .filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort().at(-1)!;
 const ROLES = ["ocr_migrator", "ocr_app", "ocr_worker", "ocr_queue"] as const;
 type Role = typeof ROLES[number];
 const TENANT_A = randomUUID();
@@ -645,7 +648,10 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
   const split: Record<string, { documentId: string; runId: string }> = {};
 
   test("0018 applies after 0017: SPLIT status, page columns, same-tenant FK, shape CHECK, and exactly the new worker rights", async () => {
-    assert.deepEqual(applied.slice(-2), ["0017_batch_processing", "0018_multipage_documents"]);
+    // Order, not position: later releases add migrations after 0018, and the runner must still end at the newest one.
+    assert.ok(applied.indexOf("0017_batch_processing") >= 0, applied.join(","));
+    assert.ok(applied.indexOf("0018_multipage_documents") > applied.indexOf("0017_batch_processing"), applied.join(","));
+    assert.equal(applied.at(-1), NEWEST_MIGRATION, applied.join(","));
     // The worker's startup gate (services/ocr-worker assertSchemaReady) runs exactly this query as ocr_worker.
     assert.equal((await workerPool.query("SELECT 1 FROM schema_migrations WHERE version = $1", ["0018_multipage_documents"])).rowCount, 1);
     assert.equal((await superDb.query("SELECT 'SPLIT'::document_status AS s")).rows[0].s, "SPLIT");
@@ -660,7 +666,7 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     assert.equal((await superDb.query<{ ok: boolean }>("SELECT has_any_column_privilege('ocr_worker', 'extraction_jobs', 'SELECT') AS ok")).rows[0]!.ok, false);
     const functions = await superDb.query<{ proname: string }>("SELECT proname FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND prokind = 'f' AND proname LIKE 'ocr%' ORDER BY proname");
     assert.deepEqual(functions.rows.map((row) => row.proname), ["ocr_claim_confirm_outbox_v1", "ocr_claim_v1", "ocr_finish_confirm_outbox_v1", "ocr_finish_retry_v1", "ocr_finish_v1",
-      "ocr_heartbeat_v1", "ocr_recover_confirm_outbox_v1", "ocr_recover_expired_v1"], "0018 created no function");
+      "ocr_heartbeat_v1", "ocr_recover_confirm_outbox_v1", "ocr_recover_expired_v1"], "0018 and 0019 created no function");
     // CHECK: a page number needs a parent and vice versa; bounds 1..1000.
     const parent = await uploadFile(TENANT_A, "shape.pdf", "application/pdf");
     for (const [parentId, page, count] of [[null, 1, null], [parent.documentId, null, 3], [parent.documentId, 0, 3], [parent.documentId, 1, 1001]] as const) {
@@ -797,5 +803,76 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
       if (names.has(claimed.jobId)) order.push(names.get(claimed.jobId)!);
     }
     assert.deepEqual(order, ["page1", "single", "page2", "batch#1", "page3"]);
+  });
+
+  // ---- 0019_user_auth: staff accounts, server-side sessions and the append-only audit log. ----
+  const AUTH_TABLES = ["audit_events", "auth_sessions", "users"] as const;   // alphabetical: query results are ordered
+  /** Obviously fake: a self-describing placeholder in the stored format, matching no password. */
+  const FAKE_HASH = "scrypt$v1$N=32768,r=8,p=3$bm90LWEtcmVhbC1zYWx0$bm90LWEtcmVhbC1rZXk";
+  const tokenHash = (seed: string) => createHash("sha256").update(seed).digest();
+  async function createUser(tenantId: string, username: string, role: "admin" | "staff" = "staff"): Promise<string> {
+    const rows = await asApp<{ id: string }>(tenantId,
+      "INSERT INTO users(organization_id, username, display_name, role, password_hash) VALUES ($1,$2,$3,$4,$5) RETURNING id",
+      [tenantId, username, `Staff ${username}`, role, FAKE_HASH]);
+    return rows[0]!.id;
+  }
+
+  test("0019 forces tenant RLS on the auth tables and grants exactly the web runtime's rights", async () => {
+    assert.ok(applied.includes("0019_user_auth"), applied.join(","));
+    const tables = await superDb.query<{ relname: string; relrowsecurity: boolean; relforcerowsecurity: boolean; owner: string }>(
+      "SELECT relname, relrowsecurity, relforcerowsecurity, pg_get_userbyid(relowner) AS owner FROM pg_class WHERE relname = ANY($1::text[]) ORDER BY relname", [[...AUTH_TABLES]]);
+    assert.deepEqual(tables.rows, AUTH_TABLES.map((relname) => ({ relname, relrowsecurity: true, relforcerowsecurity: true, owner: "ocr_migrator" })));
+    // Table-level matrix: the web runtime reads and appends, nothing more. has_table_privilege is false where only columns are granted.
+    const privileges = await superDb.query<{ role: string; relname: string; privilege: string; granted: boolean }>(
+      `SELECT r AS role, t AS relname, p AS privilege, has_table_privilege(r, t, p) AS granted
+       FROM unnest(ARRAY['ocr_app','ocr_worker','ocr_queue']) r CROSS JOIN unnest($1::text[]) t CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE']) p
+       ORDER BY r, t, p`, [[...AUTH_TABLES]]);
+    assert.deepEqual(privileges.rows.filter((row) => row.granted).map((row) => `${row.role}:${row.relname}:${row.privilege}`),
+      ["ocr_app:audit_events:INSERT", "ocr_app:audit_events:SELECT", "ocr_app:auth_sessions:INSERT", "ocr_app:auth_sessions:SELECT",
+        "ocr_app:users:INSERT", "ocr_app:users:SELECT"]);
+    // Column-level UPDATE: identity, tenant and creation time are immutable, and audit rows are append-only.
+    const updatable = async (relname: string) => (await superDb.query<{ column_name: string }>(
+      `SELECT a.attname AS column_name FROM pg_attribute a WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped
+         AND has_column_privilege('ocr_app', a.attrelid, a.attnum, 'UPDATE') ORDER BY a.attname`, [relname])).rows.map((row) => row.column_name);
+    assert.deepEqual(await updatable("users"), ["can_export", "disabled_at", "display_name", "failed_logins", "last_login_at", "locked_until",
+      "must_change_password", "password_changed_at", "password_expires_at", "password_hash", "role", "updated_at"]);
+    assert.deepEqual(await updatable("auth_sessions"), ["last_seen_at", "revoked_at", "revoked_reason"]);
+    assert.deepEqual(await updatable("audit_events"), []);
+    // ocr_queue_definer is the one BYPASSRLS role: a grant drifting onto it would expose hashes and sessions across tenants.
+    const definer = await superDb.query<{ readable: boolean }>(
+      "SELECT bool_or(has_any_column_privilege('ocr_queue_definer', t, 'SELECT')) AS readable FROM unnest($1::text[]) t", [[...AUTH_TABLES]]);
+    assert.equal(definer.rows[0]!.readable, false, "the BYPASSRLS definer role must never read users, sessions or audit rows");
+  });
+
+  test("ocr_worker and ocr_queue are refused the auth tables; ocr_app can neither delete rows nor rewrite identity or audit rows", async () => {
+    for (const relname of AUTH_TABLES) {
+      await assert.rejects(asWorker(TENANT_A, `SELECT count(*) FROM ${relname}`), { code: "42501" }, `worker:${relname}`);
+      await assert.rejects(queueRolePool.query(`SELECT count(*) FROM ${relname}`), { code: "42501" }, `queue:${relname}`);
+    }
+    await assert.rejects(asApp(TENANT_A, "UPDATE users SET organization_id = organization_id"), { code: "42501" });
+    await assert.rejects(asApp(TENANT_A, "UPDATE users SET username = username"), { code: "42501" });
+    await assert.rejects(asApp(TENANT_A, "UPDATE audit_events SET outcome = 'failure'"), { code: "42501" });
+    await assert.rejects(asApp(TENANT_A, "DELETE FROM audit_events"), { code: "42501" });
+    await assert.rejects(asApp(TENANT_A, "DELETE FROM users"), { code: "42501" });
+    await assert.rejects(asApp(TENANT_A, "DELETE FROM auth_sessions"), { code: "42501" });
+  });
+
+  test("0019 tenant scope: no GUC hides every row, tenant B sees none of tenant A's, cross-tenant writes are refused, usernames are per tenant", async () => {
+    const userA = await createUser(TENANT_A, "somchai");
+    await asApp(TENANT_A, "INSERT INTO auth_sessions(organization_id, user_id, token_hash, expires_at) VALUES ($1,$2,$3, now() + interval '8 hours')",
+      [TENANT_A, userA, tokenHash("session-a")]);
+    await asApp(TENANT_A, "INSERT INTO audit_events(organization_id, actor_user_id, action, target_type, target_id) VALUES ($1,$2,'auth.login','user',$2)", [TENANT_A, userA]);
+    for (const relname of AUTH_TABLES) {
+      const count = async (tenantId: string | null) => (await asApp<{ count: number }>(tenantId, `SELECT count(*)::int AS count FROM ${relname}`))[0]!.count;
+      assert.equal(await count(null), 0, `no GUC:${relname}`);
+      assert.equal(await count(TENANT_B), 0, `tenant B:${relname}`);
+      assert.equal(await count(TENANT_A), 1, `tenant A:${relname}`);
+    }
+    await assert.rejects(asApp(TENANT_B, "INSERT INTO users(organization_id, username, display_name, role, password_hash) VALUES ($1,'intruder','Intruder','staff',$2)",
+      [TENANT_A, FAKE_HASH]), /row-level security/, "a row for another tenant is rejected by the policy");
+    await assert.rejects(asApp(TENANT_B, "INSERT INTO auth_sessions(organization_id, user_id, token_hash, expires_at) VALUES ($1,$2,$3, now() + interval '1 hour')",
+      [TENANT_B, userA, tokenHash("cross-tenant")]), { code: "23503" }, "composite FK: a session never points at another tenant's user");
+    assert.notEqual(await createUser(TENANT_B, "somchai"), userA, "the same username may exist in both tenants");
+    await assert.rejects(createUser(TENANT_A, "somchai"), { code: "23505" }, "it is unique within one tenant");
   });
 });

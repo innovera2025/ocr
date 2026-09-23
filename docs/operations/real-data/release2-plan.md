@@ -1658,3 +1658,24 @@ defect seen through two lenses (F6/F20, F4/F21) and were fixed once.
 | F32 | An admin could reset or unlock themselves, revoking their own session and hiding the one-time password behind the login dialog | fixed | C6 (`CANNOT_CHANGE_SELF`), F1 (actions hidden on your own row), §12 |
 | F33 | The new header user menu would overflow and cause horizontal scroll at phone width | fixed | F1 (single `#me-open` pill + `me-dlg` at ≤720px), §12 manual and behaviour checks |
 | F34 | A Thai keyboard layout produced silent `INVALID_CREDENTIALS` against an ASCII-only username, and there was no way to reveal a 12+ character password | fixed | F1 login fields (keyboard hint, `แสดงรหัสผ่าน` toggle), §12 |
+
+## Deviations at implementation
+
+Recorded as each commit lands, per the implementation rule: follow the code, fix the smallest thing that works, and
+write the deviation down instead of diverging silently.
+
+**C1 (0019, its static test, the verify-db-roles additions and the batch.db.test.ts pins)**
+
+- **The 8-function message in `batch.db.test.ts`.** §12 asks for a message saying "0019 and 0020 created no function".
+  0020 does not exist yet at C1, so the message reads `0018 and 0019 created no function`; C8 extends it when 0020
+  lands. The asserted list of 8 functions is unchanged, so the check itself is exactly what §12 specifies.
+- **Which connection the new `verify-db-roles.sh` checks use.** A2 fixes the role names but not the DSN. The 0019
+  lines run on `$DATABASE_URL_BOOTSTRAP`, which the script already requires (`verify-db-roles.sh:3`): one connection
+  answers for every role, which is the point of naming them explicitly, and the role-DSN checks above are untouched.
+- **`has_any_column_privilege` for the worker/queue read checks.** A2 names the function only for the `ocr_app` audit
+  and `ocr_queue_definer` checks. `worker:no-select-*` and `queue:no-select-*` use it too: `has_table_privilege` is
+  false when only a column grant exists, so the table-level form would miss exactly the drift that matters. This
+  follows the 0018 convention (`worker:no-select-extraction-jobs`).
+- **`deploy/sql/verify-release2-grants.sql` shape.** A2 says what it must check and §15 Deploy A step 6 says it must
+  print `FAIL=0`. It is one read-only `WITH checks(...) VALUES` query that prints `PASS <name>` / `FAIL <name>` per
+  check and a final `SUMMARY PASS=n FAIL=m`, so `psql -AtX -f -` needs no wrapper script inside the container.
