@@ -35,6 +35,13 @@ export async function withTenant<T>(pool: Pool, tenantId: string, work: (client:
   const idleTimeout = timeoutValue(options.idleInTransactionTimeoutMs);
   const begin = `BEGIN${isolation ? ` ISOLATION LEVEL ${isolation}` : ""}${readOnly ? " READ ONLY" : ""}`;
   const client = await pool.connect();
+  // pg-pool emits 'error' on the POOL only for clients sitting idle in it; a checked-out client has no listener at all
+  // (it removes its own at checkout and re-attaches it inside release). An unhandled 'error' is fatal in Node, so a
+  // database restart or a `pg_terminate_backend` behind any transaction here — including the preview, which asks
+  // PostgreSQL itself to terminate the backend after `idleInTransactionTimeoutMs` — would take the whole process down.
+  let broken: Error | null = null;
+  const onError = (error: Error): void => { broken = error; };
+  client.on("error", onError);
   try {
     await client.query(begin);
     await client.query("SELECT set_config('app.current_org', $1, true)", [tenantId]);
@@ -44,5 +51,5 @@ export async function withTenant<T>(pool: Pool, tenantId: string, work: (client:
     await client.query("COMMIT");
     return result;
   } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; }
-  finally { client.release(); }
+  finally { client.release(broken !== null); client.removeListener("error", onError); }
 }

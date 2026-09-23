@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
-import { runMigrations } from "./index.js";
+import { createDatabasePool, runMigrations } from "./index.js";
 
 test("migration runner applies in order and is idempotent", async () => {
   const root = await mkdtemp(join("/tmp", "ocr-migrations-"));
@@ -23,4 +23,21 @@ test("migration runner applies in order and is idempotent", async () => {
     assert.equal((await runMigrations({ directory: root, db })).length, 0);
     assert.ok(calls.includes("BEGIN"));
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a pool 'error' is recorded instead of taking the process down", async () => {
+  const seen: Error[] = [];
+  const pool = createDatabasePool("postgres://user@127.0.0.1:1/none", (error) => { seen.push(error); });
+  pool.emit("error", new Error("terminating connection due to administrator command"));
+  assert.deepEqual(seen.map((error) => error.message), ["terminating connection due to administrator command"]);
+  await pool.end();
+
+  // No callback: the default still writes one structured line, so a restarted backend is not swallowed in silence.
+  const lines: string[] = [];
+  const write = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array) => { lines.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8")); return true; }) as typeof process.stderr.write;
+  const quiet = createDatabasePool("postgres://user@127.0.0.1:1/none");
+  try { quiet.emit("error", new Error("connection terminated unexpectedly")); } finally { process.stderr.write = write; }
+  await quiet.end();
+  assert.deepEqual(lines.map((line) => JSON.parse(line)), [{ event: "db_pool_error", error: "connection terminated unexpectedly" }]);
 });

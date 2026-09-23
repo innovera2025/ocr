@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Pool } from "pg";
-import { documentFilterSql, hasReviewFields, isUuid, legacyFieldPath, pageJobPriority, PostgresOcrDocumentStore, statusCategoryOf, structuredStaffResult, structuredDocumentResult, toBatchSummary, toStructuredResult } from "./index.js";
+import { documentFilterSql, EXPORT_MAX_DURATION_MS, hasReviewFields, isUuid, legacyFieldPath, pageJobPriority, PostgresOcrDocumentStore, statusCategoryOf, structuredStaffResult, structuredDocumentResult, toBatchSummary, toStructuredResult } from "./index.js";
 
 test("needsReview mapping detects any staff field requiring review", () => {
   const response = { documentId: "d", staffOnly: { therapistName: { needsReview: false }, treatment: { needsReview: true } } };
@@ -171,9 +171,12 @@ class FakeExportClient {
   readonly queries: FakeQuery[] = [];
   readonly released: (boolean | Error | undefined)[] = [];
   private readonly listeners = new Set<(error: Error) => void>();
+  /** Runs while the statement is in flight, so a test can kill the backend during the teardown round-trips. */
+  during: Partial<Record<string, () => void>> = {};
   constructor(private readonly pages: Row[][], private readonly total: number, private readonly fetchFails?: Error) {}
   async query(text: string, values: readonly unknown[] = []): Promise<{ rows: unknown[] }> {
     this.queries.push({ text, values });
+    this.during[text]?.();
     if (text.startsWith("FETCH")) {
       if (this.fetchFails) throw this.fetchFails;
       return { rows: this.pages.shift() ?? [] };
@@ -279,6 +282,59 @@ test("a backend killed mid-stream rejects the export instead of crashing the pro
   client.emitError(dead); // pg-pool removed its own idle listener at checkout: ours is the only one left.
   await assert.rejects((async () => { for await (const page of cursor.rows()) void page; })(), dead);
   assert.deepEqual(client.released, [true], "a client whose backend died is destroyed, not returned to the pool");
+  await pool.end();
+});
+
+test("close() keeps the 'error' listener until the client is back in the pool", async () => {
+  const dead = new Error("terminating connection due to administrator command");
+  const client = new FakeExportClient([], 0);
+  const { store, pool } = exportStore([client]);
+  const cursor = await store.openExport("t", {}, { maxRows: 10 });
+  // The backend dies while close() awaits COMMIT. FakeExportClient.emitError throws when no listener is attached, so
+  // this case fails loudly on the window that would otherwise raise ERR_UNHANDLED_ERROR and exit the web mid-upload.
+  client.during.COMMIT = () => { client.emitError(dead); };
+  await cursor.close();
+  assert.deepEqual(client.released, [true], "a client whose backend died during the teardown is destroyed, not pooled");
+  await pool.end();
+});
+
+test("rows() honours close(), so a disconnect handler cannot fire a FETCH at another request's connection", async () => {
+  const client = new FakeExportClient([[documentRow("a")], [documentRow("b")]], 2);
+  const { store, pool } = exportStore([client]);
+  const cursor = await store.openExport("t", {}, { maxRows: 10, batchSize: 1 });
+  const rows = cursor.rows();
+  await rows.next();
+  await cursor.close(); // what a 'close'/'aborted' handler or the wall-clock timer does while the generator is suspended
+  const fetches = client.texts.filter((text) => text.startsWith("FETCH")).length;
+  assert.deepEqual(await rows.next(), { value: undefined, done: true });
+  assert.equal(client.texts.filter((text) => text.startsWith("FETCH")).length, fetches, "no FETCH after the client was released");
+  await pool.end();
+});
+
+test("an export has a wall-clock budget of its own, whatever the route does", async () => {
+  const client = new FakeExportClient([[documentRow("a")], [documentRow("b")]], 2);
+  const { store, pool } = exportStore([client]);
+  let now = 1_000_000;
+  const cursor = await store.openExport("t", {}, { maxRows: 10, batchSize: 1, now: () => now });
+  const rows = cursor.rows();
+  await rows.next();
+  // A reader that accepts one page every two minutes resets statement_timeout and the idle timeout on every FETCH,
+  // so only this budget ever ends it.
+  now += EXPORT_MAX_DURATION_MS + 1;
+  await assert.rejects(rows.next(), { message: "EXPORT_TIMEOUT" });
+  assert.deepEqual(client.texts.slice(-2), ["CLOSE export_cur", "COMMIT"], "the cursor is still closed and the client released");
+  await pool.end();
+});
+
+test("a non-finite maxRows is refused instead of silently disabling the cap", async () => {
+  const client = new FakeExportClient([], 999_999);
+  const { store, pool } = exportStore([client]);
+  // `Math.max(1, Math.trunc(NaN))` is NaN and `999999 > NaN` is false: an unset OCR_EXPORT_MAX_ROWS would have
+  // streamed the whole tenant.
+  for (const bad of [Number(undefined), Number.POSITIVE_INFINITY, 0, -1]) {
+    await assert.rejects(store.openExport("t", {}, { maxRows: bad }), { message: "EXPORT_MAX_ROWS_INVALID" }, String(bad));
+  }
+  assert.deepEqual(client.queries, [], "it never even opens a transaction");
   await pool.end();
 });
 

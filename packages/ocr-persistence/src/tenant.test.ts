@@ -6,16 +6,21 @@ import { withTenant } from "./tenant.js";
 type Call = { sql: string; values: readonly unknown[] | undefined };
 
 /** A pool that records what a transaction sends, so the statement order and the GUC can be asserted without a server. */
-function fakePool(): { pool: Pool; calls: Call[]; released: () => number; connects: () => number } {
+function fakePool(): { pool: Pool; calls: Call[]; released: () => (boolean | undefined)[]; connects: () => number; emitError: (error: Error) => void } {
   const calls: Call[] = [];
-  let released = 0;
+  const released: (boolean | undefined)[] = [];
   let connects = 0;
+  const listeners = new Set<(error: Error) => void>();
   const client = {
     query: async (sql: string, values?: readonly unknown[]) => { calls.push({ sql, values }); return { rows: [], rowCount: 0 }; },
-    release: () => { released += 1; }
+    release: (destroy?: boolean) => { released.push(destroy); },
+    on: (event: string, listener: (error: Error) => void) => { if (event === "error") listeners.add(listener); return client; },
+    removeListener: (_event: string, listener: (error: Error) => void) => { listeners.delete(listener); return client; }
   };
   const pool = { connect: async () => { connects += 1; return client as unknown as PoolClient; } } as unknown as Pool;
-  return { pool, calls, released: () => released, connects: () => connects };
+  return { pool, calls, released: () => released, connects: () => connects,
+    // What node-postgres does when the backend dies: with no listener at all this event ends the process.
+    emitError: (error) => { if (listeners.size === 0) throw new Error("no 'error' listener: this event would have crashed the process"); for (const listener of listeners) listener(error); } };
 }
 
 test("withTenant opens one transaction, sets the tenant GUC transaction-locally and commits", async () => {
@@ -24,7 +29,7 @@ test("withTenant opens one transaction, sets the tenant GUC transaction-locally 
   assert.equal(result, "done");
   assert.deepEqual(calls.map((call) => call.sql), ["BEGIN", "SELECT set_config('app.current_org', $1, true)", "COMMIT"]);
   assert.deepEqual(calls[1]!.values, ["11111111-2222-3333-4444-555555555555"]);
-  assert.equal(released(), 1);
+  assert.deepEqual(released(), [false]);
 });
 
 test("withTenant builds the BEGIN from the whitelisted isolation level and sets the timeouts as parameters", async () => {
@@ -53,5 +58,16 @@ test("withTenant rolls back and releases the client when the work throws", async
   await assert.rejects(withTenant(pool, "11111111-2222-3333-4444-555555555555", async () => { throw new Error("BOOM"); }), /BOOM/);
   assert.equal(calls.at(-1)!.sql, "ROLLBACK");
   assert.ok(!calls.some((call) => call.sql === "COMMIT"));
-  assert.equal(released(), 1);
+  assert.deepEqual(released(), [false]);
+});
+
+test("a checked-out client keeps an 'error' listener for as long as it is out of the pool", async () => {
+  const { pool, released, emitError } = fakePool();
+  const dead = new Error("terminating connection due to idle-in-transaction timeout");
+  // pg-pool's own listener is removed at checkout and only re-attached inside release(); without this one the event
+  // is unhandled, which is fatal in Node. `idleInTransactionTimeoutMs` exists to make PostgreSQL do exactly this.
+  await withTenant(pool, "11111111-2222-3333-4444-555555555555", async () => { emitError(dead); },
+    { readOnly: true, idleInTransactionTimeoutMs: 60_000 });
+  assert.deepEqual(released(), [true], "a client whose backend died is destroyed, not returned to the pool");
+  assert.throws(() => emitError(dead), /would have crashed/, "and the listener is removed once it is back in the pool");
 });

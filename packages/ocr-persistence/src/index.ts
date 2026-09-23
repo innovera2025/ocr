@@ -126,7 +126,8 @@ export type DocumentListItem = { documentId: string; batchId: string | null; fil
 /** `parentId`: only the pages of that (split) PDF. The filters themselves are `DocumentFilter`, shared with the export. */
 export type ListDocumentsQuery = DocumentFilter & { limit?: number | undefined; offset?: number | undefined };
 /** `maxRows` is `OCR_EXPORT_MAX_ROWS`: above it the export is refused with EXPORT_TOO_LARGE before anything is read. */
-export type OpenExportOptions = { maxRows: number; batchSize?: number | undefined };
+/** `now` is the wall clock behind `EXPORT_MAX_DURATION_MS`; only the tests pass it. */
+export type OpenExportOptions = { maxRows: number; batchSize?: number | undefined; now?: (() => number) | undefined };
 /**
  * A streaming export in progress. `total` is the exact row count of the snapshot the rows come from (the audit row and
  * the `X-Export-Rows` header quote it). `rows()` may be consumed once; `close()` is idempotent and releases the
@@ -232,7 +233,11 @@ function exportDate(value: string | undefined): string | null {
 export function documentFilterSql(tenantId: string, filter: DocumentFilter, params: unknown[]): string {
   params.push(tenantId);
   const where = [`d.organization_id = $${params.length}::uuid`, VISIBLE_SQL];
-  const statuses = filter.status === undefined ? [] : typeof filter.status === "string" ? [filter.status] : [...filter.status];
+  // Deduplicated and bounded here, where every caller passes through. `status` is multi-valued for the export and
+  // `CATEGORY_SQL.succeeded`/`.confirmed` each embed a `jsonb_path_exists` evaluated per row, so `?status=confirmed`
+  // repeated 500 times would otherwise build 500 copies of it into both the count and the cursor.
+  const statuses = [...new Set(filter.status === undefined ? [] : typeof filter.status === "string" ? [filter.status] : filter.status)];
+  if (statuses.length > DOCUMENT_STATUS_CATEGORIES.length) throw new Error("INVALID_QUERY");
   for (const status of statuses) if (!DOCUMENT_STATUS_CATEGORIES.includes(status)) throw new Error("INVALID_QUERY");
   if (statuses.length > 0) where.push(`(${statuses.map((status) => `(${CATEGORY_SQL[status]})`).join(" OR ")})`);
   if (filter.confirmedOnly === true) where.push(`(${CATEGORY_SQL.confirmed})`);
@@ -246,7 +251,9 @@ export function documentFilterSql(tenantId: string, filter: DocumentFilter, para
     params.push(filter.parentId);
     where.push(`d.parent_document_id = $${params.length}::uuid`);
   }
-  const q = typeof filter.q === "string" ? filter.q.trim().slice(0, 200) : "";
+  // 100 is the contract (§10 H2, `parseDocumentListQuery` and `parseExportQuery` both reject longer); the slice here is
+  // the defence-in-depth backstop for a direct store caller, not a second, looser limit.
+  const q = typeof filter.q === "string" ? filter.q.trim().slice(0, MAX_FILTER_QUERY_LENGTH) : "";
   if (q) {
     params.push(`%${escapeLike(q)}%`);
     const p = `$${params.length}`;
@@ -340,8 +347,16 @@ const BATCH_IDLE_AFTER_MS = 5 * 60_000;
 const EXPORT_STATEMENT_TIMEOUT_MS = 60_000;
 const EXPORT_IDLE_TIMEOUT_MS = 120_000;
 const EXPORT_FETCH_SIZE = 500;
+/**
+ * The whole download's budget. Every successful `FETCH` resets both PostgreSQL timeouts, so a reader that accepts one
+ * page every two minutes trips neither and pins one of the two export slots for good. The cursor enforces this itself,
+ * so the bound holds however the route is wired (§10 H5's `ExportGate` adds the same cap per user on top).
+ */
+export const EXPORT_MAX_DURATION_MS = 600_000;
 /** Each open export pins one pooled connection for as long as the browser takes to receive the file. */
 const MAX_CONCURRENT_EXPORTS = 2;
+/** §10 H2: the shared filter's `q`. The HTTP parsers reject anything longer; the store slices as a backstop. */
+export const MAX_FILTER_QUERY_LENGTH = 100;
 const EXPORT_PREVIEW_ROWS = 20;
 function iso(value: unknown): string | null { return value instanceof Date ? value.toISOString() : typeof value === "string" ? new Date(value).toISOString() : null; }
 function ms(value: unknown): number | null { return value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : null; }
@@ -974,8 +989,12 @@ export class PostgresOcrDocumentStore implements ReviewStore {
    * in-flight upload.
    */
   async openExport(tenantId: string, filter: DocumentFilter = {}, options: OpenExportOptions): Promise<ExportCursor> {
-    const maxRows = Math.max(1, Math.trunc(options.maxRows));
+    // Fail closed: `Math.max(1, Math.trunc(NaN))` is NaN and `total > NaN` is false, so a route that passed
+    // `Number(process.env.OCR_EXPORT_MAX_ROWS)` with the variable unset or malformed would stream the whole tenant.
+    if (!Number.isFinite(options.maxRows) || options.maxRows < 1) throw new Error("EXPORT_MAX_ROWS_INVALID");
+    const maxRows = Math.trunc(options.maxRows);
     const batchSize = clampInt(options.batchSize, EXPORT_FETCH_SIZE, 1, EXPORT_FETCH_SIZE);
+    const deadline = (options.now ?? Date.now)() + EXPORT_MAX_DURATION_MS;
     const params: unknown[] = [];
     const condition = documentFilterSql(tenantId, filter, params);
     if (this.openExports >= MAX_CONCURRENT_EXPORTS) throw new Error("EXPORT_BUSY");
@@ -993,14 +1012,19 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     const close = async (): Promise<void> => {
       if (closed) return;
       closed = true;
-      client.removeListener("error", onError);
       this.openExports -= 1;
-      let failed = broken !== null;
+      let failed = false;
       // Nothing is CLOSEd when the pre-check refused the export: a cursor that was never declared would raise 34000
       // and cost us a healthy pooled connection on every EXPORT_TOO_LARGE.
       try { if (declared) await client.query("CLOSE export_cur"); await client.query("COMMIT"); }
       catch { failed = true; await client.query("ROLLBACK").catch(() => undefined); }
-      finally { client.release(failed); }
+      // The listener stays attached until the client is back in the pool: pg-pool removes its own idle listener at
+      // checkout and re-attaches it inside release(), so dropping ours any earlier leaves the CLOSE/COMMIT round-trips
+      // — the two statements most likely to meet a terminated backend — with no 'error' listener at all, which is a
+      // fatal exception in Node and would cut every in-flight upload.
+      // `broken` is read HERE, not before the teardown: an 'error' that arrives during the CLOSE/COMMIT round-trips
+      // must still destroy the client rather than return a dead connection to the pool.
+      finally { client.release(failed || broken !== null); client.removeListener("error", onError); }
     };
     try {
       await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -1012,9 +1036,16 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       if (total > maxRows) throw new Error("EXPORT_TOO_LARGE");
       await client.query(`DECLARE export_cur NO SCROLL CURSOR FOR ${EXPORT_SELECT} WHERE ${condition} ${EXPORT_ORDER}`, params);
       declared = true;
+      const now = options.now ?? Date.now;
       async function* rows(): AsyncGenerator<ExportDocument[], void, undefined> {
         try {
           for (;;) {
+            // `closed` is checked before every FETCH and after every yield: close() may be called from a
+            // client-disconnect handler or a wall-clock timer while the generator is suspended, and the client is back
+            // in the pool by then — a stray FETCH would land inside whichever transaction now owns that connection,
+            // fail with 34000 and leave that unrelated request's transaction aborted.
+            if (closed) return;
+            if (now() > deadline) throw new Error("EXPORT_TIMEOUT");
             const page = await client.query<Row>(`FETCH ${batchSize} FROM export_cur`);
             if (page.rows.length > 0) yield page.rows.map(toExportDocument);
             if (page.rows.length < batchSize) return;
