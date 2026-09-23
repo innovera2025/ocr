@@ -245,6 +245,12 @@ const workbenchStore: WorkbenchStore = {
   saveReview: async () => ({ corrections: 0, delivery: "NOT_REQUIRED", document: {} })
 };
 
+/** Records what a workbench route passes the store, so the attribution case can read the audit context back (§6 D9). */
+function recordingWorkbenchStore(): WorkbenchStore & { readonly batches: unknown[] } {
+  const batches: unknown[] = [];
+  return { ...workbenchStore, batches, createBatch: async (_tenantId, input) => { batches.push(input); return { batchId: "10000000-0000-4000-8000-000000000001" }; } };
+}
+
 const baseWebConfig: WebConfig = { tenantId: tenant, publicBaseUrl: "", publicOrigin: "", sessionIdleMinutes: 30, sessionAbsoluteHours: 12, exportMaxRows: 50_000 };
 
 type HarnessOptions = Readonly<{
@@ -254,6 +260,7 @@ type HarnessOptions = Readonly<{
   production?: boolean;
   seed?: (store: FakeUserStore) => void;
   clerkHash?: string;
+  workbenchStore?: WorkbenchStore;
 }>;
 
 type Harness = Readonly<{ app: Server; store: FakeUserStore; clock: { now: number }; throttle: LoginThrottle }>;
@@ -276,7 +283,7 @@ function harness(options: HarnessOptions = {}): Harness {
   }
   try {
     const app = createAppServer(
-      { ingest: { stage: async () => "key", scan: async () => "CLEAN", enqueue: async () => "job" }, workbenchStore, userStore: store },
+      { ingest: { stage: async () => "key", scan: async () => "CLEAN", enqueue: async () => "job" }, workbenchStore: options.workbenchStore ?? workbenchStore, userStore: store },
       {
         webConfig: { ...baseWebConfig, ...(options.production ? { publicBaseUrl: "https://ocr.test", publicOrigin: "https://ocr.test" } : {}), ...options.webConfig },
         loginThrottle: throttle, clock: () => clock.now
@@ -793,6 +800,23 @@ test("a forged X-Request-Id is echoed but never stored: the audit row holds the 
     assert.notEqual(denied?.requestId, "forged-request-id");
     assert.match(String(denied?.requestId), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     assert.equal(denied?.actorUserId, clerkId);
+  });
+});
+
+test("a workbench write is attributed to the live session's user and session id", async () => {
+  const workbench = recordingWorkbenchStore();
+  const h = harness({ workbenchStore: workbench });
+  await withServer(h, async (base) => {
+    const clerk = await signedIn(base, "clerk1", CLERK_PASSWORD);
+    const sessionId = h.store.audits.find((event) => event.action === "login.succeeded")?.sessionId;
+    assert.ok(sessionId, "the login opened a session");
+    const created = await fetch(`${base}/api/batches`, { method: "POST", headers: { ...authHeaders(clerk), "content-type": "application/json" }, body: JSON.stringify({ total: 2 }) });
+    assert.equal(created.status, 201);
+    const input = workbench.batches[0] as { createdBy: string; expectedTotal: number; audit: { actorUserId: string; sessionId: string; requestId: string } };
+    // `createdBy` is users.id, not a name, and the audit row rides along on the same session (§6 D9).
+    assert.deepEqual([input.createdBy, input.expectedTotal], [clerkId, 2]);
+    assert.deepEqual([input.audit.actorUserId, input.audit.sessionId], [clerkId, sessionId]);
+    assert.match(input.audit.requestId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   });
 });
 

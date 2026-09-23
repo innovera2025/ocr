@@ -1785,3 +1785,31 @@ write the deviation down instead of diverging silently.
   but the file's shared header objects are built before a port is known. `Sec-Fetch-Site: same-origin` is the branch
   C2.2 defines for a request with no `Origin`, and a browser cannot forge it; `auth.test.ts` covers the `Origin` form,
   including a sibling `*.innoveraappcenter.com` origin.
+
+**C5 (attribution and audit plumbing in the stores, runtime and server)**
+
+- **`audit` is optional on four of the five actions, required on the fifth.** §6 makes only `saveCorrection` throw
+  (`CORRECTION_AUDIT_REQUIRED`), because only it had a default to remove. `createUploadedDocument`, `createBatch`,
+  `saveReview` and `retryDocument` therefore take an optional `AuditContext` and write their row when they are given
+  one. Requiring it would force an actor on every existing DB-test call site and on
+  `scripts/runtime-hardening-check.ts`, and `audit_events`' composite FK means that actor must be a real user of the
+  tenant. What guarantees the rows in production is the server: `server.test.ts` asserts that all five routes pass
+  `ctx.userId`, `ctx.sessionId` and the request's own trace id.
+- **`CorrectionAudit` carries the context.** §6 says "an explicit audit" without naming a shape. `CorrectionAudit`
+  keeps `raw` and `verifiedBy` and gains `audit?: AuditContext`, which writes `document.field_confirmed {field}`.
+  `CORRECTION_AUDIT_REQUIRED` is thrown for a PENDING call with no `CorrectionAudit` at all, before the pool is
+  touched, so a caller that forgot the actor never opens a transaction.
+- **`document.uploaded` only on the path that creates a document.** §6 says "for new documents only": both reuse
+  paths (a replay into a full batch, and the idempotency-key conflict) return an existing document whose own upload
+  was recorded when it was created, and write nothing.
+- **Two new stdout events, `batch_created` and `document_field_confirmed`.** §6 requires every audit row to be
+  mirrored to stdout, but its "New events" list names only the auth ones; upload, review and retry already log.
+  The confirm event carries the field name, never the value, exactly like the audit row.
+- **`labels.ts` ships in C5 with the reviewer label only.** §11 lists it among the export files; the drawer (F) needs
+  `LEGACY_REVIEWER_LABEL` first, and C9 adds the export's Thai labels to it. The fallback itself stays with the
+  readers: the store returns `reviewedByName: null`, so the API keeps saying "this actor matches no user" instead of
+  baking a Thai string into its JSON, and `reviewerLabel()` is the one place that turns that into the label.
+- **The attribution test lives in `server.test.ts`.** §12 lists it under `auth.test.ts`, but the five actions need the
+  ingest, review-store and OCR-client fakes that only `workbenchHarness` has, and the same file already holds the
+  `reviewedBy` spoofing case §12 says to keep. `auth.test.ts` proves the other half — that the user id and session id
+  reaching the store come from a live session — next to C4's forged `X-Request-Id` case.

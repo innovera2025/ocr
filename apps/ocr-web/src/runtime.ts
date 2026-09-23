@@ -4,7 +4,7 @@ import type { IngestDependencies } from "@innovera/ocr-ingest";
 import { mintOriginalKey } from "@innovera/ocr-storage";
 import { createLocalStorage } from "@innovera/ocr-storage/local";
 import { DEFAULT_JOB_PRIORITY, jobPriority, PostgresQueue } from "@innovera/ocr-queue/postgres";
-import { PostgresOcrDocumentStore } from "@innovera/ocr-persistence";
+import { PostgresOcrDocumentStore, type AuditContext } from "@innovera/ocr-persistence";
 import type { Pool } from "pg";
 
 /**
@@ -14,7 +14,8 @@ import type { Pool } from "pg";
  */
 export function batchJobPriority(position: number): number { return jobPriority(DEFAULT_JOB_PRIORITY + position); }
 
-export function createRuntimeIngest(pool: Pool, tenantId: string, idempotencyKey?: string, batchId?: string): IngestDependencies {
+/** `actor` is who is uploading (§6 D9): `createUploadedDocument` writes its `document.uploaded` row in the same transaction. */
+export function createRuntimeIngest(pool: Pool, tenantId: string, idempotencyKey?: string, batchId?: string, actor?: AuditContext): IngestDependencies {
   const storage = createLocalStorage(process.env.OCR_STORAGE_ROOT ?? "/var/lib/ocr");
   const queue = new PostgresQueue(pool);
   const store = new PostgresOcrDocumentStore(pool);
@@ -41,7 +42,7 @@ export function createRuntimeIngest(pool: Pool, tenantId: string, idempotencyKey
       const { batchPosition, ...uploaded } = await store.createUploadedDocument({
         tenantId, filename, mimeType, sizeBytes: bytes.byteLength,
         contentHash: createHash("sha256").update(bytes).digest("hex"), storageKey: stagedKey,
-        ...idempotency, ...(batchId ? { batchId } : {}), requestFingerprint: fingerprint(filename, mimeType, bytes)
+        ...idempotency, ...(batchId ? { batchId } : {}), ...(actor ? { audit: actor } : {}), requestFingerprint: fingerprint(filename, mimeType, bytes)
       });
       return { ...uploaded, ...(batchPosition !== undefined ? { priority: batchJobPriority(batchPosition) } : {}) };
     },

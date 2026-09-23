@@ -13,7 +13,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { Pool } from "pg";
-import { hasReviewFields, PostgresOcrDocumentStore, PostgresUserStore, toStructuredResult, withTenant,
+import { hasReviewFields, LEGACY_REVIEWER_LABEL, PostgresOcrDocumentStore, PostgresUserStore, reviewerLabel, toStructuredResult, withTenant,
   type AuditContext, type DocumentView, type PageDocumentInput, type SessionRevokeReason, type UserRole } from "./index.js";
 
 type Claimed = { jobId: string; organizationId: string; runId: string; kind: string; leaseToken: string };
@@ -70,7 +70,7 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
   let batchA = "", batchB = "";
   const docs: Record<string, { documentId: string; runId: string }> = {};
 
-  async function upload(store: PostgresOcrDocumentStore, tenantId: string, filename: string, extra: { batchId?: string; idempotencyKey?: string; requestFingerprint?: string } = {}) {
+  async function upload(store: PostgresOcrDocumentStore, tenantId: string, filename: string, extra: { batchId?: string; idempotencyKey?: string; requestFingerprint?: string; audit?: AuditContext } = {}) {
     return store.createUploadedDocument({ tenantId, filename, mimeType: "image/png", sizeBytes: 10, contentHash: "0".repeat(64), storageKey: `org/${tenantId}/original/ab/${randomBytes(16).toString("hex")}`, ...extra });
   }
   async function asApp<T>(tenantId: string | null, sql: string, values: unknown[] = []): Promise<T[]> {
@@ -1054,6 +1054,64 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     await assert.rejects(b.recordAudit({ actorUserId: admin.id, action: "access.denied", outcome: "denied" }), { code: "23503" }, "the composite FK keeps an actor inside its tenant");
     await assert.rejects(a.recordAudit({ actorUserId: admin.id, action: "AccessDenied" }), /AUDIT_ACTION_INVALID/);
     await assert.rejects(a.recordAudit({ actorUserId: admin.id, action: "access.denied", requestId: "forged-by-the-client" }), /AUDIT_REQUEST_ID_INVALID/);
+  });
+
+  test("attribution: each document action commits one audit row with it, and the reviewer name comes from a join", async () => {
+    const actorId = await createUser(TENANT_A, "attrib.user");
+    const actorName = "Staff attrib.user";
+    const audit = (): AuditContext => ({ actorUserId: actorId, requestId: randomUUID() });
+    const rowsFor = async (targetId: string, action: string) => asApp<{ actor_user_id: string; detail: Record<string, unknown>; request_id: string; outcome: string }>(
+      TENANT_A, "SELECT actor_user_id, detail, request_id, outcome FROM audit_events WHERE target_id=$1::uuid AND action=$2 ORDER BY occurred_at", [targetId, action]);
+
+    // Batch and upload. A replay reuses the document this key already created, so it writes no second row.
+    const batch = await app.createBatch(TENANT_A, { createdBy: actorId, expectedTotal: 2, audit: audit() });
+    assert.deepEqual(await auditActions(TENANT_A, batch.batchId), ["batch.created"]);
+    const replayed = { batchId: batch.batchId, idempotencyKey: randomUUID(), requestFingerprint: "attrib-fingerprint" };
+    const doc = await upload(app, TENANT_A, "attrib.png", { ...replayed, audit: audit() });
+    const replay = await upload(app, TENANT_A, "attrib.png", { ...replayed, audit: audit() });
+    assert.deepEqual([replay.documentId, replay.reused], [doc.documentId, true]);
+    assert.deepEqual(await auditActions(TENANT_A, doc.documentId), ["document.uploaded"]);
+    const uploadedRow = (await rowsFor(doc.documentId, "document.uploaded"))[0]!;
+    assert.deepEqual([uploadedRow.actor_user_id, uploadedRow.outcome, uploadedRow.detail], [actorId, "success", {}]);
+    assert.ok(uploadedRow.request_id, "the row carries the request's trace id");
+
+    // Retry: a FAILED document that reached the queue once.
+    await asApp(TENANT_A, "UPDATE documents SET status='FAILED' WHERE id=$1::uuid", [doc.documentId]);
+    await asApp(TENANT_A, `INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, available_at)
+      SELECT gen_random_uuid(), $1::uuid, r.id, 'OCR', 'FAILED', now() FROM document_runs r WHERE r.organization_id=$1::uuid AND r.document_id=$2::uuid`, [TENANT_A, doc.documentId]);
+    await app.retryDocument(TENANT_A, doc.documentId, audit());
+    assert.deepEqual(await auditActions(TENANT_A, doc.documentId), ["document.uploaded", "document.retried"]);
+
+    // Review. The actor must exist in this tenant, so a bad audit context takes the whole review with it.
+    const reviewed = await upload(app, TENANT_A, "attrib-review.png", { audit: audit() });
+    await saveResult(TENANT_A, reviewed.documentId, { ...reviewResponse, documentId: `local-${randomUUID()}` });
+    const before = (await app.getReviewDocument(TENANT_A, reviewed.documentId))!;
+    assert.deepEqual([before.reviewedBy, before.reviewedByName, reviewerLabel(before.reviewedBy, before.reviewedByName)], [null, null, null]);
+    const edited = structuredClone(before.structuredResult) as DocumentView;
+    (edited.staffOnly.therapistName as Record<string, unknown>).value = "พิมพ์";
+    await assert.rejects(app.saveReview(TENANT_A, reviewed.documentId, { structuredResult: edited, reviewedBy: actorId, audit: { actorUserId: randomUUID(), requestId: randomUUID() } }),
+      { code: "23503" }, "an actor of no tenant is refused by the composite FK");
+    assert.deepEqual([(await app.getReviewDocument(TENANT_A, reviewed.documentId))!.reviewedAt, await auditActions(TENANT_A, reviewed.documentId)],
+      [null, ["document.uploaded"]], "the review and its audit row roll back together");
+    const saved = await app.saveReview(TENANT_A, reviewed.documentId, { structuredResult: edited, reviewedBy: actorId, audit: audit() });
+    assert.deepEqual([saved.document.reviewedBy, saved.document.reviewedByName], [actorId, actorName]);
+    assert.deepEqual((await rowsFor(reviewed.documentId, "document.reviewed"))[0]?.detail, { corrections: saved.corrections, delivery: saved.delivery });
+
+    // Legacy confirm: the field name only, and never without an actor.
+    await assert.rejects(app.saveCorrection(TENANT_A, reviewed.documentId, "roomNo", "9", "PENDING"), { message: "CORRECTION_AUDIT_REQUIRED" });
+    await app.saveCorrection(TENANT_A, reviewed.documentId, "roomNo", "9", "PENDING", undefined, undefined, { raw: "12", verifiedBy: actorId, audit: audit() });
+    await app.saveCorrection(TENANT_A, reviewed.documentId, "roomNo", "9", "SUCCEEDED", undefined, false);
+    const confirmed = await rowsFor(reviewed.documentId, "document.field_confirmed");
+    assert.deepEqual(confirmed.map((row) => row.detail), [{ field: "roomNo" }], "the status-only call writes no second row");
+    assert.equal((await asApp<{ verified_by: string }>(TENANT_A, "SELECT verified_by FROM ocr_corrections WHERE document_id=$1::uuid AND field='roomNo'", [reviewed.documentId]))[0]?.verified_by, actorId);
+
+    // The name join: a uuid matching no user and a legacy non-UUID value both yield null, and neither raises 22P02.
+    for (const value of [randomUUID(), "user-a"]) {
+      await asApp(TENANT_A, "UPDATE documents SET reviewed_by=$2 WHERE id=$1::uuid", [reviewed.documentId, value]);
+      const row = (await app.getReviewDocument(TENANT_A, reviewed.documentId))!;
+      assert.deepEqual([row.reviewedBy, row.reviewedByName], [value, null], value);
+      assert.equal(reviewerLabel(row.reviewedBy, row.reviewedByName), LEGACY_REVIEWER_LABEL);
+    }
   });
 
   test("withTenant opens a read-only transaction that refuses every write", async () => {

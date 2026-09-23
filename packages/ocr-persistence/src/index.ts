@@ -1,16 +1,24 @@
 import { Pool, type PoolClient, type PoolConfig } from "pg";
 import type { OcrResponse } from "@innovera/ocr-client";
 import { applyReviewEdits, legacyTreatmentIndex, markReviewed, normalizeStructuredResult, summarizeDocument, type DocumentSummary, type DocumentView } from "./document-view.js";
+import { insertAudit, type AuditContext } from "./audit.js";
 import { isUuid, withTenant } from "./tenant.js";
 
 export * from "./document-view.js";
 export * from "./tenant.js";
 export * from "./audit.js";
+export * from "./labels.js";
 export * from "./users.js";
 
 export type OcrDocumentStatus = "PROCESSING" | "SUCCEEDED" | "NEEDS_REVIEW" | "FAILED";
 export type ConfirmStatus = "PENDING" | "SUCCEEDED" | "RETRY";
-export type CorrectionAudit = Readonly<{ raw: string; verifiedBy: string }>;
+/**
+ * The legacy confirm's actor (§6 D9). `raw` chooses the treatment item, `verifiedBy` is the `users.id` written to
+ * `ocr_corrections.verified_by`, and `audit` carries the `document.field_confirmed` row written in the same
+ * transaction. It is required for the PENDING call: the old `verifiedBy = tenantId` default attributed every
+ * confirmation to the tenant itself.
+ */
+export type CorrectionAudit = Readonly<{ raw: string; verifiedBy: string; audit?: AuditContext | undefined }>;
 
 /** `batchPosition`: 1-based position of a new upload among the batch's files (counted under the batch lock; fair priority). */
 export type UploadedDocument = Readonly<{ documentId: string; runId: string; tenantId: string; reused?: boolean; batchId?: string; batchPosition?: number }>;
@@ -66,7 +74,10 @@ export type ReviewDocument = Readonly<{
   needsReview: boolean;
   confirmStatus: string | null;
   reviewedAt: string | null;
+  /** `users.id` since login exists; a legacy value (or a deleted account) joins to no name, see `reviewedByName`. */
   reviewedBy: string | null;
+  /** The reviewer's `display_name`, or null when `reviewed_by` matches no user — then the UI shows `LEGACY_REVIEWER_LABEL`. */
+  reviewedByName: string | null;
   updatedAt: string;
   errorMessage: string | null;
   createdAt: string;
@@ -102,7 +113,8 @@ export type BatchSummary = { batchId: string; label: string | null; createdAt: s
   durationMs: number | null /* createdAt → last completion once finished, or once nothing is queued or processing and
     nothing arrived or completed for 5 minutes (fewer files than expected arrived), else → now; null before the first upload */;
   throughputPerMinute: number | null /* completed per minute of durationMs */ };
-export type CreateBatchInput = { createdBy: string; expectedTotal: number; label?: string | null | undefined };
+/** `createdBy` is `users.id` (§6 D9); `audit` writes `batch.created` in the same transaction. */
+export type CreateBatchInput = { createdBy: string; expectedTotal: number; label?: string | null | undefined; audit?: AuditContext | undefined };
 export type DocumentListItem = { documentId: string; batchId: string | null; filename: string; mimeType: string;
   status: string; statusCategory: DocumentStatusCategory; needsReview: boolean; errorMessage: string | null; createdAt: string;
   processedAt: string | null; reviewedAt: string | null; deliveryStatus: DeliveryStatus; summary: DocumentSummary;
@@ -110,7 +122,8 @@ export type DocumentListItem = { documentId: string; batchId: string | null; fil
 /** `parentId`: only the pages of that (split) PDF. */
 export type ListDocumentsQuery = { limit?: number | undefined; offset?: number | undefined; status?: DocumentStatusCategory | undefined; q?: string | undefined;
   batchId?: string | undefined; parentId?: string | undefined };
-export type SaveReviewInput = { structuredResult: unknown; reviewedBy: string; expectedUpdatedAt?: string | undefined };
+/** `reviewedBy` is `users.id` (§6 D9); `audit` writes `document.reviewed` in the same transaction. */
+export type SaveReviewInput = { structuredResult: unknown; reviewedBy: string; expectedUpdatedAt?: string | undefined; audit?: AuditContext | undefined };
 export type SaveReviewResult = { corrections: number; delivery: "PENDING" | "NOT_REQUIRED"; document: ReviewDocument };
 
 /** Everything the web workbench needs from the store (fakes in tests can implement this shape). */
@@ -189,8 +202,16 @@ const VISIBLE_SQL = "d.deleted_at IS NULL AND d.status NOT IN ('DELETED','SPLIT'
 const PARENT_JOIN = "LEFT JOIN documents p ON p.id = d.parent_document_id AND p.organization_id = d.organization_id";
 const PAGE_COLUMNS = "d.parent_document_id, d.page_number, d.page_count, p.filename AS parent_filename";
 
+/**
+ * §6 D9: names come from a join, nothing is retyped or backfilled. `reviewed_by` is a varchar that holds `users.id`
+ * since login exists and free text before it, so the comparison is text-to-text: a legacy value simply matches no row
+ * (a `::uuid` cast would raise 22P02 on it). The users table is tiny and the join runs per document row.
+ */
+const REVIEWER_NAME_SQL = "(SELECT u.display_name FROM users u WHERE u.organization_id = d.organization_id AND u.id::text = d.reviewed_by)";
+
 const REVIEW_SELECT = `SELECT d.id, d.organization_id, d.batch_id, d.filename, d.mime_type, d.status::text AS status, d.ocr_document_id, d.ocr_engine, d.ocr_version,
-  d.raw_response, d.structured_result, d.needs_review, d.confirm_status, ${REVIEWED_AT_SQL} AS reviewed_at, d.reviewed_by, d.updated_at, d.error_message,
+  d.raw_response, d.structured_result, d.needs_review, d.confirm_status, ${REVIEWED_AT_SQL} AS reviewed_at, d.reviewed_by,
+  ${REVIEWER_NAME_SQL} AS reviewed_by_name, d.updated_at, d.error_message,
   d.created_at, d.processed_at, ${DELIVERY_SQL} AS delivery_status, ${PAGE_COLUMNS}
 FROM documents d ${PARENT_JOIN} WHERE d.id = $1::uuid AND d.organization_id = $2::uuid AND d.deleted_at IS NULL`;
 
@@ -278,6 +299,7 @@ function toReviewDocument(row: Row): ReviewDocument {
     status: String(row.status), ocrDocumentId: str(row.ocr_document_id), ocrEngine: str(row.ocr_engine), ocrVersion: str(row.ocr_version),
     rawResponse: row.raw_response ?? null, structuredResult: viewOf(row),
     needsReview: row.needs_review === true, confirmStatus: str(row.confirm_status), reviewedAt: iso(row.reviewed_at), reviewedBy: str(row.reviewed_by),
+    reviewedByName: str(row.reviewed_by_name),
     updatedAt: iso(row.updated_at) ?? "", errorMessage: str(row.error_message), createdAt: iso(row.created_at) ?? "", processedAt: iso(row.processed_at),
     deliveryStatus: delivery(row.delivery_status), ...pageFields(row)
   };
@@ -367,7 +389,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
    * has no UPDATE on ocr_batches, so the batch row cannot be locked FOR UPDATE), so there is no overshoot, and the new
    * file's 1-based position in its batch (`batchPosition`, for the fair queue priority) is exact.
    */
-  async createUploadedDocument(input: { tenantId: string; filename: string; mimeType: string; sizeBytes: number; contentHash: string; storageKey: string; idempotencyKey?: string; requestFingerprint?: string; batchId?: string | undefined }): Promise<UploadedDocument> {
+  async createUploadedDocument(input: { tenantId: string; filename: string; mimeType: string; sizeBytes: number; contentHash: string; storageKey: string; idempotencyKey?: string; requestFingerprint?: string; batchId?: string | undefined; audit?: AuditContext | undefined }): Promise<UploadedDocument> {
     if (input.batchId !== undefined && !isUuid(input.batchId)) throw new Error("BATCH_NOT_FOUND");
     let batchPosition: number | undefined;
     const client = await this.pool.connect();
@@ -420,6 +442,9 @@ export class PostgresOcrDocumentStore implements ReviewStore {
           return reused;
         }
       }
+      // §6 D9: the `document.uploaded` row is written in the upload's own transaction, and only for a document this
+      // request created. Every early return above reused a document whose upload was recorded when it was created.
+      if (input.audit) await insertAudit(client, { ...input.audit, tenantId: input.tenantId, action: "document.uploaded", targetType: "document", targetId: row.id });
       await client.query("COMMIT");
       return { documentId: row.id, runId: run.rows[0]!.id, tenantId: input.tenantId, ...(input.batchId ? { batchId: input.batchId } : {}), ...(batchPosition ? { batchPosition } : {}) };
     } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; }
@@ -643,10 +668,18 @@ export class PostgresOcrDocumentStore implements ReviewStore {
   /**
    * Legacy single-field confirm (flow unchanged). Path-aware (`legacyFieldPath`, with `audit.raw` choosing the treatment
    * item). The PENDING call writes the value and `needsReview:false`; the later SUCCEEDED/RETRY calls of the same
-   * confirmation only update statuses, so they never re-resolve (and possibly move) the target. The audit row keeps the
-   * pre-correction raw/value.
+   * confirmation only update statuses, so they never re-resolve (and possibly move) the target. The correction row keeps
+   * the pre-correction raw/value, and the PENDING call also writes `document.field_confirmed` (§6 D9).
+   *
+   * CORRECTION_AUDIT_REQUIRED: a PENDING call must name its actor. The removed default wrote the tenant id into
+   * `verified_by`, which now has to be `users.id`.
    */
-  async saveCorrection(tenantId: string, documentId: string, field: string, value: string, confirmStatus: ConfirmStatus, confirmError?: string, remainingNeedsReview?: boolean, audit: CorrectionAudit = { raw: "", verifiedBy: tenantId }): Promise<void> {
+  async saveCorrection(tenantId: string, documentId: string, field: string, value: string, confirmStatus: ConfirmStatus, confirmError?: string, remainingNeedsReview?: boolean, audit?: CorrectionAudit): Promise<void> {
+    let pending: CorrectionAudit | null = null;
+    if (confirmStatus === "PENDING") {
+      if (audit === undefined) throw new Error("CORRECTION_AUDIT_REQUIRED");
+      pending = audit;
+    }
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -654,7 +687,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       const current = await client.query<{ structured_result: unknown }>("SELECT structured_result FROM documents WHERE id=$1::uuid AND organization_id=$2::uuid AND deleted_at IS NULL FOR UPDATE", [documentId, tenantId]);
       if (!current.rows[0]) throw new Error("DOCUMENT_NOT_FOUND_OR_FORBIDDEN");
       const stored = current.rows[0].structured_result;
-      const path = confirmStatus === "PENDING" ? legacyFieldPath(stored, field, audit.raw) : null;
+      const path = pending ? legacyFieldPath(stored, field, pending.raw) : null;
       const previous = (path ?? []).reduce<unknown>((node, key) => typeof node === "object" && node !== null ? (node as Row)[key] : undefined, stored);
       const previousField: Row = path && typeof previous === "object" && previous !== null ? previous as Row : {};
       const result = await client.query(
@@ -671,13 +704,13 @@ export class PostgresOcrDocumentStore implements ReviewStore {
         [value, confirmStatus, confirmError ?? null, documentId, tenantId, remainingNeedsReview ?? null, path]
       );
       if (result.rowCount !== 1) throw new Error("DOCUMENT_NOT_FOUND_OR_FORBIDDEN");
-      if (confirmStatus === "PENDING") {
+      if (pending) {
         const correction = await client.query<{ id: string }>(
           `INSERT INTO ocr_corrections(organization_id, document_id, field, old_raw, normalized_value, verified_value, verified_by, confirm_status)
            VALUES ($1::uuid, $2::uuid, $3::varchar, COALESCE($4::text, $5::text), COALESCE($6::text, $5::text), $7::text, $8::text, 'PENDING')
            ON CONFLICT (organization_id, document_id, field, verified_value) DO UPDATE SET confirm_status='PENDING', confirm_error=NULL, verified_at=now()
            RETURNING id`,
-          [tenantId, documentId, field, str(previousField.raw), audit.raw, str(previousField.value), value, audit.verifiedBy]
+          [tenantId, documentId, field, str(previousField.raw), pending.raw, str(previousField.value), value, pending.verifiedBy]
         );
         const correctionId = correction.rows[0]!.id;
         await client.query(
@@ -685,8 +718,10 @@ export class PostgresOcrDocumentStore implements ReviewStore {
            SELECT $1::uuid, $2::uuid, jsonb_build_object('documentId', ocr_document_id, 'field', $3::text, 'raw', $4::text, 'verifiedValue', $5::text), 'PENDING', 0, now()
            FROM documents WHERE id=$6::uuid AND organization_id=$1::uuid
            ON CONFLICT (correction_id) DO UPDATE SET status='PENDING', next_attempt_at=now(), last_error=NULL`,
-          [tenantId, correctionId, field, audit.raw, value, documentId]
+          [tenantId, correctionId, field, pending.raw, value, documentId]
         );
+        // The field name, never the value: an audit row says what was confirmed, the correction row holds the data.
+        if (pending.audit) await insertAudit(client, { ...pending.audit, tenantId, action: "document.field_confirmed", targetType: "document", targetId: documentId, detail: { field: field.slice(0, 120) } });
       } else {
         await client.query(
           `UPDATE ocr_corrections SET confirm_status=$1::varchar, confirm_error=$2::text
@@ -736,6 +771,8 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     if (!Number.isInteger(input.expectedTotal) || input.expectedTotal < 1 || input.expectedTotal > 500 || (label !== null && label.length > 200) || !createdBy) throw new Error("BATCH_INVALID");
     return this.tenantTransaction(tenantId, async (client) => {
       const inserted = await client.query<{ id: string }>("INSERT INTO ocr_batches(organization_id, created_by, label, expected_total) VALUES ($1::uuid, $2, $3, $4) RETURNING id", [tenantId, createdBy, label, input.expectedTotal]);
+      // §6 D9: the label is the operator's own text and stays out of the audit row; the batch id points at it.
+      if (input.audit) await insertAudit(client, { ...input.audit, tenantId, action: "batch.created", targetType: "batch", targetId: inserted.rows[0]!.id });
       const summary = await client.query<Row>(BATCH_SELECT, [tenantId, inserted.rows[0]!.id, 1]);
       return toBatchSummary(summary.rows[0]!);
     });
@@ -804,7 +841,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
    * split again by its new job (the worker decides from the document; existing pages are kept). The job has the default
    * priority 100. DOCUMENT_NOT_FOUND / DOCUMENT_NOT_RETRYABLE.
    */
-  async retryDocument(tenantId: string, documentId: string): Promise<{ jobId: string }> {
+  async retryDocument(tenantId: string, documentId: string, audit?: AuditContext): Promise<{ jobId: string }> {
     if (!isUuid(documentId)) throw new Error("DOCUMENT_NOT_FOUND");
     return this.tenantTransaction(tenantId, async (client) => {
       const document = await client.query<{ status: string; is_page: boolean }>("SELECT status::text AS status, parent_document_id IS NOT NULL AS is_page FROM documents WHERE id=$1::uuid AND organization_id=$2::uuid AND deleted_at IS NULL FOR UPDATE", [documentId, tenantId]);
@@ -820,6 +857,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       const job = await client.query<{ id: string }>(
         "INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, available_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'OCR', 'PENDING', now()) RETURNING id",
         [tenantId, latest.id]);
+      if (audit) await insertAudit(client, { ...audit, tenantId, action: "document.retried", targetType: "document", targetId: documentId });
       return { jobId: job.rows[0]!.id };
     });
   }
@@ -866,6 +904,11 @@ export class PostgresOcrDocumentStore implements ReviewStore {
            ON CONFLICT (correction_id) DO UPDATE SET payload=EXCLUDED.payload, status='PENDING', attempts=0, next_attempt_at=now(), last_error=NULL,
              sent_at=NULL, locked_at=NULL, locked_by=NULL`,
           [tenantId, correction.rows[0]!.id, row.ocr_document_id, provider.field, provider.raw, provider.verifiedValue]);
+      }
+      // §6 D9: the review and its audit row commit together, so a confirmed document always has one.
+      if (input.audit) {
+        await insertAudit(client, { ...input.audit, tenantId, action: "document.reviewed", targetType: "document", targetId: documentId,
+          detail: { corrections: changes.length, delivery: deliver ? "PENDING" : "NOT_REQUIRED" } });
       }
       const saved = await client.query<Row>(REVIEW_SELECT, [documentId, tenantId]);
       return { corrections: changes.length, delivery: deliver ? "PENDING" : "NOT_REQUIRED", document: toReviewDocument(saved.rows[0]!) };

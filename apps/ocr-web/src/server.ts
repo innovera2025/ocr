@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { loadConfig, loadWebConfig, redactLog, type WebConfig } from "@innovera/ocr-config";
 import { handleRawUpload, type IngestDependencies } from "@innovera/ocr-ingest/http";
 import { OcrClient } from "@innovera/ocr-client";
-import { DOCUMENT_STATUS_CATEGORIES, legacyTreatmentIndex, normalizeStructuredResult, type DocumentStatusCategory, type DocumentView, type ReviewStore } from "@innovera/ocr-persistence";
+import { DOCUMENT_STATUS_CATEGORIES, legacyTreatmentIndex, normalizeStructuredResult, type AuditContext, type DocumentStatusCategory, type DocumentView, type ReviewStore } from "@innovera/ocr-persistence";
 import { assertDatabaseReady, createDatabasePool, runMigrationsWithPool } from "@innovera/ocr-db-runtime";
 import { resolve } from "node:path";
 import { PostgresOcrDocumentStore } from "@innovera/ocr-persistence";
@@ -25,17 +25,17 @@ export type DocumentListQuery = { limit: number; offset: number; status?: Docume
 
 /** Structural subset of the store methods behind the workbench routes (spec §4), so tests can pass fakes. PostgresOcrDocumentStore implements it; results are passed through as JSON. */
 export type WorkbenchStore = Readonly<{
-  createBatch(tenantId: string, input: { createdBy: string; expectedTotal: number; label?: string }): Promise<object>;
+  createBatch(tenantId: string, input: { createdBy: string; expectedTotal: number; label?: string; audit?: AuditContext }): Promise<object>;
   getBatch(tenantId: string, batchId: string): Promise<object | null>;
   listBatches(tenantId: string, limit?: number): Promise<readonly object[]>;
   listDocuments(tenantId: string, query: DocumentListQuery): Promise<{ total: number; documents: readonly object[] }>;
-  retryDocument(tenantId: string, documentId: string): Promise<{ jobId: string }>;
-  saveReview(tenantId: string, documentId: string, input: { structuredResult: unknown; reviewedBy: string; expectedUpdatedAt?: string }): Promise<{ corrections: number; delivery: "PENDING" | "NOT_REQUIRED"; document: unknown }>;
+  retryDocument(tenantId: string, documentId: string, audit?: AuditContext): Promise<{ jobId: string }>;
+  saveReview(tenantId: string, documentId: string, input: { structuredResult: unknown; reviewedBy: string; expectedUpdatedAt?: string; audit?: AuditContext }): Promise<{ corrections: number; delivery: "PENDING" | "NOT_REQUIRED"; document: unknown }>;
 }>;
 
 export type AppDependencies = Readonly<{
   ingest: IngestDependencies;
-  ingestForTenant?: (tenantId: string, idempotencyKey?: string, batchId?: string) => IngestDependencies;
+  ingestForTenant?: (tenantId: string, idempotencyKey?: string, batchId?: string, actor?: AuditContext) => IngestDependencies;
   reviewStore?: ReviewStore;
   workbenchStore?: WorkbenchStore;
   userStore?: UserStore;
@@ -245,13 +245,15 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
   /** The tenant is always `ctx.tenantId`, the configured login tenant; tenant headers stay ignored. Returns false when no /api route matched. */
   const handleApi = async (request: IncomingMessage, response: ServerResponse, url: URL, method: string, reqId: string, traceId: string, ctx: WebAuthContext): Promise<boolean> => {
     const pathname = url.pathname;
+    // §6 D9: every action of this request is attributed to the session's user and joined to its log lines by `traceId`.
+    const audit: AuditContext = { actorUserId: ctx.userId, sessionId: ctx.sessionId, requestId: traceId };
     if (pathname === "/api/documents" && method === "POST") {
       if (!app) throw new Error("INGEST_NOT_CONFIGURED");
       const batchHeader = headerValue(request.headers["x-batch-id"])?.trim();
       if (batchHeader !== undefined && !UUID.test(batchHeader)) throw new Error("INVALID_BATCH_ID");
       const batchId = batchHeader?.toLowerCase();
       const idempotencyKey = headerValue(request.headers["idempotency-key"]);
-      const uploadDependencies = app.ingestForTenant ? app.ingestForTenant(ctx.tenantId, idempotencyKey, batchId) : app.ingest;
+      const uploadDependencies = app.ingestForTenant ? app.ingestForTenant(ctx.tenantId, idempotencyKey, batchId, audit) : app.ingest;
       const uploaded = await handleRawUpload(request, uploadDependencies, config.limits.maxUploadBytes);
       const { stagedKey: _internalStorageKey, ...publicResult } = uploaded;
       metrics.increment("uploads_total", { status: String(uploaded.status) });
@@ -271,7 +273,9 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
     if (pathname === "/api/batches" && method === "POST") {
       const store = workbench();
       const input = parseBatchInput(await readJson(request));
-      respond(response, 201, await store.createBatch(ctx.tenantId, { createdBy: ctx.userId, ...input }));
+      const batch = await store.createBatch(ctx.tenantId, { createdBy: ctx.userId, ...input, audit });
+      logEvent("batch_created", { request_id: reqId, trace_id: traceId, user_id: ctx.userId, tenant_id: ctx.tenantId, batch_id: (batch as { batchId?: string }).batchId ?? null, expected_total: input.expectedTotal });
+      respond(response, 201, batch);
       return true;
     }
     if (pathname === "/api/batches" && method === "GET") {
@@ -318,7 +322,7 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
       const store = workbench();
       const documentId = uuidOr404(documentMatch[1]!, "DOCUMENT_NOT_FOUND");
       const input = parseReviewInput(await readJson(request));
-      const saved = await store.saveReview(ctx.tenantId, documentId, { ...input, reviewedBy: ctx.userId });
+      const saved = await store.saveReview(ctx.tenantId, documentId, { ...input, reviewedBy: ctx.userId, audit });
       logEvent("review_saved", { request_id: reqId, trace_id: traceId, user_id: ctx.userId, tenant_id: ctx.tenantId, document_id: documentId, corrections: saved.corrections, delivery: saved.delivery });
       respond(response, 200, { status: "confirmed", delivery: saved.delivery, corrections: saved.corrections, document: saved.document });
       return true;
@@ -326,7 +330,7 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
     if (action === "POST retry") {
       const store = workbench();
       const documentId = uuidOr404(documentMatch[1]!, "DOCUMENT_NOT_FOUND");
-      const retried = await store.retryDocument(ctx.tenantId, documentId);
+      const retried = await store.retryDocument(ctx.tenantId, documentId, audit);
       logEvent("document_retry_queued", { request_id: reqId, trace_id: traceId, user_id: ctx.userId, tenant_id: ctx.tenantId, document_id: documentId, job_id: retried.jobId });
       respond(response, 202, { status: "queued", jobId: retried.jobId });
       return true;
@@ -344,7 +348,8 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
       const current = await app.reviewStore.getReviewDocument(tenantId, documentId);
       if (!current?.ocrDocumentId) throw new Error("OCR_RESULT_NOT_FOUND");
       const otherReview = hasOtherReview(normalizeStructuredResult(current.structuredResult), field, raw);
-      await app.reviewStore.saveCorrection(tenantId, documentId, field, verifiedValue, "PENDING", undefined, undefined, { raw, verifiedBy });
+      await app.reviewStore.saveCorrection(tenantId, documentId, field, verifiedValue, "PENDING", undefined, undefined, { raw, verifiedBy, audit });
+      logEvent("document_field_confirmed", { request_id: reqId, trace_id: traceId, user_id: ctx.userId, tenant_id: tenantId, document_id: documentId, field });
       try {
         const providerField = field === "therapistName" ? "therapist" : field;
         await app.ocrClient.confirmResult({ documentId: current.ocrDocumentId, field: providerField, raw, verifiedValue });
@@ -429,7 +434,7 @@ export async function createProductionAppServer(): Promise<{ server: ReturnType<
   const userStore = new PostgresUserStore(pool, webConfig.tenantId);
   // A missing login tenant fails startup loudly, instead of every login answering "wrong password" (§4 B5).
   await userStore.assertTenant();
-  const server = createAppServer({ ingest: { stage: async () => { throw new Error("TENANT_REQUIRED"); }, scan: async () => "QUARANTINED", enqueue: async () => { throw new Error("QUEUE_RUNTIME_NOT_CONFIGURED"); } }, ingestForTenant: (tenantId, idempotencyKey, batchId) => createRuntimeIngest(pool, tenantId, idempotencyKey, batchId), reviewStore, workbenchStore: reviewStore, userStore, storage, ocrClient }, { webConfig, readiness: async () => { await assertDatabaseReady(pool); return clamAvHealthCheck({ host: process.env.OCR_CLAMAV_HOST ?? "clamav", port: Number(process.env.OCR_CLAMAV_PORT ?? 3310) }); } });
+  const server = createAppServer({ ingest: { stage: async () => { throw new Error("TENANT_REQUIRED"); }, scan: async () => "QUARANTINED", enqueue: async () => { throw new Error("QUEUE_RUNTIME_NOT_CONFIGURED"); } }, ingestForTenant: (tenantId, idempotencyKey, batchId, actor) => createRuntimeIngest(pool, tenantId, idempotencyKey, batchId, actor), reviewStore, workbenchStore: reviewStore, userStore, storage, ocrClient }, { webConfig, readiness: async () => { await assertDatabaseReady(pool); return clamAvHealthCheck({ host: process.env.OCR_CLAMAV_HOST ?? "clamav", port: Number(process.env.OCR_CLAMAV_PORT ?? 3310) }); } });
   return { server, close: async () => { await new Promise<void>((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose())); await pool.end(); } };
 }
 

@@ -15,14 +15,18 @@ const unknownId = "30000000-0000-4000-8000-000000000003";
 /** The harness authenticates by a session cookie, like the real server: the token path is gone (§5 C1). */
 const sessionToken = "Mp7xk2Qw9ZbF4nLc8TvRy1DgH6sJuA0eXiVoP3rYkNs";
 const otherSessionToken = "Zq4TmW8yRv2LbXc7NfKj1GdHs6PuA9eYiVoM3rDkQxB";
+const sessionId = "00000000-0000-4000-8000-00000000000a";
 const principal = (tenantId: string): AuthContext => ({
-  userId, tenantId, sessionId: "00000000-0000-4000-8000-00000000000a", username: "staff1", displayName: "พนักงาน",
+  userId, tenantId, sessionId, username: "staff1", displayName: "พนักงาน",
   role: "staff", canExport: false, mustChangePassword: false
 });
+/** §6 D9: what every store call must carry. The trace id is minted per request, so `maskTrace` checks and masks it. */
+const AUDIT = { actorUserId: userId, sessionId, requestId: "<trace>" } as const;
+const TRACE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const cookie = (token: string) => `ocr_session=${token}`;
 const auth = { cookie: cookie(sessionToken), "sec-fetch-site": "same-origin", "x-csrf-token": csrfTokenFor(sessionToken) };
 const otherAuth = { cookie: cookie(otherSessionToken), "sec-fetch-site": "same-origin", "x-csrf-token": csrfTokenFor(otherSessionToken) };
-const reviewExtras = { batchId: null, reviewedAt: null, reviewedBy: null, updatedAt: "2026-09-21T01:00:00.000Z", errorMessage: null, createdAt: "2026-09-21T00:59:00.000Z", processedAt: "2026-09-21T01:00:00.000Z", deliveryStatus: "NONE",
+const reviewExtras = { batchId: null, reviewedAt: null, reviewedBy: null, reviewedByName: null, updatedAt: "2026-09-21T01:00:00.000Z", errorMessage: null, createdAt: "2026-09-21T00:59:00.000Z", processedAt: "2026-09-21T01:00:00.000Z", deliveryStatus: "NONE",
   parentDocumentId: null, pageNumber: null, pageCount: null, parentFilename: null } as const;
 /** Stored views are canonical; tests may still hand the server a legacy flat shape to prove it normalizes defensively. */
 const asView = (value: unknown) => value as ReviewDocument["structuredResult"];
@@ -98,8 +102,24 @@ function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; store
   const corrections: unknown[][] = [];
   const ingestCalls: unknown[][] = [];
   const persisted: unknown[] = [];
+  const traceIds: string[] = [];
+  /**
+   * §6 D9: an audit context reaching the store must name the actor and carry the request's own trace id — never the
+   * client's `X-Request-Id`. The id is recorded for the attribution test and masked, so the other cases stay literal.
+   */
+  const maskTrace = (value: unknown): unknown => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    const entry = value as Record<string, unknown>;
+    if ("actorUserId" in entry) {
+      traceIds.push(String(entry.requestId));
+      assert.match(String(entry.requestId), TRACE_ID, "the audit context carries the server-minted trace id");
+      return { ...entry, requestId: "<trace>" };
+    }
+    if ("audit" in entry) return { ...entry, audit: maskTrace(entry.audit) };
+    return value;
+  };
   const record = (method: string, tenantId: string, ...args: unknown[]) => {
-    calls.push({ method, tenantId, args });
+    calls.push({ method, tenantId, args: args.map(maskTrace) });
     if (options.storeError) throw options.storeError;
   };
   const workbenchStore: WorkbenchStore = {
@@ -107,8 +127,8 @@ function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; store
     getBatch: async (tenantId, id) => { record("getBatch", tenantId, id); return id === batchId ? summary() : null; },
     listBatches: async (tenantId, limit) => { record("listBatches", tenantId, limit); return [summary()]; },
     listDocuments: async (tenantId, query: DocumentListQuery) => { record("listDocuments", tenantId, query); return { total: 1, documents: [{ documentId, batchId, filename: "a.png", status: "NEEDS_REVIEW", statusCategory: "review" }] }; },
-    retryDocument: async (tenantId, id) => {
-      record("retryDocument", tenantId, id);
+    retryDocument: async (tenantId, id, audit) => {
+      record("retryDocument", tenantId, id, audit);
       if (id === failedDocumentId) return { jobId: "40000000-0000-4000-8000-000000000004" };
       throw new Error(id === documentId ? "DOCUMENT_NOT_RETRYABLE" : "DOCUMENT_NOT_FOUND");
     },
@@ -130,10 +150,10 @@ function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; store
       } : null;
     },
     getOriginal: async (tenantId: string, id: string) => { record("getOriginal", tenantId, id); return id === documentId ? { storageKey: options.originalKey === undefined ? "org/x/original/ab/key" : options.originalKey, mimeType: "image/png", status: options.originalStatus ?? "NEEDS_REVIEW" } : null; },
-    saveCorrection: async (...args: unknown[]) => { corrections.push(args); }
+    saveCorrection: async (...args: unknown[]) => { corrections.push(args.map(maskTrace)); }
   };
-  const ingest = (tenantId: string, idempotencyKey?: string, batch?: string): IngestDependencies => {
-    ingestCalls.push([tenantId, idempotencyKey, batch]);
+  const ingest = (tenantId: string, idempotencyKey?: string, batch?: string, actor?: unknown): IngestDependencies => {
+    ingestCalls.push([tenantId, idempotencyKey, batch, maskTrace(actor)]);
     return {
       stage: async () => "org/x/original/ab/key", scan: async () => "CLEAN", enqueue: async () => "unused",
       persistUpload: async (input) => { persisted.push(input.filename); return { tenantId, documentId, runId: "run-1" }; },
@@ -156,7 +176,7 @@ function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; store
       throw new Error("UNAUTHENTICATED");
     }
   });
-  return { app, calls, confirmCalls, corrections, ingestCalls, persisted, contentReads: () => contentReads };
+  return { app, calls, confirmCalls, corrections, ingestCalls, persisted, traceIds, contentReads: () => contentReads };
 }
 
 async function withServer(harness: ReturnType<typeof workbenchHarness>, run: (base: string) => Promise<void>): Promise<void> {
@@ -243,10 +263,10 @@ test("batches: create, get and list", async () => {
     const created = await fetch(`${base}/api/batches`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ total: 3, label: "  Morning\u0000 shift  " }) });
     assert.equal(created.status, 201);
     assert.equal((await body(created)).expectedTotal, 3);
-    assert.deepEqual(h.calls[0], { method: "createBatch", tenantId: tenant, args: [{ createdBy: userId, expectedTotal: 3, label: "Morning shift" }] });
+    assert.deepEqual(h.calls[0], { method: "createBatch", tenantId: tenant, args: [{ createdBy: userId, expectedTotal: 3, label: "Morning shift", audit: AUDIT }] });
     const unlabeled = await fetch(`${base}/api/batches`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ total: 500, label: "   " }) });
     assert.equal(unlabeled.status, 201);
-    assert.deepEqual(h.calls[1]?.args, [{ createdBy: userId, expectedTotal: 500 }]);
+    assert.deepEqual(h.calls[1]?.args, [{ createdBy: userId, expectedTotal: 500, audit: AUDIT }]);
     for (const total of [0, 501, 2.5, "3", null]) {
       await expectError(await fetch(`${base}/api/batches`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ total }) }), 400, "INVALID_BATCH_TOTAL");
     }
@@ -312,10 +332,10 @@ test("review save: 200, conflict, validation, size limit, and bad ids", async ()
     const saved = await fetch(url, { method: "POST", headers: { ...jsonAuth, "x-tenant-id": otherTenant }, body: JSON.stringify({ structuredResult: edited, expectedUpdatedAt: "2026-09-21T01:02:03.456789+00:00" }) });
     assert.equal(saved.status, 200);
     assert.deepEqual(await body(saved), { status: "confirmed", delivery: "PENDING", corrections: 2, document: { documentId, status: "SUCCEEDED", reviewedBy: userId } });
-    assert.deepEqual(h.calls.at(-1), { method: "saveReview", tenantId: tenant, args: [documentId, { structuredResult: edited, expectedUpdatedAt: "2026-09-21T01:02:03.456789+00:00", reviewedBy: userId }] });
+    assert.deepEqual(h.calls.at(-1), { method: "saveReview", tenantId: tenant, args: [documentId, { structuredResult: edited, expectedUpdatedAt: "2026-09-21T01:02:03.456789+00:00", reviewedBy: userId, audit: AUDIT }] });
     const withoutToken = await fetch(url, { method: "POST", headers: jsonAuth, body: JSON.stringify({ structuredResult: edited, reviewedBy: "spoofed" }) });
     assert.equal(withoutToken.status, 200);
-    assert.deepEqual(h.calls.at(-1)?.args[1], { structuredResult: edited, reviewedBy: userId });
+    assert.deepEqual(h.calls.at(-1)?.args[1], { structuredResult: edited, reviewedBy: userId, audit: AUDIT });
 
     await expectError(await fetch(url, { method: "POST", headers: jsonAuth, body: JSON.stringify({ structuredResult: edited, expectedUpdatedAt: "2026-01-01T00:00:00.000Z" }) }), 409, "REVIEW_CONFLICT");
     await expectError(await fetch(`${base}/api/documents/${failedDocumentId}/ocr/review`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ structuredResult: edited }) }), 409, "DOCUMENT_NOT_REVIEWABLE");
@@ -338,12 +358,43 @@ test("retry: 202 queued, 409 when not failed, 404 for unknown or malformed ids",
     const retried = await fetch(`${base}/api/documents/${failedDocumentId}/retry`, { method: "POST", headers: auth });
     assert.equal(retried.status, 202);
     assert.deepEqual(await body(retried), { status: "queued", jobId: "40000000-0000-4000-8000-000000000004" });
-    assert.deepEqual(h.calls.at(-1), { method: "retryDocument", tenantId: tenant, args: [failedDocumentId] });
+    assert.deepEqual(h.calls.at(-1), { method: "retryDocument", tenantId: tenant, args: [failedDocumentId, AUDIT] });
     await expectError(await fetch(`${base}/api/documents/${documentId}/retry`, { method: "POST", headers: auth }), 409, "DOCUMENT_NOT_RETRYABLE");
     await expectError(await fetch(`${base}/api/documents/${unknownId}/retry`, { method: "POST", headers: auth }), 404, "DOCUMENT_NOT_FOUND");
     const count = h.calls.length;
     await expectError(await fetch(`${base}/api/documents/..%2F..%2Fetc/retry`, { method: "POST", headers: auth }), 404, "DOCUMENT_NOT_FOUND");
     assert.equal(h.calls.length, count);
+  });
+});
+
+test("attribution: upload, batch, review, confirm and retry name the session's user, with the server's trace id", async () => {
+  const h = workbenchHarness({ structuredResult: canonical({ therapist: true }) });
+  await withServer(h, async (base) => {
+    // §4 B4: `X-Request-Id` is the client's and is echoed back, but only the server-minted trace id reaches a store call.
+    const forged = { "x-request-id": "forged-by-the-client" };
+    const uploaded = await fetch(`${base}/api/documents`, { method: "POST", headers: { ...auth, ...forged, "content-type": "image/png", "x-upload-filename": "a.png" }, body: new Uint8Array([137, 80, 78, 71]) });
+    assert.equal(uploaded.status, 202);
+    assert.equal(uploaded.headers.get("x-request-id"), "forged-by-the-client", "the client's id is still echoed");
+    assert.deepEqual(h.ingestCalls.at(-1), [tenant, undefined, undefined, AUDIT]);
+
+    assert.equal((await fetch(`${base}/api/batches`, { method: "POST", headers: { ...jsonAuth, ...forged }, body: JSON.stringify({ total: 1 }) })).status, 201);
+    assert.deepEqual(h.calls.at(-1)?.args, [{ createdBy: userId, expectedTotal: 1, audit: AUDIT }]);
+
+    const reviewed = await fetch(`${base}/api/documents/${documentId}/ocr/review`, { method: "POST", headers: { ...jsonAuth, ...forged }, body: JSON.stringify({ structuredResult: canonical({ therapist: false }), reviewedBy: "spoofed" }) });
+    assert.equal(reviewed.status, 200);
+    assert.deepEqual((h.calls.at(-1)?.args[1] as { reviewedBy: string; audit: unknown }), { structuredResult: canonical({ therapist: false }), reviewedBy: userId, audit: AUDIT });
+
+    const confirmed = await fetch(`${base}/api/documents/${documentId}/ocr/confirm`, { method: "POST", headers: { ...jsonAuth, ...forged }, body: JSON.stringify({ field: "therapistName", raw: "พิพิ", verifiedValue: "พีพี" }) });
+    assert.equal(confirmed.status, 200);
+    assert.deepEqual(h.corrections[0]?.[7], { raw: "พิพิ", verifiedBy: userId, audit: AUDIT }, "the PENDING call names the actor and writes document.field_confirmed");
+    assert.equal(h.corrections[1]?.[7], undefined, "the status-only calls of the same confirmation write no second audit row");
+
+    assert.equal((await fetch(`${base}/api/documents/${failedDocumentId}/retry`, { method: "POST", headers: { ...auth, ...forged } })).status, 202);
+    assert.deepEqual(h.calls.at(-1)?.args, [failedDocumentId, AUDIT]);
+
+    assert.equal(h.traceIds.length, 5, "one audit context per action: upload, batch, review, confirm, retry");
+    assert.equal(new Set(h.traceIds).size, 5, "each request mints its own trace id");
+    assert.equal(h.traceIds.includes("forged-by-the-client"), false);
   });
 });
 
@@ -395,12 +446,12 @@ test("upload threads the batch id and decodes URI-encoded filenames", async () =
     assert.equal(result.documentId, documentId);
     assert.equal(result.jobId, "job-1");
     assert.equal("stagedKey" in result, false);
-    assert.deepEqual(h.ingestCalls, [[tenant, "file-1", batchId]]);
+    assert.deepEqual(h.ingestCalls, [[tenant, "file-1", batchId, AUDIT]]);
     assert.deepEqual(h.persisted, [name]);
     const unbatched = await upload({});
     assert.equal(unbatched.status, 202);
     assert.equal((await body(unbatched)).batchId, null);
-    assert.deepEqual(h.ingestCalls.at(-1), [tenant, "file-1", undefined]);
+    assert.deepEqual(h.ingestCalls.at(-1), [tenant, "file-1", undefined, AUDIT]);
     await expectError(await upload({ "x-batch-id": "batch-1" }), 400, "INVALID_BATCH_ID");
     await expectError(await upload({ "x-upload-filename": "bad%E0%A4%A.png" }), 400, "INVALID_UPLOAD_HEADERS");
     await expectError(await upload({ "content-type": "text/html" }), 415, "UNSUPPORTED_MEDIA_TYPE");

@@ -101,6 +101,8 @@ test("store methods reject malformed ids without touching the database", async (
   await assert.rejects(store.createBatch("t", { createdBy: "u", expectedTotal: 2, label: "x".repeat(201) }), { message: "BATCH_INVALID" });
   await assert.rejects(store.createBatch("t", { createdBy: " ", expectedTotal: 2 }), { message: "BATCH_INVALID" });
   await assert.rejects(store.saveReview("t", "0b7e9f5e-3b1c-4c0e-9d53-2a5f0c7c8f11", { structuredResult: {}, reviewedBy: "u", expectedUpdatedAt: "yesterday" }), { message: "REVIEW_INVALID" });
+  // §6 D9: a PENDING confirmation must name its actor; the removed default wrote the tenant id into verified_by.
+  await assert.rejects(store.saveCorrection("t", "0b7e9f5e-3b1c-4c0e-9d53-2a5f0c7c8f11", "roomNo", "7", "PENDING"), { message: "CORRECTION_AUDIT_REQUIRED" });
   await pool.end();
 });
 
