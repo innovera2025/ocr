@@ -20,7 +20,10 @@ never a value. Deploy outside spa hours: between step 4 and step 5 nobody can us
   login dialog, a password screen and a user administration dialog.
 - The host env file: `OCR_WEB_AUTO_AUTH` is deleted, `OCR_PUBLIC_BASE_URL` is added, `OCR_TRUSTED_PROXY_HOPS` is set
   and `AUTH_JWT_SECRETS` is rotated.
-- The worker is **not** touched. It still requires `0018_multipage_documents`.
+- The worker is **not** touched. The image Deploy A shipped (commit `52ba15f`) still requires
+  `0018_multipage_documents`. **Deploy A is done** — it is recorded here as it ran, and it must be replayed only
+  from its own tag, never from a later one: at HEAD the worker requires `0020_batch_round_clock`, so a rebuild off
+  the current tag with only 0019 applied crash-loops with `SCHEMA_NOT_READY`.
 
 ## 0. Read-only inspection (approved once)
 
@@ -101,8 +104,11 @@ in-container form, which earlier releases already used.
 6. **Grant check** (must print `FAIL=0` before staff accounts are created):
    ```sh
    $C exec -T postgres psql -U ocr_bootstrap -d innovera_ocr -AtX -f - < deploy/sql/verify-release2-grants.sql
-   #   … SUMMARY PASS=18 FAIL=0
+   #   … SUMMARY PASS=18 SKIP=2 FAIL=0      before Deploy B (the two 0020 checks cannot be asked yet)
+   #   … SUMMARY PASS=20 SKIP=0 FAIL=0      after Deploy B
    ```
+   `FAIL=0` is the gate. A `SKIP` line names a check whose migration is not applied to this database yet — before
+   Deploy B that is `app:update-batch-round` and `app:no-update-batch-label`, and nothing else may ever be skipped.
    Only if the host has `/etc/innovera/ocr-production.env`, host `psql` and host-reachable DSNs:
    ```sh
    set -a; . /etc/innovera/ocr-production.env; set +a; ./deploy/verify-db-roles.sh
@@ -126,9 +132,11 @@ in-container form, which earlier releases already used.
    ```
    Optionally `APP_BASE_URL=https://ocr.innoveraappcenter.com SAMPLE_FILE=<file> E2E_USERNAME=<own account>
    ./deploy/e2e-production.sh`; it prompts for the password.
-10. The worker is **not** touched in Deploy A (it still requires 0018).
-11. **Freeze 0019.** Commit the `test/migration-checksums.test.ts` pin. From here on a schema fix takes 0020 and the
-    batch clock slides to 0021.
+10. The worker is **not** touched in Deploy A (the image it shipped requires 0018).
+11. **Freeze 0019.** Commit the `test/migration-checksums.test.ts` pin (`APPLIED_IN_PRODUCTION = "0019_user_auth"`).
+    From here on a fix to 0001–0019 takes a new migration. `0020_batch_round_clock` — the batch clock — is that new
+    migration and ships in Deploy B; it is applied nowhere yet, so it may still be edited, with its pin regenerated
+    in the same commit. A schema fix on top of it takes 0021.
 
 ## Rollback A
 
@@ -149,8 +157,23 @@ $C up -d --no-deps web
 
 Runs only after Deploy A is accepted. It adds migration `0020_batch_round_clock` (two nullable columns and one
 column-scoped GRANT — no function, nothing rewritten), the three `/api/exports/*` routes with the `ส่งออก` dialog, and
-`OCR_REQUEST_TIMEOUT=300`. **Migration 0019 is frozen**: it is applied in production and its sha256 is pinned by
-`test/migration-checksums.test.ts`, so a schema fix takes a new migration, never an edit.
+`OCR_REQUEST_TIMEOUT=300`. **Migrations 0001–0019 are frozen**: they are applied in production and their sha256 is
+pinned by `test/migration-checksums.test.ts`, so a fix to any of them takes a new migration, never an edit. `0020` is
+that new migration and is applied nowhere yet, so it may still be edited up to this deploy — with its pin regenerated
+in the same commit. (`OCR_REQUEST_TIMEOUT` is the **worker's** HTTP timeout to the OCR API, `packages/config` →
+`ocr.requestTimeoutSeconds`; it is unrelated to the export's own budgets.)
+
+0. **The proxy's read timeout** (read-only, and it needs its own approval because it reads the shared proxy, exactly
+   like Deploy A step 0):
+   ```sh
+   docker exec <nginx-proxy> nginx -T 2>/dev/null | grep -E 'proxy_read_timeout|proxy_send_timeout'
+   ```
+   Record what the vhost carries. An export streams one chunk per `FETCH 500`, and the only thing bounding the gap
+   between two writes is the export's own `statement_timeout` of **60 s** — exactly nginx's default
+   `proxy_read_timeout`. The BOM and header row go out at once, so the proxy never waits with no data at all, but a
+   slow page mid-stream can still be cut. If the vhost is at the 60 s default, expect a large export to end as a 504
+   in the browser (`audit_events` records `export.failed`, and the browser saves nothing), and raise
+   `proxy_read_timeout` before raising `OCR_EXPORT_MAX_ROWS`. Changing the shared proxy is its own approved step.
 
 1. **[CHANGE] Backup and tags.**
    ```sh
@@ -190,8 +213,9 @@ column-scoped GRANT — no function, nothing rewritten), the three `/api/exports
    $C exec -T worker printenv OCR_REQUEST_TIMEOUT      # 300
    $C logs --since 5m worker | grep -c worker_started  # 1
    ```
-6. **Grant check.** Re-run Deploy A step 6; it must print `FAIL=0`, now including `app:update-batch-round` and
-   `app:no-update-batch-label`.
+6. **Grant check.** Re-run Deploy A step 6. It must now print `SUMMARY PASS=20 SKIP=0 FAIL=0`: the two 0020 checks
+   (`app:update-batch-round`, `app:no-update-batch-label`) answer instead of skipping, which is itself the proof that
+   0020 reached this database.
 7. **Checks by the user** (production exports never leave the user's browser and never reach git or chat):
    - a staff account **without** export rights sees no `ส่งออก` pill, and opening `/api/exports/documents.csv`
      directly answers 403;
@@ -231,7 +255,8 @@ $C up -d --no-deps web worker
 - **`เกิน 50000 แถว`:** narrow the date range in the dialog, or raise `OCR_EXPORT_MAX_ROWS` (maximum 200000) and
   recreate the web. The cap exists so one request cannot stream the whole tenant.
 - **`EXPORT_BUSY` (429):** one download per user and two per process are open at a time, and an export is given ten
-  minutes. Wait, or ask whoever is downloading to finish.
+  minutes — after which the web ends that download (it closes the cursor **and** the socket) and the slot comes back.
+  Wait, or ask whoever is downloading to finish.
 - **The download stops part-way:** the browser saves nothing (the file is fetched as a Blob, and a rejected Blob is
   never written), and the attempt is in `audit_events` as `export.failed`. `export.started` is always there, so the
   table still answers who exported what.

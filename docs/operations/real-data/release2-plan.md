@@ -1013,7 +1013,11 @@ H5. **Web** (`apps/ocr-web/src/export.ts`):
   1. await the first generator step (the count) **before** `writeHead`, so `EXPORT_TOO_LARGE` stays a clean 400;
   2. **insert and commit the `export.started` audit row** (actor, session, format, columns, filters with `has_q`, the
      total count) — still before `writeHead`;
-  3. write the BOM and header row at once, so nginx-proxy's read timeout is never reached;
+  3. write the BOM and header row at once, so nginx-proxy is never left waiting with no data at all. This does
+     **not** make its read timeout irrelevant: the header cannot go out before the `count(*)` that
+     `EXPORT_TOO_LARGE` depends on, so time-to-first-byte is bounded only by `EXPORT_STATEMENT_TIMEOUT_MS`
+     (60 s) plus the `export.started` insert, and the gap between two later writes by the same 60 s. Deploy B
+     step 0 records the vhost's `proxy_read_timeout` against that budget;
   4. stream with `if (!res.write(buf)) await once(res, 'drain')`;
   5. append `export.completed` or `export.failed` in its own transaction afterwards.
   Only `export.started` is guaranteed: a crash, a redeploy, an OOM kill or a pool with no free client while the export
@@ -1039,7 +1043,12 @@ H5. **Web** (`apps/ocr-web/src/export.ts`):
 - A stream error after the headers destroys the socket (`server.ts:432`). The browser's `blob()` then rejects, so a
   cut-off file is never saved.
 - Audit and logs: `export.completed` or `export.failed` with `{format, columns, headers, filters (has_q, never the q
-  text), rows, complete, duration_ms}`.
+  text), rows, complete, duration_ms}` — the same filter detail as `export.started`, so one row answers what was asked
+  for without a join back on `request_id`. `export.failed` also carries `result` (the metric bucket) **and** `error`
+  (the SCREAMING_SNAKE code), because `aborted` alone cannot tell a statement timeout from a client walking away.
+- The wall clock ends **both** halves of a stalled download: it closes the cursor *and* destroys the response. Closing
+  the cursor alone leaves the loop parked on a `'drain'` a client that stopped reading never fires, so the per-user
+  gate slot would never be released and that account's next export would answer 429 `EXPORT_BUSY` for good.
 
 H6. **UI:**
 - A secondary pill `ส่งออก` in the toolbar (`workbench.ts:230`), rendered only for admin or `canExport`, opens
@@ -1352,7 +1361,10 @@ and `pnpm test`, plus the DB suite.
   - `auth_csrf_rejected_total`
   - `auth_sessions_revoked_total{reason}`
   - `user_admin_total{action}`
-  - `exports_total{format,result=ok|too_large|busy|forbidden|aborted|error}`
+  - `exports_total{format=csv|jsonl|preview,result=ok|too_large|busy|throttled|forbidden|aborted|error}` — `busy`
+    is the one-download-per-user gate (429, `Retry-After: 30`) and `throttled` the 60-previews-per-15-minutes
+    limiter (429, `Retry-After: 900`): two different remedies, so two labels. `forbidden` is raised where the
+    denial happens (`recordDenied`), because `authorize` refuses the request before the export handler is entered.
   - `export_rows_total{format}`
   - `access_denied_suppressed_total`
   - **`documents_read_total{kind=listed|opened}`** — rows returned by `GET /api/documents` and full documents opened
@@ -1996,9 +2008,11 @@ write the deviation down instead of diverging silently.
   guard refuses only your own `role` and your own `disabled` (`auth-routes.ts:322`), never `canExport`. So the first
   admin of a fresh tenant reaches `/api/exports/*` on the role alone **and** may still turn the flag on for itself.
   The smallest correct fix is therefore no code change but a regression test: `auth.test.ts` now signs in the
-  bootstrap admin (`can_export = false`, as the CLI writes it), asserts all three export routes answer 404 rather
-  than 403 — past the gate, handlers still to come in C10 — and then grants the flag to itself through
-  `POST /api/users/:id`. An `ocr-users grant-export` subcommand would have added a break-glass path for a lock-out
+  bootstrap admin (`can_export = false`, as the CLI writes it), asserts all three export routes answer **past the
+  gate** rather than 403, and then grants the flag to itself through `POST /api/users/:id`. At C8 "past the gate" was
+  a 404, because the handlers were still to come; C10 shipped them in this same branch, so the test now asserts
+  **200** on all three (`auth.test.ts`, "the admin role carries export by itself"). What it pins is unchanged: the
+  admin passes on the role alone, with `can_export` still false. An `ocr-users grant-export` subcommand would have added a break-glass path for a lock-out
   that cannot happen, and "admin implies export" is already D8's wording. The CLI comment now names D8 and
   `hasRight` so the next reader does not re-derive this.
 - **`BatchSummary` gains three fields, so the whole-object pin in `batch.db.test.ts` had to list them.** G4 adds
@@ -2214,3 +2228,84 @@ write the deviation down instead of diverging silently.
   same WHERE, so the rows written must equal `cursor.total`. Anything less raises `EXPORT_TRUNCATED` (and a wall-clock
   stop raises `EXPORT_TIMEOUT` first, to name the cause), the socket is destroyed, the browser's `blob()` rejects and
   nothing is saved. `export.failed` records how many rows did leave.
+
+**C12 (the second adversarial review of C10/C11 and the Deploy B docs)**
+
+- **The wall clock now destroys the response as well as the cursor.** §10 H5 promised a ten-minute cap, but the timer
+  only closed the cursor. A client that stops reading and keeps the socket open parks the loop on a `'drain'` that
+  never fires, so `release()` was unreachable: the pooled connection came back, the per-user gate slot did not, and
+  that account's every later export answered 429 `EXPORT_BUSY` until the container restarted. The timer now also calls
+  `response.destroy()`, which rejects the pending write, unwinds the loop and runs the gate's `finally`. The
+  `timedOut` flag renames the resulting `EXPORT_ABORTED` to `EXPORT_TIMEOUT`, so the audit row and the metric name the
+  real cause. `ExportRouteDeps.wallClockMs` is new and optional (production leaves it at `EXPORT_WALL_CLOCK_MS`); it
+  exists so the regression test can drive a stalled download from a raw socket in under a second.
+- **`export.previewed` is awaited, like `export.started`.** §6 and §10 H1 say the preview is audited *because* it
+  returns the export's full column set for any filter, 20 rows a call. It was going through the best-effort path, so a
+  failing `audit_events` insert left the preview answering 200 with customer rows and no trace but a log line.
+  Best-effort now covers `export.completed` / `export.failed` only — the two rows written after the data has left.
+- **The terminal audit rows carry the filters and the error code.** §10 H5 specifies `{format, columns, headers,
+  filters, rows, complete, duration_ms}`; the code recorded only the last four, and `export.failed`'s `error` was the
+  coarse metric bucket. `filterDetail(query)` is now spread into both, and the failure records `result` (the bucket)
+  beside `error` (the SCREAMING_SNAKE code, or `INTERNAL_ERROR` for anything else — a pg message must not reach an
+  audit row).
+- **`exports_total{result="forbidden"}` is emitted, and `EXPORT_THROTTLED` got its own bucket.** §13 listed
+  `forbidden`, but the right is checked in `authorize` before `handleExportRoutes` is entered, so nothing could ever
+  raise it; it is now raised in `recordDenied` when the route is one of the three (`exportFormatLabel`). `busy` and
+  `throttled` are split because their remedies differ (`Retry-After: 30` versus `900`). §13 is updated to match.
+- **CSV truncation cuts on a code-point boundary.** `slice` counts UTF-16 units, so a cell crossing 32,000 characters
+  at an astral character (emoji, rare CJK) ended in a lone surrogate, which UTF-8 encoding turns into U+FFFD — a value
+  the matching JSONL export does not have. The cut backs off one unit when it lands on a high surrogate.
+- **The export dialog's `ชุดอัปโหลด` reuses the toolbar's fallback option.** `/api/batches?limit=20` need not carry the
+  batch the page is filtered to (one just created by an upload, or any batch once 20 newer ones exist). Setting
+  `select.value` to a value no `<option>` holds reads back as `""`, so the export silently covered **every** batch
+  while the toolbar still showed the one. `fillBatchOptions` is now shared by both selects. The fake DOM could not see
+  this (its `value` is a plain string), so the new behaviour test asserts `batchId=` is in the preview URL.
+- **Every export error code has a Thai message, including one this script raises itself.** `EXPORT_TOO_LARGE`,
+  `EXPORT_BUSY`, `EXPORT_THROTTLED`, `INVALID_EXPORT_FILTER`, `EXPORT_TIMEOUT` and `EXPORT_NOT_CONFIGURED` were all
+  reachable and all rendered as `คำขอไม่สำเร็จ (<status> · <CODE>)`. A download that dies *after* the 200 headers is
+  worse: `api()` only wraps the fetch, so the deliberate socket destroy (`EXPORT_TRUNCATED` / `EXPORT_TIMEOUT`) put the
+  platform's own English `TypeError` in the dialog. `r.blob()` is now wrapped and reported as `EXPORT_INCOMPLETE`. A
+  client-side `INVALID_EXPORT_RANGE` check stops `ถึงวันที่ < ตั้งแต่วันที่` ever reaching the server. The 429 test
+  asserts the exact string now, because its old alternation passed on the untranslated fallback.
+- **`state.exTotal` gains a "not counted yet" value (`null`).** `0` is a claim about the data, and the dialog was
+  making it on open (beside `กำลังนับจำนวนแถว…`) and beside every preview failure — telling staff to widen a filter
+  when the remedy was to wait. The download button is also disabled from the moment a control moves, so it can never
+  be live with a row count that belongs to the previous filters. `#ex-limit` gained `role="status"`, so the reason the
+  button is disabled is announced.
+- **`ปิด` clears the preview, not just the dialog.** Only logout did. With `คอลัมน์ = ละเอียด` the preview holds
+  fields (health conditions, raw readings) the workbench table never shows, and `#ex-chips` holds the staff member's
+  own search text.
+- **The download anchor is appended before the click and the object URL is revoked a turn later.** A detached anchor
+  and a same-tick `revokeObjectURL` are only reliable in Chromium, and the failure is silent —
+  `ดาวน์โหลดไฟล์ส่งออกแล้ว` fired either way. The fake DOM gained `remove()` and `click()` so the path is exercised.
+- **The two 0020 grant checks SKIP until 0020 is applied.** They were added to Deploy A's gate unguarded:
+  `has_column_privilege()` raises 42703 for a column that is not there, one error aborts the whole SQL statement, and
+  `check_sql` discards stderr — so on production's current schema (0019) the SQL file printed nothing at all and
+  `verify-db-roles.sh` reported a FAIL and a non-zero exit out of `deploy/go-live-check.sh`, for the entire window
+  between the two deploys. Both files now compute the guard from `pg_attribute` and print `SKIP`, and the summary is
+  `PASS=n SKIP=s FAIL=m`: `PASS=18 SKIP=2 FAIL=0` before Deploy B, `PASS=20 SKIP=0 FAIL=0` after. Verified against a
+  throwaway `postgres:17.6` built at 0001–0019 and at 0001–0020. A skip is deliberately not a pass — it says the
+  question could not be asked.
+- **`migration-checksums.test.ts` distinguishes frozen from not-yet-applied.** Its failure message told anyone editing
+  0020 before Deploy B to put the fix in a new migration, which is false: 0020 is applied nowhere. The pin stays (the
+  directory-versus-pin assertion is worth having), and `APPLIED_IN_PRODUCTION` now names what production has actually
+  recorded, so the message is right for both cases.
+- **The Deploy A section is marked done and pinned to its own tag.** It said the worker requires 0018 and that "the
+  batch clock slides to 0021". At HEAD the worker requires `0020_batch_round_clock` and 0020 *is* the batch clock, so
+  replaying Deploy A from a current tag would build a worker that crash-loops with `SCHEMA_NOT_READY` against a
+  database at 0019.
+- **Deploy B gained a read-only `proxy_read_timeout` precondition.** Nothing established what the shared proxy allows,
+  while the gap between two writes of an export is bounded only by the 60 s `statement_timeout` — exactly nginx's
+  default. The in-code claim that writing the header "at once" means the read timeout "is never reached" covered only
+  the first chunk and is corrected in both the comment and §10 H5 step 3. The proxy's actual value is not verifiable
+  from here (no production access), which is why the step records it rather than asserting it.
+- **Rejected: the bare `OCR_EXPORT_MAX_ROWS=` line in the deploy env sample.** Reported as a defect. The whole
+  Release-2 block of that file is deliberately key-names-only (values never leave the host), and
+  `deploy/docker-compose.yml` reads `${OCR_EXPORT_MAX_ROWS:-50000}`, whose `:-` form substitutes the default for an
+  empty value as well as an unset one. No change.
+- **Rejected: a bare LF inside a quoted CSV cell.** Reported as a defect. RFC 4180's `escaped` production explicitly
+  admits bare CR and bare LF inside a quoted field, and Excel renders them as in-cell line breaks. No change.
+- **Rejected: `EXPORT_WALL_CLOCK_MS` (600 s) versus `OCR_REQUEST_TIMEOUT=300`.** Reported as a conflict. They are
+  unrelated: `OCR_REQUEST_TIMEOUT` is the worker's HTTP timeout to the OCR API (`packages/config` →
+  `ocr.requestTimeoutSeconds`) and is not a web response budget, and Node's `server.requestTimeout` does not abort a
+  slow *response*. The nginx half of that report is real and is handled by the Deploy B step above.
