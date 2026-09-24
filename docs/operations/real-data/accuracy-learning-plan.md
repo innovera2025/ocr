@@ -1449,3 +1449,20 @@ frozen answers with 0 new silent errors, 0 broken pages and no field paying revi
 The **app side needs no deploy for accuracy**: the only app change is the W3a weight rule in
 `packages/ocr-persistence/src/document-view.ts`, whose sole caller is its own tests today. Ship it with the next app
 release; it is what stops junk confirmations the moment the review route is wired up.
+
+## Production record — Local AI v3.3 (2026-09-24)
+Deployed to the AI host: backup `/opt/innovera-backups/v33-20260924/ocr-pre-v33.tar.gz` plus `corrections-pre-v33.jsonl`
+(9 rows) and image tag `innovera-ocr-api:pre-v33-20260924`. The whole `local-ai/` payload (code, `master_data.json`,
+`calibration.json`, `tools/`) was copied over the bind-mounted `/opt/innovera-ocr` and the container restarted;
+`/health` reports version 3.3, `masterData: ok`, `calibration: ok`, and the worker reaches it through the public
+gateway. A synthetic form uploaded end to end was stored with `ocr_version 3.3`, verdict `known`, and was deleted
+afterwards together with its storage object and its Local AI upload.
+
+**Model throughput dropped on the host, not in this release.** `ocr_model.py` is byte-identical to v3.2, yet Ollama's
+prompt eval fell from a median 48.9 tok/s during the 95-page run (n=186) to 34–39 tok/s now (n=13+), so a page costs
+~72–77 s instead of ~52 s. Restarting `ollama` did not recover it (litellm on the same host does not use Ollama, so the
+restart was safe). With `OCR_REQUEST_TIMEOUT=300` there is headroom, but a 95-page batch would now take ~2 h instead of
+82 min. Watch it; if it persists, it is a VPS-level regression to raise with the provider.
+
+**Still local-only:** the 95 production page renders (1610 px) live in the Local AI's `uploads/` with no retention job.
+G0, W2 and anything image-derived remain blocked until those frozen inputs can be measured against the labels.
