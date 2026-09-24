@@ -226,9 +226,9 @@ removal; the production base image has it through `paddlepaddle`/`paddleocr`). O
 | `OCR_MODEL_CONFIDENCE_<TYPE>` | see `ocr_confidence.REVIEW_BELOW` | Review threshold on modelConfidence for one field type: `NAME`, `NATIONALITY`, `HOTEL_NAME`, `TREATMENT`, `THERAPIST`, `ROOM`, `FORM_NUMBER`, `DATE`, `TIME`; `TOKEN` = the floor for any single token of a value (0.5) (0–1) |
 | `OCR_SECTION_PARALLELISM` | `2` | Concurrent section calls per document (1–8); `1` = sequential |
 | `OCR_CUSTOMER_CROP_SCALE` | `1.0` | Upscale factor for the customer crop (0.5–4); tuning knob for the real model |
-| `OCR_UPLOAD_DIR` | `/app/uploads` | Working copy of the uploaded page, kept only **for the duration of one request** — see [Upload retention](#upload-retention-pdpa) |
-| `OCR_UPLOAD_TTL_MINUTES` | `60` | Age at which the sweeper removes a leftover a crash left in `OCR_UPLOAD_DIR` (1–1440) |
-| `OCR_KEEP_UPLOADS` | unset (off) | `1`/`true`/`yes`/`on` keeps every page image on disk and stops the sweeper. Debugging only — `/health` reports it as `uploads.keep` |
+| `OCR_UPLOAD_DIR` | `/app/uploads` | **Swept, not written**: a reading stores no page image. Only `OCR_KEEP_UPLOADS` writes here — see [Upload retention](#upload-retention-pdpa) |
+| `OCR_UPLOAD_TTL_MINUTES` | `60` | Age at which the sweeper removes a leftover in `OCR_UPLOAD_DIR` (1–1440). The startup sweep ignores it and takes every age |
+| `OCR_KEEP_UPLOADS` | unset (off) | `1`/`true`/`yes`/`on` writes every page image to `OCR_UPLOAD_DIR` and keeps it (the sweeper stops). Debugging only — `/health` reports it as `uploads.keep` |
 | `OCR_VERIFIED_FILE` | `/app/verified_dataset/corrections.jsonl` | Where `POST /v1/ocr/confirm` appends. Audit trail only since W3a — written, never read back into a reading |
 | `OCR_MASTER_DATA` | `<module dir>/master_data.json` | Masters file |
 | `OCR_CALIBRATION_FILE` | `<module dir>/calibration.json` | Review-threshold calibration file (plan §8.6). Absent = the `REVIEW_BELOW` defaults; refused = the same defaults plus `status:"degraded"` |
@@ -236,19 +236,37 @@ removal; the production base image has it through `paddlepaddle`/`paddleocr`). O
 
 ## Upload retention (PDPA)
 
-A scanned intake form carries a name, a hotel and ticked health conditions, so **no page image survives a finished
-request**. `POST /v1/ocr` writes the bytes to `OCR_UPLOAD_DIR/{documentId}{ext}` and deletes them again in a `finally`:
-on a 200, on a 400/413/415 and on an unexpected exception alike. `/app/uploads` should read empty between requests.
+A scanned intake form carries a name, a hotel and ticked health conditions, so **this host writes no page image at
+all** — not even for the length of the request. `POST /v1/ocr` reads entirely from the bytes in memory: the model crops
+never touch disk, and since 2026-09-24 neither does the page.
 
-The working copy is still written, for one reason: PDFium and Pillow decode **in the API process**, so a segfault or an
-OOM kill leaves no traceback, and those bytes are then the only record of which page did it. Nothing reads the file
-during the request — the reading runs entirely from the bytes in memory, and the model crops never touch disk.
+**Why the working copy went instead of being deleted at the end of the request.** It was kept for crash forensics —
+PDFium and Pillow decode **in the API process**, so a segfault or an OOM kill leaves no traceback and no response. But
+what that needs is the *identity* of the page, not its pixels: the app keeps its own original for 90 days
+(`docs/operations/retention.md`) and knows which page it posted, so one log line is enough to find it —
 
-What a crash or a `kill -9` leaves behind is swept: `_sweep_uploads()` runs in the app's lifespan (before the first
-request) and then every 60 s on a daemon thread, off the request path, and unlinks files older than
-`OCR_UPLOAD_TTL_MINUTES`. It only unlinks names `os.scandir` yields for that one directory, never follows a symlink, and
-swallows every `OSError`: a missing, empty or read-only upload dir degrades to "removed nothing" and never fails a
-reading or `/health`.
+```
+ocr documentId=7c1f… ext=.png bytes=1772418 sha256=3f9a1c0b8d7e4a52
+```
+
+— and the digest matches the app's copy exactly. Writing the pixels bought a second copy on a second host, on every
+request, for a convenience the digest already provides. Nothing ever read the file back: `upload_dir()` is reached only
+by the sweeper and by `/health`.
+
+**The sweeper** is the safety net for what an older version, a crash or a debugging session left in `OCR_UPLOAD_DIR`. It
+runs in the app's lifespan **before the first request, with no age limit** (nothing can be in flight in a process that
+has not started serving, and a page a `docker stop` killed mid-read would otherwise outlive the restart by a whole TTL),
+then every 60 s on a daemon thread, off the request path, removing what is older than `OCR_UPLOAD_TTL_MINUTES`. Four
+guards, because it runs as root over a host bind mount:
+
+- `OCR_KEEP_UPLOADS` stops it entirely;
+- it unlinks only names `os.scandir` yields for that one directory — a bare name, never a path from outside;
+- it unlinks only `{uuid4}.{png,jpg,jpeg,webp,pdf}`, the shape this service writes, so a mistyped `OCR_UPLOAD_DIR`
+  (`/app` is one word from the default, with the deployed code mounted there) cannot eat a directory of real files;
+- it never follows a symlink, so a link planted in the mount reaches nothing outside.
+
+A missing, empty or read-only directory degrades to "removed nothing"; one sweep that raises is logged and the next one
+still runs. Neither can fail a reading or `/health`.
 
 `/health` carries the monitor:
 
@@ -256,13 +274,20 @@ reading or `/health`.
 "uploads": { "files": 0, "ttlMinutes": 60, "keep": false }
 ```
 
-`files` is a count only — never a file name, never a customer value — and should be 0 between requests; a number that
-only grows means the sweeper is not running or `keep` is on. `keep` must read `false` in production. Neither field moves
-`status`: `healthCheck` false is what closes the ocr-worker's OCR gate, and how long a working copy lives has no effect
-on what the service reads.
+`files` is a count only — never a file name, never a customer value — and in production it is **0 during a reading as
+well as between readings**; any other number is a leftover to look at. `keep` must read `false`. Neither field moves
+`status`: `healthCheck` false is what closes the ocr-worker's OCR gate, and what is on that disk has no effect on what
+the service reads.
 
-`OCR_KEEP_UPLOADS=1` is the debugging escape hatch — it holds every page image and disables the sweeper. Use it on a
-scratch instance, never on the production host, and check `uploads.keep` in `/health` afterwards.
+`OCR_KEEP_UPLOADS=1` is the debugging escape hatch — it writes every page image and disables the sweeper. Use it on a
+scratch instance, never on the production host, delete what it collected when the session ends, and check
+`uploads.keep` in `/health` afterwards.
+
+> **One more copy exists, briefly, and needs no rule.** Starlette spools any multipart part above 1 MiB to a temp file in
+> the container's `TMPDIR`, and a real 1610 px page is ≈1.7 MB, so every real upload passes through one. It is
+> `SpooledTemporaryFile`: already unlinked, so it has no name, is not in `OCR_UPLOAD_DIR`, cannot be swept, cannot be
+> opened by anything else and dies with the file descriptor or the process. Budget the disk for it —
+> `OCR_MAX_UPLOAD_BYTES` (30 MiB) × concurrent uploads.
 
 > The app side keeps its own originals (staff need them in the review drawer, 90-day clock); this retention covers the
 > Local AI's copy only.
@@ -467,6 +492,8 @@ IMAGE=$(docker inspect -f '{{.Config.Image}}' "$LIVE")
 
 # 1. Backups (code + verified memory); keep them for at least 2 weeks
 mkdir -p /opt/backups
+# NOTE: uploads are excluded on purpose (code+memory backup, not customer data). They have their own archive step --
+#       see "Deploying the upload-retention change" below; that archive is the ONLY copy of the production page renders.
 tar czf /opt/backups/innovera-ocr-v22-$(date +%F-%H%M).tgz -C /opt --exclude='innovera-ocr/uploads' innovera-ocr
 cp -a /opt/innovera-ocr/verified_dataset/corrections.jsonl /opt/backups/corrections-$(date +%F-%H%M).jsonl
 
@@ -482,10 +509,15 @@ docker run -d --name innovera-ocr-v3 -p 127.0.0.1:5001:5000 \
 curl -s http://127.0.0.1:5001/health          # expect "version":"3.2","masterData":"ok"
 
 # 4. Compare with the live v2.2 on forms that are ALREADY on the server. Do not copy the repo fixture to the server.
-#    /opt/innovera-ocr/uploads is EMPTY between requests since the retention change ("Upload retention" above), so take
-#    the page from the app's own page storage instead. To re-fill the directory for one comparison session, start the
-#    GREEN container (step 3 only, never the live one) with -e OCR_KEEP_UPLOADS=1, send the pages, then remove the flag,
-#    restart it and check "uploads":{"keep":false,"files":0} in /health before the swap.
+#    /opt/innovera-ocr/uploads holds no page images since the retention change ("Upload retention" above), so take the
+#    page from the app's own page storage (or from the G0 archive, see the retention runbook below).
+#    Do NOT re-fill a directory with -e OCR_KEEP_UPLOADS=1 unless you tear it down in the same session: the green
+#    container's OCR_UPLOAD_DIR is /opt/innovera-ocr-v3/uploads, which step 5 MOUNTS OVER with the live uploads dir --
+#    anything left there becomes unreachable to the sweeper and to /health, and is never deleted by anything.
+#    If a held session is unavoidable, end it before step 5 and verify on the HOST, not through /health:
+#      docker rm -f innovera-ocr-v3
+#      shred -u /opt/innovera-ocr-v3/uploads/* 2>/dev/null; rmdir /opt/innovera-ocr-v3/uploads
+#      ls -1A /opt/innovera-ocr-v3/uploads 2>/dev/null | wc -l     # 0 (or "no such directory") before you swap
 SAMPLE=/path/to/an-existing-page-on-this-host.png
 for port in 5000 5001; do
   for i in 1 2 3 4 5; do curl -s -o /tmp/ocr-$port.json -w "$port %{time_total}s\n" -F "file=@$SAMPLE" http://127.0.0.1:$port/v1/ocr; done
@@ -523,6 +555,77 @@ Notes:
 - Confirmations written by v3 use the unchanged JSONL format in the live `verified_dataset`, so rollback needs no data migration.
 - v3 is backward compatible for v2.2 readers, because the legacy fields are kept. So the app/worker upgrade can ship before or after this swap.
 - PDF uploads: check `pdfSupport` in `/health` (or `python -c 'import pypdfium2.version as v; print(v.PDFIUM_INFO)'` in the container). The production base image normally includes `pypdfium2` through `paddleocr`; without it the service answers 415, and the worker treats that as non-retryable.
+
+## Deploying the upload-retention change (code only, same image, same version)
+
+This ships no new dependency, no schema change and no version bump: only `api.py` and the tests move. **It is
+irreversible for the upload directory** — the first restarted container sweeps every page image it finds there, whatever
+its age — so the archive in step 1 is not optional. Run it at a quiet moment (queue empty); the worker retries 5xx and
+network errors, so an in-flight page is re-read, not lost.
+
+```bash
+# 0. Derive the two paths this touches from the running container -- never assume them
+LIVE=innovera-ocr                       # replace with the real container name (docker ps)
+docker inspect "$LIVE" --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
+CODE=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app"}}{{.Source}}{{end}}{{end}}' "$LIVE")
+UPLOADS=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/uploads"}}{{.Source}}{{end}}{{end}}' "$LIVE")
+UPLOADS=${UPLOADS:-$CODE/uploads}       # no separate mount => the directory inside the code mount
+echo "code=$CODE uploads=$UPLOADS"      # e.g. code=/opt/innovera-ocr-v3 uploads=/opt/innovera-ocr/uploads
+ls -1A "$UPLOADS" | wc -l               # ~95 today
+du -sh "$UPLOADS"                       # ~163 MB today
+
+# 1. ARCHIVE FIRST. These are the 1610 px production renders the accuracy plan's G0 gate needs (§4), and this is their
+#    only copy: the step-1 backup of the blue/green procedure excludes them on purpose. The archive is customer data --
+#    keep it where the operator's labelled scratch set lives, with the same erasure procedure and a deletion date.
+mkdir -p /opt/backups
+ls -1A "$UPLOADS" | sort > /opt/backups/uploads-g0-$(date +%F).list
+tar czf /opt/backups/uploads-g0-$(date +%F).tgz -C "$(dirname "$UPLOADS")" "$(basename "$UPLOADS")"
+( cd "$UPLOADS" && sha256sum -- * ) > /opt/backups/uploads-g0-$(date +%F).sha256
+wc -l < /opt/backups/uploads-g0-$(date +%F).sha256          # must equal the count from step 0
+
+# 2. Ship the code (a tar of the current code dir is the rollback; --exclude keeps --delete off the data dirs)
+tar czf /opt/backups/code-before-retention-$(date +%F-%H%M).tgz -C "$(dirname "$CODE")" "$(basename "$CODE")"
+rsync -a --delete --exclude 'tests/fixtures/' --exclude '__pycache__/' \
+      --exclude 'uploads/' --exclude 'verified_dataset/' ./local-ai/ "$CODE"/
+
+# 3. Restart (same image, same mounts, same env -- only the bind-mounted code changed).
+#    Do NOT add -e OCR_KEEP_UPLOADS here; it is the one flag that puts customer pages back on this host.
+docker restart "$LIVE"
+
+# 4. Verify -- both sides, because they answer different questions
+curl -s http://127.0.0.1:5000/health | jq '{version, masterData, calibration, uploads}'
+#   expected: {"version":"3.3","masterData":"ok","calibration":"ok",
+#              "uploads":{"files":0,"ttlMinutes":60,"keep":false}}
+ls -1A "$UPLOADS" | wc -l                                   # 0 on the HOST -- /health only sees the mount it was given
+docker logs --since 5m "$LIVE" | grep -c 'upload sweep failed'   # 0
+#   then push one real document through the app and read it again: "files" must still be 0 DURING a reading
+```
+
+**The one-off clear.** The startup sweep in step 3 removes the 95 pages by itself. Run this only if step 4 shows a
+non-zero count — e.g. a name the sweeper deliberately refuses to touch (it deletes `{uuid4}.{png,jpg,jpeg,webp,pdf}` and
+nothing else). It is a dry run first, and it never leaves the directory or follows a link:
+
+```bash
+cd "$UPLOADS"
+ls -1A . | sort > /tmp/uploads-before.txt
+# a) exactly what will go
+find . -maxdepth 1 -type f -regextype posix-extended \
+     -regex './[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(png|jpe?g|webp|pdf)' \
+     -printf '%f\n' | sort > /tmp/uploads-to-delete.txt
+wc -l < /tmp/uploads-to-delete.txt                          # expect 95
+# b) everything else in there -- read this list before you continue; it is NOT deleted by the command below
+comm -23 /tmp/uploads-before.txt /tmp/uploads-to-delete.txt
+# c) delete, then confirm both the count and that (b) is untouched
+find . -maxdepth 1 -type f -regextype posix-extended \
+     -regex './[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(png|jpe?g|webp|pdf)' -delete
+ls -1A . | wc -l                                            # 0 (or the size of list (b))
+diff <(ls -1A . | sort) <(comm -23 /tmp/uploads-before.txt /tmp/uploads-to-delete.txt)   # no output
+curl -s http://127.0.0.1:5000/health | jq .uploads          # {"files":0,"ttlMinutes":60,"keep":false}
+```
+
+**Rollback** (code only, seconds): `rm -rf "$CODE" && tar xzf /opt/backups/code-before-retention-*.tgz -C "$(dirname
+"$CODE")" && docker restart "$LIVE"`. Note that rollback does **not** bring the page images back — restore them from the
+step-1 archive if a benchmark needs them, and delete the restored copy again when it is done.
 
 ## Known limitations
 

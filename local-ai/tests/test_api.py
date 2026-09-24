@@ -1,10 +1,13 @@
 """HTTP contract of the Local AI service (schema v3) with the model call mocked."""
 
+import hashlib
 import io
 import json
+import logging
 import os
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -426,84 +429,110 @@ def test_model_failure_is_500(client, monkeypatch):
     assert sorted(model.kinds()) == ["headerCustomer", "headerCustomer", "staff", "staff"]
 
 
-def test_no_page_image_survives_a_finished_request(client, fake_model, monkeypatch, isolated_paths):
-    """A scanned intake form carries a name, a hotel and health conditions (accuracy-learning-plan.md §2.7). The working
-    copy exists only while the request runs -- and every way out of it is the same way out: success, 4xx, and an
-    exception from inside `process_image`. Crops were never written and still are not."""
+def upload_name(ext=".png"):
+    """A name `_store_upload` could have written: only these are sweepable."""
+    return f"{uuid.uuid4()}{ext}"
+
+
+def test_no_page_image_reaches_the_disk_on_any_path(client, fake_model, monkeypatch, isolated_paths):
+    """A scanned intake form carries a name, a hotel and ticked health conditions (accuracy-learning-plan.md §2.7), and
+    nothing in the service ever reads the file back, so the bytes are not written at all -- not even for the length of
+    the request. Success, 4xx and an exception from inside `process_image` alike. Crops never touched disk either."""
     uploads = isolated_paths / "uploads"
+    seen, real = {}, api.process_image
+
+    def spy(image, document_id, *args, **kwargs):
+        seen["during"] = sorted(path.name for path in uploads.iterdir()) if uploads.exists() else []
+        return real(image, document_id, *args, **kwargs)
+    monkeypatch.setattr(api, "process_image", spy)
+
     assert post(client, png_of(S.filled_form()), "x.png").status_code == 200
-    assert os.listdir(uploads) == [], "the working copy of a read page is gone"
+    assert seen["during"] == [], "not even while the reading runs"
+    assert not uploads.exists() or os.listdir(uploads) == [], "and nothing after it"
 
     assert post(client, b"not an image at all", "x.png").status_code == 400
-    assert os.listdir(uploads) == [], "a 400 leaves nothing behind either"
+    assert not uploads.exists() or os.listdir(uploads) == [], "a 400 leaves nothing behind either"
 
     def boom(*args, **kwargs):
         raise RuntimeError("normalizer exploded")
     monkeypatch.setattr(api, "process_image", boom)
     assert post(client, png_of(S.filled_form()), "x.png").status_code == 500
-    assert os.listdir(uploads) == [], "an unexpected exception leaves nothing behind either"
+    assert not uploads.exists() or os.listdir(uploads) == [], "an unexpected exception leaves nothing behind either"
 
 
-def test_the_working_copy_exists_while_the_request_runs(client, fake_model, monkeypatch, isolated_paths):
-    """It is kept for exactly one reason: PDFium and Pillow decode in-process, so a segfault or an OOM kill leaves no
-    traceback and these bytes are the only record of which page did it. So it must really be on disk during the read."""
-    seen, real = {}, api.process_image
-
-    def spy(image, document_id, *args, **kwargs):
-        seen["files"] = sorted(path.name for path in (isolated_paths / "uploads").iterdir())
-        seen["documentId"] = document_id
-        return real(image, document_id, *args, **kwargs)
-    monkeypatch.setattr(api, "process_image", spy)
-    assert post(client, png_of(S.filled_form()), "x.png").status_code == 200
-    assert seen["files"] == [f"{seen['documentId']}.png"]
-    assert os.listdir(isolated_paths / "uploads") == []
+def test_a_crashed_page_is_identifiable_from_the_log_without_its_pixels(client, fake_model, caplog):
+    """What the removed working copy was for: PDFium and Pillow decode in-process, so a segfault or an OOM kill leaves
+    no traceback. The digest pins the page that did it to the app's own 90-day original -- and carries no pixels, and no
+    file name, which on a real scan is the customer's."""
+    data = png_of(S.filled_form())
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        body = post(client, data, "somchai-sukhumvit-page-3.png").json()
+    line = next(record.getMessage() for record in caplog.records if record.getMessage().startswith("ocr documentId="))
+    assert body["documentId"] in line and f"bytes={len(data)}" in line
+    assert hashlib.sha256(data).hexdigest()[:16] in line, "the app can match its own copy by digest"
+    assert "somchai" not in line and "page-3" not in line, "the file name of a real scan is customer data"
 
 
 def test_keep_uploads_is_off_by_default_and_reported_by_health(client, fake_model, monkeypatch, isolated_paths):
-    """The escape hatch is what turns the upload dir back into an unbounded store of customer data, so /health has to
-    say when it is on -- but it may not move `status`: a false `healthCheck` closes the ocr-worker's OCR gate."""
+    """The escape hatch is the only thing that puts a page image on this host, so /health has to say when it is on --
+    but it may not move `status`: a false `healthCheck` closes the ocr-worker's OCR gate."""
     uploads = isolated_paths / "uploads"
-    health = client.get("/health").json()
-    assert health["uploads"] == {"files": 0, "ttlMinutes": 60, "keep": False}
+    assert api.keep_uploads() is False, "off unless an operator turns it on"
+    assert post(client, png_of(S.filled_form()), "x.png").status_code == 200
+    assert not uploads.exists(), "with the flag unset the upload dir is not even created"
+    assert client.get("/health").json()["uploads"] == {"files": 0, "ttlMinutes": 60, "keep": False}
 
     monkeypatch.setenv("OCR_KEEP_UPLOADS", "1")
     body = post(client, png_of(S.filled_form()), "x.png").json()
-    assert os.listdir(uploads) == [f"{body['documentId']}.png"], "the page is held for debugging"
+    assert os.listdir(uploads) == [f"{body['documentId']}.png"], "and on, the page is written and held"
     health = client.get("/health").json()
     assert health["uploads"] == {"files": 1, "ttlMinutes": 60, "keep": True} and health["status"] == "ok"
-    assert api._sweep_uploads() == 0, "the sweeper leaves held pages alone whatever their age"
+    assert api._sweep_uploads(every_age=True) == 0, "the sweeper leaves held pages alone whatever their age"
 
     monkeypatch.setenv("OCR_KEEP_UPLOADS", "no")  # anything but 1/true/yes/on is off
     assert api.keep_uploads() is False and client.get("/health").json()["uploads"]["keep"] is False
+    assert api._sweep_uploads(every_age=True) == 1 and os.listdir(uploads) == [], "and what it held is swept once it is off"
 
 
 def test_health_counts_uploads_without_naming_one(client, fake_model, isolated_paths):
-    """`files` is the monitor -- it should read 0 between requests -- and it is a count only: no name, no byte, nothing
-    a customer could be recognised by."""
+    """`files` is the monitor -- 0 is the only number production should ever show -- and it is a count only: no name, no
+    byte, nothing a customer could be recognised by. It counts every file, including one the sweeper will not touch."""
     uploads = isolated_paths / "uploads"
     uploads.mkdir(parents=True)
     (uploads / "5f1c-somchai-sukhumvit.png").write_bytes(b"x")
-    (uploads / "b2d4.jpg").write_bytes(b"x")
+    (uploads / upload_name(".jpg")).write_bytes(b"x")
     body = client.get("/health").json()
     assert body["uploads"]["files"] == 2
     assert "somchai" not in json.dumps(body) and "5f1c" not in json.dumps(body)
 
 
 def test_the_sweeper_removes_only_expired_leftovers(isolated_paths, monkeypatch):
-    """What a `kill -9` left behind, and nothing else: a page younger than the TTL is still a request in flight."""
+    """On the timer it removes what a `kill -9` left behind and nothing younger; at startup (`every_age`) it removes
+    both, because nothing can be in flight in a process that has not started serving."""
     uploads = isolated_paths / "uploads"
     uploads.mkdir(parents=True)
-    old, fresh = uploads / "crashed.png", uploads / "in-flight.png"
+    old, fresh = uploads / upload_name(), uploads / upload_name()
     for path in (old, fresh):
         path.write_bytes(b"page")
     os.utime(old, (time.time() - 3600 - 60, time.time() - 3600 - 60))  # one minute past the 60-minute default
     assert api._sweep_uploads() == 1
-    assert [path.name for path in uploads.iterdir()] == ["in-flight.png"]
+    assert [path.name for path in uploads.iterdir()] == [fresh.name]
 
     monkeypatch.setenv("OCR_UPLOAD_TTL_MINUTES", "1")
     os.utime(fresh, (time.time() - 120, time.time() - 120))
     assert api._sweep_uploads() == 1 and list(uploads.iterdir()) == []
     assert api._sweep_uploads() == 0, "an empty directory sweeps to nothing"
+
+
+def test_the_startup_sweep_ignores_the_ttl(isolated_paths):
+    """A `docker stop` gives 10 s and a page takes ~50, so SIGKILL mid-read is the normal deploy. A TTL-gated startup
+    sweep would carry that page into the new container for up to an hour."""
+    uploads = isolated_paths / "uploads"
+    uploads.mkdir(parents=True)
+    just_now = uploads / upload_name()
+    just_now.write_bytes(b"page")
+    assert api._sweep_uploads() == 0, "on the timer a fresh file is left alone"
+    assert api._sweep_uploads(every_age=True) == 1 and list(uploads.iterdir()) == []
 
 
 def test_the_ttl_is_clamped_like_every_other_knob(monkeypatch):
@@ -513,7 +542,25 @@ def test_the_ttl_is_clamped_like_every_other_knob(monkeypatch):
         assert api.upload_ttl_minutes() == expected, value
 
 
-def test_the_sweeper_never_follows_a_symlink_or_leaves_the_upload_dir(isolated_paths, monkeypatch):
+def test_the_sweeper_deletes_only_names_it_could_have_written(isolated_paths, monkeypatch):
+    """This runs as root over a host bind mount, so one mistyped OCR_UPLOAD_DIR (`/app`, one word from the default,
+    with the deployed code mounted there) would otherwise unlink the service itself every 60 seconds."""
+    directory = isolated_paths / "not-the-upload-dir"
+    directory.mkdir()
+    for name in ("api.py", "master_data.json", "calibration.json", "corrections.jsonl", "page.png", "..evil.png"):
+        (directory / name).write_bytes(b"real file")
+    mine = directory / upload_name()
+    mine.write_bytes(b"page")
+    for path in directory.iterdir():
+        os.utime(path, (time.time() - 86400,) * 2)
+    monkeypatch.setenv("OCR_UPLOAD_DIR", str(directory))
+
+    assert api._sweep_uploads(every_age=True) == 1, "only the one name this service can have written"
+    assert sorted(path.name for path in directory.iterdir()) == [
+        "..evil.png", "api.py", "calibration.json", "corrections.jsonl", "master_data.json", "page.png"]
+
+
+def test_the_sweeper_never_follows_a_symlink_or_leaves_the_upload_dir(isolated_paths):
     """A symlink planted in the bind mount is the one way a sweep could delete something outside the upload dir. Only
     names `os.scandir` yields for that directory are unlinked, and a link is skipped rather than followed."""
     uploads, outside = isolated_paths / "uploads", isolated_paths / "elsewhere"
@@ -526,26 +573,27 @@ def test_the_sweeper_never_follows_a_symlink_or_leaves_the_upload_dir(isolated_p
     stale = time.time() - 86400
     for path in (keep_file, keep_dir):
         os.utime(path, (stale, stale))
-    (uploads / "escape.png").symlink_to(keep_file)          # a link to a file outside
-    (uploads / "escape-dir").symlink_to(keep_dir)           # a link to a directory outside
-    (uploads / "..evil.png").write_bytes(b"page")           # a name that only looks like traversal
-    for name in ("escape.png", "escape-dir", "..evil.png"):
+    link_file, link_dir = upload_name(), upload_name(".jpg")   # links wearing a sweepable name: still not followed
+    (uploads / link_file).symlink_to(keep_file)
+    (uploads / link_dir).symlink_to(keep_dir)
+    (uploads / "..evil.png").write_bytes(b"page")              # a name that only looks like traversal
+    real = uploads / upload_name()
+    real.write_bytes(b"page")
+    for name in (link_file, link_dir, "..evil.png", real.name):
         os.utime(uploads / name, (stale, stale), follow_symlinks=False)
 
-    assert api._sweep_uploads() == 1, "only the real file in the upload dir"
+    assert api._sweep_uploads(every_age=True) == 1, "only the real file in the upload dir"
     assert keep_file.read_bytes() == b"the audit trail" and (keep_dir / "inner.txt").exists()
-    assert sorted(path.name for path in uploads.iterdir()) == ["escape-dir", "escape.png"], "links are skipped, not followed"
+    assert sorted(path.name for path in uploads.iterdir()) == sorted([link_dir, link_file, "..evil.png"]), \
+        "links are skipped, not followed"
 
 
 def test_a_missing_or_unusable_upload_dir_never_breaks_the_api(client, fake_model, isolated_paths, monkeypatch):
     """The sweeper runs in the lifespan and on a timer, and the count runs inside /health: a directory the container
-    cannot read or write may not raise out of any of them."""
+    cannot read or write may not raise out of any of them -- and, now that a reading writes nothing, may not fail one."""
     assert not (isolated_paths / "uploads").exists()
     assert api._sweep_uploads() == 0 and api._upload_file_count() == 0, "a missing directory is not an error"
     assert client.get("/health").json()["uploads"]["files"] == 0
-
-    monkeypatch.setenv("OCR_UPLOAD_DIR", str(isolated_paths / "uploads" / "sub" / "dir"))
-    assert post(client, png_of(S.filled_form()), "x.png").status_code == 200, "a missing dir is created"
 
     # A directory that cannot exist at all -- its parent is a file -- so mkdir and scandir fail for root as well.
     blocker = isolated_paths / "not-a-dir"
@@ -553,15 +601,20 @@ def test_a_missing_or_unusable_upload_dir_never_breaks_the_api(client, fake_mode
     monkeypatch.setenv("OCR_UPLOAD_DIR", str(blocker / "uploads"))
     assert api._sweep_uploads() == 0 and api._upload_file_count() == 0, "an unusable directory degrades, it does not raise"
     assert client.get("/health").json()["uploads"] == {"files": 0, "ttlMinutes": 60, "keep": False}, "/health still answers"
-    assert post(client, png_of(S.filled_form()), "x.png").status_code == 500, "an unstorable upload is still a 500"
+    assert post(client, png_of(S.filled_form()), "x.png").status_code == 200, "and a reading no longer depends on it"
 
-    # A refused unlink (read-only mount) is swallowed on both paths: a failed cleanup may not fail a good reading.
+    monkeypatch.setenv("OCR_KEEP_UPLOADS", "1")
+    assert post(client, png_of(S.filled_form()), "x.png").status_code == 500, \
+        "only the debugging hatch fails loudly, so nobody believes pages are being collected when they are not"
+
+    # A refused unlink (read-only mount) is swallowed: a failed sweep may not raise out of the thread or /health.
     def refuse(path):
         raise PermissionError(30, "Read-only file system", str(path))
+    monkeypatch.delenv("OCR_KEEP_UPLOADS")
     uploads = isolated_paths / "sweepable"
     uploads.mkdir()
-    (uploads / "left.png").write_bytes(b"page")
-    os.utime(uploads / "left.png", (time.time() - 86400,) * 2)
+    (uploads / upload_name()).write_bytes(b"page")
+    os.utime(next(uploads.iterdir()), (time.time() - 86400,) * 2)
     monkeypatch.setenv("OCR_UPLOAD_DIR", str(uploads))
     monkeypatch.setattr(os, "unlink", refuse)
     assert api._sweep_uploads() == 0, "nothing removed, nothing raised"
@@ -569,13 +622,12 @@ def test_a_missing_or_unusable_upload_dir_never_breaks_the_api(client, fake_mode
 
 
 def test_startup_sweeps_what_the_last_crash_left_and_then_keeps_sweeping(isolated_paths, monkeypatch):
-    """`_sweep_uploads` on the way in (a hard restart is the case this exists for) and a daemon thread after it, so a
-    process that stays up for weeks does not accumulate pages between deploys."""
+    """A hard restart is the case the sweeper exists for: `_sweep_uploads` on the way in and a daemon thread after it,
+    so a process that stays up for weeks does not accumulate pages between deploys."""
     from fastapi.testclient import TestClient
     uploads = isolated_paths / "uploads"
     uploads.mkdir(parents=True)
-    (uploads / "crashed.png").write_bytes(b"page")
-    os.utime(uploads / "crashed.png", (time.time() - 86400,) * 2)
+    (uploads / upload_name()).write_bytes(b"page")             # fresh: only an every-age startup sweep takes it
     monkeypatch.setattr(api, "UPLOAD_SWEEP_INTERVAL_S", 0.01)
 
     def sweepers():
@@ -583,16 +635,39 @@ def test_startup_sweeps_what_the_last_crash_left_and_then_keeps_sweeping(isolate
 
     assert sweepers() == []
     with TestClient(api.app) as started:
-        assert list(uploads.iterdir()) == [], "swept before the first request"
+        assert list(uploads.iterdir()) == [], "swept before the first request, whatever its age"
         assert started.get("/health").json()["uploads"]["files"] == 0
         assert len(sweepers()) == 1 and sweepers()[0].daemon, "one daemon thread, off the request path"
-        (uploads / "later.png").write_bytes(b"page")
-        os.utime(uploads / "later.png", (time.time() - 86400,) * 2)
+        later = uploads / upload_name()
+        later.write_bytes(b"page")
+        os.utime(later, (time.time() - 86400,) * 2)
         deadline = time.time() + 5
         while list(uploads.iterdir()) and time.time() < deadline:
             time.sleep(0.01)
         assert list(uploads.iterdir()) == [], "and again on the timer"
     assert sweepers() == [], "and it stops with the app"
+
+
+def test_one_failing_sweep_does_not_end_retention(isolated_paths, monkeypatch, caplog):
+    """`_sweep_uploads` swallows OSError, but a poisoned OCR_UPLOAD_DIR raises ValueError. Unguarded, that one
+    exception would kill the sweeper thread for the life of the process with nothing logged."""
+    from fastapi.testclient import TestClient
+    calls = []
+
+    def explode(**kwargs):
+        calls.append(kwargs)
+        raise ValueError("embedded null byte")
+    monkeypatch.setattr(api, "_sweep_uploads", explode)
+    monkeypatch.setattr(api, "UPLOAD_SWEEP_INTERVAL_S", 0.01)
+
+    with caplog.at_level(logging.ERROR, logger="uvicorn.error"), TestClient(api.app) as started:
+        assert started.get("/health").status_code == 200, "a failing sweep does not stop the app from starting"
+        deadline = time.time() + 5
+        while len(calls) < 3 and time.time() < deadline:
+            time.sleep(0.01)
+    assert len(calls) >= 3, "it keeps sweeping after an exception"
+    assert calls[0] == {"every_age": True}, "the startup sweep is the every-age one"
+    assert any("upload sweep failed" in record.getMessage() for record in caplog.records), "and it is not silent"
 
 
 def test_model_crops_match_v22_geometry_and_scale(client, fake_model, monkeypatch):

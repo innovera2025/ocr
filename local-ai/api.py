@@ -6,14 +6,18 @@ STAFF ONLY crop alone with a Thai vocabulary prompt, and the header stacked abov
 capped by the model's own token probabilities; a call that fails after one retry degrades only its own section.
 OCR_SECTION_MODE=combined keeps v3.1's single call, OCR_SECTION_MODE=separate v3.0's two calls without the header.
 
-The page image is a working copy only: /v1/ocr deletes it before it answers, a sweeper removes what a crash left behind,
-and nothing reads it in between (README "Upload retention (PDPA)", accuracy-learning-plan.md §2.7).
+No page image is written on this host: /v1/ocr reads from the bytes in memory and logs only the page's digest, and a
+sweeper clears what an older version or a debugging session left in OCR_UPLOAD_DIR (README "Upload retention (PDPA)",
+accuracy-learning-plan.md §2.7).
 """
 
 import contextlib
 import functools
+import hashlib
 import io
+import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -43,15 +47,19 @@ import ocr_register as R
 # even though `SCHEMA_VERSION` does not (adversarial review, 2026-09-23).
 VERSION, ENGINE, SCHEMA_VERSION = "3.3", "typhoon-sections", 3
 
-UPLOAD_SWEEP_INTERVAL_S = 60  # cheap: one scandir of a directory a completed request always leaves empty
+UPLOAD_SWEEP_INTERVAL_S = 60  # cheap: one scandir of a directory that is empty unless OCR_KEEP_UPLOADS is on
 _SWEEPER_STOP = threading.Event()
+# uvicorn configures this logger; a fresh `getLogger(__name__)` would have no handler and the lines would vanish.
+_log = logging.getLogger("uvicorn.error")
 
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app):
-    """A request deletes its own working copy, so the upload dir only ever holds what a crash or a `kill -9` left
-    behind: sweep it once before the first request, then every minute. The helpers below are resolved when this runs."""
-    _sweep_uploads()
+    """Sweep the upload dir with NO age limit before the first request, then every minute on the TTL. Unconditional is
+    both safe and necessary here: no request can be in flight in a process that has not started serving, while a page a
+    `docker stop` killed mid-read (10 s grace, ~50 s per page -- the normal deploy, not an exotic crash) would otherwise
+    outlive the restart by a whole TTL. The helpers below are resolved when this runs."""
+    _sweep_quietly(every_age=True)
     _SWEEPER_STOP.clear()
     sweeper = threading.Thread(target=_sweeper_loop, name="upload-sweeper", daemon=True)
     sweeper.start()
@@ -66,6 +74,11 @@ app = FastAPI(title="INNOVERA OCR API", version=VERSION, lifespan=_lifespan)
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 MIME_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf"}
+# The sweeper deletes only what `_store_upload` can have written: `{uuid4}{ext}`, the accepted extensions and nothing
+# else. Without this guard one wrong OCR_UPLOAD_DIR (`/app`, one word away from the `/app/uploads` default, with the
+# host's code bind-mounted there) would make a root daemon unlink the deployed service every 60 seconds.
+UPLOAD_NAME = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+                         rf"(?:{'|'.join(re.escape(ext) for ext in sorted(IMAGE_EXTENSIONS + ('.pdf',)))})\Z")
 STAMP_RED_MIN = 40  # red minus max(green, blue) of a pink/red stamp pixel (PAID stamps), removed from model crops
 # ...only at a stamp's luminance: real PAID-stamp ink sits at 150-200 (1 % of it below 117), red or crimson ballpoint at
 # 65-95, and pen strokes must reach the model.
@@ -106,16 +119,16 @@ def upload_ttl_minutes():
 
 
 def keep_uploads():
-    """Debugging escape hatch (OFF by default): keep every page image on disk, and stop the sweeper from removing any.
-    Scanned intake forms carry names, hotels and health conditions (accuracy-learning-plan.md §2.7), so /health reports
-    this flag -- leaving it on turns the upload dir back into an unbounded store of customer data."""
+    """Debugging escape hatch (OFF by default): write every page image to OCR_UPLOAD_DIR and keep it, which also stops
+    the sweeper. Scanned intake forms carry names, hotels and health conditions (accuracy-learning-plan.md §2.7), so
+    /health reports this flag -- leaving it on turns the upload dir into an unbounded store of customer data."""
     return os.environ.get("OCR_KEEP_UPLOADS", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _store_upload(document_id, ext, data):
-    """Write the working copy and return its path. It exists only for a crash: PDFium and Pillow decode in-process, so a
-    segfault or an OOM kill leaves no traceback and these bytes are the only record of which page did it. Every path out
-    of the request deletes it again (`_discard_upload`); what a crash leaves behind is the sweeper's job."""
+    """Write the page image and return its path. Only `OCR_KEEP_UPLOADS` reaches this: the default request writes no
+    pixels at all (see `ocr`). A failed write is a 500 on purpose -- an operator who turned the hatch on must not be
+    left believing the pages are being collected."""
     try:
         directory = upload_dir()
         directory.mkdir(parents=True, exist_ok=True)
@@ -126,25 +139,16 @@ def _store_upload(document_id, ext, data):
         raise HTTPException(500, f"Cannot store the upload: {error}") from error
 
 
-def _discard_upload(path):
-    """Delete the working copy. Runs in a `finally`, so it must never raise: a failed unlink may not turn a good reading
-    into a 500 (the sweeper picks the file up within the TTL anyway)."""
-    if keep_uploads():
-        return
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
-
-
-def _sweep_uploads():
-    """Delete upload-dir files older than the TTL and return how many went. Only entries `os.scandir` yields for that one
-    directory are touched -- a bare name, never a path from outside -- and a symlink is skipped rather than followed, so
-    a link planted in the bind mount cannot make this delete anything else. A missing, empty or unwritable directory is
-    not an error: the API must keep answering."""
+def _sweep_uploads(every_age=False):
+    """Delete page images left in the upload dir and return how many went: everything when `every_age` (startup), else
+    only what is older than the TTL. Four guards, because this runs as root over a host bind mount: `OCR_KEEP_UPLOADS`
+    stops it entirely; only names `os.scandir` yields for that one directory are unlinked -- a bare name, never a path
+    from outside; only `{uuid4}{ext}` names, so a mistyped OCR_UPLOAD_DIR cannot eat a directory of real files; and a
+    symlink is skipped rather than followed, so a link planted in the mount reaches nothing. A missing, empty or
+    read-only directory is not an error: the API must keep answering."""
     if keep_uploads():
         return 0
-    cutoff = time.time() - upload_ttl_minutes() * 60
+    cutoff = float("inf") if every_age else time.time() - upload_ttl_minutes() * 60
     removed = 0
     try:
         entries = list(os.scandir(upload_dir()))
@@ -152,7 +156,9 @@ def _sweep_uploads():
         return 0
     for entry in entries:
         try:
-            if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:
+            if not UPLOAD_NAME.fullmatch(entry.name) or not entry.is_file(follow_symlinks=False):
+                continue
+            if entry.stat(follow_symlinks=False).st_mtime < cutoff:
                 os.unlink(entry.path)
                 removed += 1
         except OSError:
@@ -161,16 +167,29 @@ def _sweep_uploads():
 
 
 def _upload_file_count():
-    """How many working copies are on disk right now, for /health. A count only: never a name, never a byte."""
+    """How many page images are on disk right now, for /health. A count only: never a name, never a byte. It counts
+    every regular file, not just sweepable names, so a leftover the sweeper deliberately refuses to touch still shows."""
     try:
         return sum(1 for entry in os.scandir(upload_dir()) if entry.is_file(follow_symlinks=False))
     except OSError:
         return 0
 
 
+def _sweep_quietly(every_age=False):
+    """`_sweep_uploads` swallows every `OSError`, but not everything is one -- a poisoned OCR_UPLOAD_DIR (an embedded
+    null byte) raises `ValueError`. Unguarded that would end the sweeper thread for the life of the process, silently,
+    or stop the app from starting. One iteration may fail; retention may not."""
+    try:
+        return _sweep_uploads(every_age=every_age)
+    except Exception:
+        _log.exception("upload sweep failed (OCR_UPLOAD_DIR=%r); retention continues on the next pass",
+                       os.environ.get("OCR_UPLOAD_DIR", "/app/uploads"))
+        return 0
+
+
 def _sweeper_loop():
     while not _SWEEPER_STOP.wait(UPLOAD_SWEEP_INTERVAL_S):
-        _sweep_uploads()
+        _sweep_quietly()
 
 
 SECTION_MODES = ("staff-separate", "combined", "separate")
@@ -670,9 +689,10 @@ def health():
     # pages keep being read, and `healthCheck` false is what trips the worker's OCR gate -- whose half-open probe calls
     # `healthCheck` again, so a "degraded" here would stall the whole document pipeline on a configuration typo
     # (packages/ocr-client/src/index.ts:163, services/ocr-worker/src/index.ts:333,372; adversarial review 2026-09-23).
-    # `uploads` is the retention monitor: `files` should read 0 between requests and only spike while pages are in
-    # flight, `keep` must read false in production. For the same reason as `calibration`, neither moves `status`: how
-    # long a working copy lives has no effect on what the service reads, and a "degraded" would close the OCR gate.
+    # `uploads` is the retention monitor: with `keep` false -- which is what production must read -- nothing writes a
+    # page image, so `files` is 0 during a reading as well as between them, and any other number is a leftover to look
+    # at. For the same reason as `calibration`, neither moves `status`: what is on that disk has no effect on what the
+    # service reads, and a "degraded" would close the OCR gate.
     return {"status": "ok" if master_state == "ok" else "degraded",
             "service": "innovera-ocr", "version": VERSION, "engine": ENGINE,
             "schemaVersion": SCHEMA_VERSION, "model": ocr_model.model_name(), "pdfSupport": _pdf_renderer() is not None,
@@ -695,16 +715,23 @@ def ocr(file: UploadFile = File(...)):
     if ext == ".pdf" and _pdf_renderer() is None:
         raise HTTPException(415, "PDF input needs pypdfium2 or PyMuPDF in the Local AI image; upload PNG/JPG/WebP instead")
     document_id = str(uuid.uuid4())
-    stored = _store_upload(document_id, ext, data)
+    # No page image is written on this host -- not even for the length of the request. A scan carries a name, a hotel
+    # and ticked health conditions (§2.7), and nothing here ever reads the file back: `upload_dir()` is retention code
+    # only. The one thing a crash needs is the IDENTITY of the page, not its pixels: PDFium and Pillow decode
+    # in-process, so a segfault or an OOM kill leaves no traceback, and this line pins the page that did it to the app's
+    # own 90-day original by digest -- which is the copy PDPA erasure already reaches. OCR_KEEP_UPLOADS=1 writes the
+    # bytes instead, for a scratch instance.
+    _log.info("ocr documentId=%s ext=%s bytes=%d sha256=%s", document_id, ext, len(data),
+              hashlib.sha256(data).hexdigest()[:16])
+    if keep_uploads():
+        _store_upload(document_id, ext, data)
+    image, warnings = _decode(data, ext)
     try:
-        image, warnings = _decode(data, ext)  # a 400 here leaves through the `except HTTPException`, past the `finally`
         return JSONResponse(process_image(image, document_id, file.filename, started, warnings))
     except HTTPException:
         raise
     except Exception as error:
         raise HTTPException(500, str(error)) from error
-    finally:
-        _discard_upload(stored)  # no page image survives a completed request: success, 4xx and crash alike
 
 
 class ConfirmRequest(BaseModel):

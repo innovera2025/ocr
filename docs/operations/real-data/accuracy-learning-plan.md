@@ -373,25 +373,32 @@ see what the system learned and why.
   for uploads, crops, results, jobs, keys and logs — and no row for any of these: `corrections.jsonl` (appended forever with no
   tenant, branch or expiry, `api.py:609-616`, `ocr_normalize.py:128-134`), **its unbounded deploy backups**
   (`local-ai/README.md:287` copies it to `/opt/backups/corrections-<date>.jsonl` on every deploy), the published learned
-  snapshots, and `OCR_UPLOAD_DIR/{documentId}{ext}` (~~`api.py:588-592`, **no clean-up code anywhere in `local-ai/*.py`**~~ —
-  **closed 2026-09-24, see below**) while app originals follow 90 days; the visual harvest job re-cuts crops from exactly those
-  uploads. Add the remaining three rows in this release, and define **erasure as a procedure that touches DB + snapshot +
+  snapshots, and `OCR_UPLOAD_DIR/{documentId}{ext}` (~~written by `/v1/ocr` with **no clean-up code anywhere in
+  `local-ai/*.py`**~~ — **closed 2026-09-24: the write itself is gone, see below**) while app originals follow 90 days; a visual
+  harvest job can therefore no longer re-cut crops from those uploads (§8, decision 8). Add the remaining three rows in this
+  release, and define **erasure as a procedure that touches DB + snapshot +
   `corrections.jsonl` + backups**, with the `pg_dump` / `/opt/innovera-backups` residency limit stated explicitly. A
   retire/block that only bumps `snapshotVersion` touches one file; it is an undo, not an erasure.
-* **`OCR_UPLOAD_DIR` retention — closed (2026-09-24).** The Local AI now deletes its working copy of the page in a `finally`,
-  so nothing survives a finished request (200, 4xx and crash alike), and a lifespan + 60 s daemon sweep removes what a segfault
-  or a `kill -9` left behind once it is older than `OCR_UPLOAD_TTL_MINUTES` (default 60, clamped 1–1440). `OCR_KEEP_UPLOADS=1`
-  is an off-by-default debugging hatch, reported in `/health` as `uploads.keep` beside a bare `uploads.files` count — no name,
-  no customer value. The 95 real pages that had accumulated on the AI host are covered by the first sweep after deploy. Details:
-  `local-ai/README.md` → "Upload retention (PDPA)", and `retention.md` now carries its row (a per-request lifetime, not
-  "forever"). The operator's scratch archive of the 95 labelled pages is unaffected.
-  **Two consequences for this plan, both binding:**
-  1. **§4 G0 and §8.8 lose their page source.** "The archived 1610 px production PNGs from `OCR_UPLOAD_DIR`" (§4 G0, and the
-     re-split option at §2.5 p.685) describes a directory that is now empty between requests. Frozen benchmark inputs and any
-     future visual-store seeding must come from the app's own page storage under its 90-day clock — which is the copy PDPA
-     erasure already reaches — or from a scratch instance run with `OCR_KEEP_UPLOADS=1` and its own deletion date. No new
-     harvest may assume the AI host holds pages.
-  2. **The bullet below is falsified.** "The Local AI already holds the page" was true only because nothing deleted it. Any
+* **`OCR_UPLOAD_DIR` retention — closed (2026-09-24).** The Local AI no longer writes a page image **at all**: `/v1/ocr` reads
+  from the bytes in memory and logs `documentId`, `ext`, byte length and a `sha256` prefix instead, which pins a page that
+  segfaults PDFium to the app's own 90-day original — the copy PDPA erasure already reaches — without keeping a second copy on
+  a second host. What an older version, a crash or a debugging session left in the directory is swept: with no age limit in the
+  lifespan (before the first request), then every 60 s on a daemon thread above `OCR_UPLOAD_TTL_MINUTES` (default 60, clamped
+  1–1440), deleting only `{uuid4}{ext}` names, never following a symlink, never leaving the directory, never raising into the
+  API. `OCR_KEEP_UPLOADS=1` is the off-by-default hatch that writes and holds pages for a scratch instance, reported in
+  `/health` as `uploads.keep` beside a bare `uploads.files` count — no name, no customer value; in production those read
+  `false` and `0`, during a reading as well as between readings. Details: `local-ai/README.md` → "Upload retention (PDPA)", and
+  `retention.md` carries the row.
+  **Three consequences for this plan, all binding:**
+  1. **The 95 production pages are archived before the deploy, not lost with it.** The retention runbook (`local-ai/README.md`
+     → "Deploying the upload-retention change") archives `OCR_UPLOAD_DIR` to `/opt/backups/uploads-g0-<date>.tgz` **with the
+     `sha256` manifest §4 G0 asks for** as its first step — because the restarted container sweeps that directory whatever the
+     file ages, and the code backup excludes it. That tarball **is** G0's deliverable; it is customer data and carries the same
+     erasure procedure and a deletion date.
+  2. **§2.5, §4 G0 and §8.8 now name that archive, not the directory** (edited below in the same change). No later harvest may
+     assume the AI host holds pages: the sources are the G0 archive, the app's own page storage under its 90-day clock, or a
+     scratch instance run with `OCR_KEEP_UPLOADS=1` and its own deletion date.
+  3. **The bullet below is falsified.** "The Local AI already holds the page" was true only because nothing deleted it. Any
      later design that needs pixels after the request must say where they come from; it can no longer assume the AI host.
 * **No image ever moves between app and Local AI for learning** — the confirm payload carries `(documentId, fieldPath, value)`
   and the Local AI ~~already holds the page~~ **no longer holds the page after the request** (see the retention bullet above):
@@ -698,8 +705,11 @@ given. *(Third limit added 2026-09-23 by the adversarial review of §15; on this
 replay to `api.process_image` in both section modes. Consequence: W1, W2, W3, W5 and W6 are scored with **zero model calls**, and
 any future parser, dictionary or threshold change is scored the same way on every reviewed document.
 
-**Freeze the inputs — do this first, before any body-map work.** Archive the exact page PNGs the Local AI received (they are in
-`OCR_UPLOAD_DIR`, `api.py:588-592`, or re-split the source PDF with the deployed worker) with a `sha256` manifest and point the
+**Freeze the inputs — do this first, before any body-map work.** Archive the exact page PNGs the Local AI received — since
+2026-09-24 they are **only** in `/opt/backups/uploads-g0-<date>.tgz`, the archive the retention runbook takes before the deploy
+(`local-ai/README.md` → "Deploying the upload-retention change"; `OCR_UPLOAD_DIR` itself now holds no page image, §2.7). The
+fallbacks are the app's own page storage inside its 90-day window, or re-splitting the source PDF with the deployed worker.
+Keep the archive's `sha256` manifest — that manifest is what G0 asks for — and point the
 deterministic eval at those instead of `pages/*.jpg`. Production ran 1610 px renders while the eval reads 1400 px JPEGs, and that
 alone moves the body map on 30/95 pages. Neither offline render is a usable stand-in: against production's own answers the
 1610 px upsample agrees on preferred 49/95 and avoid 60/95, the plain JPEG on 56/95 and 67/95, and the body-map evidence is
@@ -713,7 +723,9 @@ below are superseded where the frozen file differs — the file is the baseline,
 
 **Gates — every change, both sources (1400 px and 1610 px):**
 * **G0 frozen inputs (blocking, precedes G1–G7):** the archived production PNGs exist with a `sha256` manifest and the
-  deterministic eval runs on them. No body-map or checkbox change ships against a simulated render.
+  deterministic eval runs on them. Since 2026-09-24 that archive is `/opt/backups/uploads-g0-<date>.tgz`, taken from
+  `OCR_UPLOAD_DIR` by the retention runbook before the deploy empties it (§2.7). No body-map or checkbox change ships against a
+  simulated render.
 * **G1 safety (blocking):** total wrong-and-**unflagged** must not rise, and no field may rise above its **production** frozen
   baseline, measured on `results-prod`: hotel 1, room 1, **treatment 2** (names and names+durations alike, pages 23 and 88 —
   "5" was not reproducible), name 3, nationality 0, date 0, **body map preferred 3, avoid 1, and 0 as one unit**. The earlier "body map 2 as one unit" was the simulated render's figure; production's is **0**,
@@ -791,7 +803,9 @@ W4, W7 and W8c.
 | R6 W8c step 0 | base → GGUF → Q4_K_M round-trip, reproduce today's numbers | ~20 min CPU conversion + 82 min |
 
 Protocol: same image digest as production, separate port, `OCR_VERIFIED_FILE` pointing at an empty file, `OCR_UPLOAD_DIR` in
-scratch, Ollama version and model digest recorded, frozen PNG set, **off-hours** (a full run halves production throughput),
+scratch (a scratch instance that must keep the pages it is sent also needs `OCR_KEEP_UPLOADS=1` — nothing is written without
+it since §2.7 — and then a deletion date for that scratch dir), Ollama version and model digest recorded, frozen PNG set,
+**off-hours** (a full run halves production throughput),
 one pass per variant, first-sight timings only (repeats hit the prompt cache at 1.7–2.4 s). Single-run probe variance is ±3 of 16:
 a variant must beat the baseline by more than that to earn a full run. Raw responses are copied to the operator scratch dir only.
 
@@ -864,7 +878,9 @@ a variant must beat the baseline by more than that to earn a full run. Raw respo
 8. **Seed the visual store from the 95 hand-labelled pages?** *Default: yes for `roomNo` digits, with written client consent;
    **no** for health-condition and body-area samples until §2.7's corrected classification is agreed.* It is the difference
    between day-1 coverage of 12/95 room pages and 1.6/95 — and the seed must carry `render_scale_px`, because a store harvested
-   at 1400 px and read at 1610 px drops to 10 correct of 11 readings (W5a).
+   at 1400 px and read at 1610 px drops to 10 correct of 11 readings (W5a). **Its page source is the G0 archive**
+   (`/opt/backups/uploads-g0-<date>.tgz`) or the app's own storage inside the 90-day window — not `OCR_UPLOAD_DIR`, which holds
+   no page images since §2.7 — so a seeding run has to be scheduled against a copy that has its own deletion date.
 9. **Do handwriting crops ever leave the host?** *Default: no for customer crops, ever; yes for STAFF crops only, under a signed
    DPA with delete-on-completion, and only when W8c step 0 has passed.* Learning itself is text-only; crops are a training-project
    decision, not a learning-loop one.
@@ -1187,8 +1203,10 @@ stored answers — which is precisely why the loop had to be built.
 
 ### Still blocking, unchanged by this step
 
-**G0 frozen inputs** — the archived 1610 px production PNGs from `OCR_UPLOAD_DIR` plus a sha256 manifest; every W2
-body-map number stays `sim-1610` until they exist. **The §9 label-hygiene hour** — worth about +4 treatment-name pages
+**G0 frozen inputs** — the archived 1610 px production PNGs plus a sha256 manifest; every W2 body-map number stays
+`sim-1610` until they exist. **Their source is now the retention deploy's step-1 archive**
+(`/opt/backups/uploads-g0-<date>.tgz` + `.sha256`, `local-ai/README.md` → "Deploying the upload-retention change"), not
+`OCR_UPLOAD_DIR`, which no longer holds page images (§2.7). Taking that archive **is** this gate's remaining work. **The §9 label-hygiene hour** — worth about +4 treatment-name pages
 (15/16/23/24, the hot-oil convention) and the explanation of page 23's silent treatment error. Both are one-day,
 zero-model-call jobs and both remain the cheapest work left.
 
