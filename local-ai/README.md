@@ -226,11 +226,46 @@ removal; the production base image has it through `paddlepaddle`/`paddleocr`). O
 | `OCR_MODEL_CONFIDENCE_<TYPE>` | see `ocr_confidence.REVIEW_BELOW` | Review threshold on modelConfidence for one field type: `NAME`, `NATIONALITY`, `HOTEL_NAME`, `TREATMENT`, `THERAPIST`, `ROOM`, `FORM_NUMBER`, `DATE`, `TIME`; `TOKEN` = the floor for any single token of a value (0.5) (0–1) |
 | `OCR_SECTION_PARALLELISM` | `2` | Concurrent section calls per document (1–8); `1` = sequential |
 | `OCR_CUSTOMER_CROP_SCALE` | `1.0` | Upscale factor for the customer crop (0.5–4); tuning knob for the real model |
-| `OCR_UPLOAD_DIR` | `/app/uploads` | Where the uploaded original is saved |
+| `OCR_UPLOAD_DIR` | `/app/uploads` | Working copy of the uploaded page, kept only **for the duration of one request** — see [Upload retention](#upload-retention-pdpa) |
+| `OCR_UPLOAD_TTL_MINUTES` | `60` | Age at which the sweeper removes a leftover a crash left in `OCR_UPLOAD_DIR` (1–1440) |
+| `OCR_KEEP_UPLOADS` | unset (off) | `1`/`true`/`yes`/`on` keeps every page image on disk and stops the sweeper. Debugging only — `/health` reports it as `uploads.keep` |
 | `OCR_VERIFIED_FILE` | `/app/verified_dataset/corrections.jsonl` | Where `POST /v1/ocr/confirm` appends. Audit trail only since W3a — written, never read back into a reading |
 | `OCR_MASTER_DATA` | `<module dir>/master_data.json` | Masters file |
 | `OCR_CALIBRATION_FILE` | `<module dir>/calibration.json` | Review-threshold calibration file (plan §8.6). Absent = the `REVIEW_BELOW` defaults; refused = the same defaults plus `status:"degraded"` |
 | `OCR_MAX_UPLOAD_BYTES` | `31457280` (30 MiB) | Larger uploads ⇒ 413 |
+
+## Upload retention (PDPA)
+
+A scanned intake form carries a name, a hotel and ticked health conditions, so **no page image survives a finished
+request**. `POST /v1/ocr` writes the bytes to `OCR_UPLOAD_DIR/{documentId}{ext}` and deletes them again in a `finally`:
+on a 200, on a 400/413/415 and on an unexpected exception alike. `/app/uploads` should read empty between requests.
+
+The working copy is still written, for one reason: PDFium and Pillow decode **in the API process**, so a segfault or an
+OOM kill leaves no traceback, and those bytes are then the only record of which page did it. Nothing reads the file
+during the request — the reading runs entirely from the bytes in memory, and the model crops never touch disk.
+
+What a crash or a `kill -9` leaves behind is swept: `_sweep_uploads()` runs in the app's lifespan (before the first
+request) and then every 60 s on a daemon thread, off the request path, and unlinks files older than
+`OCR_UPLOAD_TTL_MINUTES`. It only unlinks names `os.scandir` yields for that one directory, never follows a symlink, and
+swallows every `OSError`: a missing, empty or read-only upload dir degrades to "removed nothing" and never fails a
+reading or `/health`.
+
+`/health` carries the monitor:
+
+```json
+"uploads": { "files": 0, "ttlMinutes": 60, "keep": false }
+```
+
+`files` is a count only — never a file name, never a customer value — and should be 0 between requests; a number that
+only grows means the sweeper is not running or `keep` is on. `keep` must read `false` in production. Neither field moves
+`status`: `healthCheck` false is what closes the ocr-worker's OCR gate, and how long a working copy lives has no effect
+on what the service reads.
+
+`OCR_KEEP_UPLOADS=1` is the debugging escape hatch — it holds every page image and disables the sweeper. Use it on a
+scratch instance, never on the production host, and check `uploads.keep` in `/health` afterwards.
+
+> The app side keeps its own originals (staff need them in the review drawer, 90-day clock); this retention covers the
+> Local AI's copy only.
 
 ## Calibration (sample2.png)
 
@@ -446,9 +481,12 @@ docker run -d --name innovera-ocr-v3 -p 127.0.0.1:5001:5000 \
   -e OCR_SECTION_PARALLELISM=2 "$IMAGE" uvicorn api:app --host 0.0.0.0 --port 5000
 curl -s http://127.0.0.1:5001/health          # expect "version":"3.2","masterData":"ok"
 
-# 4. Compare with the live v2.2 on forms that are ALREADY on the server (e.g. the upload of the sample2 form and a few
-#    recent ones in /opt/innovera-ocr/uploads). Do not copy the repo fixture to the server.
-SAMPLE=/opt/innovera-ocr/uploads/<existing-upload>.png
+# 4. Compare with the live v2.2 on forms that are ALREADY on the server. Do not copy the repo fixture to the server.
+#    /opt/innovera-ocr/uploads is EMPTY between requests since the retention change ("Upload retention" above), so take
+#    the page from the app's own page storage instead. To re-fill the directory for one comparison session, start the
+#    GREEN container (step 3 only, never the live one) with -e OCR_KEEP_UPLOADS=1, send the pages, then remove the flag,
+#    restart it and check "uploads":{"keep":false,"files":0} in /health before the swap.
+SAMPLE=/path/to/an-existing-page-on-this-host.png
 for port in 5000 5001; do
   for i in 1 2 3 4 5; do curl -s -o /tmp/ocr-$port.json -w "$port %{time_total}s\n" -F "file=@$SAMPLE" http://127.0.0.1:$port/v1/ocr; done
 done

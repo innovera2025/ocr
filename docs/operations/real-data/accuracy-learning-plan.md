@@ -373,13 +373,30 @@ see what the system learned and why.
   for uploads, crops, results, jobs, keys and logs — and no row for any of these: `corrections.jsonl` (appended forever with no
   tenant, branch or expiry, `api.py:609-616`, `ocr_normalize.py:128-134`), **its unbounded deploy backups**
   (`local-ai/README.md:287` copies it to `/opt/backups/corrections-<date>.jsonl` on every deploy), the published learned
-  snapshots, and `OCR_UPLOAD_DIR/{documentId}{ext}` (`api.py:588-592`, **no clean-up code anywhere in `local-ai/*.py`** while app
-  originals follow 90 days; the visual harvest job re-cuts crops from exactly those uploads). Add all four rows in this release,
-  and define **erasure as a procedure that touches DB + snapshot + `corrections.jsonl` + backups**, with the `pg_dump` /
-  `/opt/innovera-backups` residency limit stated explicitly. A retire/block that only bumps `snapshotVersion` touches one file;
-  it is an undo, not an erasure.
+  snapshots, and `OCR_UPLOAD_DIR/{documentId}{ext}` (~~`api.py:588-592`, **no clean-up code anywhere in `local-ai/*.py`**~~ —
+  **closed 2026-09-24, see below**) while app originals follow 90 days; the visual harvest job re-cuts crops from exactly those
+  uploads. Add the remaining three rows in this release, and define **erasure as a procedure that touches DB + snapshot +
+  `corrections.jsonl` + backups**, with the `pg_dump` / `/opt/innovera-backups` residency limit stated explicitly. A
+  retire/block that only bumps `snapshotVersion` touches one file; it is an undo, not an erasure.
+* **`OCR_UPLOAD_DIR` retention — closed (2026-09-24).** The Local AI now deletes its working copy of the page in a `finally`,
+  so nothing survives a finished request (200, 4xx and crash alike), and a lifespan + 60 s daemon sweep removes what a segfault
+  or a `kill -9` left behind once it is older than `OCR_UPLOAD_TTL_MINUTES` (default 60, clamped 1–1440). `OCR_KEEP_UPLOADS=1`
+  is an off-by-default debugging hatch, reported in `/health` as `uploads.keep` beside a bare `uploads.files` count — no name,
+  no customer value. The 95 real pages that had accumulated on the AI host are covered by the first sweep after deploy. Details:
+  `local-ai/README.md` → "Upload retention (PDPA)", and `retention.md` now carries its row (a per-request lifetime, not
+  "forever"). The operator's scratch archive of the 95 labelled pages is unaffected.
+  **Two consequences for this plan, both binding:**
+  1. **§4 G0 and §8.8 lose their page source.** "The archived 1610 px production PNGs from `OCR_UPLOAD_DIR`" (§4 G0, and the
+     re-split option at §2.5 p.685) describes a directory that is now empty between requests. Frozen benchmark inputs and any
+     future visual-store seeding must come from the app's own page storage under its 90-day clock — which is the copy PDPA
+     erasure already reaches — or from a scratch instance run with `OCR_KEEP_UPLOADS=1` and its own deletion date. No new
+     harvest may assume the AI host holds pages.
+  2. **The bullet below is falsified.** "The Local AI already holds the page" was true only because nothing deleted it. Any
+     later design that needs pixels after the request must say where they come from; it can no longer assume the AI host.
 * **No image ever moves between app and Local AI for learning** — the confirm payload carries `(documentId, fieldPath, value)`
-  and the Local AI already holds the page.
+  and the Local AI ~~already holds the page~~ **no longer holds the page after the request** (see the retention bullet above):
+  the confirm path itself is unchanged and still moves no image, but a feature that wants the pixels must fetch them from the
+  app, which is where the 90-day original lives.
 
 ### 2.8 Why Release 2's login is what makes this loop trustworthy
 Today every confirmation is attributed to one shared subject: the workbench authenticates through `/api/web-token` with

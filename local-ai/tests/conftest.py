@@ -30,6 +30,8 @@ def isolated_paths(tmp_path, monkeypatch):
     monkeypatch.delenv("OCR_MASTER_DATA", raising=False)
     monkeypatch.delenv("OCR_SECTION_PARALLELISM", raising=False)
     monkeypatch.delenv("OCR_SECTION_MODE", raising=False)
+    for name in ("OCR_KEEP_UPLOADS", "OCR_UPLOAD_TTL_MINUTES"):
+        monkeypatch.delenv(name, raising=False)  # an operator's debugging export may not silently disable the retention tests
     return tmp_path
 
 

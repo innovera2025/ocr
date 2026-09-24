@@ -5,8 +5,12 @@ body-map / empty-box detection, and two concurrent Typhoon OCR calls (OCR_SECTIO
 STAFF ONLY crop alone with a Thai vocabulary prompt, and the header stacked above the customer rows. Field confidence is
 capped by the model's own token probabilities; a call that fails after one retry degrades only its own section.
 OCR_SECTION_MODE=combined keeps v3.1's single call, OCR_SECTION_MODE=separate v3.0's two calls without the header.
+
+The page image is a working copy only: /v1/ocr deletes it before it answers, a sweeper removes what a crash left behind,
+and nothing reads it in between (README "Upload retention (PDPA)", accuracy-learning-plan.md §2.7).
 """
 
+import contextlib
 import functools
 import io
 import os
@@ -38,7 +42,27 @@ import ocr_register as R
 # of which reader produced a stored answer, and plan §2.5.6 keys kind-B learned entries by it, so the string has to move
 # even though `SCHEMA_VERSION` does not (adversarial review, 2026-09-23).
 VERSION, ENGINE, SCHEMA_VERSION = "3.3", "typhoon-sections", 3
-app = FastAPI(title="INNOVERA OCR API", version=VERSION)
+
+UPLOAD_SWEEP_INTERVAL_S = 60  # cheap: one scandir of a directory a completed request always leaves empty
+_SWEEPER_STOP = threading.Event()
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    """A request deletes its own working copy, so the upload dir only ever holds what a crash or a `kill -9` left
+    behind: sweep it once before the first request, then every minute. The helpers below are resolved when this runs."""
+    _sweep_uploads()
+    _SWEEPER_STOP.clear()
+    sweeper = threading.Thread(target=_sweeper_loop, name="upload-sweeper", daemon=True)
+    sweeper.start()
+    try:
+        yield
+    finally:
+        _SWEEPER_STOP.set()
+        sweeper.join(timeout=5)
+
+
+app = FastAPI(title="INNOVERA OCR API", version=VERSION, lifespan=_lifespan)
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 MIME_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "application/pdf": ".pdf"}
@@ -75,6 +99,78 @@ def max_upload_bytes():
 
 def customer_crop_scale():
     return _env_number("OCR_CUSTOMER_CROP_SCALE", 1.0, 0.5, 4.0)
+
+
+def upload_ttl_minutes():
+    return _env_number("OCR_UPLOAD_TTL_MINUTES", 60, 1, 1440, int)
+
+
+def keep_uploads():
+    """Debugging escape hatch (OFF by default): keep every page image on disk, and stop the sweeper from removing any.
+    Scanned intake forms carry names, hotels and health conditions (accuracy-learning-plan.md §2.7), so /health reports
+    this flag -- leaving it on turns the upload dir back into an unbounded store of customer data."""
+    return os.environ.get("OCR_KEEP_UPLOADS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _store_upload(document_id, ext, data):
+    """Write the working copy and return its path. It exists only for a crash: PDFium and Pillow decode in-process, so a
+    segfault or an OOM kill leaves no traceback and these bytes are the only record of which page did it. Every path out
+    of the request deletes it again (`_discard_upload`); what a crash leaves behind is the sweeper's job."""
+    try:
+        directory = upload_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{document_id}{ext}"
+        path.write_bytes(data)
+        return path
+    except OSError as error:
+        raise HTTPException(500, f"Cannot store the upload: {error}") from error
+
+
+def _discard_upload(path):
+    """Delete the working copy. Runs in a `finally`, so it must never raise: a failed unlink may not turn a good reading
+    into a 500 (the sweeper picks the file up within the TTL anyway)."""
+    if keep_uploads():
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _sweep_uploads():
+    """Delete upload-dir files older than the TTL and return how many went. Only entries `os.scandir` yields for that one
+    directory are touched -- a bare name, never a path from outside -- and a symlink is skipped rather than followed, so
+    a link planted in the bind mount cannot make this delete anything else. A missing, empty or unwritable directory is
+    not an error: the API must keep answering."""
+    if keep_uploads():
+        return 0
+    cutoff = time.time() - upload_ttl_minutes() * 60
+    removed = 0
+    try:
+        entries = list(os.scandir(upload_dir()))
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                os.unlink(entry.path)
+                removed += 1
+        except OSError:
+            continue  # a file someone else removed, or a directory we may not write: skip it, sweep the rest
+    return removed
+
+
+def _upload_file_count():
+    """How many working copies are on disk right now, for /health. A count only: never a name, never a byte."""
+    try:
+        return sum(1 for entry in os.scandir(upload_dir()) if entry.is_file(follow_symlinks=False))
+    except OSError:
+        return 0
+
+
+def _sweeper_loop():
+    while not _SWEEPER_STOP.wait(UPLOAD_SWEEP_INTERVAL_S):
+        _sweep_uploads()
 
 
 SECTION_MODES = ("staff-separate", "combined", "separate")
@@ -574,10 +670,14 @@ def health():
     # pages keep being read, and `healthCheck` false is what trips the worker's OCR gate -- whose half-open probe calls
     # `healthCheck` again, so a "degraded" here would stall the whole document pipeline on a configuration typo
     # (packages/ocr-client/src/index.ts:163, services/ocr-worker/src/index.ts:333,372; adversarial review 2026-09-23).
+    # `uploads` is the retention monitor: `files` should read 0 between requests and only spike while pages are in
+    # flight, `keep` must read false in production. For the same reason as `calibration`, neither moves `status`: how
+    # long a working copy lives has no effect on what the service reads, and a "degraded" would close the OCR gate.
     return {"status": "ok" if master_state == "ok" else "degraded",
             "service": "innovera-ocr", "version": VERSION, "engine": ENGINE,
             "schemaVersion": SCHEMA_VERSION, "model": ocr_model.model_name(), "pdfSupport": _pdf_renderer() is not None,
-            "masterData": master_state, "calibration": calibration_state}
+            "masterData": master_state, "calibration": calibration_state,
+            "uploads": {"files": _upload_file_count(), "ttlMinutes": upload_ttl_minutes(), "keep": keep_uploads()}}
 
 
 @app.post("/v1/ocr")
@@ -595,19 +695,16 @@ def ocr(file: UploadFile = File(...)):
     if ext == ".pdf" and _pdf_renderer() is None:
         raise HTTPException(415, "PDF input needs pypdfium2 or PyMuPDF in the Local AI image; upload PNG/JPG/WebP instead")
     document_id = str(uuid.uuid4())
+    stored = _store_upload(document_id, ext, data)
     try:
-        directory = upload_dir()
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / f"{document_id}{ext}").write_bytes(data)
-    except OSError as error:
-        raise HTTPException(500, f"Cannot store the upload: {error}") from error
-    image, warnings = _decode(data, ext)
-    try:
+        image, warnings = _decode(data, ext)  # a 400 here leaves through the `except HTTPException`, past the `finally`
         return JSONResponse(process_image(image, document_id, file.filename, started, warnings))
     except HTTPException:
         raise
     except Exception as error:
         raise HTTPException(500, str(error)) from error
+    finally:
+        _discard_upload(stored)  # no page image survives a completed request: success, 4xx and crash alike
 
 
 class ConfirmRequest(BaseModel):
