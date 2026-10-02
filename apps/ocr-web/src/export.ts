@@ -1,7 +1,11 @@
 /**
  * The export's HTTP half (plan §10 H1/H2/H5): the query parser, the CSV and JSONL writers, the concurrency gate and the
- * three routes. The column contract and the cell values come from `@innovera/ocr-persistence` (`export.ts`), so the file
+ * routes. The column contract and the cell values come from `@innovera/ocr-persistence` (`export.ts`), so the file
  * a staff member downloads, the 20 rows they previewed and the table on screen can never disagree.
+ *
+ * Export selection (migration 0021): the dialog lists candidates (`GET /api/exports/candidates`), downloads a
+ * selection (`POST /api/exports/documents.{csv,jsonl}`, which records an `exported` event per row once the stream has
+ * completed) and flips rows by hand (`POST /api/exports/marks`). The `GET` downloads keep working and never mark.
  *
  * Two writers with deliberately opposite rules:
  * - **CSV** is what Excel opens: one UTF-8 BOM, CRLF, RFC 4180 quoting, a formula guard on every TEXT cell (file names
@@ -9,19 +13,24 @@
  * - **JSONL** is the lossless one: no BOM, `\n`, no guard, no truncation, and every timestamp as a Bangkok-offset
  *   instant beside its UTC twin.
  */
-import type { ServerResponse } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import {
-  bangkokTimestamp, DOCUMENT_STATUS_CATEGORIES, exportCells, exportColumns, flattenDocument, MAX_FILTER_QUERY_LENGTH,
-  normalizeStructuredResult, type DocumentFilter, type DocumentStatusCategory, type ExportColumn, type ExportColumnSet,
-  type ExportCursor, type ExportDateField, type ExportDocument, type ExportPreview, type OpenExportOptions
+  bangkokTimestamp, DOCUMENT_STATUS_CATEGORIES, EXPORT_SELECTION_MAX, exportCells, exportColumns, flattenDocument,
+  MAX_FILTER_QUERY_LENGTH, normalizeStructuredResult, type DocumentFilter, type DocumentStatusCategory, type ExportCandidatesPage,
+  type ExportCandidatesResult, type ExportColumn, type ExportColumnSet, type ExportCursor, type ExportDateField,
+  type ExportDocument, type ExportMarkInput, type ExportMarkResult, type ExportPreview, type ExportState,
+  type ExportStateChangeInput, type OpenExportOptions
 } from "@innovera/ocr-persistence";
 import { logEvent, metrics } from "@innovera/ocr-observability";
-import { respond, SlidingWindow, type UserStore, type WebAuthContext } from "./auth.js";
+import { readJson, respond, SlidingWindow, type UserStore, type WebAuthContext } from "./auth.js";
 
 /** The structural subset of `PostgresOcrDocumentStore` the export routes use, so tests can pass a fake. */
 export type ExportStore = Readonly<{
   previewExport(tenantId: string, filter: DocumentFilter, options?: { limit?: number | undefined }): Promise<ExportPreview>;
   openExport(tenantId: string, filter: DocumentFilter, options: OpenExportOptions): Promise<ExportCursor>;
+  listExportCandidates(tenantId: string, filter: DocumentFilter, page?: ExportCandidatesPage): Promise<ExportCandidatesResult>;
+  recordExportMarks(tenantId: string, input: ExportMarkInput): Promise<number>;
+  markExportState(tenantId: string, input: ExportStateChangeInput): Promise<ExportMarkResult>;
 }>;
 
 export type ExportFormat = "csv" | "jsonl";
@@ -31,6 +40,16 @@ export type ExportQuery = DocumentFilter & Readonly<{ columns: ExportColumnSet; 
 /** §10 H1: the preview returns the whole column set for any filter, so it is a paging API over the export's own data. */
 export const PREVIEW_LIMIT = 60;
 export const PREVIEW_WINDOW_MS = 900_000;
+/**
+ * D9: the dialog's list is paged and re-read on every tab switch, so it gets a wider window than the preview (same 15
+ * minutes). C3: manual marks write to an append-only table, so a stuck client must not be able to flood it.
+ */
+export const EXPORT_LIST_LIMIT = 300;
+export const EXPORT_MARK_LIMIT = 60;
+/** C1 paging: `limit` 1..100 (default 50), `offset` 0..1,000,000. */
+export const CANDIDATES_DEFAULT_LIMIT = 50;
+export const CANDIDATES_MAX_LIMIT = 100;
+export const CANDIDATES_MAX_OFFSET = 1_000_000;
 /** §10 H5: one open download per user, two per process (the store enforces the process cap — it owns the connections). */
 export const EXPORT_PER_USER = 1;
 /** The gate's wall clock. The cursor enforces the same budget itself, so neither half can be the only thing holding. */
@@ -40,8 +59,14 @@ const CRLF = "\r\n";
 /** Excel reads a leading `=`, `+`, `-` or `@` as a formula; a leading tab or CR can smuggle one past a naive reader. */
 const FORMULA_START = /^[=+\-@\t\r]/;
 const PREVIEW_ROUTE = "/api/exports/preview";
+const CANDIDATES_ROUTE = "/api/exports/candidates";
+const MARKS_ROUTE = "/api/exports/marks";
 const FILE_ROUTES: ReadonlyMap<string, ExportFormat> = new Map([
   ["/api/exports/documents.csv", "csv"], ["/api/exports/documents.jsonl", "jsonl"]
+]);
+/** The `format` label of every export route (`exports_total{format}`), so a refused request is counted under its route. */
+const ROUTE_LABELS: ReadonlyMap<string, string> = new Map([
+  [PREVIEW_ROUTE, "preview"], [CANDIDATES_ROUTE, "candidates"], [MARKS_ROUTE, "marks"], ...FILE_ROUTES
 ]);
 const CONTENT_TYPE: Readonly<Record<ExportFormat, string>> = {
   csv: "text/csv; charset=utf-8", jsonl: "application/x-ndjson; charset=utf-8"
@@ -63,14 +88,16 @@ function isRealDate(value: string): boolean {
 }
 
 /**
- * Strict, like `parseDocumentListQuery`: any bad value is 400 `INVALID_EXPORT_FILTER` rather than something the store
- * has to make sense of. The date range and `dateField` are validated again inside `documentFilterSql`, because those
- * values reach a `::date` cast where a pg error would be a 500 quoting the input back.
+ * The export filters (§10 H2) plus `exportState` (0021), shared by the GET query, the candidates list and the filter
+ * of a POSTed selection, so the three can never validate differently. Strict, like `parseDocumentListQuery`: any bad
+ * value is 400 `INVALID_EXPORT_FILTER` rather than something the store has to make sense of. The date range and
+ * `dateField` are validated again inside `documentFilterSql`, because those values reach a `::date` cast where a pg
+ * error would be a 500 quoting the input back.
  */
-export function parseExportQuery(params: URLSearchParams): ExportQuery {
+export function parseExportFilter(params: URLSearchParams): DocumentFilter {
   const filter: {
     status?: DocumentStatusCategory[]; q?: string; batchId?: string; parentId?: string;
-    confirmedOnly?: boolean; from?: string; to?: string; dateField?: ExportDateField;
+    confirmedOnly?: boolean; from?: string; to?: string; dateField?: ExportDateField; exportState?: ExportState;
   } = {};
   const status = params.get("status")?.trim() ?? "";
   if (status) {
@@ -105,24 +132,173 @@ export function parseExportQuery(params: URLSearchParams): ExportQuery {
     filter[key] = value;
   }
   if (filter.from !== undefined && filter.to !== undefined && filter.from > filter.to) throw new Error("INVALID_EXPORT_FILTER");
-  const columns = params.get("columns")?.trim() || "compact";
-  if (columns !== "compact" && columns !== "detailed") throw new Error("INVALID_EXPORT_FILTER");
-  const headers = params.get("headers")?.trim() || "th";
-  if (headers !== "th" && headers !== "en") throw new Error("INVALID_EXPORT_FILTER");
+  // 0021: the dialog's tabs. Omitted means every row (the "ทั้งหมด" tab); there is no `all` value.
+  const exportState = params.get("exportState")?.trim() ?? "";
+  if (exportState) {
+    if (exportState !== "never" && exportState !== "exported") throw new Error("INVALID_EXPORT_FILTER");
+    filter.exportState = exportState;
+  }
+  return filter;
+}
+
+function columnsParam(value: string): ExportColumnSet {
+  if (value !== "compact" && value !== "detailed") throw new Error("INVALID_EXPORT_FILTER");
+  return value;
+}
+function headersParam(value: string): ExportHeaders {
+  if (value !== "th" && value !== "en") throw new Error("INVALID_EXPORT_FILTER");
+  return value;
+}
+
+/** The GET download and the preview: the shared filters plus the column set and the header language. */
+export function parseExportQuery(params: URLSearchParams): ExportQuery {
+  const filter = parseExportFilter(params);
+  const columns = columnsParam(params.get("columns")?.trim() || "compact");
+  const headers = headersParam(params.get("headers")?.trim() || "th");
   return { ...filter, columns, headers };
 }
 
-/** The `export.started` / `.completed` detail: which filters were used, never what was searched for. */
-function filterDetail(query: ExportQuery): Record<string, string | number | boolean | null> {
+/** `intParam` of the document list, with the export's one error code: digits only, inside the range, empty = default. */
+function intParam(value: string | null, fallback: number, min: number, max: number): number {
+  if (value === null || value.trim() === "") return fallback;
+  if (!/^\d{1,9}$/.test(value.trim())) throw new Error("INVALID_EXPORT_FILTER");
+  const parsed = Number(value.trim());
+  if (parsed < min || parsed > max) throw new Error("INVALID_EXPORT_FILTER");
+  return parsed;
+}
+
+export type CandidatesQuery = Readonly<{ filter: DocumentFilter; limit: number; offset: number }>;
+/** C1: the shared filters (with `exportState`), then `limit` 1..100 (default 50) and `offset` 0..1,000,000. */
+export function parseCandidatesQuery(params: URLSearchParams): CandidatesQuery {
+  const filter = parseExportFilter(params);
+  const limit = intParam(params.get("limit"), CANDIDATES_DEFAULT_LIMIT, 1, CANDIDATES_MAX_LIMIT);
+  const offset = intParam(params.get("offset"), 0, 0, CANDIDATES_MAX_OFFSET);
+  return { filter, limit, offset };
+}
+
+/**
+ * D6: what the user selected. `ids` is what they ticked (at most `EXPORT_SELECTION_MAX` distinct UUIDs, lower-cased);
+ * `filter` is "select all N matching", carrying the N they saw so a moved count is refused before anything happens.
+ */
+export type ExportSelection =
+  | Readonly<{ mode: "ids"; ids: readonly string[] }>
+  | Readonly<{ mode: "filter"; filter: DocumentFilter; expectedTotal: number }>;
+export type ExportBody = Readonly<{ columns: ExportColumnSet; headers: ExportHeaders; selection: ExportSelection }>;
+export type MarksBody = Readonly<{ action: "mark" | "unmark"; selection: ExportSelection }>;
+
+type Json = Record<string, unknown>;
+function isPlainObject(value: unknown): value is Json {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+/** Unknown keys are refused, so a typo (`expected_total`) is a 400 instead of a silently different request. */
+function onlyKeys(value: Json, allowed: readonly string[]): void {
+  for (const key of Object.keys(value)) if (!allowed.includes(key)) throw new Error("INVALID_EXPORT_SELECTION");
+}
+const FILTER_STRING_KEYS = ["q", "batchId", "parentId", "dateField", "from", "to", "exportState"] as const;
+const FILTER_KEYS: readonly string[] = ["status", "confirmedOnly", ...FILTER_STRING_KEYS];
+
+/**
+ * A POSTed filter object becomes the query string the GET would have carried and goes through `parseExportFilter`, so
+ * the two can never validate differently. Shape errors (unknown key, wrong type) are INVALID_EXPORT_SELECTION; a bad
+ * value is INVALID_EXPORT_FILTER, exactly as on the GET.
+ */
+function filterFromBody(value: unknown): DocumentFilter {
+  if (!isPlainObject(value)) throw new Error("INVALID_EXPORT_SELECTION");
+  onlyKeys(value, FILTER_KEYS);
+  const params = new URLSearchParams();
+  if (value.status !== undefined) {
+    if (!Array.isArray(value.status) || !value.status.every((item) => typeof item === "string")) throw new Error("INVALID_EXPORT_SELECTION");
+    const statuses = value.status as string[];
+    // The GET's list separator: an element holding a comma would otherwise smuggle in a second value.
+    if (statuses.some((item) => item.includes(","))) throw new Error("INVALID_EXPORT_FILTER");
+    if (statuses.length > 0) params.set("status", statuses.join(","));
+  }
+  if (value.confirmedOnly !== undefined) {
+    if (typeof value.confirmedOnly !== "boolean") throw new Error("INVALID_EXPORT_SELECTION");
+    if (value.confirmedOnly) params.set("confirmedOnly", "1");
+  }
+  for (const key of FILTER_STRING_KEYS) {
+    const item = value[key];
+    if (item === undefined) continue;
+    if (typeof item !== "string") throw new Error("INVALID_EXPORT_SELECTION");
+    params.set(key, item);
+  }
+  return parseExportFilter(params);
+}
+
+/**
+ * C2/C3 `selection`, strictly: `{ mode: "ids", ids }` with 1..5,000 distinct UUIDs, or
+ * `{ mode: "filter", filter, expectedTotal }` with an integer 0..maxRows. Everything is checked before the store is
+ * touched; the ids reach SQL only as one bound `uuid[]`.
+ */
+export function parseSelectionBody(value: unknown, maxRows: number): ExportSelection {
+  if (!isPlainObject(value)) throw new Error("INVALID_EXPORT_SELECTION");
+  if (value.mode === "ids") {
+    onlyKeys(value, ["mode", "ids"]);
+    if (!Array.isArray(value.ids) || value.ids.length === 0) throw new Error("INVALID_EXPORT_SELECTION");
+    const ids = new Set<string>();
+    for (const id of value.ids) {
+      if (typeof id !== "string" || !UUID.test(id)) throw new Error("INVALID_EXPORT_SELECTION");
+      ids.add(id.toLowerCase());
+      if (ids.size > EXPORT_SELECTION_MAX) throw new Error("INVALID_EXPORT_SELECTION");
+    }
+    return { mode: "ids", ids: [...ids] };
+  }
+  if (value.mode === "filter") {
+    onlyKeys(value, ["mode", "filter", "expectedTotal"]);
+    const expectedTotal = value.expectedTotal;
+    if (typeof expectedTotal !== "number" || !Number.isSafeInteger(expectedTotal) || expectedTotal < 0 || expectedTotal > maxRows) {
+      throw new Error("INVALID_EXPORT_SELECTION");
+    }
+    return { mode: "filter", filter: filterFromBody(value.filter), expectedTotal };
+  }
+  throw new Error("INVALID_EXPORT_SELECTION");
+}
+
+/** C2 body: `columns` (default compact), `headers` (default th) and the `selection`. A bad column/header value is the GET's error. */
+export function parseExportBody(value: unknown, maxRows: number): ExportBody {
+  if (!isPlainObject(value)) throw new Error("INVALID_EXPORT_SELECTION");
+  onlyKeys(value, ["columns", "headers", "selection"]);
+  for (const key of ["columns", "headers"] as const) {
+    if (value[key] !== undefined && typeof value[key] !== "string") throw new Error("INVALID_EXPORT_SELECTION");
+  }
+  const columns = columnsParam((value.columns as string | undefined)?.trim() || "compact");
+  const headers = headersParam((value.headers as string | undefined)?.trim() || "th");
+  return { columns, headers, selection: parseSelectionBody(value.selection, maxRows) };
+}
+
+/** C3 body: `action` (`mark` | `unmark`) and the `selection`. */
+export function parseMarksBody(value: unknown, maxRows: number): MarksBody {
+  if (!isPlainObject(value)) throw new Error("INVALID_EXPORT_SELECTION");
+  onlyKeys(value, ["action", "selection"]);
+  if (value.action !== "mark" && value.action !== "unmark") throw new Error("INVALID_EXPORT_SELECTION");
+  return { action: value.action, selection: parseSelectionBody(value.selection, maxRows) };
+}
+
+/** What the store is asked for: an explicit selection is ONLY its ids (D6), "select all" is the filter plus N. */
+function selectionFilter(selection: ExportSelection): { filter: DocumentFilter; expectedTotal?: number } {
+  return selection.mode === "ids" ? { filter: { ids: selection.ids } } : { filter: selection.filter, expectedTotal: selection.expectedTotal };
+}
+
+/** §7: how the rows were chosen, as counts only. `filter_get` is the Release 2 GET download, which never marks. */
+type SelectionDetail = Readonly<{ selection: "ids" | "filter" | "filter_get"; requested: number | null; export_state: string | null }>;
+function selectionDetail(selection: ExportSelection | null, filter: DocumentFilter): SelectionDetail {
+  if (selection === null) return { selection: "filter_get", requested: null, export_state: filter.exportState ?? null };
+  if (selection.mode === "ids") return { selection: "ids", requested: selection.ids.length, export_state: null };
+  return { selection: "filter", requested: selection.expectedTotal, export_state: selection.filter.exportState ?? null };
+}
+
+/** The `export.started` / `.completed` detail: which filters were used, never what was searched for (and never ids). */
+function filterDetail(filter: DocumentFilter, columns: ExportColumnSet, headers: ExportHeaders): Record<string, string | number | boolean | null> {
   return {
-    columns: query.columns, headers: query.headers,
-    date_field: query.dateField ?? "created_at",
-    statuses: typeof query.status === "string" ? query.status : (query.status ?? []).join(","),
-    confirmed_only: query.confirmedOnly === true,
-    from: query.from ?? null, to: query.to ?? null,
-    batch_id: query.batchId ?? null, parent_id: query.parentId ?? null,
+    columns, headers,
+    date_field: filter.dateField ?? "created_at",
+    statuses: typeof filter.status === "string" ? filter.status : (filter.status ?? []).join(","),
+    confirmed_only: filter.confirmedOnly === true,
+    from: filter.from ?? null, to: filter.to ?? null,
+    batch_id: filter.batchId ?? null, parent_id: filter.parentId ?? null,
     // The search text itself is customer data (a name, a form number), so only its presence is recorded.
-    has_q: typeof query.q === "string" && query.q.length > 0
+    has_q: typeof filter.q === "string" && filter.q.length > 0
   };
 }
 
@@ -217,6 +393,10 @@ export type ExportRouteDeps = Readonly<{
   users: UserStore;
   gate: ExportGate;
   previewLimit: SlidingWindow;
+  /** `EXPORT_LIST_LIMIT` candidates requests per user per window (D9). */
+  listLimit: SlidingWindow;
+  /** `EXPORT_MARK_LIMIT` manual mark/unmark requests per user per window (C3). */
+  markLimit: SlidingWindow;
   maxRows: number;
   publicBaseUrl: string;
   traceId: string;
@@ -254,7 +434,7 @@ function errorCodeOf(error: unknown): string {
  * is entered, so the 403 is counted from there (§13 `exports_total{result="forbidden"}`).
  */
 export function exportFormatLabel(pathname: string): string | null {
-  return FILE_ROUTES.get(pathname) ?? (pathname === PREVIEW_ROUTE ? "preview" : null);
+  return ROUTE_LABELS.get(pathname) ?? null;
 }
 
 /**
@@ -282,20 +462,38 @@ async function write(response: ServerResponse, chunk: string): Promise<void> {
 }
 
 /**
- * The three export routes. Returns false when `pathname` is not one of them, so the caller falls through to its 404.
- * The permission gate (`requiredRight`) and the `Sec-Fetch-Site` / `Origin` guards have already run in `authorize`.
+ * The export routes. Returns false when `pathname` is not one of them or the method is not served there, so the caller
+ * falls through to its 404. The permission gate (`requiredRight`) and the `Sec-Fetch-Site` / `Origin` / CSRF guards
+ * have already run in `authorize`; the POST bodies go through `readJson` (JSON content type, 1 MB).
+ *
+ * - `GET  /api/exports/candidates`          the dialog's list (C1), metered, not audited per call
+ * - `GET  /api/exports/preview`             unchanged (kept one release for rollback, D8)
+ * - `GET  /api/exports/documents.{csv,jsonl}` unchanged Release 2 download, never marks (D7)
+ * - `POST /api/exports/documents.{csv,jsonl}` a selection download, marks on a complete stream (C2, D4)
+ * - `POST /api/exports/marks`               manual mark / unmark (C3)
  */
-export async function handleExportRoutes(response: ServerResponse, url: URL, method: string, ctx: WebAuthContext,
-  deps: ExportRouteDeps): Promise<boolean> {
+export async function handleExportRoutes(request: IncomingMessage, response: ServerResponse, url: URL, method: string,
+  ctx: WebAuthContext, deps: ExportRouteDeps): Promise<boolean> {
   const pathname = url.pathname;
+  const label = exportFormatLabel(pathname);
+  if (label === null) return false;
   const format = FILE_ROUTES.get(pathname);
-  if (pathname !== PREVIEW_ROUTE && format === undefined) return false;
-  if (method !== "GET") return false;
-  const label: string = format ?? "preview";
+  const served = method === "GET" ? pathname !== MARKS_ROUTE : method === "POST" && (format !== undefined || pathname === MARKS_ROUTE);
+  if (!served) return false;
   try {
-    const query = parseExportQuery(url.searchParams);
-    if (format === undefined) await preview(response, ctx, query, deps);
-    else await download(response, ctx, query, format, deps);
+    if (pathname === CANDIDATES_ROUTE) await candidates(response, ctx, parseCandidatesQuery(url.searchParams), deps);
+    else if (pathname === PREVIEW_ROUTE) await preview(response, ctx, parseExportQuery(url.searchParams), deps);
+    else if (pathname === MARKS_ROUTE) await marks(request, response, ctx, deps);
+    else if (format !== undefined && method === "GET") {
+      const { columns, headers, ...filter } = parseExportQuery(url.searchParams);
+      await download(response, ctx, { filter, columns, headers, selection: null }, format, deps);
+    } else if (format !== undefined) {
+      // Everything is validated before the gate or the store: a bad body is a clean 400 that costs nothing.
+      const body = parseExportBody(await readJson(request), deps.maxRows);
+      const { filter, expectedTotal } = selectionFilter(body.selection);
+      await download(response, ctx, { filter, columns: body.columns, headers: body.headers, selection: body.selection,
+        ...(expectedTotal === undefined ? {} : { expectedTotal }) }, format, deps);
+    }
     return true;
   } catch (error) {
     metrics.increment("exports_total", { format: label, result: resultOf(error) });
@@ -309,13 +507,60 @@ export async function handleExportRoutes(response: ServerResponse, url: URL, met
   }
 }
 
+/**
+ * C1: one page of the rows the export would hold, with each row's export history and the tab counts. Identifying
+ * fields only (the same class `GET /api/documents` returns), so it is metered (D8's bulk-read control) and throttled,
+ * not audited per call.
+ */
+async function candidates(response: ServerResponse, ctx: WebAuthContext, query: CandidatesQuery, deps: ExportRouteDeps): Promise<void> {
+  if (deps.listLimit.blocked(ctx.userId, deps.now())) throw new Error("EXPORT_THROTTLED");
+  deps.listLimit.record(ctx.userId, deps.now());
+  const result = await deps.store.listExportCandidates(ctx.tenantId, query.filter, { limit: query.limit, offset: query.offset });
+  metrics.increment("exports_total", { format: "candidates", result: "ok" });
+  metrics.increment("documents_read_total", { kind: "export_candidates" }, result.rows.length);
+  respond(response, 200, {
+    total: result.total, limit: result.limit, offset: result.offset, counts: result.counts,
+    maxRows: deps.maxRows, selectionMax: EXPORT_SELECTION_MAX, rows: result.rows
+  });
+}
+
+/**
+ * C3: a manual mark or unmark. The store runs the count, the `expectedTotal` check and the insert in one REPEATABLE
+ * READ transaction (nothing is half-written); the audit row follows the commit, and a failure to write it is logged
+ * without undoing the mark — the event rows themselves (actor, request id, time) are the durable record (§7).
+ */
+async function marks(request: IncomingMessage, response: ServerResponse, ctx: WebAuthContext, deps: ExportRouteDeps): Promise<void> {
+  if (deps.markLimit.blocked(ctx.userId, deps.now())) throw new Error("EXPORT_THROTTLED");
+  deps.markLimit.record(ctx.userId, deps.now());
+  const body = parseMarksBody(await readJson(request), deps.maxRows);
+  const kind = body.action === "mark" ? "marked" : "unmarked";
+  const { filter, expectedTotal } = selectionFilter(body.selection);
+  let result: ExportMarkResult;
+  try {
+    result = await deps.store.markExportState(ctx.tenantId, {
+      action: body.action, filter, maxRows: deps.maxRows, actorUserId: ctx.userId, requestId: deps.traceId,
+      ...(expectedTotal === undefined ? {} : { expectedTotal })
+    });
+  } catch (error) {
+    metrics.increment("export_marks_total", { kind, result: "error" });
+    throw error;
+  }
+  metrics.increment("export_marks_total", { kind, result: "ok" });
+  metrics.increment("export_marked_rows_total", { kind }, result.affected);
+  metrics.increment("exports_total", { format: "marks", result: "ok" });
+  const detail = selectionDetail(body.selection, filter);
+  await audit(deps, ctx, `export.${kind}`, "success",
+    { selection: detail.selection, requested: detail.requested, total: result.total, affected: result.affected, skipped: result.skipped });
+  respond(response, 200, { action: body.action, affected: result.affected, skipped: result.skipped, total: result.total });
+}
+
 async function preview(response: ServerResponse, ctx: WebAuthContext, query: ExportQuery, deps: ExportRouteDeps): Promise<void> {
   if (deps.previewLimit.blocked(ctx.userId, deps.now())) throw new Error("EXPORT_THROTTLED");
   deps.previewLimit.record(ctx.userId, deps.now());
   const columns = exportColumns(query.columns);
   const result = await deps.store.previewExport(ctx.tenantId, query);
   // §10 H1: the preview answers with the full column set for any filter, so it is audited like the file itself.
-  await audit(deps, ctx, "export.previewed", "success", { ...filterDetail(query), format: "preview", rows: result.total });
+  await audit(deps, ctx, "export.previewed", "success", { ...filterDetail(query, query.columns, query.headers), format: "preview", rows: result.total });
   metrics.increment("exports_total", { format: "preview", result: "ok" });
   respond(response, 200, {
     columns: columns.map((column) => ({ key: column.key, label: columnLabel(column, query.headers) })),
@@ -325,21 +570,35 @@ async function preview(response: ServerResponse, ctx: WebAuthContext, query: Exp
   });
 }
 
-async function download(response: ServerResponse, ctx: WebAuthContext, query: ExportQuery, format: ExportFormat,
+/**
+ * One download. `selection` is null for the Release 2 GET (never marks, D7); a POSTed selection marks every streamed
+ * row once the stream is complete (D4). `expectedTotal` is "select all N" (D6).
+ */
+type DownloadRequest = Readonly<{
+  filter: DocumentFilter; columns: ExportColumnSet; headers: ExportHeaders;
+  selection: ExportSelection | null; expectedTotal?: number;
+}>;
+
+async function download(response: ServerResponse, ctx: WebAuthContext, request: DownloadRequest, format: ExportFormat,
   deps: ExportRouteDeps): Promise<void> {
   const release = deps.gate.acquire(ctx.userId);
   if (release === null) throw new Error("EXPORT_BUSY");
   const startedAt = deps.now();
+  const mark = request.selection !== null;
+  const detail = { ...filterDetail(request.filter, request.columns, request.headers), ...selectionDetail(request.selection, request.filter) };
   let cursor: ExportCursor | null = null;
   let rows = 0;
+  let marked = 0;
   let complete = false;
   try {
-    // Step 1: the count runs before anything is written, so EXPORT_TOO_LARGE is still a clean 400.
-    cursor = await deps.store.openExport(ctx.tenantId, query, { maxRows: deps.maxRows });
+    // Step 1: the count runs before anything is written, so EXPORT_TOO_LARGE, EXPORT_SELECTION_CHANGED and
+    // EXPORT_SELECTION_EMPTY are still clean 4xx answers.
+    cursor = await deps.store.openExport(ctx.tenantId, request.filter,
+      { maxRows: deps.maxRows, ...(request.expectedTotal === undefined ? {} : { expectedTotal: request.expectedTotal }) });
     const open = cursor;
     // Step 2: the audit row is committed BEFORE the first byte. Only `export.started` is guaranteed — a crash, a
     // redeploy or an OOM kill during the stream would otherwise let the data leave with no audit row at all.
-    await audit(deps, ctx, "export.started", "success", { ...filterDetail(query), format, rows: open.total });
+    await audit(deps, ctx, "export.started", "success", { ...detail, format, rows: open.total });
     // The gate's wall clock. It ends BOTH halves of a stalled download: `close()` gives the pooled connection back,
     // and `destroy()` ends the response — without it the loop would stay parked on a `'drain'` that a client which
     // stopped reading never fires, so `release()` below would never run and that user's next export would answer 429
@@ -348,29 +607,45 @@ async function download(response: ServerResponse, ctx: WebAuthContext, query: Ex
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; void open.close(); response.destroy(); }, deps.wallClockMs ?? EXPORT_WALL_CLOCK_MS);
     timer.unref?.();
+    // D2: the snapshot of each row is the `rowVersion` the cursor itself read, collected only for rows actually written.
+    const streamed: { documentId: string; rowVersion: string }[] = [];
     try {
-      const columns = exportColumns(query.columns);
+      const columns = exportColumns(request.columns);
       response.writeHead(200, {
         "content-type": CONTENT_TYPE[format],
         "content-disposition": `attachment; filename="${exportFilename(format, startedAt)}"`,
-        "cache-control": "no-store", "x-content-type-options": "nosniff", "x-export-rows": String(open.total)
+        "cache-control": "no-store", "x-content-type-options": "nosniff", "x-export-rows": String(open.total),
+        ...(request.selection === null ? {} : { "x-export-selection": request.selection.mode })
       });
       // Step 3: the BOM and the header row go out at once, so nginx-proxy does not sit waiting with no data at all.
       // It does not make the proxy's read timeout irrelevant: a FETCH may take up to EXPORT_STATEMENT_TIMEOUT_MS
       // between two writes, which is the gap Deploy B's `proxy_read_timeout` precondition is there to cover.
-      if (format === "csv") await write(response, CSV_BOM + csvRow(columns.map((column) => columnLabel(column, query.headers))));
+      if (format === "csv") await write(response, CSV_BOM + csvRow(columns.map((column) => columnLabel(column, request.headers))));
       for await (const page of open.rows()) {
         const chunk = page.map((document) => format === "csv"
-          ? csvDocumentRow(document, columns, query.columns, deps.publicBaseUrl)
-          : jsonlDocumentLine(document, columns, query.columns, deps.publicBaseUrl)).join("");
+          ? csvDocumentRow(document, columns, request.columns, deps.publicBaseUrl)
+          : jsonlDocumentLine(document, columns, request.columns, deps.publicBaseUrl)).join("");
         await write(response, chunk);
         rows += page.length;
+        if (mark) for (const document of page) streamed.push({ documentId: document.documentId, rowVersion: document.rowVersion });
       }
       if (timedOut) throw new Error("EXPORT_TIMEOUT");
       // The count and the cursor read the same REPEATABLE READ snapshot through the same WHERE, so they agree on how
       // many rows exist. A short stream means something ended the cursor early, and a truncated file must never be
       // handed over as a complete one with a 200 — the socket is destroyed instead and the browser's blob() rejects.
       if (rows !== open.total) throw new Error("EXPORT_TRUNCATED");
+      // The stream is done: the wall clock has nothing left to guard, and it must not cut the response AFTER the marks
+      // below have committed (that would mark rows the browser never saved). The cursor goes back before the marks
+      // take a second connection.
+      clearTimeout(timer);
+      await open.close();
+      if (mark) {
+        // D4: marks only for a complete stream, and BEFORE the final end(), so "file saved" implies "rows marked". A
+        // client that already left gets no marks; a failed insert fails the download (strict), so the socket is
+        // destroyed and the browser saves nothing.
+        if (response.destroyed || response.writableEnded) throw new Error("EXPORT_ABORTED");
+        marked = await recordMarks(ctx, format, streamed, deps);
+      }
       complete = true;
       response.end();
     } catch (error) {
@@ -383,17 +658,34 @@ async function download(response: ServerResponse, ctx: WebAuthContext, query: Ex
     // §10 H5: the terminal rows carry the same filter detail as `export.started`, so one row answers what was asked
     // for without a join back to the started row on request_id (which a crash may be the only survivor of).
     await audit(deps, ctx, "export.completed", "success",
-      { ...filterDetail(query), format, rows, complete, duration_ms: deps.now() - startedAt });
-    logEvent("export_completed", { trace_id: deps.traceId, user_id: ctx.userId, format, rows, duration_ms: deps.now() - startedAt });
+      { ...detail, format, rows, complete, marked, mark, duration_ms: deps.now() - startedAt });
+    logEvent("export_completed", { trace_id: deps.traceId, user_id: ctx.userId, format, rows, marked, duration_ms: deps.now() - startedAt });
   } catch (error) {
     metrics.increment("export_rows_total", { format }, rows);
     // Both the metric bucket and the code: `aborted` alone cannot tell a statement timeout from a client walking away.
     await audit(deps, ctx, "export.failed", "failure",
-      { ...filterDetail(query), format, rows, complete, duration_ms: deps.now() - startedAt, result: resultOf(error), error: errorCodeOf(error) });
+      { ...detail, format, rows, complete, duration_ms: deps.now() - startedAt, result: resultOf(error), error: errorCodeOf(error) });
     throw error;
   } finally {
     await cursor?.close();
     release();
+  }
+}
+
+/** One `exported` event per streamed row (D4). Any store failure is EXPORT_MARK_FAILED; the pg message is only logged, truncated. */
+async function recordMarks(ctx: WebAuthContext, format: ExportFormat, streamed: readonly { documentId: string; rowVersion: string }[],
+  deps: ExportRouteDeps): Promise<number> {
+  try {
+    const inserted = await deps.store.recordExportMarks(ctx.tenantId,
+      { kind: "exported", source: format, actorUserId: ctx.userId, requestId: deps.traceId, rows: streamed });
+    metrics.increment("export_marks_total", { kind: "exported", result: "ok" });
+    metrics.increment("export_marked_rows_total", { kind: "exported" }, inserted);
+    return inserted;
+  } catch (error: unknown) {
+    metrics.increment("export_marks_total", { kind: "exported", result: "error" });
+    logEvent("export_mark_failed", { level: "error", trace_id: deps.traceId, user_id: ctx.userId, rows: streamed.length,
+      error: error instanceof Error ? error.message.slice(0, 120) : "unknown" });
+    throw new Error("EXPORT_MARK_FAILED");
   }
 }
 

@@ -569,3 +569,30 @@ test("legacy confirm of one treatment keeps the document in review while another
     assert.equal(oneFlagged.corrections[1]?.[6], false, "the confirmed item was the only flagged field");
   });
 });
+
+test("export selection routes: Origin and CSRF guard both POSTs, the export right guards all three, and the labels are bounded", async () => {
+  const h = workbenchHarness();
+  const selection = JSON.stringify({ action: "mark", selection: { mode: "ids", ids: [documentId] } });
+  const download = JSON.stringify({ selection: { mode: "ids", ids: [documentId] } });
+  await withServer(h, async (base) => {
+    for (const [path, payload] of [["/api/exports/marks", selection], ["/api/exports/documents.csv", download], ["/api/exports/documents.jsonl", download]] as const) {
+      const { "x-csrf-token": _token, ...withoutToken } = jsonAuth;
+      await expectError(await fetch(`${base}${path}`, { method: "POST", headers: withoutToken, body: payload }), 403, "CSRF_REJECTED");
+      await expectError(await fetch(`${base}${path}`, { method: "POST", headers: { ...jsonAuth, "x-csrf-token": csrfTokenFor(otherSessionToken) }, body: payload }), 403, "CSRF_REJECTED");
+      await expectError(await fetch(`${base}${path}`, { method: "POST", headers: { ...jsonAuth, origin: "https://evil.test", "sec-fetch-site": "cross-site" }, body: payload }), 403, "CSRF_REJECTED");
+      // A same-origin request with a valid token still needs the export right, which this staff account lacks.
+      await expectError(await fetch(`${base}${path}`, { method: "POST", headers: jsonAuth, body: payload }), 403, "FORBIDDEN");
+    }
+    await expectError(await fetch(`${base}/api/exports/candidates`, { headers: auth }), 403, "FORBIDDEN");
+    await expectError(await fetch(`${base}/api/exports/candidates`), 401, "UNAUTHENTICATED");
+  });
+  for (const path of ["/api/exports/candidates", "/api/exports/marks"]) assert.equal(routeLabel(path), path);
+  assert.equal(routeLabel("/api/exports/marks/extra"), "unmatched");
+});
+
+test("export selection error codes map to their statuses", () => {
+  assert.equal(errorStatus("EXPORT_SELECTION_CHANGED"), 409);
+  for (const code of ["INVALID_EXPORT_SELECTION", "EXPORT_SELECTION_EMPTY", "INVALID_EXPORT_FILTER", "EXPORT_TOO_LARGE"]) assert.equal(errorStatus(code), 400, code);
+  assert.equal(errorStatus("EXPORT_THROTTLED"), 429);
+  assert.equal(errorStatus("EXPORT_BUSY"), 429);
+});

@@ -6,17 +6,19 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createServer, type Server } from "node:http";
 import { connect } from "node:net";
-import { AuthenticationError } from "@innovera/ocr-auth";
+import { AuthenticationError, csrfTokenFor } from "@innovera/ocr-auth";
 import type { WebConfig } from "@innovera/ocr-config";
 import {
-  normalizeStructuredResult, type AuditEvent, type DocumentFilter, type ExportCursor, type ExportDocument,
-  type OpenExportOptions
+  normalizeStructuredResult, type AuditEvent, type DocumentFilter, type ExportCandidate, type ExportCandidatesPage,
+  type ExportCandidatesResult, type ExportCursor, type ExportDocument, type ExportMarkInput, type ExportMarkResult,
+  type ExportStateChangeInput, type OpenExportOptions
 } from "@innovera/ocr-persistence";
 import type { UserStore, WebAuthContext } from "./auth.js";
 import { SlidingWindow } from "./auth.js";
 import {
-  bangkokOffsetIso, csvCell, csvRow, exportFilename, exportFormatLabel, ExportGate, guardFormula, handleExportRoutes,
-  parseExportQuery, PREVIEW_LIMIT, PREVIEW_WINDOW_MS, type ExportStore
+  bangkokOffsetIso, csvCell, csvRow, EXPORT_LIST_LIMIT, EXPORT_MARK_LIMIT, exportFilename, exportFormatLabel, ExportGate,
+  guardFormula, handleExportRoutes, parseCandidatesQuery, parseExportBody, parseExportQuery, parseMarksBody, parseSelectionBody,
+  PREVIEW_LIMIT, PREVIEW_WINDOW_MS, type ExportRouteDeps, type ExportStore
 } from "./export.js";
 import { createAppServer } from "./server.js";
 
@@ -54,12 +56,29 @@ function deferred(): Deferred {
 type StoreOptions = Readonly<{
   total?: number; pageSize?: number; failAfter?: number; gateBeforePage?: number; gate?: Deferred;
   openError?: string; previewTotal?: number; stopAfter?: number;
+  /** `recordExportMarks` throws this (a pg-style lowercase message, so it is never a client code by itself). */
+  markError?: string;
+  /** `markExportState` throws this code, or answers `markResult`. */
+  stateError?: string; markResult?: ExportMarkResult;
+  candidates?: ExportCandidatesResult;
 }>;
-type FakeStore = ExportStore & { closed: number; opened: number; filters: DocumentFilter[]; maxRows: number[] };
+type FakeStore = ExportStore & {
+  closed: number; opened: number; filters: DocumentFilter[]; maxRows: number[]; expectedTotals: (number | undefined)[];
+  marks: ExportMarkInput[]; closedAtMark: number[]; stateCalls: ExportStateChangeInput[];
+  listCalls: { filter: DocumentFilter; page: ExportCandidatesPage | undefined }[];
+};
 
-/** A store that yields `total` identical rows in pages, and can stall or throw exactly where a test needs it to. */
+/**
+ * A store that yields `total` identical rows in pages, and can stall or throw exactly where a test needs it to. Like
+ * the real `openExport`, a POSTed "select all N" whose N differs is EXPORT_SELECTION_CHANGED and an explicit selection
+ * that matches nothing is EXPORT_SELECTION_EMPTY, both before the cursor exists.
+ */
 function fakeStore(documents: readonly ExportDocument[], options: StoreOptions = {}): FakeStore {
-  const state = { closed: 0, opened: 0, filters: [] as DocumentFilter[], maxRows: [] as number[] };
+  const state = {
+    closed: 0, opened: 0, filters: [] as DocumentFilter[], maxRows: [] as number[], expectedTotals: [] as (number | undefined)[],
+    marks: [] as ExportMarkInput[], closedAtMark: [] as number[], stateCalls: [] as ExportStateChangeInput[],
+    listCalls: [] as { filter: DocumentFilter; page: ExportCandidatesPage | undefined }[]
+  };
   const total = options.total ?? documents.length;
   const pageSize = options.pageSize ?? Math.max(1, documents.length);
   return Object.assign(state, {
@@ -70,7 +89,10 @@ function fakeStore(documents: readonly ExportDocument[], options: StoreOptions =
     openExport: async (_tenantId: string, filter: DocumentFilter, open: OpenExportOptions): Promise<ExportCursor> => {
       state.filters.push(filter);
       state.maxRows.push(open.maxRows);
+      state.expectedTotals.push(open.expectedTotal);
       if (options.openError) throw new Error(options.openError);
+      if (open.expectedTotal !== undefined && open.expectedTotal !== total) throw new Error("EXPORT_SELECTION_CHANGED");
+      if (total === 0 && filter.ids !== undefined) throw new Error("EXPORT_SELECTION_EMPTY");
       state.opened += 1;
       let closed = false;
       const close = async (): Promise<void> => { if (!closed) { closed = true; state.closed += 1; } };
@@ -89,6 +111,22 @@ function fakeStore(documents: readonly ExportDocument[], options: StoreOptions =
         } finally { await close(); }
       }
       return { total, rows, close };
+    },
+    listExportCandidates: async (_tenantId: string, filter: DocumentFilter, page?: ExportCandidatesPage): Promise<ExportCandidatesResult> => {
+      state.listCalls.push({ filter, page });
+      return options.candidates ?? { total: 0, limit: page?.limit ?? 50, offset: page?.offset ?? 0, counts: { never: 0, exported: 0, all: 0, unconfirmed: 0 }, rows: [] };
+    },
+    recordExportMarks: async (_tenantId: string, input: ExportMarkInput): Promise<number> => {
+      // How many cursors were closed when the marks were written: the export's connection must go back first.
+      state.closedAtMark.push(state.closed);
+      if (options.markError) throw new Error(options.markError);
+      state.marks.push(input);
+      return input.rows.length;
+    },
+    markExportState: async (_tenantId: string, input: ExportStateChangeInput): Promise<ExportMarkResult> => {
+      state.stateCalls.push(input);
+      if (options.stateError) throw new Error(options.stateError);
+      return options.markResult ?? { total: 0, affected: 0, skipped: 0 };
     }
   });
 }
@@ -309,6 +347,8 @@ test("the terminal audit rows say what was asked for, not just how it ended", as
     assert.deepEqual(completed.detail, {
       columns: "detailed", headers: "en", date_field: "reviewed_at", statuses: "confirmed", confirmed_only: false,
       from: "2026-09-01", to: "2026-09-22", batch_id: null, parent_id: null, has_q: true,
+      // 0021 (§7): the Release 2 GET is its own selection kind and never marks.
+      selection: "filter_get", requested: null, export_state: null, marked: 0, mark: false,
       format: "csv", rows: 2, complete: true, duration_ms: completed.detail?.duration_ms
     });
     assert.equal(completed.detail?.q, undefined, "the search text itself is customer data, never the filter value");
@@ -324,10 +364,11 @@ test("the wall clock ends a download stuck on drain, and gives the user's slot b
   const gate = new ExportGate();
   const deps = {
     store, users: fakeUsers(audits), gate, previewLimit: new SlidingWindow(PREVIEW_LIMIT, PREVIEW_WINDOW_MS),
+    listLimit: new SlidingWindow(EXPORT_LIST_LIMIT, PREVIEW_WINDOW_MS), markLimit: new SlidingWindow(EXPORT_MARK_LIMIT, PREVIEW_WINDOW_MS),
     maxRows: 500_000, publicBaseUrl: "https://ocr.example.test", traceId: "t-1", now: Date.now, wallClockMs: 60
   };
   const server = createServer((request, response) => {
-    void handleExportRoutes(response, new URL(request.url ?? "/", "http://127.0.0.1"), request.method ?? "GET", context(), deps)
+    void handleExportRoutes(request, response, new URL(request.url ?? "/", "http://127.0.0.1"), request.method ?? "GET", context(), deps)
       .catch(() => { if (!response.headersSent) response.writeHead(500); response.end(); });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -495,10 +536,10 @@ test("the export routes need a session, and a staff account without can_export i
   });
 });
 
-test("exportFormatLabel names the three export routes and nothing else", () => {
-  assert.deepEqual(["/api/exports/preview", "/api/exports/documents.csv", "/api/exports/documents.jsonl"].map(exportFormatLabel),
-    ["preview", "csv", "jsonl"]);
-  for (const path of ["/api/documents", "/api/exports", "/api/exports/documents.txt", "unmatched"]) {
+test("exportFormatLabel names the five export routes and nothing else", () => {
+  assert.deepEqual(["/api/exports/preview", "/api/exports/documents.csv", "/api/exports/documents.jsonl", "/api/exports/candidates",
+    "/api/exports/marks"].map(exportFormatLabel), ["preview", "csv", "jsonl", "candidates", "marks"]);
+  for (const path of ["/api/documents", "/api/exports", "/api/exports/documents.txt", "/api/exports/marks/x", "unmatched"]) {
     assert.equal(exportFormatLabel(path), null, path);
   }
 });
@@ -531,4 +572,427 @@ test("exportFilename is ASCII, Bangkok-timed and carries no client input", () =>
   assert.equal(exportFilename("csv", Date.parse("2026-09-22T07:05:00.000Z")), "ocr-export-20260922-1405.csv");
   assert.equal(exportFilename("jsonl", Date.parse("2026-09-22T17:00:00.000Z")), "ocr-export-20260923-0000.jsonl");
   assert.doesNotMatch(exportFilename("csv", Date.now()), /[^\x20-\x7E]/, "nothing here can split a response header");
+});
+
+// ---- export selection (0021): parsers -------------------------------------------------------------
+
+/** Obviously fake ids: the row number is the last group, so a failing assertion names the row. */
+const docId = (n: number): string => `aaaaaaaa-aaaa-4aaa-8aaa-${String(n).padStart(12, "0")}`;
+const idList = (count: number): string[] => Array.from({ length: count }, (_unused, index) => docId(index + 1));
+/** `count` different documents, each with its own exact-microsecond snapshot (the value that must reach the marks). */
+const distinctDocuments = (count: number): ExportDocument[] => idList(count).map((documentId, index) =>
+  document({ documentId, rowVersion: `2026-09-22T07:05:00.${String(index + 1).padStart(6, "0")}Z` }));
+
+test("parseSelectionBody: ids are 1..5,000 distinct UUIDs, filter mode needs expectedTotal, and unknown keys are refused", () => {
+  const upper = docId(1).toUpperCase();
+  assert.deepEqual(parseSelectionBody({ mode: "ids", ids: [upper, docId(1), docId(2)] }, 50_000), { mode: "ids", ids: [docId(1), docId(2)] },
+    "lower-cased and de-duplicated");
+  assert.deepEqual(parseSelectionBody({ mode: "ids", ids: [...idList(5000), docId(1)] }, 50_000).mode, "ids", "5,000 distinct after de-dup is fine");
+  assert.deepEqual(parseSelectionBody({ mode: "filter", filter: {}, expectedTotal: 0 }, 50_000), { mode: "filter", filter: {}, expectedTotal: 0 });
+  assert.deepEqual(parseSelectionBody({
+    mode: "filter", expectedTotal: 12, filter: { status: ["review", "failed"], q: "  สมชาย ", batchId: "22222222-2222-4222-8222-222222222222",
+      confirmedOnly: true, dateField: "reviewed_at", from: "2026-09-01", to: "2026-09-22", exportState: "never" }
+  }, 50_000), {
+    mode: "filter", expectedTotal: 12, filter: { status: ["review", "failed"], q: "สมชาย", batchId: "22222222-2222-4222-8222-222222222222",
+      confirmedOnly: true, dateField: "reviewed_at", from: "2026-09-01", to: "2026-09-22", exportState: "never" }
+  });
+  assert.deepEqual(parseSelectionBody({ mode: "filter", filter: { confirmedOnly: false, status: [] }, expectedTotal: 3 }, 50_000).mode, "filter");
+  const shape: [string, unknown][] = [
+    ["not an object", "ids"], ["array", [docId(1)]], ["null", null], ["no mode", { ids: [docId(1)] }], ["unknown mode", { mode: "all" }],
+    ["empty ids", { mode: "ids", ids: [] }], ["ids not an array", { mode: "ids", ids: docId(1) }], ["non-uuid id", { mode: "ids", ids: ["nope"] }],
+    ["number id", { mode: "ids", ids: [1] }], ["5,001 distinct", { mode: "ids", ids: idList(5001) }],
+    ["extra key in ids mode", { mode: "ids", ids: [docId(1)], filter: {} }],
+    ["missing expectedTotal", { mode: "filter", filter: {} }], ["string expectedTotal", { mode: "filter", filter: {}, expectedTotal: "3" }],
+    ["fractional expectedTotal", { mode: "filter", filter: {}, expectedTotal: 1.5 }], ["negative expectedTotal", { mode: "filter", filter: {}, expectedTotal: -1 }],
+    ["expectedTotal above maxRows", { mode: "filter", filter: {}, expectedTotal: 50_001 }], ["missing filter", { mode: "filter", expectedTotal: 1 }],
+    ["filter not an object", { mode: "filter", filter: "status=review", expectedTotal: 1 }],
+    ["unknown filter key", { mode: "filter", filter: { ids: [docId(1)] }, expectedTotal: 1 }],
+    ["status not an array", { mode: "filter", filter: { status: "review" }, expectedTotal: 1 }],
+    ["confirmedOnly not a boolean", { mode: "filter", filter: { confirmedOnly: 1 }, expectedTotal: 1 }],
+    ["q not a string", { mode: "filter", filter: { q: 5 }, expectedTotal: 1 }], ["null value", { mode: "filter", filter: { batchId: null }, expectedTotal: 1 }]
+  ];
+  for (const [name, value] of shape) assert.throws(() => parseSelectionBody(value, 50_000), { message: "INVALID_EXPORT_SELECTION" }, name);
+  const values: [string, Record<string, unknown>][] = [
+    ["status value", { status: ["nope"] }], ["status with a comma", { status: ["review,failed"] }], ["bad batch id", { batchId: "x" }],
+    ["long q", { q: "x".repeat(101) }], ["bad date", { from: "2026-13-01" }], ["inverted range", { from: "2026-09-22", to: "2026-09-21" }],
+    ["bad date field", { dateField: "id" }], ["exportState all", { exportState: "all" }]
+  ];
+  for (const [name, filter] of values) {
+    assert.throws(() => parseSelectionBody({ mode: "filter", filter, expectedTotal: 1 }, 50_000), { message: "INVALID_EXPORT_FILTER" }, name);
+  }
+});
+
+test("parseExportBody and parseMarksBody: defaults, strict keys, and the GET's own error for a bad column set", () => {
+  const ids = { mode: "ids", ids: [docId(1)] };
+  assert.deepEqual(parseExportBody({ selection: ids }, 50_000), { columns: "compact", headers: "th", selection: { mode: "ids", ids: [docId(1)] } });
+  assert.deepEqual(parseExportBody({ columns: "detailed", headers: "en", selection: ids }, 50_000).columns, "detailed");
+  assert.throws(() => parseExportBody({ columns: "all", selection: ids }, 50_000), { message: "INVALID_EXPORT_FILTER" });
+  assert.throws(() => parseExportBody({ headers: "de", selection: ids }, 50_000), { message: "INVALID_EXPORT_FILTER" });
+  for (const value of [{ columns: 1, selection: ids }, { selection: ids, format: "csv" }, {}, { selection: null }, []]) {
+    assert.throws(() => parseExportBody(value, 50_000), { message: "INVALID_EXPORT_SELECTION" }, JSON.stringify(value));
+  }
+  assert.deepEqual(parseMarksBody({ action: "unmark", selection: ids }, 50_000), { action: "unmark", selection: { mode: "ids", ids: [docId(1)] } });
+  for (const value of [{ action: "delete", selection: ids }, { selection: ids }, { action: "mark" }, { action: "mark", selection: ids, extra: true }]) {
+    assert.throws(() => parseMarksBody(value, 50_000), { message: "INVALID_EXPORT_SELECTION" }, JSON.stringify(value));
+  }
+});
+
+test("parseCandidatesQuery pages strictly, and every export query now understands exportState", () => {
+  const params = (query: string) => new URLSearchParams(query);
+  assert.deepEqual(parseCandidatesQuery(params("")), { filter: {}, limit: 50, offset: 0 });
+  assert.deepEqual(parseCandidatesQuery(params("exportState=exported&status=review&limit=100&offset=1000000")),
+    { filter: { status: ["review"], exportState: "exported" }, limit: 100, offset: 1_000_000 });
+  for (const bad of ["limit=0", "limit=101", "limit=-1", "limit=1.5", "limit=ten", "offset=1000001", "offset=-1", "exportState=all", "status=nope"]) {
+    assert.throws(() => parseCandidatesQuery(params(bad)), { message: "INVALID_EXPORT_FILTER" }, bad);
+  }
+  assert.equal(parseExportQuery(params("exportState=never")).exportState, "never", "the GET download accepts it too (and still never marks)");
+  assert.throws(() => parseExportQuery(params("exportState=marked")), { message: "INVALID_EXPORT_FILTER" });
+});
+
+// ---- export selection (0021): POST download -------------------------------------------------------
+
+/** The cookie and the token `assertCsrfToken` checks; `authenticate` is the test seam, so any well-formed token works. */
+const SESSION = "Mp7xk2Qw9ZbF4nLc8TvRy1DgH6sJuA0eXiVoP3rYkNs";
+const POST_HEADERS = { cookie: `ocr_session=${SESSION}`, "sec-fetch-site": "same-origin", "x-csrf-token": csrfTokenFor(SESSION), "content-type": "application/json" };
+function post(base: string, path: string, body: unknown, headers: Record<string, string> = {}): Promise<Response> {
+  return fetch(`${base}${path}`, { method: "POST", headers: { ...POST_HEADERS, ...headers }, body: typeof body === "string" ? body : JSON.stringify(body) });
+}
+
+test("an explicit selection exports exactly those ids and marks every streamed row once, after the stream and the cursor", async () => {
+  const instance = app(fakeStore(distinctDocuments(3), { pageSize: 2 }));
+  await withServer(instance, async (base) => {
+    const MARKS = /export_marks_total\{kind="exported",result="ok"\} (\d+)/;
+    const MARKED_ROWS = /export_marked_rows_total\{kind="exported"\} (\d+)/;
+    const before = [await counter(base, MARKS), await counter(base, MARKED_ROWS)];
+    const response = await post(base, "/api/exports/documents.csv",
+      { columns: "compact", headers: "th", selection: { mode: "ids", ids: [docId(1).toUpperCase(), docId(2), docId(3), docId(2)] } });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-export-selection"), "ids");
+    assert.equal(response.headers.get("x-export-rows"), "3");
+    const text = await bodyText(response);
+    assert.equal(text.slice(1).split("\r\n").filter(Boolean).length, 4, "header row plus the three selected rows");
+    assert.ok(!text.includes("2026-09-22T07:05:00.000001Z"), "the snapshot travels to the marks, never into the file");
+    // D6: the ticked rows and nothing else; tenant and visibility are the store's.
+    assert.deepEqual(instance.store.filters, [{ ids: [docId(1), docId(2), docId(3)] }]);
+    assert.deepEqual(instance.store.expectedTotals, [undefined]);
+    assert.equal(instance.store.marks.length, 1, "one recordExportMarks call per download");
+    const marks = instance.store.marks[0]!;
+    assert.deepEqual([marks.kind, marks.source, marks.actorUserId], ["exported", "csv", userId]);
+    assert.match(marks.requestId, /^[0-9a-f-]{36}$/, "the server-minted trace id, which also stamps the audit rows");
+    assert.deepEqual(marks.rows, [
+      { documentId: docId(1), rowVersion: "2026-09-22T07:05:00.000001Z" }, { documentId: docId(2), rowVersion: "2026-09-22T07:05:00.000002Z" },
+      { documentId: docId(3), rowVersion: "2026-09-22T07:05:00.000003Z" }]);
+    assert.deepEqual(instance.store.closedAtMark, [1], "the export's cursor went back before the marks took a connection");
+    const startedRow = started(instance)[0]!;
+    const completed = instance.audits.find((event) => event.action === "export.completed")!;
+    assert.deepEqual([startedRow.detail?.selection, startedRow.detail?.requested, startedRow.detail?.export_state], ["ids", 3, null]);
+    assert.deepEqual([completed.detail?.rows, completed.detail?.marked, completed.detail?.mark, completed.detail?.complete], [3, 3, true, true]);
+    for (const event of instance.audits) assert.ok(!JSON.stringify(event.detail).includes("aaaaaaaa-"), `${event.action}: counts only, never ids`);
+    assert.deepEqual([await counter(base, MARKS) - before[0]!, await counter(base, MARKED_ROWS) - before[1]!], [1, 3]);
+  });
+});
+
+test("select all N: the filter and N reach the store, JSONL marks with source jsonl, and the audit names the selection", async () => {
+  const instance = app(fakeStore(distinctDocuments(2)));
+  await withServer(instance, async (base) => {
+    const response = await post(base, "/api/exports/documents.jsonl",
+      { selection: { mode: "filter", filter: { status: ["review"], q: "สมชาย", exportState: "never" }, expectedTotal: 2 } });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-export-selection"), "filter");
+    assert.equal((await bodyText(response)).split("\n").filter(Boolean).length, 2);
+    assert.deepEqual(instance.store.filters, [{ status: ["review"], q: "สมชาย", exportState: "never" }]);
+    assert.deepEqual(instance.store.expectedTotals, [2]);
+    assert.deepEqual([instance.store.marks[0]?.source, instance.store.marks[0]?.rows.length], ["jsonl", 2]);
+    const completed = instance.audits.find((event) => event.action === "export.completed")!;
+    assert.deepEqual([completed.detail?.selection, completed.detail?.requested, completed.detail?.export_state, completed.detail?.has_q],
+      ["filter", 2, "never", true]);
+    assert.ok(!JSON.stringify(instance.audits).includes("สมชาย"), "the search text is never audit metadata");
+  });
+});
+
+test("a moved count is 409 EXPORT_SELECTION_CHANGED and a vanished selection 400 EXPORT_SELECTION_EMPTY, both before any byte or mark", async () => {
+  const changed = app(fakeStore(distinctDocuments(3)));
+  await withServer(changed, async (base) => {
+    const response = await post(base, "/api/exports/documents.csv", { selection: { mode: "filter", filter: {}, expectedTotal: 2 } });
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), { error: "EXPORT_SELECTION_CHANGED" });
+    assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8", "no file headers were written");
+    assert.deepEqual([changed.store.marks.length, started(changed).length], [0, 0]);
+    assert.equal(changed.audits.find((event) => event.action === "export.failed")?.detail?.error, "EXPORT_SELECTION_CHANGED");
+  });
+  const empty = app(fakeStore([], { total: 0 }));
+  await withServer(empty, async (base) => {
+    const response = await post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: [docId(9)] } });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: "EXPORT_SELECTION_EMPTY" });
+    assert.deepEqual([empty.store.marks.length, started(empty).length], [0, 0]);
+  });
+});
+
+test("no marks unless the stream completed: a dead stream, a truncated cursor, a failed open and a client that left", async () => {
+  const selection = { selection: { mode: "ids", ids: idList(10) } };
+  for (const [name, options] of [["stream died", { failAfter: 3 }], ["cursor ended early", { stopAfter: 4 }]] as const) {
+    const instance = app(fakeStore(distinctDocuments(10), { pageSize: 1, ...options }));
+    await withServer(instance, async (base) => {
+      await assert.rejects(post(base, "/api/exports/documents.csv", selection).then((response) => response.arrayBuffer()), name);
+      assert.equal(instance.store.marks.length, 0, `${name}: nothing marked`);
+      assert.equal(instance.store.closedAtMark.length, 0, `${name}: recordExportMarks never called`);
+      assert.ok(!instance.audits.some((event) => event.action === "export.completed"), name);
+    });
+  }
+  const refused = app(fakeStore(distinctDocuments(2), { openError: "EXPORT_TOO_LARGE" }));
+  await withServer(refused, async (base) => {
+    const response = await post(base, "/api/exports/documents.csv", { selection: { mode: "filter", filter: {}, expectedTotal: 2 } });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: "EXPORT_TOO_LARGE" });
+    assert.equal(refused.store.closedAtMark.length, 0, "open failed: nothing marked");
+  });
+  const gate = deferred();
+  const walked = app(fakeStore(distinctDocuments(4), { pageSize: 1, gate, gateBeforePage: 1 }));
+  await withServer(walked, async (base) => {
+    const controller = new AbortController();
+    const response = await fetch(`${base}/api/exports/documents.csv`, { method: "POST", headers: POST_HEADERS, body: JSON.stringify({ selection: { mode: "ids", ids: idList(4) } }), signal: controller.signal });
+    await response.body!.getReader().read();
+    controller.abort();
+    await tick();
+    gate.resolve();
+    await tick();
+    assert.equal(walked.store.closedAtMark.length, 0, "aborted: nothing marked");
+    assert.equal(walked.audits.find((event) => event.action === "export.failed")?.detail?.error, "EXPORT_ABORTED");
+  });
+});
+
+test("a mark that cannot be saved fails the whole download: the socket is cut, export.failed says EXPORT_MARK_FAILED", async () => {
+  const instance = app(fakeStore(distinctDocuments(3), { markError: "insert into document_export_marks failed" }));
+  await withServer(instance, async (base) => {
+    const ERRORS = /export_marks_total\{kind="exported",result="error"\} (\d+)/;
+    const before = await counter(base, ERRORS);
+    await assert.rejects(post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: idList(3) } }).then((response) => response.arrayBuffer()),
+      "D4 strict: the browser's blob() rejects, so no unmarked file is ever saved");
+    const failed = instance.audits.find((event) => event.action === "export.failed")!;
+    assert.deepEqual([failed.detail?.error, failed.detail?.complete, failed.detail?.rows], ["EXPORT_MARK_FAILED", false, 3]);
+    assert.ok(!instance.audits.some((event) => event.action === "export.completed"));
+    assert.equal(instance.store.closed, 1);
+    assert.equal(await counter(base, ERRORS) - before, 1);
+    assert.ok(!JSON.stringify(failed.detail).includes("document_export_marks"), "the pg message stays out of the audit row");
+  });
+});
+
+test("the wall clock ends a stalled POST download without marking anything", async () => {
+  const store = fakeStore(distinctDocuments(1), { total: 200_000, pageSize: 500 });
+  const audits: Omit<AuditEvent, "tenantId">[] = [];
+  const gate = new ExportGate();
+  const deps: ExportRouteDeps = {
+    store, users: fakeUsers(audits), gate, previewLimit: new SlidingWindow(PREVIEW_LIMIT, PREVIEW_WINDOW_MS),
+    listLimit: new SlidingWindow(EXPORT_LIST_LIMIT, PREVIEW_WINDOW_MS), markLimit: new SlidingWindow(EXPORT_MARK_LIMIT, PREVIEW_WINDOW_MS),
+    maxRows: 500_000, publicBaseUrl: "https://ocr.example.test", traceId: "00000000-0000-4000-8000-0000000000ff", now: Date.now, wallClockMs: 60
+  };
+  const server = createServer((request, response) => {
+    void handleExportRoutes(request, response, new URL(request.url ?? "/", "http://127.0.0.1"), request.method ?? "GET", context(), deps)
+      .catch(() => { if (!response.headersSent) response.writeHead(500); response.end(); });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  const client = connect(port, "127.0.0.1");
+  try {
+    client.pause();
+    await new Promise<void>((resolve) => client.on("connect", () => resolve()));
+    const body = JSON.stringify({ selection: { mode: "filter", filter: {}, expectedTotal: 200_000 } });
+    client.write(`POST /api/exports/documents.csv HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+    for (let waited = 0; waited < 200 && gate.size === 0; waited += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(gate.size, 1);
+    for (let waited = 0; waited < 300 && gate.size > 0; waited += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(gate.size, 0, "the slot came back");
+    await tick();
+    assert.equal(store.closedAtMark.length, 0, "timed out: nothing marked");
+    assert.equal(audits.find((event) => event.action === "export.failed")?.detail?.error, "EXPORT_TIMEOUT");
+  } finally {
+    client.destroy();
+    await new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()); });
+  }
+});
+
+test("the GET download never marks, and shares the one-download-per-user gate with the POST", async () => {
+  const plain = app(fakeStore(distinctDocuments(2)));
+  await withServer(plain, async (base) => {
+    const response = await fetch(`${base}/api/exports/documents.csv?exportState=never`);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-export-selection"), null, "the Release 2 response headers are unchanged");
+    await bodyText(response);
+    assert.equal(plain.store.closedAtMark.length, 0, "D7: a GET has no side effect");
+    assert.deepEqual(plain.store.filters, [{ exportState: "never" }]);
+    const completed = plain.audits.find((event) => event.action === "export.completed")!;
+    assert.deepEqual([completed.detail?.selection, completed.detail?.marked, completed.detail?.mark, completed.detail?.export_state],
+      ["filter_get", 0, false, "never"]);
+  });
+  const gate = deferred();
+  const busy = app(fakeStore(distinctDocuments(2), { pageSize: 1, gate, gateBeforePage: 1 }));
+  await withServer(busy, async (base) => {
+    const first = fetch(`${base}/api/exports/documents.csv`).then((response) => response.text());
+    await tick();
+    const second = await post(base, "/api/exports/documents.jsonl", { selection: { mode: "ids", ids: [docId(1)] } });
+    assert.equal(second.status, 429);
+    assert.deepEqual(await second.json(), { error: "EXPORT_BUSY" });
+    assert.equal(second.headers.get("retry-after"), "30");
+    gate.resolve();
+    await first;
+  });
+});
+
+test("a bad POST body is refused before the gate or the store: 400, 415 and 413", async () => {
+  const instance = app(fakeStore(distinctDocuments(1)));
+  await withServer(instance, async (base) => {
+    const ids = { mode: "ids", ids: [docId(1)] };
+    // [download body, marks body, status, download code, marks code]
+    const cases: [unknown, unknown, Record<string, string>, number, string, string][] = [
+      [{ selection: { mode: "ids", ids: [] } }, { action: "mark", selection: { mode: "ids", ids: [] } }, {}, 400, "INVALID_EXPORT_SELECTION", "INVALID_EXPORT_SELECTION"],
+      [{ selection: { mode: "filter", filter: {} } }, { action: "mark", selection: { mode: "filter", filter: {} } }, {}, 400, "INVALID_EXPORT_SELECTION", "INVALID_EXPORT_SELECTION"],
+      [{ selection: { mode: "filter", filter: { status: ["nope"] }, expectedTotal: 1 } }, { action: "mark", selection: { mode: "filter", filter: { status: ["nope"] }, expectedTotal: 1 } },
+        {}, 400, "INVALID_EXPORT_FILTER", "INVALID_EXPORT_FILTER"],
+      // `columns` belongs to the download only: a bad value there is the GET's error, on the marks route an unknown key.
+      [{ selection: ids, columns: "all" }, { action: "mark", selection: ids, columns: "all" }, {}, 400, "INVALID_EXPORT_FILTER", "INVALID_EXPORT_SELECTION"],
+      [[ids], [ids], {}, 400, "INVALID_JSON", "INVALID_JSON"],
+      ["{not json", "{not json", {}, 400, "INVALID_JSON", "INVALID_JSON"],
+      [{ selection: ids }, { action: "mark", selection: ids }, { "content-type": "text/plain" }, 415, "UNSUPPORTED_MEDIA_TYPE", "UNSUPPORTED_MEDIA_TYPE"],
+      [{ selection: ids, pad: "x".repeat(1_100_000) }, { action: "mark", selection: ids, pad: "x".repeat(1_100_000) }, {}, 413, "PAYLOAD_TOO_LARGE", "PAYLOAD_TOO_LARGE"]
+    ];
+    for (const [downloadBody, marksBody, headers, status, downloadCode, marksCode] of cases) {
+      const download = await post(base, "/api/exports/documents.csv", downloadBody, headers);
+      assert.equal(download.status, status, `download ${downloadCode}`);
+      assert.deepEqual(await download.json(), { error: downloadCode }, `download ${downloadCode}`);
+      const marks = await post(base, "/api/exports/marks", marksBody, headers);
+      assert.equal(marks.status, status, `marks ${marksCode}`);
+      assert.deepEqual(await marks.json(), { error: marksCode }, `marks ${marksCode}`);
+    }
+    assert.deepEqual([instance.store.opened, instance.store.filters.length, instance.store.stateCalls.length, instance.audits.length], [0, 0, 0, 0]);
+  });
+});
+
+// ---- export selection (0021): candidates ----------------------------------------------------------
+
+const candidateRow: ExportCandidate = {
+  documentId: docId(1), filename: "ใบลูกค้า ทดสอบ.pdf", pageNumber: 2, pageCount: 5, statusCategory: "review", needsReview: true,
+  customerName: "ลูกค้า ทดสอบ", formNumber: "F-0001", createdAt: "2026-09-22T07:05:00.000Z", reviewedAt: null,
+  exportState: "exported", changedAfterExport: true, lastExportedAt: "2026-09-23T03:00:00.000Z", lastExportKind: "marked", lastExportedByName: "บอส"
+};
+
+test("candidates: the C1 shape, the filters and page reach the store, metered and never audited", async () => {
+  const listed: ExportCandidatesResult = { total: 7, limit: 2, offset: 4, counts: { never: 5, exported: 7, all: 12, unconfirmed: 3 }, rows: [candidateRow] };
+  const instance = app(fakeStore([], { candidates: listed }), { webConfig: { exportMaxRows: 20_000 } });
+  await withServer(instance, async (base) => {
+    const READ = /documents_read_total\{kind="export_candidates"\} (\d+)/;
+    const OK = /exports_total\{format="candidates",result="ok"\} (\d+)/;
+    const before = [await counter(base, READ), await counter(base, OK)];
+    const response = await fetch(`${base}/api/exports/candidates?exportState=exported&status=review,failed&confirmedOnly=0&limit=2&offset=4&q=${encodeURIComponent("ทดสอบ")}`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      total: 7, limit: 2, offset: 4, counts: { never: 5, exported: 7, all: 12, unconfirmed: 3 }, maxRows: 20_000, selectionMax: 5000, rows: [candidateRow]
+    });
+    assert.deepEqual(instance.store.listCalls, [{ filter: { status: ["review", "failed"], q: "ทดสอบ", exportState: "exported" }, page: { limit: 2, offset: 4 } }]);
+    assert.equal(instance.audits.length, 0, "D9: metered, not audited per call");
+    assert.deepEqual([await counter(base, READ) - before[0]!, await counter(base, OK) - before[1]!], [1, 1]);
+    const bad = await fetch(`${base}/api/exports/candidates?limit=500`);
+    assert.equal(bad.status, 400);
+    assert.deepEqual(await bad.json(), { error: "INVALID_EXPORT_FILTER" });
+    assert.equal(instance.store.listCalls.length, 1, "a bad query never reaches the store");
+  });
+});
+
+test("candidates: 300 a quarter of an hour per user, then 429 EXPORT_THROTTLED in its own metric bucket", async () => {
+  const instance = app(fakeStore([]));
+  await withServer(instance, async (base) => {
+    const THROTTLED = /exports_total\{format="candidates",result="throttled"\} (\d+)/;
+    const before = await counter(base, THROTTLED);
+    for (let call = 0; call < EXPORT_LIST_LIMIT; call += 1) assert.equal((await fetch(`${base}/api/exports/candidates`)).status, 200, `call ${call}`);
+    const throttled = await fetch(`${base}/api/exports/candidates`);
+    assert.equal(throttled.status, 429);
+    assert.deepEqual(await throttled.json(), { error: "EXPORT_THROTTLED" });
+    assert.equal(throttled.headers.get("retry-after"), "900");
+    assert.equal(await counter(base, THROTTLED) - before, 1);
+    assert.equal((await fetch(`${base}/api/exports/preview`)).status, 200, "the preview keeps its own window");
+  });
+});
+
+// ---- export selection (0021): manual marks --------------------------------------------------------
+
+test("marks: mark and unmark reach the store as one call, answer C3, and are audited with counts after the commit", async () => {
+  const instance = app(fakeStore([], { markResult: { total: 3, affected: 2, skipped: 1 } }), { webConfig: { exportMaxRows: 7_000 } });
+  await withServer(instance, async (base) => {
+    const OK = /export_marks_total\{kind="marked",result="ok"\} (\d+)/;
+    const ROWS = /export_marked_rows_total\{kind="marked"\} (\d+)/;
+    const before = [await counter(base, OK), await counter(base, ROWS)];
+    const marked = await post(base, "/api/exports/marks", { action: "mark", selection: { mode: "ids", ids: [docId(1), docId(2), docId(3), docId(3)] } });
+    assert.equal(marked.status, 200);
+    assert.deepEqual(await marked.json(), { action: "mark", affected: 2, skipped: 1, total: 3 });
+    const call = instance.store.stateCalls[0]!;
+    assert.deepEqual([call.action, call.filter, call.expectedTotal, call.maxRows, call.actorUserId], ["mark", { ids: [docId(1), docId(2), docId(3)] }, undefined, 7_000, userId]);
+    assert.match(call.requestId, /^[0-9a-f-]{36}$/);
+    const audit = instance.audits.find((event) => event.action === "export.marked")!;
+    assert.deepEqual([audit.outcome, audit.targetType, audit.requestId], ["success", "export", call.requestId]);
+    assert.deepEqual(audit.detail, { selection: "ids", requested: 3, total: 3, affected: 2, skipped: 1 });
+    assert.deepEqual([await counter(base, OK) - before[0]!, await counter(base, ROWS) - before[1]!], [1, 2]);
+
+    const unmarked = await post(base, "/api/exports/marks", { action: "unmark", selection: { mode: "filter", filter: { exportState: "exported" }, expectedTotal: 3 } });
+    assert.equal(unmarked.status, 200);
+    assert.deepEqual(await unmarked.json(), { action: "unmark", affected: 2, skipped: 1, total: 3 });
+    assert.deepEqual([instance.store.stateCalls[1]!.filter, instance.store.stateCalls[1]!.expectedTotal], [{ exportState: "exported" }, 3]);
+    assert.deepEqual(instance.audits.find((event) => event.action === "export.unmarked")?.detail, { selection: "filter", requested: 3, total: 3, affected: 2, skipped: 1 });
+    assert.equal(instance.audits.length, 2, "no export.started or file audit rows for a manual flip");
+  });
+});
+
+test("marks: a refused flip is its status code with no audit row, and a failed audit write never undoes a committed mark", async () => {
+  for (const [code, status] of [["EXPORT_SELECTION_CHANGED", 409], ["EXPORT_TOO_LARGE", 400], ["EXPORT_SELECTION_EMPTY", 400]] as const) {
+    const refused = app(fakeStore([], { stateError: code }));
+    await withServer(refused, async (base) => {
+      const response = await post(base, "/api/exports/marks", { action: "mark", selection: { mode: "filter", filter: {}, expectedTotal: 5 } });
+      assert.equal(response.status, status, code);
+      assert.deepEqual(await response.json(), { error: code });
+      assert.equal(refused.audits.length, 0, `${code}: nothing was written, so nothing is audited`);
+      assert.ok(await counter(base, /export_marks_total\{kind="marked",result="error"\} (\d+)/) >= 1);
+    });
+  }
+  const unaudited = app(fakeStore([], { markResult: { total: 1, affected: 1, skipped: 0 } }), { failAudit: "export.unmarked" });
+  await withServer(unaudited, async (base) => {
+    const response = await post(base, "/api/exports/marks", { action: "unmark", selection: { mode: "ids", ids: [docId(1)] } });
+    assert.equal(response.status, 200, "the event rows are the durable record; the audit failure is only logged");
+    assert.deepEqual(await response.json(), { action: "unmark", affected: 1, skipped: 0, total: 1 });
+  });
+});
+
+test("marks: 60 a quarter of an hour per user, then 429 EXPORT_THROTTLED; GET on the route is not served", async () => {
+  const instance = app(fakeStore([], { markResult: { total: 1, affected: 0, skipped: 1 } }));
+  await withServer(instance, async (base) => {
+    const body = { action: "mark", selection: { mode: "ids", ids: [docId(1)] } };
+    for (let call = 0; call < EXPORT_MARK_LIMIT; call += 1) assert.equal((await post(base, "/api/exports/marks", body)).status, 200, `call ${call}`);
+    const throttled = await post(base, "/api/exports/marks", body);
+    assert.equal(throttled.status, 429);
+    assert.deepEqual(await throttled.json(), { error: "EXPORT_THROTTLED" });
+    assert.equal(throttled.headers.get("retry-after"), "900");
+    assert.equal(instance.store.stateCalls.length, EXPORT_MARK_LIMIT, "the throttled call never reached the store");
+    assert.equal((await fetch(`${base}/api/exports/marks`)).status, 404, "marks are POST only");
+  });
+});
+
+test("the new export routes need a session and the export right, and a refusal is counted under its own route", async () => {
+  const anonymous = app(fakeStore([]), { ctx: null });
+  await withServer(anonymous, async (base) => {
+    assert.equal((await fetch(`${base}/api/exports/candidates`)).status, 401);
+    assert.equal((await post(base, "/api/exports/marks", { action: "mark", selection: { mode: "ids", ids: [docId(1)] } })).status, 401);
+    assert.equal((await post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: [docId(1)] } })).status, 401);
+  });
+  const staff = app(fakeStore(distinctDocuments(1)), { ctx: context({ role: "staff", canExport: false }) });
+  await withServer(staff, async (base) => {
+    const before = [await counter(base, /exports_total\{format="candidates",result="forbidden"\} (\d+)/), await counter(base, /exports_total\{format="marks",result="forbidden"\} (\d+)/)];
+    for (const response of [await fetch(`${base}/api/exports/candidates`),
+      await post(base, "/api/exports/marks", { action: "mark", selection: { mode: "ids", ids: [docId(1)] } }),
+      await post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: [docId(1)] } })]) {
+      assert.equal(response.status, 403);
+      assert.deepEqual(await response.json(), { error: "FORBIDDEN" });
+    }
+    assert.deepEqual([staff.store.listCalls.length, staff.store.stateCalls.length, staff.store.opened], [0, 0, 0]);
+    assert.deepEqual([await counter(base, /exports_total\{format="candidates",result="forbidden"\} (\d+)/) - before[0]!,
+      await counter(base, /exports_total\{format="marks",result="forbidden"\} (\d+)/) - before[1]!], [1, 1]);
+  });
 });

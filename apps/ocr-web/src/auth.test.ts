@@ -257,7 +257,10 @@ function recordingWorkbenchStore(): WorkbenchStore & { readonly batches: unknown
 /** An empty tenant: enough for the permission cases, which are about who reaches the routes, not what comes back. */
 const emptyExportStore: ExportStore = {
   previewExport: async () => ({ total: 0, documents: [] }),
-  openExport: async () => ({ total: 0, rows: async function* () { /* no rows */ }, close: async () => undefined })
+  openExport: async () => ({ total: 0, rows: async function* () { /* no rows */ }, close: async () => undefined }),
+  listExportCandidates: async () => ({ total: 0, limit: 50, offset: 0, counts: { never: 0, exported: 0, all: 0, unconfirmed: 0 }, rows: [] }),
+  recordExportMarks: async () => 0,
+  markExportState: async () => ({ total: 0, affected: 0, skipped: 0 })
 };
 
 const baseWebConfig: WebConfig = { tenantId: tenant, publicBaseUrl: "", publicOrigin: "", sessionIdleMinutes: 30, sessionAbsoluteHours: 12, exportMaxRows: 50_000 };

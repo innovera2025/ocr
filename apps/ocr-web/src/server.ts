@@ -17,7 +17,10 @@ import {
   type WebAuthContext
 } from "./auth.js";
 import { handleAuthRoutes, LOGIN_BUSY_RETRY_SECONDS, type AuthRouteDeps } from "./auth-routes.js";
-import { ExportGate, exportFormatLabel, handleExportRoutes, PREVIEW_LIMIT, PREVIEW_WINDOW_MS, type ExportStore } from "./export.js";
+import {
+  EXPORT_LIST_LIMIT, EXPORT_MARK_LIMIT, ExportGate, exportFormatLabel, handleExportRoutes, PREVIEW_LIMIT, PREVIEW_WINDOW_MS,
+  type ExportStore
+} from "./export.js";
 import { logEvent, metrics, requestId } from "@innovera/ocr-observability";
 import { clamAvHealthCheck } from "@innovera/ocr-ingest/clamav";
 import type { LocalStorage } from "@innovera/ocr-storage/local";
@@ -63,7 +66,7 @@ const THROTTLED_ERRORS: ReadonlyMap<string, number> = new Map([["LOGIN_THROTTLED
   ["EXPORT_BUSY", 30], ["EXPORT_THROTTLED", Math.round(PREVIEW_WINDOW_MS / 1000)]]);
 const CONFLICT_ERRORS = new Set(["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT",
   "DOCUMENT_QUARANTINED", "DOCUMENT_NOT_SCANNED", "CONFIRMATION_TARGET_AMBIGUOUS", "UPLOAD_IN_PROGRESS",
-  "USERNAME_TAKEN", "LAST_ADMIN", "CANNOT_CHANGE_SELF"]);
+  "USERNAME_TAKEN", "LAST_ADMIN", "CANNOT_CHANGE_SELF", "EXPORT_SELECTION_CHANGED"]);
 /** Originals are only served once ClamAV let them through: quarantined bytes never reach a reviewer's browser. */
 const UNSERVED_CONTENT: ReadonlyMap<string, string> = new Map([["QUARANTINED", "DOCUMENT_QUARANTINED"], ["VALIDATING", "DOCUMENT_NOT_SCANNED"], ["SCANNING", "DOCUMENT_NOT_SCANNED"]]);
 const TIMESTAMP = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}(:?\d{2})?)?$/;
@@ -71,7 +74,7 @@ const TIMESTAMP = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{
 const PROXY_HEADERS = ["x-forwarded-for", "x-forwarded-host", "x-real-ip"] as const;
 const EXACT_ROUTES = ["/", "/metrics", "/health/live", "/health/ready", "/api/batches", "/api/documents", "/api/auth/login",
   "/api/auth/logout", "/api/auth/session", "/api/auth/password", "/api/users", "/api/exports/preview",
-  "/api/exports/documents.csv", "/api/exports/documents.jsonl"];
+  "/api/exports/documents.csv", "/api/exports/documents.jsonl", "/api/exports/candidates", "/api/exports/marks"];
 
 export function healthResponse(pathname: string): { status: number; body: { status: string } } {
   if (pathname === "/health/live") return { status: 200, body: { status: "ok" } };
@@ -219,6 +222,9 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
   /** §10 H5: one open download per user, and 60 previews per user per 15 minutes (the preview pages the same data). */
   const exportGate = new ExportGate();
   const previewLimit = new SlidingWindow(PREVIEW_LIMIT, PREVIEW_WINDOW_MS);
+  /** 0021: 300 candidates pages and 60 manual mark/unmark requests per user per 15 minutes (D9, C3). */
+  const listLimit = new SlidingWindow(EXPORT_LIST_LIMIT, PREVIEW_WINDOW_MS);
+  const markLimit = new SlidingWindow(EXPORT_MARK_LIMIT, PREVIEW_WINDOW_MS);
   const exportStore = (): ExportStore => { if (!app?.exportStore) throw new Error("EXPORT_NOT_CONFIGURED"); return app.exportStore; };
 
   /**
@@ -424,9 +430,9 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
         }
         if (!ctx) throw new AuthenticationError("UNAUTHENTICATED");
         if (pathname.startsWith("/api/exports/")) {
-          const deps = { store: exportStore(), users: users(), gate: exportGate, previewLimit, maxRows: webConfig.exportMaxRows,
-            publicBaseUrl: webConfig.publicBaseUrl, traceId, now: clock };
-          if (await handleExportRoutes(response, url, method, ctx, deps)) return;
+          const deps = { store: exportStore(), users: users(), gate: exportGate, previewLimit, listLimit, markLimit,
+            maxRows: webConfig.exportMaxRows, publicBaseUrl: webConfig.publicBaseUrl, traceId, now: clock };
+          if (await handleExportRoutes(request, response, url, method, ctx, deps)) return;
         }
         if (await handleApi(request, response, url, method, reqId, traceId, ctx)) return;
       }
