@@ -18,7 +18,7 @@ import {
 } from "./auth.js";
 import { handleAuthRoutes, LOGIN_BUSY_RETRY_SECONDS, type AuthRouteDeps } from "./auth-routes.js";
 import {
-  EXPORT_LIST_LIMIT, EXPORT_MARK_LIMIT, ExportGate, exportFormatLabel, handleExportRoutes, PREVIEW_LIMIT, PREVIEW_WINDOW_MS,
+  EXPORT_LIST_LIMIT, EXPORT_MARK_LIMIT, EXPORT_MARKING_PER_TENANT, ExportGate, exportFormatLabel, handleExportRoutes, PREVIEW_LIMIT, PREVIEW_WINDOW_MS,
   type ExportStore
 } from "./export.js";
 import { logEvent, metrics, requestId } from "@innovera/ocr-observability";
@@ -63,7 +63,9 @@ const AUTH_ERRORS = new Set(["UNAUTHENTICATED", "AUTH_NOT_CONFIGURED", "INVALID_
 const FORBIDDEN_ERRORS = new Set(["CSRF_REJECTED", "FORBIDDEN", "PASSWORD_CHANGE_REQUIRED"]);
 /** Every 429 carries `Retry-After`; the login route computes its own from the window that is spent. */
 const THROTTLED_ERRORS: ReadonlyMap<string, number> = new Map([["LOGIN_THROTTLED", 900], ["LOGIN_BUSY", LOGIN_BUSY_RETRY_SECONDS],
-  ["EXPORT_BUSY", 30], ["EXPORT_THROTTLED", Math.round(PREVIEW_WINDOW_MS / 1000)]]);
+  ["EXPORT_BUSY", 30], ["EXPORT_BUSY_ORG", 30], ["EXPORT_THROTTLED", Math.round(PREVIEW_WINDOW_MS / 1000)]]);
+/** A write the server could not complete right now and rolled back (a lock wait or a statement past its bound): retryable. */
+const UNAVAILABLE_ERRORS = new Set(["EXPORT_MARK_FAILED"]);
 const CONFLICT_ERRORS = new Set(["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT",
   "DOCUMENT_QUARANTINED", "DOCUMENT_NOT_SCANNED", "CONFIRMATION_TARGET_AMBIGUOUS", "UPLOAD_IN_PROGRESS",
   "USERNAME_TAKEN", "LAST_ADMIN", "CANNOT_CHANGE_SELF", "EXPORT_SELECTION_CHANGED"]);
@@ -91,7 +93,7 @@ export function errorStatus(code: string): number {
   if (CONFLICT_ERRORS.has(code)) return 409;
   if (code === "PAYLOAD_TOO_LARGE") return 413;
   if (code === "UNSUPPORTED_MEDIA_TYPE") return 415;
-  if (code.endsWith("_NOT_CONFIGURED")) return 503;
+  if (code.endsWith("_NOT_CONFIGURED") || UNAVAILABLE_ERRORS.has(code)) return 503;
   if (code === "INTERNAL_ERROR") return 500;
   return 400;
 }
@@ -221,6 +223,8 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
   const authDeps = (traceId: string): AuthRouteDeps => ({ store: users(), webConfig, env, throttle, hops: config.trustedProxyHops, now: clock, traceId });
   /** §10 H5: one open download per user, and 60 previews per user per 15 minutes (the preview pages the same data). */
   const exportGate = new ExportGate();
+  /** H1 (review of 0021): one marking download per organization at a time, so two staff cannot export the same rows twice. */
+  const exportTenantGate = new ExportGate(EXPORT_MARKING_PER_TENANT);
   const previewLimit = new SlidingWindow(PREVIEW_LIMIT, PREVIEW_WINDOW_MS);
   /** 0021: 300 candidates pages and 60 manual mark/unmark requests per user per 15 minutes (D9, C3). */
   const listLimit = new SlidingWindow(EXPORT_LIST_LIMIT, PREVIEW_WINDOW_MS);
@@ -430,7 +434,7 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
         }
         if (!ctx) throw new AuthenticationError("UNAUTHENTICATED");
         if (pathname.startsWith("/api/exports/")) {
-          const deps = { store: exportStore(), users: users(), gate: exportGate, previewLimit, listLimit, markLimit,
+          const deps = { store: exportStore(), users: users(), gate: exportGate, tenantGate: exportTenantGate, previewLimit, listLimit, markLimit,
             maxRows: webConfig.exportMaxRows, publicBaseUrl: webConfig.publicBaseUrl, traceId, now: clock };
           if (await handleExportRoutes(request, response, url, method, ctx, deps)) return;
         }

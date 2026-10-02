@@ -572,8 +572,8 @@ test("legacy confirm of one treatment keeps the document in review while another
 
 test("export selection routes: Origin and CSRF guard both POSTs, the export right guards all three, and the labels are bounded", async () => {
   const h = workbenchHarness();
-  const selection = JSON.stringify({ action: "mark", selection: { mode: "ids", ids: [documentId] } });
-  const download = JSON.stringify({ selection: { mode: "ids", ids: [documentId] } });
+  const selection = JSON.stringify({ action: "mark", selection: { mode: "ids", ids: [documentId], expectState: "never" } });
+  const download = JSON.stringify({ selection: { mode: "ids", ids: [documentId], expectState: "never" } });
   await withServer(h, async (base) => {
     for (const [path, payload] of [["/api/exports/marks", selection], ["/api/exports/documents.csv", download], ["/api/exports/documents.jsonl", download]] as const) {
       const { "x-csrf-token": _token, ...withoutToken } = jsonAuth;
@@ -595,4 +595,7 @@ test("export selection error codes map to their statuses", () => {
   for (const code of ["INVALID_EXPORT_SELECTION", "EXPORT_SELECTION_EMPTY", "INVALID_EXPORT_FILTER", "EXPORT_TOO_LARGE"]) assert.equal(errorStatus(code), 400, code);
   assert.equal(errorStatus("EXPORT_THROTTLED"), 429);
   assert.equal(errorStatus("EXPORT_BUSY"), 429);
+  // Review of 0021: another person's marking download in the same organization (H1), and a rolled-back mark write (M1).
+  assert.equal(errorStatus("EXPORT_BUSY_ORG"), 429);
+  assert.equal(errorStatus("EXPORT_MARK_FAILED"), 503);
 });

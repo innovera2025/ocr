@@ -352,11 +352,14 @@ export type ExportMarkInput = Readonly<{
   rows: readonly Readonly<{ documentId: string; rowVersion: string }>[];
 }>;
 /**
- * A manual flip (`markExportState`). The selection is `filter`: an explicit one carries `ids`, "select all matching"
- * carries the filter and the `expectedTotal` the user saw. `maxRows` is `OCR_EXPORT_MAX_ROWS`.
+ * A manual flip (`markExportState`). The selection is `filter`: an explicit one carries `ids` (and, from the dialog, the
+ * `expectState` of the tab they were ticked in: every id must still be visible and, unless null, in that state, or the
+ * flip is EXPORT_SELECTION_CHANGED), "select all matching" carries the filter and the `expectedTotal` the user saw.
+ * `maxRows` is `OCR_EXPORT_MAX_ROWS`.
  */
 export type ExportStateChangeInput = Readonly<{
   action: "mark" | "unmark"; filter: DocumentFilter; expectedTotal?: number | undefined; maxRows: number;
+  expectState?: ExportState | null | undefined;
   actorUserId: string; requestId: string;
 }>;
 /** `total` rows matched the selection; `affected` got an event, `skipped` already were in the requested state. */

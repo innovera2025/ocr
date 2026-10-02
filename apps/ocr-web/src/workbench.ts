@@ -437,11 +437,11 @@ const ERRORS={NETWORK:'เชื่อมต่อเซิร์ฟเวอร
 USER_CHANGED:'มีการเข้าสู่ระบบด้วยบัญชีอื่น กำลังโหลดหน้านี้ใหม่',INVALID_CREDENTIALS:'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง',PASSWORD_EXPIRED:'รหัสผ่านชั่วคราวหมดอายุหรือถูกใช้ไปแล้ว กรุณาขอรหัสผ่านใหม่จากผู้ดูแลระบบ',LOGIN_THROTTLED:'พยายามเข้าสู่ระบบบ่อยเกินไป กรุณารอสักครู่แล้วลองใหม่',LOGIN_BUSY:'ระบบกำลังตรวจสอบรหัสผ่านจำนวนมาก กรุณาลองใหม่ในอีกสักครู่',LOGIN_NOT_CONFIGURED:'ระบบเข้าสู่ระบบยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแลระบบ',INVALID_LOGIN:'ข้อมูลเข้าสู่ระบบไม่ถูกต้อง',UNAUTHENTICATED:'กรุณาเข้าสู่ระบบอีกครั้ง',CSRF_REJECTED:'คำขอถูกปฏิเสธเพื่อความปลอดภัย กรุณาลองใหม่อีกครั้ง',FORBIDDEN:'บัญชีของคุณไม่มีสิทธิ์ใช้งานส่วนนี้',PASSWORD_CHANGE_REQUIRED:'กรุณาตั้งรหัสผ่านใหม่ก่อนใช้งานต่อ',PASSWORD_INCORRECT:'รหัสผ่านปัจจุบันไม่ถูกต้อง',PASSWORD_UNCHANGED:'รหัสผ่านใหม่ต้องไม่ซ้ำกับรหัสผ่านเดิม',WEAK_PASSWORD:'รหัสผ่านไม่ปลอดภัยพอ: ใช้อย่างน้อย 12 ตัวอักษร ไม่ซ้ำกับชื่อผู้ใช้ และไม่ใช่รหัสผ่านที่ใช้กันทั่วไป',USERNAME_TAKEN:'มีชื่อผู้ใช้นี้อยู่แล้ว',INVALID_USERNAME:'ชื่อผู้ใช้ไม่ถูกต้อง (ใช้ได้เฉพาะภาษาอังกฤษ ตัวเลข จุด ขีดกลางและขีดล่าง)',INVALID_DISPLAY_NAME:'ชื่อที่แสดงไม่ถูกต้อง',INVALID_ROLE:'บทบาทไม่ถูกต้อง',USER_INVALID:'ข้อมูลผู้ใช้ไม่ถูกต้อง',USER_NOT_FOUND:'ไม่พบผู้ใช้นี้',LAST_ADMIN:'ต้องเหลือผู้ดูแลระบบที่ใช้งานได้อย่างน้อยหนึ่งคน',CANNOT_CHANGE_SELF:'เปลี่ยนสิทธิ์หรือรีเซ็ตรหัสผ่านของบัญชีตัวเองที่นี่ไม่ได้',
 /* The export's own codes (§10 H6): every one of them is reachable from the dialog, so none may reach staff as a raw
    English code. EXPORT_INCOMPLETE is this script's own: the server cuts the socket instead of sending a code. */
-EXPORT_TOO_LARGE:'ข้อมูลที่เลือกมีจำนวนแถวเกินที่ส่งออกได้ในครั้งเดียว กรุณาเลือกช่วงวันที่ให้แคบลงแล้วลองใหม่',EXPORT_BUSY:'การดาวน์โหลดครั้งก่อนของคุณยังไม่เสร็จ กรุณารอสักครู่แล้วลองใหม่',EXPORT_THROTTLED:'ปรับตัวกรองบ่อยเกินไป กรุณารอประมาณ 15 นาทีแล้วเปิดหน้าต่างส่งออกใหม่',INVALID_EXPORT_FILTER:'ตัวกรองส่งออกไม่ถูกต้อง กรุณาตรวจสอบช่วงวันที่และตัวเลือกอีกครั้ง',INVALID_EXPORT_RANGE:'ถึงวันที่ต้องไม่อยู่ก่อนตั้งแต่วันที่',EXPORT_TIMEOUT:'การส่งออกใช้เวลานานเกินไปจึงถูกยกเลิก กรุณาเลือกช่วงวันที่ให้แคบลงแล้วลองใหม่',EXPORT_INCOMPLETE:'ไฟล์ส่งออกถูกตัดกลางคัน หรือบันทึกสถานะ Export ไม่สำเร็จ จึงไม่ได้บันทึกไฟล์ กรุณาเลือกช่วงวันที่ให้แคบลงแล้วลองใหม่',EXPORT_NOT_CONFIGURED:'ระบบส่งออกยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแลระบบ',
-/* The selection and history codes (0021). EXPORT_MARK_FAILED reaches the browser only as a cut socket, so staff read it
-   through EXPORT_INCOMPLETE; the entry is here so a header-based signal would need no new copy. */
-INVALID_EXPORT_SELECTION:'รายการที่เลือกไม่ถูกต้องหรือมากเกินไป (เลือกเองได้ไม่เกิน 5,000 แถว) กรุณาใช้ "เลือกทั้งหมด" หรือเลือกใหม่',EXPORT_SELECTION_EMPTY:'ไม่พบแถวที่เลือกแล้ว (อาจถูกลบหรือเปลี่ยนไป) กรุณาโหลดรายการใหม่',EXPORT_SELECTION_CHANGED:'รายการเปลี่ยนไประหว่างที่คุณเลือก (มีเอกสารเข้ามาใหม่หรือสถานะเปลี่ยน) กรุณาตรวจรายการแล้วเลือกใหม่อีกครั้ง',EXPORT_MARK_FAILED:'บันทึกสถานะ Export ไม่สำเร็จ จึงไม่ได้บันทึกไฟล์ กรุณาลองใหม่อีกครั้ง'};
-const state={exSeq:0,exAbort:null,exTimer:0,exBusy:false,exTotal:null,exMax:0,exQ:'',exParent:'',exParentName:'',exTab:'never',exOffset:0,exRows:[],exCounts:null,exSel:new Set(),exWarnIds:new Set(),exAll:false,exSig:'',exPending:false,
+EXPORT_TOO_LARGE:'ข้อมูลที่เลือกมีจำนวนแถวเกินที่ส่งออกได้ในครั้งเดียว กรุณาเลือกช่วงวันที่ให้แคบลงแล้วลองใหม่',EXPORT_BUSY:'การดาวน์โหลดครั้งก่อนของคุณยังไม่เสร็จ กรุณารอสักครู่แล้วลองใหม่',EXPORT_BUSY_ORG:'มีคนอื่นกำลัง Export อยู่ตอนนี้ กรุณารอสักครู่แล้วลองใหม่',EXPORT_THROTTLED:'ทำรายการบ่อยเกินไป กรุณารอประมาณ 15 นาทีแล้วลองใหม่',INVALID_EXPORT_FILTER:'ตัวกรองส่งออกไม่ถูกต้อง กรุณาตรวจสอบช่วงวันที่และตัวเลือกอีกครั้ง',INVALID_EXPORT_RANGE:'ถึงวันที่ต้องไม่อยู่ก่อนตั้งแต่วันที่',EXPORT_TIMEOUT:'การส่งออกใช้เวลานานเกินไปจึงถูกยกเลิก กรุณาเลือกช่วงวันที่ให้แคบลงแล้วลองใหม่',EXPORT_INCOMPLETE:'ไฟล์ส่งออกถูกตัดกลางคัน หรือบันทึกสถานะ Export ไม่สำเร็จ จึงไม่ได้บันทึกไฟล์ กรุณาเลือกช่วงวันที่ให้แคบลงแล้วลองใหม่',EXPORT_NOT_CONFIGURED:'ระบบส่งออกยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแลระบบ',
+/* The selection and history codes (0021). A download whose marks fail is a cut socket, so staff read that through
+   EXPORT_INCOMPLETE; EXPORT_MARK_FAILED itself is what ทำเครื่องหมาย / ย้ายกลับ answer when the write was rolled back. */
+INVALID_EXPORT_SELECTION:'รายการที่เลือกไม่ถูกต้องหรือมากเกินไป (เลือกเองได้ไม่เกิน 5,000 แถว) กรุณาใช้ "เลือกทั้งหมด" หรือเลือกใหม่',EXPORT_SELECTION_EMPTY:'ไม่พบแถวที่เลือกแล้ว (อาจถูกลบหรือเปลี่ยนไป) กรุณาโหลดรายการใหม่',EXPORT_SELECTION_CHANGED:'รายการเปลี่ยนไประหว่างที่คุณเลือก (มีเอกสารเข้ามาใหม่หรือสถานะเปลี่ยน) กรุณาตรวจรายการแล้วเลือกใหม่อีกครั้ง',EXPORT_MARK_FAILED:'บันทึกสถานะ Export ไม่สำเร็จ ยังไม่มีแถวใดเปลี่ยนสถานะ กรุณาลองใหม่อีกครั้ง'};
+const state={exSeq:0,exAbort:null,exTimer:0,exBusy:false,exTotal:null,exMax:0,exQ:'',exParent:'',exParentName:'',exTab:'never',exOffset:0,exRows:[],exCounts:null,exSel:new Set(),exWarnIds:new Set(),exAll:false,exAllTotal:null,exDlg:0,exGen:0,exSig:'',exPending:false,
 user:null,csrf:'',authWait:null,authSettle:null,authBefore:null,csrfWait:null,rearm:null,leaving:false,started:false,bg:0,xhrs:new Set(),users:[],tempPass:'',pwForced:false,pwBusy:false,pwResolve:null,loginBusy:false,confirmResolve:null,confirmReturn:null,conn:'',docs:[],total:0,offset:0,q:'',status:'',batchFilter:'',parentFilter:'',parentName:'',pdfView:false,batches:[],batchId:null,batch:null,listSeq:0,listAbort:null,listSig:'',loaded:false,uploads:[],active:0,timer:0,ticking:false,soon:0,searchTimer:0,noticeTimer:0,current:null,draft:null,originalSig:'',editable:false,dirty:false,saving:false,blobUrl:'',previewSeq:0,previewAbort:null,previewMissing:false,zoom:1,openSeq:0,lastFocus:null,askResolve:null,askReturn:null,uid:0,inputs:new WeakMap()};
 const $=id=>document.getElementById(id);
 const dateFmt=new Intl.DateTimeFormat('th-TH',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
@@ -665,7 +665,7 @@ function copyTemp(){if(!state.tempPass)return;try{if(typeof navigator!=='undefin
 function setExportError(text){$('ex-error').textContent=text||'';}
 /* The selection belongs to one filter (exSig): a tab, a control or a chip that moves clears it, so a tick can never
    carry over to rows the user is no longer looking at. Paging keeps it: ticks are ids, not positions. */
-function clearExportSelection(){state.exSel.clear();state.exWarnIds.clear();state.exAll=false;}
+function clearExportSelection(){state.exSel.clear();state.exWarnIds.clear();state.exAll=false;state.exAllTotal=null;}
 /* exTotal is null until the list has actually answered: 0 is a claim about the data ("no documents match"), and
    making it while the first count is in flight — or beside a 429 — tells staff to widen a filter that is fine. */
 function blankExportList(){state.exTotal=null;state.exMax=0;state.exRows=[];state.exCounts=null;state.exOffset=0;state.exSig='';clearExportSelection();
@@ -674,7 +674,7 @@ renderExportTabs();renderExportBar();}
 function stopExportList(){clearTimeout(state.exTimer);if(state.exAbort){state.exAbort.abort();state.exAbort=null;}state.exSeq++;}
 /* Closing is not logging out, but the list holds the same customer data the table does, so it leaves the DOM with
    the dialog; an answer still in flight is dropped (exSeq) instead of refilling a closed dialog. */
-function closeExportDialog(){stopExportList();blankExportList();
+function closeExportDialog(){state.exDlg++;stopExportList();blankExportList();
 const d=$('export-dlg');if(d.open)d.close();}
 /* Logging out, an expired session and a user change (clearPhi) take the same path as ปิด. */
 function clearExportPreview(){closeExportDialog();}
@@ -710,11 +710,13 @@ if(f.exportState)p.set('exportState',f.exportState);
 return p;}
 /* The server answers 400 INVALID_EXPORT_FILTER for from > to, which says nothing about which field to change. */
 function badExportRange(){const from=str($('ex-from').value),to=str($('ex-to').value);return !!(from&&to&&from>to);}
-/* How many rows the buttons act on: the ticked ids, or every row of the tab in "เลือกทั้งหมด" mode. */
-function exPicked(){return state.exAll?(typeof state.exTotal==='number'?state.exTotal:0):state.exSel.size;}
+/* How many rows the buttons act on: the ticked ids, or the N the tab held when "เลือกทั้งหมด" was chosen (exAllTotal). */
+function exPicked(){return state.exAll?(typeof state.exAllTotal==='number'?state.exAllTotal:0):state.exSel.size;}
 function exWarned(){return state.exAll?(isObj(state.exCounts)&&typeof state.exCounts.unconfirmed==='number'?state.exCounts.unconfirmed:0):state.exWarnIds.size;}
-/* Exactly what the user is looking at: the ids they ticked, or the filter with the N they saw (a moved N is a 409). */
-function exportSelection(){return state.exAll?{mode:'filter',filter:exportFilter(),expectedTotal:state.exTotal}:{mode:'ids',ids:Array.from(state.exSel)};}
+/* Exactly what the user is looking at: the ids they ticked with the tab they ticked them in (an id gone or moved to the
+   other tab is a 409), or the filter with the N pinned when they chose เลือกทั้งหมด (a moved N is a 409). */
+function exportSelection(){return state.exAll?{mode:'filter',filter:exportFilter(),expectedTotal:state.exAllTotal}
+:{mode:'ids',ids:Array.from(state.exSel),expectState:state.exTab==='all'?null:state.exTab};}
 function renderExportTabs(){const c=state.exCounts;
 EX_TABS.forEach(t=>{const b=$('ex-tab-'+t);b.textContent=EX_TAB_LABEL[t]+' ('+(isObj(c)&&typeof c[t]==='number'?c[t]:'…')+')';b.setAttribute('aria-pressed',t===state.exTab?'true':'false');});}
 /* Everything that follows from the selection and the busy flags: the page checkbox (checked / indeterminate), the
@@ -722,7 +724,7 @@ EX_TABS.forEach(t=>{const b=$('ex-tab-'+t);b.textContent=EX_TAB_LABEL[t]+' ('+(i
 function renderExportBar(){const rows=state.exRows,total=typeof state.exTotal==='number'?state.exTotal:0,x=exPicked(),busy=state.exBusy||state.exPending,bad=badExportRange();
 const onPage=rows.filter(r=>state.exSel.has(r.documentId)).length,full=rows.length>0&&onPage===rows.length;
 const page=$('ex-page');page.checked=state.exAll||full;page.indeterminate=!state.exAll&&onPage>0&&!full;page.disabled=state.exAll||!rows.length;
-$('ex-picked').textContent=state.exAll?'เลือกทั้งหมด '+total+' แถวที่ตรงกับตัวกรองแล้ว':'เลือกแล้ว '+x+' แถว';
+$('ex-picked').textContent=state.exAll?'เลือกทั้งหมด '+x+' แถวที่ตรงกับตัวกรองแล้ว':'เลือกแล้ว '+x+' แถว';
 const offer=!state.exAll&&full&&total>rows.length,over=state.exMax>0&&total>state.exMax;
 const all=$('ex-all');all.hidden=!offer;all.disabled=over;all.textContent='เลือกทั้งหมด '+total+' แถวที่ตรงกับตัวกรอง';
 $('ex-clear').hidden=!state.exAll;
@@ -741,27 +743,33 @@ function exportRow(r){const id=r.documentId,cat=typeof r.statusCategory==='strin
 const tr=el('tr'),ck=el('td','ex-ck'),box=el('input');box.type='checkbox';
 box.setAttribute('aria-label','เลือก '+str(r.filename)+(page?' หน้า '+page:''));
 box.checked=state.exAll||state.exSel.has(id);box.disabled=state.exAll;
-box.addEventListener('change',()=>pickExportRow(r,box));ck.append(box);
+const gen=state.exGen;box.addEventListener('change',()=>pickExportRow(r,box,gen));ck.append(box);
 const st=el('td'),tags=el('div','d-status');tags.append(cat==='confirmed'?badge('confirmed'):warnBadge(cat));
 if(r.changedAfterExport===true)tags.append(el('span','badge ex-chg','แก้ไขหลัง Export'));
 if(state.exTab==='all')tags.append(r.exportState==='exported'?el('span','badge ex-done','Export แล้ว'):el('span','badge','ยังไม่เคย Export'));
 st.append(tags);
 tr.append(ck,cell(r.filename,'fname'),cell(page?page+(typeof r.pageCount==='number'?'/'+r.pageCount:''):'','num'),cell(r.customerName),cell(r.formNumber,'mono'),st,cell(lastExport(r)));
 return tr;}
-function renderExportRows(){$('ex-rows').replaceChildren(...state.exRows.map(exportRow));}
+function renderExportRows(){state.exGen++;$('ex-rows').replaceChildren(...state.exRows.map(exportRow));}
+/* A tick only counts on a row of the list as it stands: while a list request is in flight (the rows on screen may be
+   about to leave the tab), or from a box rendered for an earlier list (exGen moved on since), the box is put back to
+   what the selection says. */
+function exListing(){return state.exTotal===null||!!state.exAbort;}
 /* Ticking stops at EX_PICK_MAX: the box is put back and the limits line points at "เลือกทั้งหมด". */
-function pickExportRow(r,box){if(state.exAll)return;const id=r.documentId;
+function pickExportRow(r,box,gen){if(state.exAll)return;const id=r.documentId;
+if(exListing()||gen!==state.exGen){box.checked=state.exSel.has(id);renderExportBar();return;}
 if(box.checked){if(!state.exSel.has(id)&&state.exSel.size>=EX_PICK_MAX){box.checked=false;renderExportBar();return;}
 state.exSel.add(id);if(r.statusCategory!=='confirmed')state.exWarnIds.add(id);}
 else{state.exSel.delete(id);state.exWarnIds.delete(id);}
 renderExportBar();}
-function pickExportPage(){if(state.exAll)return;const on=$('ex-page').checked===true;
+function pickExportPage(){if(state.exAll)return;if(exListing()){renderExportBar();return;}const on=$('ex-page').checked===true;
 state.exRows.forEach(r=>{const id=r.documentId;
 if(on){if(state.exSel.has(id)||state.exSel.size>=EX_PICK_MAX)return;state.exSel.add(id);if(r.statusCategory!=='confirmed')state.exWarnIds.add(id);}
 else{state.exSel.delete(id);state.exWarnIds.delete(id);}});
 renderExportRows();renderExportBar();}
+/* The N is pinned here: it is what the user agreed to, and what the server must still count (expectedTotal). */
 function pickAllMatching(){if(state.exAll||typeof state.exTotal!=='number'||(state.exMax>0&&state.exTotal>state.exMax))return;
-state.exAll=true;state.exSel.clear();state.exWarnIds.clear();renderExportRows();renderExportBar();$('ex-clear').focus();}
+state.exAll=true;state.exAllTotal=state.exTotal;state.exSel.clear();state.exWarnIds.clear();renderExportRows();renderExportBar();$('ex-clear').focus();}
 function clearAllMatching(){clearExportSelection();renderExportRows();renderExportBar();$('ex-page').focus();}
 /* The list on screen stops matching the filters the moment a control moves: it is cleared with the selection, and
    the request goes out after the 300 ms debounce. A late answer for the old filters is dropped (exSeq). */
@@ -772,10 +780,15 @@ function setExportTab(tab){if(!EX_TABS.includes(tab)||tab===state.exTab)return;s
 function pageExport(step){if(state.exAbort||typeof state.exTotal!=='number')return;const next=state.exOffset+step*EX_PAGE;
 if(next<0||next>=state.exTotal)return;state.exOffset=next;setExportError('');loadExportList();}
 /* After a download or a mark the rows have moved between tabs: start again from the first page with no selection,
-   which also sidesteps the offset shift of a page whose rows just left it. */
-function reloadExportList(){stopExportList();clearExportSelection();state.exOffset=0;state.exTotal=null;state.exCounts=null;renderExportRows();loadExportList();}
+   which also sidesteps the offset shift of a page whose rows just left it. The old rows leave the screen at once, so
+   none of them (some now in the other tab) can be ticked while the new page is on its way. */
+function reloadExportList(){stopExportList();clearExportSelection();state.exOffset=0;state.exTotal=null;state.exCounts=null;state.exRows=[];
+state.exGen++;$('ex-rows').replaceChildren();renderExportTabs();renderExportBar();loadExportList();}
 function renderExportList(data){const rows=Array.isArray(data.rows)?data.rows.filter(r=>isObj(r)&&typeof r.documentId==='string'&&UUID.test(r.documentId)):[];
 const total=typeof data.total==='number'&&data.total>=0?data.total:0;
+/* เลือกทั้งหมด covers the N the user saw. A later answer (paging) that counts differently means rows arrived or left the
+   tab meanwhile: the selection no longer describes what is on screen, so it is dropped and the reason is said. */
+if(state.exAll&&total!==state.exAllTotal){clearExportSelection();setExportError(ERRORS.EXPORT_SELECTION_CHANGED);}
 /* A page past the end (its rows moved to the other tab meanwhile) starts over from the first page. */
 if(!rows.length&&total>0&&state.exOffset>0){state.exOffset=0;loadExportList();return;}
 state.exRows=rows;state.exTotal=total;state.exMax=typeof data.maxRows==='number'?data.maxRows:0;state.exCounts=isObj(data.counts)?data.counts:null;
@@ -802,7 +815,7 @@ EXPORT_STATUSES.forEach(s=>{$('ex-st-'+s).checked=state.status===s;});
    <select> given a value that matches no <option> reads back as '' — the export would silently cover every batch. */
 fillBatchOptions($('ex-batch'),state.batchFilter||'');
 $('ex-confirmed').checked=false;$('ex-datefield').value='created_at';$('ex-from').value='';$('ex-to').value='';$('ex-format').value='csv';$('ex-columns').value='compact';
-stopExportList();state.exTab='never';blankExportList();
+state.exDlg++;stopExportList();state.exTab='never';blankExportList();
 renderExportChips();
 const d=$('export-dlg');if(!d.open)d.showModal();
 loadExportList();}
@@ -814,6 +827,8 @@ function selectionGone(e){return !!e&&(e.code==='EXPORT_SELECTION_CHANGED'||e.co
    exported only after the whole file has streamed, so a saved file is a marked file (D4). */
 async function downloadExport(){if(state.exBusy||state.exPending)return;
 const x=exPicked();if(!x||badExportRange())return;
+/* The dialog this download belongs to: closed and reopened meanwhile, the new one keeps its own selection and list. */
+const dlg=state.exDlg,here=()=>state.exDlg===dlg&&$('export-dlg').open;
 const format=$('ex-format').value==='jsonl'?'jsonl':'csv',columns=$('ex-columns').value==='detailed'?'detailed':'compact',selection=exportSelection();
 state.exBusy=true;$('ex-download').textContent='กำลังเตรียมไฟล์…';renderExportBar();setExportError('');
 let reload=false;
@@ -832,18 +847,20 @@ a.remove();
 if(typeof URL.revokeObjectURL==='function')setTimeout(()=>{URL.revokeObjectURL(url);},0);
 /* X-Export-Rows is what the file holds: ticked rows deleted since are simply absent, and the notice says how many. */
 const sent=str(r.headers&&r.headers.get('x-export-rows')),rows=/^\d+$/.test(sent)?Number(sent):x;
-notify('ดาวน์โหลดไฟล์ส่งออก '+rows+' แถวแล้ว และทำเครื่องหมายว่า Export แล้ว'+(rows<x?' (ไม่พบอีก '+(x-rows)+' แถว)':''));
+/* The rows count as exported once the file has streamed; if the browser did not keep it, ย้ายกลับ undoes that. */
+notify('ดาวน์โหลดไฟล์ส่งออก '+rows+' แถวแล้ว และทำเครื่องหมายว่า Export แล้ว'+(rows<x?' (ไม่พบอีก '+(x-rows)+' แถว)':'')+' · ถ้าไม่ได้บันทึกไฟล์ไว้ ให้กด "ย้ายกลับเป็นยังไม่ Export"');
 reload=true;}
-catch(e){setExportError(e.message);reload=selectionGone(e);}
+catch(e){if(here())setExportError(e.message);reload=selectionGone(e);}
 finally{state.exBusy=false;renderExportBar();}
-if(reload&&$('export-dlg').open)reloadExportList();}
+if(reload&&here())reloadExportList();}
 /* ทำเครื่องหมายว่า Export แล้ว / ย้ายกลับเป็นยังไม่ Export: no file, so the top-level confirm says what will happen. */
 async function markExport(action){if(state.exBusy||state.exPending)return;
 const mark=action==='mark',x=exPicked();if(!x)return;
+const dlg=state.exDlg,here=()=>state.exDlg===dlg&&$('export-dlg').open;
 const yes=await confirmAsk(mark?'ทำเครื่องหมายว่า Export แล้ว?':'ย้ายกลับเป็นยังไม่ Export?',
 mark?x+' แถวจะย้ายไปอยู่ในกลุ่ม "Export แล้ว" โดยไม่สร้างไฟล์ ใช้เมื่อคุณนำข้อมูลเหล่านี้เข้าระบบปลายทางไปแล้ว':x+' แถวจะกลับไปอยู่ในกลุ่ม "ยังไม่เคย Export" และจะถูกเสนอให้ Export อีกครั้ง ใช้เมื่อนำเข้าระบบปลายทางไม่สำเร็จ',
 mark?'ทำเครื่องหมาย':'ย้ายกลับ');
-if(!yes||!$('export-dlg').open||state.exBusy||state.exPending||exPicked()!==x)return;
+if(!yes||!here()||state.exBusy||state.exPending||exPicked()!==x)return;
 const selection=exportSelection();
 state.exPending=true;renderExportBar();setExportError('');
 let reload=false;
@@ -851,9 +868,9 @@ try{const r=await postJson('/api/exports/marks',{action:mark?'mark':'unmark',sel
 const affected=isObj(r)&&typeof r.affected==='number'?r.affected:0,skipped=isObj(r)&&typeof r.skipped==='number'?r.skipped:0;
 notify((mark?'ทำเครื่องหมายว่า Export แล้ว ':'ย้ายกลับเป็นยังไม่ Export ')+affected+' แถว'+(skipped>0?' · ข้าม '+skipped+' แถวที่ทำเครื่องหมายไว้แล้ว':''));
 reload=true;}
-catch(e){setExportError(e.message);reload=selectionGone(e);}
+catch(e){if(here())setExportError(e.message);reload=selectionGone(e);}
 finally{state.exPending=false;renderExportBar();}
-if(reload&&$('export-dlg').open)reloadExportList();}
+if(reload&&here())reloadExportList();}
 
 /* ---------- a real top-level confirmation ---------- */
 /* The drawer's "ask" overlay lives inside <dialog id="drawer"> and is only un-hidden there: called from the header or

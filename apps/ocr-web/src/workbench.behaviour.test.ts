@@ -114,7 +114,7 @@ type Workbench = {
     openSeq: number; originalSig: string; user: { id: string } | null; csrf: string; dirty: boolean; leaving: boolean;
     timer: number; users: unknown[]; tempPass: string; q: string; status: string; parentFilter: string; parentName: string;
     exQ: string; exParent: string; exTotal: number | null; exMax: number; batchFilter: string;
-    exTab: string; exOffset: number; exSel: Set<string>; exWarnIds: Set<string>; exAll: boolean; exRows: unknown[];
+    exTab: string; exOffset: number; exSel: Set<string>; exWarnIds: Set<string>; exAll: boolean; exAllTotal: number | null; exRows: unknown[];
   };
 };
 
@@ -1238,15 +1238,16 @@ test("a download POSTs the ticked ids with the CSRF token, saves the file, then 
   assert.equal(posts[0]?.url, "/api/exports/documents.csv", "the selection travels in the body, not the URL");
   assert.equal(posts[0]?.headers["X-CSRF-Token"], "csrf-1");
   assert.equal(posts[0]?.headers["Content-Type"], "application/json");
-  assert.deepEqual(bodyOf(posts[0]), { columns: "detailed", selection: { mode: "ids", ids: [exId(51), exId(1)] } });
+  assert.deepEqual(bodyOf(posts[0]), { columns: "detailed", selection: { mode: "ids", ids: [exId(51), exId(1)], expectState: "never" } },
+    "H1: the tab the rows were ticked in travels with them");
   // The anchor is in the document when it is clicked and gone afterwards, and the blob URL outlives the click by a
   // turn: a detached anchor and a same-tick revoke are only reliable in Chromium.
   assert.deepEqual(ctx.body.children.filter((node) => node.tagName === "A"), [], "the anchor does not stay in the document");
   assert.deepEqual([blobs.created, blobs.revoked], [1, 0], "the object URL survives the click");
   ctx.clock.run([...ctx.clock.timers.keys()].find((id) => !armed.includes(id))!);
   assert.deepEqual([blobs.created, blobs.revoked], [1, 1], "and is revoked on the next turn, so none is left alive");
-  assert.match(ctx.$("notice").textContent, /ดาวน์โหลดไฟล์ส่งออก 1 แถวแล้ว และทำเครื่องหมายว่า Export แล้ว \(ไม่พบอีก 1 แถว\)/,
-    "X-Export-Rows below the selection: a ticked row no longer exists");
+  assert.ok(ctx.$("notice").textContent.startsWith('ดาวน์โหลดไฟล์ส่งออก 1 แถวแล้ว และทำเครื่องหมายว่า Export แล้ว (ไม่พบอีก 1 แถว) · ถ้าไม่ได้บันทึกไฟล์ไว้ ให้กด "ย้ายกลับเป็นยังไม่ Export"'),
+    "X-Export-Rows below the selection: a ticked row no longer exists; and M4: what to do if the browser did not keep the file");
   // The rows moved to Export แล้ว: the list starts again from the first page with nothing ticked and fresh counts.
   const reload = candidateCalls(ctx).at(-1)!;
   assert.deepEqual([reload.get("exportState"), reload.get("offset")], ["never", "0"]);
@@ -1280,7 +1281,7 @@ test("ทำเครื่องหมายว่า Export แล้ว and �
   const marks = ctx.calls.filter((call) => call.url === "/api/exports/marks");
   assert.equal(marks.length, 1);
   assert.equal(marks[0]?.headers["X-CSRF-Token"], "csrf-1");
-  assert.deepEqual(bodyOf(marks[0]), { action: "mark", selection: { mode: "ids", ids: [exId(1), exId(2)] } });
+  assert.deepEqual(bodyOf(marks[0]), { action: "mark", selection: { mode: "ids", ids: [exId(1), exId(2)], expectState: "never" } });
   assert.match(ctx.$("notice").textContent, /ทำเครื่องหมายว่า Export แล้ว 1 แถว · ข้าม 1 แถวที่ทำเครื่องหมายไว้แล้ว/);
   assert.deepEqual([ctx.wb.state.exSel.size, candidateCalls(ctx).at(-1)?.get("offset")], [0, "0"], "reloaded from the first page, nothing ticked");
   tick(ctx, 2);
@@ -1292,7 +1293,7 @@ test("ทำเครื่องหมายว่า Export แล้ว and �
   assert.equal(ctx.$("cf-yes").textContent, "ย้ายกลับ");
   ctx.$("cf-yes").dispatch("click");
   await settle();
-  assert.deepEqual(bodyOf(ctx.calls.filter((call) => call.url === "/api/exports/marks").at(-1)), { action: "unmark", selection: { mode: "ids", ids: [exId(3), exId(1)] } });
+  assert.deepEqual(bodyOf(ctx.calls.filter((call) => call.url === "/api/exports/marks").at(-1)), { action: "unmark", selection: { mode: "ids", ids: [exId(3), exId(1)], expectState: "never" } });
   assert.match(ctx.$("notice").textContent, /ย้ายกลับเป็นยังไม่ Export 2 แถว/);
   assert.ok(!ctx.$("notice").textContent.includes("ข้าม"), "no skip clause when nothing was skipped");
 });
@@ -1488,6 +1489,118 @@ test("a download that finishes after the dialog closed does not refill it", asyn
   assert.match(ctx.$("notice").textContent, /ดาวน์โหลดไฟล์ส่งออก 1 แถวแล้ว/, "the file was saved, so it is announced");
   assert.deepEqual(candidateCalls(ctx), [], "but the closed dialog is not refilled with customer rows");
   assert.ok(!ctx.dom().includes("ลูกค้า 1"));
+});
+
+// ---- review of 0021 (Phase 4 step 39): H1 tab state, M2 pinned N, L2 stale rows, L3 a reopened dialog ----------------
+
+test("H1: an explicit selection carries the tab it was ticked in: never, exported, or null on ทั้งหมด", async () => {
+  const rows = [...many(2), ...many(2, { exportState: "exported", lastExportedAt: "2026-09-23T03:00:00.000Z", lastExportKind: "exported" })
+    .map((row, index) => ({ ...row, documentId: exId(800 + index) }))];
+  const ctx = await openList(rows, either(downloadRoute(() => csvFile({ "x-export-rows": "1" })),
+    (url, init) => url === "/api/exports/marks" && String(init.method) === "POST" ? json(200, { action: "unmark", affected: 1, skipped: 0, total: 1 }) : null));
+  ctx.$("ex-tab-exported").dispatch("click");
+  runLastTimer(ctx);
+  await settle();
+  tick(ctx, 0);
+  ctx.$("ex-download").dispatch("click");
+  await settle();
+  assert.deepEqual(bodyOf(ctx.calls.find((call) => call.url === "/api/exports/documents.csv")).selection,
+    { mode: "ids", ids: [exId(800)], expectState: "exported" }, "a re-export of rows the user saw as exported");
+  ctx.$("ex-tab-all").dispatch("click");
+  runLastTimer(ctx);
+  await settle();
+  tick(ctx, 0);
+  ctx.$("ex-unmark").dispatch("click");
+  await settle();
+  ctx.$("cf-yes").dispatch("click");
+  await settle();
+  assert.deepEqual(bodyOf(ctx.calls.filter((call) => call.url === "/api/exports/marks").at(-1)).selection,
+    { mode: "ids", ids: [exId(1)], expectState: null }, "ทั้งหมด: the rows must still be there, in either state");
+});
+
+test("M2: เลือกทั้งหมด pins the N the user agreed to; a later page that counts differently drops the selection and says why", async () => {
+  const rows = many(70);
+  const ctx = await openList(rows, downloadRoute(() => csvFile({ "x-export-rows": "70" })));
+  tickPage(ctx);
+  ctx.$("ex-all").dispatch("click");
+  assert.deepEqual([ctx.wb.state.exAll, ctx.wb.state.exAllTotal], [true, 70]);
+  ctx.$("ex-next").dispatch("click");
+  await settle();
+  assert.deepEqual([ctx.wb.state.exAll, ctx.$("ex-error").textContent], [true, ""], "the same 70 on the next page: still all of them");
+  // A document arrives in the tab while the user pages: the 70 they agreed to are no longer "all matching".
+  rows.push(candidate(71));
+  ctx.$("ex-prev").dispatch("click");
+  await settle();
+  assert.deepEqual([ctx.wb.state.exAll, ctx.wb.state.exAllTotal, ctx.wb.state.exSel.size], [false, null, 0]);
+  assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS.EXPORT_SELECTION_CHANGED);
+  assert.deepEqual([ctx.$("ex-picked").textContent, ctx.$("ex-download").disabled, rowBox(ctx, 0).disabled], ["เลือกแล้ว 0 แถว", true, false]);
+  assert.equal(ctx.$("ex-count").textContent, "พบ 71 แถว · แสดงแถวที่ 1–50", "the new count is shown, nothing is downloaded");
+  ctx.$("ex-download").dispatch("click");
+  await settle();
+  assert.deepEqual(ctx.calls.filter((call) => call.url.startsWith("/api/exports/documents.")), []);
+  // Picked again, the new N is the one that travels.
+  tickPage(ctx);
+  ctx.$("ex-all").dispatch("click");
+  ctx.$("ex-download").dispatch("click");
+  await settle();
+  const selection = bodyOf(ctx.calls.find((call) => call.url === "/api/exports/documents.csv")).selection as Record<string, unknown>;
+  assert.deepEqual([selection.mode, selection.expectedTotal], ["filter", 71]);
+});
+
+test("L2: after a download the old rows leave the screen at once, and no tick lands while the list reloads", async () => {
+  let holding = false;
+  const { ctx, release } = await bootedWithGate({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 },
+    either(downloadRoute(() => csvFile({ "x-export-rows": "1" })), candidatesRoute({ rows: many(3) })),
+    (url) => holding && url.startsWith("/api/exports/candidates?"));
+  ctx.wb.openExportDialog();
+  await settle();
+  tick(ctx, 0);
+  const stale = rowBox(ctx, 1);
+  holding = true;
+  ctx.$("ex-download").dispatch("click");
+  await settle();
+  assert.deepEqual(ctx.$("ex-rows").children, [], "the rows the download just moved are gone while the new page loads");
+  stale.checked = true;
+  stale.dispatch("change");
+  assert.deepEqual([ctx.wb.state.exSel.size, stale.checked], [0, false], "a box of the old list cannot select a row that may have left the tab");
+  ctx.$("ex-page").checked = true;
+  ctx.$("ex-page").dispatch("change");
+  assert.equal(ctx.wb.state.exSel.size, 0, "nor can the page checkbox while the list is loading");
+  holding = false;
+  await release();
+  assert.equal(ctx.$("ex-rows").children.length, 3);
+  assert.deepEqual([ctx.wb.state.exSel.size, rowBox(ctx, 1).checked], [0, false]);
+  stale.checked = true;
+  stale.dispatch("change");
+  assert.equal(ctx.wb.state.exSel.size, 0, "a detached box of the old list stays without effect after the new one arrived");
+  tick(ctx, 1);
+  assert.equal(ctx.wb.state.exSel.size, 1, "the new list ticks as usual");
+});
+
+test("L3: a download or a flip that finishes after the dialog was closed and reopened leaves the new dialog alone", async () => {
+  for (const kind of ["download", "unmark", "refused"] as const) {
+    const { ctx, release } = await bootedWithGate({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 },
+      either(downloadRoute(() => kind === "refused" ? json(409, { error: "EXPORT_SELECTION_CHANGED" }) : csvFile()),
+        (url, init) => url === "/api/exports/marks" && String(init.method) === "POST" ? json(200, { action: "unmark", affected: 1, skipped: 0, total: 1 }) : null,
+        candidatesRoute({ rows: many(3) })),
+      (url) => url.startsWith("/api/exports/documents.") || url === "/api/exports/marks");
+    ctx.wb.openExportDialog();
+    await settle();
+    tick(ctx, 0);
+    if (kind === "unmark") { ctx.$("ex-unmark").dispatch("click"); await settle(); ctx.$("cf-yes").dispatch("click"); }
+    else ctx.$("ex-download").dispatch("click");
+    await settle();
+    ctx.$("ex-close").dispatch("click");
+    ctx.wb.openExportDialog();
+    await settle();
+    tick(ctx, 1);
+    ctx.calls.length = 0;
+    await release();
+    assert.deepEqual([...ctx.wb.state.exSel], [exId(2)], `${kind}: the new dialog's selection is kept`);
+    assert.deepEqual(candidateCalls(ctx), [], `${kind}: and its list is not reloaded under it`);
+    assert.equal(ctx.$("ex-error").textContent, "", `${kind}: an old answer's error does not land in the new dialog`);
+    assert.equal(rowBox(ctx, 1).checked, true);
+  }
 });
 
 test("the users table shows the effective export right and offers no pointless grant on an admin row", async () => {

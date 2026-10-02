@@ -13,7 +13,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { Pool } from "pg";
-import { flattenDocument, hasReviewFields, LEGACY_REVIEWER_LABEL, PostgresOcrDocumentStore, PostgresUserStore, reviewerLabel, toStructuredResult, withTenant,
+import { EXPORT_MARK_LOCK_TIMEOUT_MS, EXPORT_MARK_STATEMENT_TIMEOUT_MS, flattenDocument, hasReviewFields, LEGACY_REVIEWER_LABEL, PostgresOcrDocumentStore, PostgresUserStore, reviewerLabel, toStructuredResult, withTenant,
   type AuditContext, type DocumentFilter, type DocumentView, type ExportCandidate, type ExportDocument, type OpenExportOptions, type PageDocumentInput,
   type SessionRevokeReason, type UserRole } from "./index.js";
 
@@ -1673,5 +1673,83 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     // Every refusal released its slot: both export slots open at once.
     const open = await Promise.all([app.openExport(TENANT_A, { batchId }, { maxRows: 10 }), app.openExport(TENANT_A, { batchId }, { maxRows: 10 })]);
     await Promise.all(open.map((cursor) => cursor.close()));
+  });
+
+  // ---- review of 0021 (Phase 4 step 39): H1 expected-state guard, the race the organization gate closes, M1 bounds --
+
+  test("H1: an explicit selection must still be visible and in its tab's state in the export's own snapshot, or nothing happens", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3 });
+    const [g1, g2, g3] = await images(batch.batchId, "history-guard", 3) as [string, string, string];
+    const foreign = (await uploadFile(TENANT_B, "history-guard-b.png", "image/png")).documentId;
+    await download({ ids: [g1] });
+    const open = (ids: string[], expectState: "never" | "exported" | null) => drain(TENANT_A, { ids }, { maxRows: 10, expectState });
+    await assert.rejects(open([g1, g2], "never"), { message: "EXPORT_SELECTION_CHANGED" }, "g1 was exported by someone else after it was ticked");
+    assert.equal((await open([g2, g3], "never")).total, 2);
+    assert.equal((await open([g1], "exported")).total, 1);
+    await assert.rejects(open([g2], "exported"), { message: "EXPORT_SELECTION_CHANGED" });
+    assert.equal((await open([g1, g2, g2.toUpperCase()], null)).total, 2, "ทั้งหมด: either state, a duplicate counts once");
+    await assert.rejects(open([g2, foreign], null), { message: "EXPORT_SELECTION_CHANGED" }, "another tenant's id is no row of this one");
+    await asApp(TENANT_A, "UPDATE documents SET status='DELETED', deleted_at=now() WHERE id=$1::uuid", [g3]);
+    await assert.rejects(open([g2, g3], null), { message: "EXPORT_SELECTION_CHANGED" }, "a ticked row deleted meanwhile");
+    await assert.rejects(open([g3], "never"), { message: "EXPORT_SELECTION_EMPTY" }, "a selection that vanished entirely keeps its own code");
+
+    const before = await eventCount();
+    const flip = (action: "mark" | "unmark", ids: string[], expectState: "never" | "exported" | null) =>
+      app.markExportState(TENANT_A, { action, filter: { ids }, expectState, maxRows: 10, ...history() });
+    await assert.rejects(flip("mark", [g1, g2], "never"), { message: "EXPORT_SELECTION_CHANGED" });
+    await assert.rejects(flip("unmark", [g1, g2], "exported"), { message: "EXPORT_SELECTION_CHANGED" });
+    await assert.rejects(flip("unmark", [g1, g3], null), { message: "EXPORT_SELECTION_CHANGED" });
+    assert.equal(await eventCount(), before, "every refusal wrote nothing");
+    assert.deepEqual(await flip("mark", [g1, g2], null), { total: 2, affected: 1, skipped: 1 }, "ทั้งหมด keeps D5's skipping");
+    assert.deepEqual(await flip("unmark", [g1, g2], "exported"), { total: 2, affected: 2, skipped: 0 });
+    assert.deepEqual(await flip("mark", [g2], "never"), { total: 1, affected: 1, skipped: 0 });
+  });
+
+  test("H1: two marking downloads of the same rows: concurrent snapshots both pass, serialized the second is refused (the gate's job)", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 2 });
+    const [r1, r2] = await images(batch.batchId, "history-race2", 2) as [string, string];
+    const tab = { batchId: batch.batchId, exportState: "never" as const };
+    // Without a gate: both snapshots are taken before either download's marks commit, so both pass every check and
+    // both files would hold the same two rows. This is what the per-organization gate in the web layer prevents.
+    const [a, b] = await Promise.all([app.openExport(TENANT_A, tab, { maxRows: 10, expectedTotal: 2 }),
+      app.openExport(TENANT_A, { ids: [r1, r2] }, { maxRows: 10, expectState: "never" })]);
+    assert.deepEqual([a.total, b.total], [2, 2]);
+    const streamed: ExportDocument[] = [];
+    try { for await (const page of a.rows()) streamed.push(...page); } finally { await a.close(); }
+    await b.close();
+    await app.recordExportMarks(TENANT_A, { kind: "exported", source: "csv", ...history(),
+      rows: streamed.map((document) => ({ documentId: document.documentId, rowVersion: document.rowVersion })) });
+    // Serialized (the gate releases only after the first download's marks committed): the next snapshot sees them.
+    await assert.rejects(app.openExport(TENANT_A, tab, { maxRows: 10, expectedTotal: 2 }), { message: "EXPORT_SELECTION_CHANGED" }, "select all 2 of ยังไม่เคย Export");
+    await assert.rejects(app.openExport(TENANT_A, { ids: [r1, r2] }, { maxRows: 10, expectState: "never" }), { message: "EXPORT_SELECTION_CHANGED" }, "the same two ticked rows");
+    await assert.rejects(app.markExportState(TENANT_A, { action: "mark", filter: tab, expectedTotal: 2, maxRows: 10, ...history() }), { message: "EXPORT_SELECTION_CHANGED" });
+    assert.deepEqual((await app.listExportCandidates(TENANT_A, { batchId: batch.batchId })).counts, { never: 0, exported: 2, all: 2, unconfirmed: 2 });
+  });
+
+  test("M1: behind a reviewer's FOR UPDATE lock both history writes give up after the lock timeout, write nothing and free the connection", async () => {
+    const doc = (await uploadFile(TENANT_A, "history-locked.png", "image/png")).documentId;
+    const version = (await drain(TENANT_A, { ids: [doc] })).documents[0]!.rowVersion;
+    const holder = await superDb.connect();
+    const before = await eventCount();
+    try {
+      // What saveReview holds while it saves: the marks' composite FK needs FOR KEY SHARE on the same row.
+      await holder.query("BEGIN");
+      await holder.query("SELECT id FROM documents WHERE id = $1 FOR UPDATE", [doc]);
+      let startedAt = Date.now();
+      await assert.rejects(app.recordExportMarks(TENANT_A, { kind: "exported", source: "csv", ...history(), rows: [{ documentId: doc, rowVersion: version }] }),
+        { code: "55P03" }, "lock_timeout, not a hang");
+      const waited = Date.now() - startedAt;
+      assert.ok(waited >= EXPORT_MARK_LOCK_TIMEOUT_MS - 100 && waited < EXPORT_MARK_STATEMENT_TIMEOUT_MS, `gave up after ${waited} ms`);
+      startedAt = Date.now();
+      await assert.rejects(app.markExportState(TENANT_A, { action: "mark", filter: { ids: [doc] }, expectState: "never", maxRows: 10, ...history() }), { code: "55P03" });
+      assert.ok(Date.now() - startedAt < EXPORT_MARK_STATEMENT_TIMEOUT_MS);
+      assert.equal(await eventCount(), before, "both transactions rolled back");
+      assert.deepEqual([appPool.totalCount - appPool.idleCount, appPool.waitingCount], [0, 0], "no connection is left checked out");
+    } finally { await holder.query("ROLLBACK"); holder.release(); }
+    assert.equal(await app.recordExportMarks(TENANT_A, { kind: "exported", source: "csv", ...history(), rows: [{ documentId: doc, rowVersion: version }] }), 1,
+      "once the lock is gone the same write goes through on a pooled connection");
+    const bounds = await withTenant(appPool, TENANT_A, async (client) => (await client.query<{ lock: string; statement: string }>(
+      "SELECT current_setting('lock_timeout') AS lock, current_setting('statement_timeout') AS statement")).rows[0]);
+    assert.deepEqual(bounds, { lock: "0", statement: "0" }, "SET LOCAL: the bounds did not stay on the pooled connection");
   });
 });

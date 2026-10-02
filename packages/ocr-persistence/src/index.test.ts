@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Pool } from "pg";
-import { documentFilterSql, EXPORT_MAX_DURATION_MS, EXPORT_SELECTION_MAX, hasReviewFields, isUuid, legacyFieldPath, pageJobPriority, PostgresOcrDocumentStore, statusCategoryOf, structuredStaffResult, structuredDocumentResult, toBatchSummary, toStructuredResult } from "./index.js";
+import { documentFilterSql, EXPORT_MARK_LOCK_TIMEOUT_MS, EXPORT_MARK_STATEMENT_TIMEOUT_MS, EXPORT_MAX_DURATION_MS, EXPORT_SELECTION_MAX, hasReviewFields, isUuid, legacyFieldPath, pageJobPriority, PostgresOcrDocumentStore, statusCategoryOf, structuredStaffResult, structuredDocumentResult, toBatchSummary, toStructuredResult } from "./index.js";
 
 test("needsReview mapping detects any staff field requiring review", () => {
   const response = { documentId: "d", staffOnly: { therapistName: { needsReview: false }, treatment: { needsReview: true } } };
@@ -173,7 +173,8 @@ class FakeExportClient {
   private readonly listeners = new Set<(error: Error) => void>();
   /** Runs while the statement is in flight, so a test can kill the backend during the teardown round-trips. */
   during: Partial<Record<string, () => void>> = {};
-  constructor(private readonly pages: Row[][], private readonly total: number, private readonly fetchFails?: Error) {}
+  /** `inState`: what the H1 expected-state count answers (rows of the selection in the tab's state); defaults to `total`. */
+  constructor(private readonly pages: Row[][], private readonly total: number, private readonly fetchFails?: Error, private readonly inState?: number) {}
   async query(text: string, values: readonly unknown[] = []): Promise<{ rows: unknown[] }> {
     this.queries.push({ text, values });
     this.during[text]?.();
@@ -181,7 +182,8 @@ class FakeExportClient {
       if (this.fetchFails) throw this.fetchFails;
       return { rows: this.pages.shift() ?? [] };
     }
-    return { rows: text.includes("count(*)") ? [{ total: this.total }] : [] };
+    if (text.startsWith("INSERT")) return { rows: [], rowCount: 0 } as { rows: unknown[] };
+    return { rows: text.includes("count(*)") ? [{ total: this.total, ...(text.includes("in_state") ? { in_state: this.inState ?? this.total } : {}) }] : [] };
   }
   on(event: string, listener: (error: Error) => void): this { if (event === "error") this.listeners.add(listener); return this; }
   removeListener(_event: string, listener: (error: Error) => void): this { this.listeners.delete(listener); return this; }
@@ -480,4 +482,71 @@ test("the export history methods refuse malformed input without touching the dat
   await assert.rejects(store.listExportCandidates(tenant, { exportState: "all" as never }), { message: "INVALID_EXPORT_FILTER" });
   await assert.rejects(store.listExportCandidates(tenant, { batchId: "x" }), { message: "BATCH_NOT_FOUND" });
   await pool.end();
+});
+
+test("H1: openExport and markExportState check an explicit selection's expected state in the count's own statement", async () => {
+  const tenant = "11111111-1111-4111-8111-111111111111";
+  const user = "22222222-2222-4222-8222-222222222222", request = "33333333-3333-4333-8333-333333333333";
+  const [a, b] = ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"];
+  // [rows found, rows in the tab's state, expectState, expected outcome]
+  const cases: [number, number, "never" | "exported" | null, string][] = [
+    [2, 2, "never", "ok"], [2, 1, "never", "EXPORT_SELECTION_CHANGED"], [2, 1, "exported", "EXPORT_SELECTION_CHANGED"],
+    [1, 1, "never", "EXPORT_SELECTION_CHANGED"], [1, 1, null, "EXPORT_SELECTION_CHANGED"], [2, 0, null, "ok"], [0, 0, "never", "EXPORT_SELECTION_EMPTY"]
+  ];
+  for (const [found, inState, expectState, outcome] of cases) {
+    const label = `${found} found, ${inState} in state, expect ${String(expectState)}`;
+    const client = new FakeExportClient([], found, undefined, inState);
+    const { store, pool } = exportStore([client]);
+    const opening = store.openExport(tenant, { ids: [a, b, a.toUpperCase()] }, { maxRows: 10, expectState });
+    if (outcome === "ok") await (await opening).close(); else await assert.rejects(opening, { message: outcome }, label);
+    const count = client.texts.find((text) => text.includes("count(*)"))!;
+    // One statement: the same snapshot the cursor then reads. null (ทั้งหมด) needs no state predicate at all.
+    assert.equal(count.includes("count(*) FILTER (WHERE COALESCE("), expectState !== null, label);
+    assert.equal(client.texts.some((text) => text.startsWith("DECLARE")), outcome === "ok", `${label}: a cursor only when the selection still holds`);
+    const flip = new FakeExportClient([], found, undefined, inState);
+    const flips = exportStore([flip]);
+    const change = flips.store.markExportState(tenant, { action: "mark", filter: { ids: [a, b] }, expectState, maxRows: 10, actorUserId: user, requestId: request });
+    if (outcome === "ok") await change; else await assert.rejects(change, { message: outcome }, `marks: ${label}`);
+    assert.equal(flip.texts.some((text) => text.startsWith("INSERT")), outcome === "ok", `marks: ${label}: nothing written on a refusal`);
+    await pool.end();
+    await flips.pool.end();
+  }
+  const pool = new Pool();
+  Object.assign(pool, { connect: async () => { throw new Error("database must not be used"); } });
+  const store = new PostgresOcrDocumentStore(pool);
+  for (const [filter, expectState] of [[{ batchId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }, "never"], [{ ids: [a] }, "all"], [{ ids: [a] }, 1]] as const) {
+    await assert.rejects(store.openExport(tenant, filter, { maxRows: 10, expectState: expectState as never }), { message: "INVALID_EXPORT_SELECTION" }, JSON.stringify([filter, expectState]));
+    await assert.rejects(store.markExportState(tenant, { action: "unmark", filter, expectState: expectState as never, maxRows: 10, actorUserId: user, requestId: request }),
+      { message: "INVALID_EXPORT_SELECTION" });
+  }
+  await pool.end();
+});
+
+test("M1: the two export-history writes bound their lock waits and statements transaction-locally", async () => {
+  const tenant = "11111111-1111-4111-8111-111111111111";
+  const user = "22222222-2222-4222-8222-222222222222", request = "33333333-3333-4333-8333-333333333333";
+  const doc = "44444444-4444-4444-8444-444444444444";
+  const bounds = (client: FakeExportClient) => client.queries.filter((query) => /set_config\('(statement_timeout|lock_timeout)'/.test(query.text))
+    .map((query) => [/'(\w+)'/.exec(query.text)![1], query.values[0]]);
+  const record = new FakeExportClient([], 0);
+  const recorded = exportStore([record]);
+  await recorded.store.recordExportMarks(tenant, { kind: "exported", source: "csv", actorUserId: user, requestId: request,
+    rows: [{ documentId: doc, rowVersion: "2026-09-22T08:00:00.123456Z" }] });
+  assert.deepEqual(bounds(record), [["statement_timeout", String(EXPORT_MARK_STATEMENT_TIMEOUT_MS)], ["lock_timeout", String(EXPORT_MARK_LOCK_TIMEOUT_MS)]]);
+  assert.deepEqual([EXPORT_MARK_LOCK_TIMEOUT_MS, EXPORT_MARK_STATEMENT_TIMEOUT_MS], [5_000, 30_000]);
+  const flip = new FakeExportClient([], 1);
+  const flipped = exportStore([flip]);
+  await flipped.store.markExportState(tenant, { action: "mark", filter: { ids: [doc] }, maxRows: 10, actorUserId: user, requestId: request });
+  assert.equal(flip.texts[0], "BEGIN ISOLATION LEVEL REPEATABLE READ");
+  assert.deepEqual(bounds(flip), [["statement_timeout", "30000"], ["lock_timeout", "5000"]]);
+  // A lock that is not granted in time: pg cancels the statement (55P03), the transaction rolls back and the client goes back.
+  const stuck = new FakeExportClient([], 1);
+  const lockTimeout = Object.assign(new Error("canceling statement due to lock timeout"), { code: "55P03" });
+  const original = stuck.query.bind(stuck);
+  Object.assign(stuck, { query: async (text: string, values?: readonly unknown[]) => { if (text.startsWith("INSERT")) { stuck.queries.push({ text, values: values ?? [] }); throw lockTimeout; } return original(text, values); } });
+  const stuckStore = exportStore([stuck]);
+  await assert.rejects(stuckStore.store.recordExportMarks(tenant, { kind: "exported", source: "jsonl", actorUserId: user, requestId: request,
+    rows: [{ documentId: doc, rowVersion: "2026-09-22T08:00:00.123456Z" }] }), { code: "55P03" });
+  assert.deepEqual([stuck.texts.at(-1), stuck.released], ["ROLLBACK", [false]], "rolled back, connection returned intact");
+  await Promise.all([recorded.pool.end(), flipped.pool.end(), stuckStore.pool.end()]);
 });

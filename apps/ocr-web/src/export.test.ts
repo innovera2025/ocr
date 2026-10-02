@@ -4,7 +4,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server } from "node:http";
 import { connect } from "node:net";
 import { AuthenticationError, csrfTokenFor } from "@innovera/ocr-auth";
 import type { WebConfig } from "@innovera/ocr-config";
@@ -58,12 +58,15 @@ type StoreOptions = Readonly<{
   openError?: string; previewTotal?: number; stopAfter?: number;
   /** `recordExportMarks` throws this (a pg-style lowercase message, so it is never a client code by itself). */
   markError?: string;
+  /** `recordExportMarks` waits for this before it "commits" (a client can leave while the marks are being written). */
+  markGate?: Deferred;
   /** `markExportState` throws this code, or answers `markResult`. */
   stateError?: string; markResult?: ExportMarkResult;
   candidates?: ExportCandidatesResult;
 }>;
 type FakeStore = ExportStore & {
   closed: number; opened: number; filters: DocumentFilter[]; maxRows: number[]; expectedTotals: (number | undefined)[];
+  expectStates: OpenExportOptions["expectState"][];
   marks: ExportMarkInput[]; closedAtMark: number[]; stateCalls: ExportStateChangeInput[];
   listCalls: { filter: DocumentFilter; page: ExportCandidatesPage | undefined }[];
 };
@@ -76,6 +79,7 @@ type FakeStore = ExportStore & {
 function fakeStore(documents: readonly ExportDocument[], options: StoreOptions = {}): FakeStore {
   const state = {
     closed: 0, opened: 0, filters: [] as DocumentFilter[], maxRows: [] as number[], expectedTotals: [] as (number | undefined)[],
+    expectStates: [] as OpenExportOptions["expectState"][],
     marks: [] as ExportMarkInput[], closedAtMark: [] as number[], stateCalls: [] as ExportStateChangeInput[],
     listCalls: [] as { filter: DocumentFilter; page: ExportCandidatesPage | undefined }[]
   };
@@ -90,6 +94,7 @@ function fakeStore(documents: readonly ExportDocument[], options: StoreOptions =
       state.filters.push(filter);
       state.maxRows.push(open.maxRows);
       state.expectedTotals.push(open.expectedTotal);
+      state.expectStates.push(open.expectState);
       if (options.openError) throw new Error(options.openError);
       if (open.expectedTotal !== undefined && open.expectedTotal !== total) throw new Error("EXPORT_SELECTION_CHANGED");
       if (total === 0 && filter.ids !== undefined) throw new Error("EXPORT_SELECTION_EMPTY");
@@ -119,6 +124,7 @@ function fakeStore(documents: readonly ExportDocument[], options: StoreOptions =
     recordExportMarks: async (_tenantId: string, input: ExportMarkInput): Promise<number> => {
       // How many cursors were closed when the marks were written: the export's connection must go back first.
       state.closedAtMark.push(state.closed);
+      if (options.markGate) await options.markGate.promise;
       if (options.markError) throw new Error(options.markError);
       state.marks.push(input);
       return input.rows.length;
@@ -153,13 +159,18 @@ const context = (overrides: Partial<WebAuthContext> = {}): WebAuthContext => ({
 });
 
 type App = Readonly<{ store: FakeStore; audits: Omit<AuditEvent, "tenantId">[]; server: Server }>;
-function app(store: FakeStore, options: { ctx?: WebAuthContext | null; webConfig?: Partial<WebConfig>; failAudit?: string } = {}): App {
+/** `ctxFor` picks the signed-in user per request (a test header), for the cases that need two people at once. */
+function app(store: FakeStore, options: { ctx?: WebAuthContext | null; webConfig?: Partial<WebConfig>; failAudit?: string;
+  ctxFor?: (request: IncomingMessage) => WebAuthContext } = {}): App {
   const audits: Omit<AuditEvent, "tenantId">[] = [];
   const server = createAppServer(
     { ingest: { stage: async () => "key", scan: async () => "CLEAN", enqueue: async () => "job" }, userStore: fakeUsers(audits, options.failAudit), exportStore: store },
     {
       webConfig: { ...baseWebConfig, ...options.webConfig },
-      authenticate: () => { if (options.ctx === null) throw new AuthenticationError("UNAUTHENTICATED"); return options.ctx ?? context(); }
+      authenticate: (request) => {
+        if (options.ctx === null) throw new AuthenticationError("UNAUTHENTICATED");
+        return options.ctxFor?.(request) ?? options.ctx ?? context();
+      }
     });
   return { store, audits, server };
 }
@@ -362,8 +373,9 @@ test("the wall clock ends a download stuck on drain, and gives the user's slot b
   const store = fakeStore([document()], { total: 200_000, pageSize: 500 });
   const audits: Omit<AuditEvent, "tenantId">[] = [];
   const gate = new ExportGate();
+  const tenantGate = new ExportGate(1);
   const deps = {
-    store, users: fakeUsers(audits), gate, previewLimit: new SlidingWindow(PREVIEW_LIMIT, PREVIEW_WINDOW_MS),
+    store, users: fakeUsers(audits), gate, tenantGate, previewLimit: new SlidingWindow(PREVIEW_LIMIT, PREVIEW_WINDOW_MS),
     listLimit: new SlidingWindow(EXPORT_LIST_LIMIT, PREVIEW_WINDOW_MS), markLimit: new SlidingWindow(EXPORT_MARK_LIMIT, PREVIEW_WINDOW_MS),
     maxRows: 500_000, publicBaseUrl: "https://ocr.example.test", traceId: "t-1", now: Date.now, wallClockMs: 60
   };
@@ -585,9 +597,13 @@ const distinctDocuments = (count: number): ExportDocument[] => idList(count).map
 
 test("parseSelectionBody: ids are 1..5,000 distinct UUIDs, filter mode needs expectedTotal, and unknown keys are refused", () => {
   const upper = docId(1).toUpperCase();
-  assert.deepEqual(parseSelectionBody({ mode: "ids", ids: [upper, docId(1), docId(2)] }, 50_000), { mode: "ids", ids: [docId(1), docId(2)] },
+  assert.deepEqual(parseSelectionBody({ mode: "ids", ids: [upper, docId(1), docId(2)], expectState: "never" }, 50_000), { mode: "ids", ids: [docId(1), docId(2)], expectState: "never" },
     "lower-cased and de-duplicated");
-  assert.deepEqual(parseSelectionBody({ mode: "ids", ids: [...idList(5000), docId(1)] }, 50_000).mode, "ids", "5,000 distinct after de-dup is fine");
+  assert.deepEqual(parseSelectionBody({ mode: "ids", ids: [...idList(5000), docId(1)], expectState: "never" }, 50_000).mode, "ids", "5,000 distinct after de-dup is fine");
+  // H1: the tab the rows were ticked in; null is "ทั้งหมด" (every id must still be there, in either state).
+  for (const expectState of ["exported", null] as const) {
+    assert.deepEqual(parseSelectionBody({ mode: "ids", ids: [docId(1)], expectState }, 50_000), { mode: "ids", ids: [docId(1)], expectState });
+  }
   assert.deepEqual(parseSelectionBody({ mode: "filter", filter: {}, expectedTotal: 0 }, 50_000), { mode: "filter", filter: {}, expectedTotal: 0 });
   assert.deepEqual(parseSelectionBody({
     mode: "filter", expectedTotal: 12, filter: { status: ["review", "failed"], q: "  สมชาย ", batchId: "22222222-2222-4222-8222-222222222222",
@@ -599,9 +615,13 @@ test("parseSelectionBody: ids are 1..5,000 distinct UUIDs, filter mode needs exp
   assert.deepEqual(parseSelectionBody({ mode: "filter", filter: { confirmedOnly: false, status: [] }, expectedTotal: 3 }, 50_000).mode, "filter");
   const shape: [string, unknown][] = [
     ["not an object", "ids"], ["array", [docId(1)]], ["null", null], ["no mode", { ids: [docId(1)] }], ["unknown mode", { mode: "all" }],
-    ["empty ids", { mode: "ids", ids: [] }], ["ids not an array", { mode: "ids", ids: docId(1) }], ["non-uuid id", { mode: "ids", ids: ["nope"] }],
-    ["number id", { mode: "ids", ids: [1] }], ["5,001 distinct", { mode: "ids", ids: idList(5001) }],
-    ["extra key in ids mode", { mode: "ids", ids: [docId(1)], filter: {} }],
+    ["empty ids", { mode: "ids", ids: [], expectState: "never" }], ["ids not an array", { mode: "ids", ids: docId(1), expectState: "never" }], ["non-uuid id", { mode: "ids", ids: ["nope"], expectState: "never" }],
+    ["number id", { mode: "ids", ids: [1], expectState: "never" }], ["5,001 distinct", { mode: "ids", ids: idList(5001), expectState: "never" }],
+    ["extra key in ids mode", { mode: "ids", ids: [docId(1)], expectState: "never", filter: {} }],
+    // H1: required, not defaulted; only the two tab states or null.
+    ["ids without expectState", { mode: "ids", ids: [docId(1)] }], ["expectState all", { mode: "ids", ids: [docId(1)], expectState: "all" }],
+    ["expectState marked", { mode: "ids", ids: [docId(1)], expectState: "marked" }], ["expectState not a string", { mode: "ids", ids: [docId(1)], expectState: 1 }],
+    ["expectState in filter mode", { mode: "filter", filter: {}, expectedTotal: 1, expectState: "never" }],
     ["missing expectedTotal", { mode: "filter", filter: {} }], ["string expectedTotal", { mode: "filter", filter: {}, expectedTotal: "3" }],
     ["fractional expectedTotal", { mode: "filter", filter: {}, expectedTotal: 1.5 }], ["negative expectedTotal", { mode: "filter", filter: {}, expectedTotal: -1 }],
     ["expectedTotal above maxRows", { mode: "filter", filter: {}, expectedTotal: 50_001 }], ["missing filter", { mode: "filter", expectedTotal: 1 }],
@@ -623,15 +643,15 @@ test("parseSelectionBody: ids are 1..5,000 distinct UUIDs, filter mode needs exp
 });
 
 test("parseExportBody and parseMarksBody: defaults, strict keys, and the GET's own error for a bad column set", () => {
-  const ids = { mode: "ids", ids: [docId(1)] };
-  assert.deepEqual(parseExportBody({ selection: ids }, 50_000), { columns: "compact", headers: "th", selection: { mode: "ids", ids: [docId(1)] } });
+  const ids = { mode: "ids", ids: [docId(1)], expectState: "never" };
+  assert.deepEqual(parseExportBody({ selection: ids }, 50_000), { columns: "compact", headers: "th", selection: { mode: "ids", ids: [docId(1)], expectState: "never" } });
   assert.deepEqual(parseExportBody({ columns: "detailed", headers: "en", selection: ids }, 50_000).columns, "detailed");
   assert.throws(() => parseExportBody({ columns: "all", selection: ids }, 50_000), { message: "INVALID_EXPORT_FILTER" });
   assert.throws(() => parseExportBody({ headers: "de", selection: ids }, 50_000), { message: "INVALID_EXPORT_FILTER" });
   for (const value of [{ columns: 1, selection: ids }, { selection: ids, format: "csv" }, {}, { selection: null }, []]) {
     assert.throws(() => parseExportBody(value, 50_000), { message: "INVALID_EXPORT_SELECTION" }, JSON.stringify(value));
   }
-  assert.deepEqual(parseMarksBody({ action: "unmark", selection: ids }, 50_000), { action: "unmark", selection: { mode: "ids", ids: [docId(1)] } });
+  assert.deepEqual(parseMarksBody({ action: "unmark", selection: ids }, 50_000), { action: "unmark", selection: { mode: "ids", ids: [docId(1)], expectState: "never" } });
   for (const value of [{ action: "delete", selection: ids }, { selection: ids }, { action: "mark" }, { action: "mark", selection: ids, extra: true }]) {
     assert.throws(() => parseMarksBody(value, 50_000), { message: "INVALID_EXPORT_SELECTION" }, JSON.stringify(value));
   }
@@ -665,7 +685,7 @@ test("an explicit selection exports exactly those ids and marks every streamed r
     const MARKED_ROWS = /export_marked_rows_total\{kind="exported"\} (\d+)/;
     const before = [await counter(base, MARKS), await counter(base, MARKED_ROWS)];
     const response = await post(base, "/api/exports/documents.csv",
-      { columns: "compact", headers: "th", selection: { mode: "ids", ids: [docId(1).toUpperCase(), docId(2), docId(3), docId(2)] } });
+      { columns: "compact", headers: "th", selection: { mode: "ids", ids: [docId(1).toUpperCase(), docId(2), docId(3), docId(2)], expectState: "never" } });
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("x-export-selection"), "ids");
     assert.equal(response.headers.get("x-export-rows"), "3");
@@ -675,6 +695,7 @@ test("an explicit selection exports exactly those ids and marks every streamed r
     // D6: the ticked rows and nothing else; tenant and visibility are the store's.
     assert.deepEqual(instance.store.filters, [{ ids: [docId(1), docId(2), docId(3)] }]);
     assert.deepEqual(instance.store.expectedTotals, [undefined]);
+    assert.deepEqual(instance.store.expectStates, ["never"], "H1: the tab the rows were ticked in reaches the snapshot check");
     assert.equal(instance.store.marks.length, 1, "one recordExportMarks call per download");
     const marks = instance.store.marks[0]!;
     assert.deepEqual([marks.kind, marks.source, marks.actorUserId], ["exported", "csv", userId]);
@@ -702,6 +723,7 @@ test("select all N: the filter and N reach the store, JSONL marks with source js
     assert.equal((await bodyText(response)).split("\n").filter(Boolean).length, 2);
     assert.deepEqual(instance.store.filters, [{ status: ["review"], q: "สมชาย", exportState: "never" }]);
     assert.deepEqual(instance.store.expectedTotals, [2]);
+    assert.deepEqual(instance.store.expectStates, [undefined], "a filter selection is pinned by expectedTotal instead");
     assert.deepEqual([instance.store.marks[0]?.source, instance.store.marks[0]?.rows.length], ["jsonl", 2]);
     const completed = instance.audits.find((event) => event.action === "export.completed")!;
     assert.deepEqual([completed.detail?.selection, completed.detail?.requested, completed.detail?.export_state, completed.detail?.has_q],
@@ -722,7 +744,7 @@ test("a moved count is 409 EXPORT_SELECTION_CHANGED and a vanished selection 400
   });
   const empty = app(fakeStore([], { total: 0 }));
   await withServer(empty, async (base) => {
-    const response = await post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: [docId(9)] } });
+    const response = await post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: [docId(9)], expectState: "never" } });
     assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), { error: "EXPORT_SELECTION_EMPTY" });
     assert.deepEqual([empty.store.marks.length, started(empty).length], [0, 0]);
@@ -730,7 +752,7 @@ test("a moved count is 409 EXPORT_SELECTION_CHANGED and a vanished selection 400
 });
 
 test("no marks unless the stream completed: a dead stream, a truncated cursor, a failed open and a client that left", async () => {
-  const selection = { selection: { mode: "ids", ids: idList(10) } };
+  const selection = { selection: { mode: "ids", ids: idList(10), expectState: "never" } };
   for (const [name, options] of [["stream died", { failAfter: 3 }], ["cursor ended early", { stopAfter: 4 }]] as const) {
     const instance = app(fakeStore(distinctDocuments(10), { pageSize: 1, ...options }));
     await withServer(instance, async (base) => {
@@ -751,7 +773,7 @@ test("no marks unless the stream completed: a dead stream, a truncated cursor, a
   const walked = app(fakeStore(distinctDocuments(4), { pageSize: 1, gate, gateBeforePage: 1 }));
   await withServer(walked, async (base) => {
     const controller = new AbortController();
-    const response = await fetch(`${base}/api/exports/documents.csv`, { method: "POST", headers: POST_HEADERS, body: JSON.stringify({ selection: { mode: "ids", ids: idList(4) } }), signal: controller.signal });
+    const response = await fetch(`${base}/api/exports/documents.csv`, { method: "POST", headers: POST_HEADERS, body: JSON.stringify({ selection: { mode: "ids", ids: idList(4), expectState: "never" } }), signal: controller.signal });
     await response.body!.getReader().read();
     controller.abort();
     await tick();
@@ -767,7 +789,7 @@ test("a mark that cannot be saved fails the whole download: the socket is cut, e
   await withServer(instance, async (base) => {
     const ERRORS = /export_marks_total\{kind="exported",result="error"\} (\d+)/;
     const before = await counter(base, ERRORS);
-    await assert.rejects(post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: idList(3) } }).then((response) => response.arrayBuffer()),
+    await assert.rejects(post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: idList(3), expectState: "never" } }).then((response) => response.arrayBuffer()),
       "D4 strict: the browser's blob() rejects, so no unmarked file is ever saved");
     const failed = instance.audits.find((event) => event.action === "export.failed")!;
     assert.deepEqual([failed.detail?.error, failed.detail?.complete, failed.detail?.rows], ["EXPORT_MARK_FAILED", false, 3]);
@@ -782,8 +804,9 @@ test("the wall clock ends a stalled POST download without marking anything", asy
   const store = fakeStore(distinctDocuments(1), { total: 200_000, pageSize: 500 });
   const audits: Omit<AuditEvent, "tenantId">[] = [];
   const gate = new ExportGate();
+  const tenantGate = new ExportGate(1);
   const deps: ExportRouteDeps = {
-    store, users: fakeUsers(audits), gate, previewLimit: new SlidingWindow(PREVIEW_LIMIT, PREVIEW_WINDOW_MS),
+    store, users: fakeUsers(audits), gate, tenantGate, previewLimit: new SlidingWindow(PREVIEW_LIMIT, PREVIEW_WINDOW_MS),
     listLimit: new SlidingWindow(EXPORT_LIST_LIMIT, PREVIEW_WINDOW_MS), markLimit: new SlidingWindow(EXPORT_MARK_LIMIT, PREVIEW_WINDOW_MS),
     maxRows: 500_000, publicBaseUrl: "https://ocr.example.test", traceId: "00000000-0000-4000-8000-0000000000ff", now: Date.now, wallClockMs: 60
   };
@@ -802,8 +825,10 @@ test("the wall clock ends a stalled POST download without marking anything", asy
     client.write(`POST /api/exports/documents.csv HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
     for (let waited = 0; waited < 200 && gate.size === 0; waited += 1) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(gate.size, 1);
+    assert.equal(tenantGate.size, 1, "a marking download also holds its organization's slot");
     for (let waited = 0; waited < 300 && gate.size > 0; waited += 1) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(gate.size, 0, "the slot came back");
+    assert.equal(tenantGate.size, 0, "and so did the organization's");
     await tick();
     assert.equal(store.closedAtMark.length, 0, "timed out: nothing marked");
     assert.equal(audits.find((event) => event.action === "export.failed")?.detail?.error, "EXPORT_TIMEOUT");
@@ -831,7 +856,7 @@ test("the GET download never marks, and shares the one-download-per-user gate wi
   await withServer(busy, async (base) => {
     const first = fetch(`${base}/api/exports/documents.csv`).then((response) => response.text());
     await tick();
-    const second = await post(base, "/api/exports/documents.jsonl", { selection: { mode: "ids", ids: [docId(1)] } });
+    const second = await post(base, "/api/exports/documents.jsonl", { selection: { mode: "ids", ids: [docId(1)], expectState: "never" } });
     assert.equal(second.status, 429);
     assert.deepEqual(await second.json(), { error: "EXPORT_BUSY" });
     assert.equal(second.headers.get("retry-after"), "30");
@@ -843,10 +868,10 @@ test("the GET download never marks, and shares the one-download-per-user gate wi
 test("a bad POST body is refused before the gate or the store: 400, 415 and 413", async () => {
   const instance = app(fakeStore(distinctDocuments(1)));
   await withServer(instance, async (base) => {
-    const ids = { mode: "ids", ids: [docId(1)] };
+    const ids = { mode: "ids", ids: [docId(1)], expectState: "never" };
     // [download body, marks body, status, download code, marks code]
     const cases: [unknown, unknown, Record<string, string>, number, string, string][] = [
-      [{ selection: { mode: "ids", ids: [] } }, { action: "mark", selection: { mode: "ids", ids: [] } }, {}, 400, "INVALID_EXPORT_SELECTION", "INVALID_EXPORT_SELECTION"],
+      [{ selection: { mode: "ids", ids: [], expectState: "never" } }, { action: "mark", selection: { mode: "ids", ids: [], expectState: "never" } }, {}, 400, "INVALID_EXPORT_SELECTION", "INVALID_EXPORT_SELECTION"],
       [{ selection: { mode: "filter", filter: {} } }, { action: "mark", selection: { mode: "filter", filter: {} } }, {}, 400, "INVALID_EXPORT_SELECTION", "INVALID_EXPORT_SELECTION"],
       [{ selection: { mode: "filter", filter: { status: ["nope"] }, expectedTotal: 1 } }, { action: "mark", selection: { mode: "filter", filter: { status: ["nope"] }, expectedTotal: 1 } },
         {}, 400, "INVALID_EXPORT_FILTER", "INVALID_EXPORT_FILTER"],
@@ -922,11 +947,12 @@ test("marks: mark and unmark reach the store as one call, answer C3, and are aud
     const OK = /export_marks_total\{kind="marked",result="ok"\} (\d+)/;
     const ROWS = /export_marked_rows_total\{kind="marked"\} (\d+)/;
     const before = [await counter(base, OK), await counter(base, ROWS)];
-    const marked = await post(base, "/api/exports/marks", { action: "mark", selection: { mode: "ids", ids: [docId(1), docId(2), docId(3), docId(3)] } });
+    const marked = await post(base, "/api/exports/marks", { action: "mark", selection: { mode: "ids", ids: [docId(1), docId(2), docId(3), docId(3)], expectState: "never" } });
     assert.equal(marked.status, 200);
     assert.deepEqual(await marked.json(), { action: "mark", affected: 2, skipped: 1, total: 3 });
     const call = instance.store.stateCalls[0]!;
-    assert.deepEqual([call.action, call.filter, call.expectedTotal, call.maxRows, call.actorUserId], ["mark", { ids: [docId(1), docId(2), docId(3)] }, undefined, 7_000, userId]);
+    assert.deepEqual([call.action, call.filter, call.expectedTotal, call.expectState, call.maxRows, call.actorUserId],
+      ["mark", { ids: [docId(1), docId(2), docId(3)] }, undefined, "never", 7_000, userId]);
     assert.match(call.requestId, /^[0-9a-f-]{36}$/);
     const audit = instance.audits.find((event) => event.action === "export.marked")!;
     assert.deepEqual([audit.outcome, audit.targetType, audit.requestId], ["success", "export", call.requestId]);
@@ -936,7 +962,8 @@ test("marks: mark and unmark reach the store as one call, answer C3, and are aud
     const unmarked = await post(base, "/api/exports/marks", { action: "unmark", selection: { mode: "filter", filter: { exportState: "exported" }, expectedTotal: 3 } });
     assert.equal(unmarked.status, 200);
     assert.deepEqual(await unmarked.json(), { action: "unmark", affected: 2, skipped: 1, total: 3 });
-    assert.deepEqual([instance.store.stateCalls[1]!.filter, instance.store.stateCalls[1]!.expectedTotal], [{ exportState: "exported" }, 3]);
+    assert.deepEqual([instance.store.stateCalls[1]!.filter, instance.store.stateCalls[1]!.expectedTotal, instance.store.stateCalls[1]!.expectState],
+      [{ exportState: "exported" }, 3, undefined]);
     assert.deepEqual(instance.audits.find((event) => event.action === "export.unmarked")?.detail, { selection: "filter", requested: 3, total: 3, affected: 2, skipped: 1 });
     assert.equal(instance.audits.length, 2, "no export.started or file audit rows for a manual flip");
   });
@@ -955,7 +982,7 @@ test("marks: a refused flip is its status code with no audit row, and a failed a
   }
   const unaudited = app(fakeStore([], { markResult: { total: 1, affected: 1, skipped: 0 } }), { failAudit: "export.unmarked" });
   await withServer(unaudited, async (base) => {
-    const response = await post(base, "/api/exports/marks", { action: "unmark", selection: { mode: "ids", ids: [docId(1)] } });
+    const response = await post(base, "/api/exports/marks", { action: "unmark", selection: { mode: "ids", ids: [docId(1)], expectState: "never" } });
     assert.equal(response.status, 200, "the event rows are the durable record; the audit failure is only logged");
     assert.deepEqual(await response.json(), { action: "unmark", affected: 1, skipped: 0, total: 1 });
   });
@@ -964,7 +991,7 @@ test("marks: a refused flip is its status code with no audit row, and a failed a
 test("marks: 60 a quarter of an hour per user, then 429 EXPORT_THROTTLED; GET on the route is not served", async () => {
   const instance = app(fakeStore([], { markResult: { total: 1, affected: 0, skipped: 1 } }));
   await withServer(instance, async (base) => {
-    const body = { action: "mark", selection: { mode: "ids", ids: [docId(1)] } };
+    const body = { action: "mark", selection: { mode: "ids", ids: [docId(1)], expectState: "never" } };
     for (let call = 0; call < EXPORT_MARK_LIMIT; call += 1) assert.equal((await post(base, "/api/exports/marks", body)).status, 200, `call ${call}`);
     const throttled = await post(base, "/api/exports/marks", body);
     assert.equal(throttled.status, 429);
@@ -979,20 +1006,189 @@ test("the new export routes need a session and the export right, and a refusal i
   const anonymous = app(fakeStore([]), { ctx: null });
   await withServer(anonymous, async (base) => {
     assert.equal((await fetch(`${base}/api/exports/candidates`)).status, 401);
-    assert.equal((await post(base, "/api/exports/marks", { action: "mark", selection: { mode: "ids", ids: [docId(1)] } })).status, 401);
-    assert.equal((await post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: [docId(1)] } })).status, 401);
+    assert.equal((await post(base, "/api/exports/marks", { action: "mark", selection: { mode: "ids", ids: [docId(1)], expectState: "never" } })).status, 401);
+    assert.equal((await post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: [docId(1)], expectState: "never" } })).status, 401);
   });
   const staff = app(fakeStore(distinctDocuments(1)), { ctx: context({ role: "staff", canExport: false }) });
   await withServer(staff, async (base) => {
     const before = [await counter(base, /exports_total\{format="candidates",result="forbidden"\} (\d+)/), await counter(base, /exports_total\{format="marks",result="forbidden"\} (\d+)/)];
     for (const response of [await fetch(`${base}/api/exports/candidates`),
-      await post(base, "/api/exports/marks", { action: "mark", selection: { mode: "ids", ids: [docId(1)] } }),
-      await post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: [docId(1)] } })]) {
+      await post(base, "/api/exports/marks", { action: "mark", selection: { mode: "ids", ids: [docId(1)], expectState: "never" } }),
+      await post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: [docId(1)], expectState: "never" } })]) {
       assert.equal(response.status, 403);
       assert.deepEqual(await response.json(), { error: "FORBIDDEN" });
     }
     assert.deepEqual([staff.store.listCalls.length, staff.store.stateCalls.length, staff.store.opened], [0, 0, 0]);
     assert.deepEqual([await counter(base, /exports_total\{format="candidates",result="forbidden"\} (\d+)/) - before[0]!,
       await counter(base, /exports_total\{format="marks",result="forbidden"\} (\d+)/) - before[1]!], [1, 1]);
+  });
+});
+
+// ---- review of 0021 (Phase 4 step 39): H1 expected state + organization gate, M1 bounded marks ---------------------
+
+/**
+ * The routes on a bare server with deps the case can see (both gates, the audit rows), for the paths where a slot must
+ * be proven to come back: a mark failure, a mark timeout, an abort, a client leaving during the marks.
+ */
+async function directServer(store: FakeStore, run: (base: string, seen: { gate: ExportGate; tenantGate: ExportGate; audits: Omit<AuditEvent, "tenantId">[] }) => Promise<void>): Promise<void> {
+  const audits: Omit<AuditEvent, "tenantId">[] = [];
+  const gate = new ExportGate();
+  const tenantGate = new ExportGate(1);
+  const deps: ExportRouteDeps = {
+    store, users: fakeUsers(audits), gate, tenantGate, previewLimit: new SlidingWindow(PREVIEW_LIMIT, PREVIEW_WINDOW_MS),
+    listLimit: new SlidingWindow(EXPORT_LIST_LIMIT, PREVIEW_WINDOW_MS), markLimit: new SlidingWindow(EXPORT_MARK_LIMIT, PREVIEW_WINDOW_MS),
+    maxRows: 50_000, publicBaseUrl: "https://ocr.example.test", traceId: "00000000-0000-4000-8000-0000000000fe", now: Date.now
+  };
+  const server = createServer((request, response) => {
+    void handleExportRoutes(request, response, new URL(request.url ?? "/", "http://127.0.0.1"), request.method ?? "GET", context(), deps)
+      .catch((error: unknown) => {
+        // What server.ts does: a refusal before the headers is a JSON code, a failure after them a destroyed socket.
+        if (response.headersSent) { response.destroy(); return; }
+        response.writeHead(500, { "content-type": "application/json" }).end(JSON.stringify({ error: error instanceof Error ? error.message : "?" }));
+      });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  try { await run(`http://127.0.0.1:${port}`, { gate, tenantGate, audits }); }
+  finally { await new Promise<void>((resolve) => { server.closeAllConnections(); server.close(() => resolve()); }); }
+}
+const postBody = (body: unknown): RequestInit => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+const waitFor = async (done: () => boolean): Promise<void> => {
+  for (let waited = 0; waited < 300 && !done(); waited += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+};
+
+test("H1: an explicit selection whose rows moved tab or vanished is 409 before any byte or mark, and frees both slots", async () => {
+  const instance = app(fakeStore(distinctDocuments(2), { openError: "EXPORT_SELECTION_CHANGED" }));
+  await withServer(instance, async (base) => {
+    for (const expectState of ["never", "exported", null]) {
+      const response = await post(base, "/api/exports/documents.csv", { selection: { mode: "ids", ids: idList(2), expectState } });
+      assert.equal(response.status, 409, String(expectState));
+      assert.deepEqual(await response.json(), { error: "EXPORT_SELECTION_CHANGED" });
+      assert.equal(response.headers.get("content-type"), "application/json; charset=utf-8", "no file headers were written");
+    }
+    assert.deepEqual(instance.store.expectStates, ["never", "exported", null], "the tab state reaches the snapshot check as sent");
+    assert.deepEqual([instance.store.marks.length, started(instance).length], [0, 0]);
+    // Three refusals in a row from one user, and each one answered 409, not 429: the slots came back every time.
+  });
+});
+
+test("H1: one marking download per organization; the second person gets 429 EXPORT_BUSY_ORG, GET and other organizations do not", async () => {
+  const gate = deferred();
+  const otherTenant = "00000000-0000-0000-0000-000000000002";
+  const instance = app(fakeStore(distinctDocuments(2), { pageSize: 1, gate, gateBeforePage: 1 }), {
+    ctxFor: (request) => {
+      const who = request.headers["x-test-user"];
+      if (who === "b") return context({ userId: otherUserId, sessionId: "00000000-0000-4000-8000-0000000000bb" });
+      if (who === "c") return context({ userId: "00000000-0000-4000-8000-000000000003", tenantId: otherTenant, sessionId: "00000000-0000-4000-8000-0000000000cc" });
+      return context();
+    }
+  });
+  await withServer(instance, async (base) => {
+    const BUSY = /exports_total\{format="csv",result="busy"\} (\d+)/;
+    const before = await counter(base, BUSY);
+    const selection = { selection: { mode: "ids", ids: idList(2), expectState: "never" } };
+    const first = post(base, "/api/exports/documents.csv", selection).then((response) => bodyText(response));
+    // Whatever happens below, the parked streams are let go, so a regression is a failure and never a hang.
+    try {
+      await tick();
+      const second = await post(base, "/api/exports/documents.csv", selection, { "x-test-user": "b" });
+      assert.equal(second.status, 429);
+      assert.deepEqual(await second.json(), { error: "EXPORT_BUSY_ORG" });
+      assert.equal(second.headers.get("retry-after"), "30");
+      assert.equal(await counter(base, BUSY) - before, 1, "counted as busy");
+      const filterMode = await post(base, "/api/exports/documents.csv", { selection: { mode: "filter", filter: { exportState: "never" }, expectedTotal: 2 } }, { "x-test-user": "b" });
+      assert.equal(filterMode.status, 429, "select all N of the same tab waits too: its snapshot must see the first one's marks");
+      assert.deepEqual(await filterMode.json(), { error: "EXPORT_BUSY_ORG" });
+      // The Release 2 GET never marks, so it keeps only the per-user gate; another organization has its own slot.
+      const plain = fetch(`${base}/api/exports/documents.csv`, { headers: { "x-test-user": "b" } });
+      const elsewhere = post(base, "/api/exports/documents.csv", selection, { "x-test-user": "c" });
+      assert.deepEqual([(await plain).status, (await elsewhere).status], [200, 200]);
+      assert.equal(instance.store.opened, 3, "the refused one never opened a snapshot");
+    } finally { gate.resolve(); }
+    await first;
+    await tick();
+    const after = await post(base, "/api/exports/documents.csv", selection, { "x-test-user": "b" });
+    assert.equal(after.status, 200, "the organization's slot came back once the first download's marks were written");
+    await bodyText(after);
+  });
+});
+
+test("H1: a busy organization never charges the user's own slot", async () => {
+  await directServer(fakeStore(distinctDocuments(1)), async (base, seen) => {
+    assert.ok(seen.tenantGate.acquire(tenant), "someone else in this organization is exporting");
+    const response = await fetch(`${base}/api/exports/documents.csv`, postBody({ selection: { mode: "ids", ids: idList(1), expectState: "never" } }));
+    assert.deepEqual(await response.json(), { error: "EXPORT_BUSY_ORG" });
+    await tick();
+    assert.equal(seen.gate.size, 0, "the per-user slot taken before the refusal was given back");
+  });
+});
+
+test("M1: a mark write that fails or runs out of time cuts the socket and gives back both slots and the cursor", async () => {
+  for (const markError of ["insert into document_export_marks failed", "canceling statement due to lock timeout", "canceling statement due to statement timeout"]) {
+    const store = fakeStore(distinctDocuments(3), { markError });
+    await directServer(store, async (base, seen) => {
+      await assert.rejects(fetch(`${base}/api/exports/documents.csv`, postBody({ selection: { mode: "ids", ids: idList(3), expectState: "never" } }))
+        .then((response) => response.arrayBuffer()), markError);
+      await waitFor(() => seen.audits.some((event) => event.action === "export.failed"));
+      const failed = seen.audits.find((event) => event.action === "export.failed")!;
+      assert.deepEqual([failed.detail?.error, failed.detail?.marked, failed.detail?.complete], ["EXPORT_MARK_FAILED", 0, false], markError);
+      assert.deepEqual([seen.gate.size, seen.tenantGate.size, store.closed], [0, 0, 1], `${markError}: nothing is held afterwards`);
+      assert.ok(!seen.audits.some((event) => event.action === "export.completed"));
+    });
+  }
+});
+
+test("M1: a manual flip that runs out of time is 503 EXPORT_MARK_FAILED with no audit row; a refusal keeps its own code", async () => {
+  for (const stateError of ["canceling statement due to lock timeout", "canceling statement due to statement timeout", "connection terminated unexpectedly"]) {
+    const instance = app(fakeStore([], { stateError }));
+    await withServer(instance, async (base) => {
+      const ERRORS = /export_marks_total\{kind="unmarked",result="error"\} (\d+)/;
+      const before = await counter(base, ERRORS);
+      const response = await post(base, "/api/exports/marks", { action: "unmark", selection: { mode: "ids", ids: [docId(1)], expectState: "exported" } });
+      assert.equal(response.status, 503, stateError);
+      assert.deepEqual(await response.json(), { error: "EXPORT_MARK_FAILED" }, "the pg message never reaches the browser");
+      assert.equal(instance.audits.length, 0, "rolled back, so nothing to audit");
+      assert.equal(await counter(base, ERRORS) - before, 1);
+    });
+  }
+});
+
+test("an aborted POST download gives back both slots and the cursor, and marks nothing", async () => {
+  const gate = deferred();
+  const store = fakeStore(distinctDocuments(4), { pageSize: 1, gate, gateBeforePage: 1 });
+  await directServer(store, async (base, seen) => {
+    const controller = new AbortController();
+    const response = await fetch(`${base}/api/exports/documents.csv`, { ...postBody({ selection: { mode: "ids", ids: idList(4), expectState: "never" } }), signal: controller.signal });
+    await response.body!.getReader().read();
+    assert.deepEqual([seen.gate.size, seen.tenantGate.size], [1, 1], "both slots are held while the file streams");
+    controller.abort();
+    await tick();
+    gate.resolve();
+    await waitFor(() => seen.gate.size === 0 && seen.tenantGate.size === 0);
+    assert.deepEqual([seen.gate.size, seen.tenantGate.size, store.closed, store.closedAtMark.length], [0, 0, 1, 0]);
+    assert.equal(seen.audits.find((event) => event.action === "export.failed")?.detail?.error, "EXPORT_ABORTED");
+  });
+});
+
+test("a client that leaves WHILE the marks are written: the marks stand, export.failed EXPORT_ABORTED says how many, no completed row", async () => {
+  const markGate = deferred();
+  const store = fakeStore(distinctDocuments(3), { markGate });
+  await directServer(store, async (base, seen) => {
+    const controller = new AbortController();
+    const response = await fetch(`${base}/api/exports/documents.csv`, { ...postBody({ selection: { mode: "ids", ids: idList(3), expectState: "never" } }), signal: controller.signal });
+    assert.equal(response.status, 200);
+    await waitFor(() => store.closedAtMark.length === 1);
+    assert.equal(store.closedAtMark.length, 1, "the stream is complete and the marks are being written");
+    controller.abort();
+    await tick();
+    markGate.resolve();
+    await waitFor(() => seen.audits.some((event) => event.action === "export.failed"));
+    assert.equal(store.marks.length, 1, "the marks committed before the browser's departure was noticed (D4's residual window)");
+    const failed = seen.audits.find((event) => event.action === "export.failed")!;
+    assert.deepEqual([failed.detail?.error, failed.detail?.marked, failed.detail?.rows, failed.detail?.complete], ["EXPORT_ABORTED", 3, 3, false],
+      "the operator can find the request whose rows need ย้ายกลับ");
+    assert.ok(!seen.audits.some((event) => event.action === "export.completed"), "no file was saved, so no completed export");
+    assert.deepEqual([seen.gate.size, seen.tenantGate.size, store.closed], [0, 0, 1]);
   });
 });

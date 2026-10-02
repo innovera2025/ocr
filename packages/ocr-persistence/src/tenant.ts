@@ -5,9 +5,13 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function isUuid(value: unknown): value is string { return typeof value === "string" && UUID.test(value); }
 
 export type TenantIsolation = "READ COMMITTED" | "REPEATABLE READ" | "SERIALIZABLE";
-/** `statementTimeoutMs` / `idleInTransactionTimeoutMs` are transaction-local (`SET LOCAL`), so a pooled connection keeps nothing. */
+/**
+ * `statementTimeoutMs` / `idleInTransactionTimeoutMs` / `lockTimeoutMs` are transaction-local (`SET LOCAL`), so a pooled
+ * connection keeps nothing. `lockTimeoutMs` bounds how long one statement may WAIT for a row or table lock (pg 55P03 when
+ * it runs out), independently of how long it may run.
+ */
 export type TenantTransactionOptions = Readonly<{ readOnly?: boolean | undefined; isolation?: TenantIsolation | undefined;
-  statementTimeoutMs?: number | undefined; idleInTransactionTimeoutMs?: number | undefined }>;
+  statementTimeoutMs?: number | undefined; idleInTransactionTimeoutMs?: number | undefined; lockTimeoutMs?: number | undefined }>;
 
 const ISOLATION: ReadonlySet<string> = new Set(["READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"]);
 /** An hour is longer than any request this process serves; beyond it a caller passed seconds, a float or a string. */
@@ -33,6 +37,7 @@ export async function withTenant<T>(pool: Pool, tenantId: string, work: (client:
   if (isolation !== undefined && !ISOLATION.has(isolation)) throw new Error("TENANT_ISOLATION_INVALID");
   const statementTimeout = timeoutValue(options.statementTimeoutMs);
   const idleTimeout = timeoutValue(options.idleInTransactionTimeoutMs);
+  const lockTimeout = timeoutValue(options.lockTimeoutMs);
   const begin = `BEGIN${isolation ? ` ISOLATION LEVEL ${isolation}` : ""}${readOnly ? " READ ONLY" : ""}`;
   const client = await pool.connect();
   // pg-pool emits 'error' on the POOL only for clients sitting idle in it; a checked-out client has no listener at all
@@ -47,6 +52,7 @@ export async function withTenant<T>(pool: Pool, tenantId: string, work: (client:
     await client.query("SELECT set_config('app.current_org', $1, true)", [tenantId]);
     if (statementTimeout) await client.query("SELECT set_config('statement_timeout', $1, true)", [statementTimeout]);
     if (idleTimeout) await client.query("SELECT set_config('idle_in_transaction_session_timeout', $1, true)", [idleTimeout]);
+    if (lockTimeout) await client.query("SELECT set_config('lock_timeout', $1, true)", [lockTimeout]);
     const result = await work(client);
     await client.query("COMMIT");
     return result;

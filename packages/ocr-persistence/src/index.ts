@@ -129,7 +129,14 @@ export type ListDocumentsQuery = DocumentFilter & { limit?: number | undefined; 
 /** `maxRows` is `OCR_EXPORT_MAX_ROWS`: above it the export is refused with EXPORT_TOO_LARGE before anything is read. */
 /** `now` is the wall clock behind `EXPORT_MAX_DURATION_MS`; only the tests pass it. */
 /** `expectedTotal`: the row count the user saw ("select all N matching"); a different count is EXPORT_SELECTION_CHANGED. */
-export type OpenExportOptions = { maxRows: number; batchSize?: number | undefined; now?: (() => number) | undefined; expectedTotal?: number | undefined };
+/**
+ * `expectState`: only with an explicit selection (`filter.ids`). The tab the rows were ticked in (`never` /
+ * `exported`, or null for "ทั้งหมด"): every ticked id must still be a visible row of this tenant AND, unless null, still
+ * be in that state, in the export's own snapshot, or the export is EXPORT_SELECTION_CHANGED before a single byte.
+ * Undefined means no such guard (the Release 2 GET, and "select all N", which `expectedTotal` already pins).
+ */
+export type OpenExportOptions = { maxRows: number; batchSize?: number | undefined; now?: (() => number) | undefined; expectedTotal?: number | undefined;
+  expectState?: ExportState | null | undefined };
 /**
  * A streaming export in progress. `total` is the exact row count of the snapshot the rows come from (the audit row and
  * the `X-Export-Rows` header quote it). `rows()` may be consumed once; `close()` is idempotent and releases the
@@ -397,6 +404,17 @@ const BATCH_IDLE_AFTER_MS = 5 * 60_000;
  * FETCHes while the socket drains, after which PostgreSQL terminates the backend rather than pin a connection forever. */
 const EXPORT_STATEMENT_TIMEOUT_MS = 60_000;
 const EXPORT_IDLE_TIMEOUT_MS = 120_000;
+/**
+ * M1 (review of 0021): the bounds of the two WRITING export-history transactions (`recordExportMarks`, which runs while
+ * the download's response is still open and its gate slots are held, and `markExportState`). Their inserts take a
+ * FOR KEY SHARE lock on each referenced `documents` row (the composite FK), which waits behind a reviewer's
+ * `saveReview` FOR UPDATE. One statement may wait at most 5 s for a lock (pg 55P03) and run at most 30 s (57014); the
+ * whole transaction rolls back, the connection goes back to the pool, and the route reports EXPORT_MARK_FAILED (a
+ * download is then cut, strict D4). A 1,000-row chunk takes milliseconds (Phase 4 load check: 20,000 manual flips in
+ * 1.4 s), so both are generous for the work and short for a user waiting on a stuck lock.
+ */
+export const EXPORT_MARK_LOCK_TIMEOUT_MS = 5_000;
+export const EXPORT_MARK_STATEMENT_TIMEOUT_MS = 30_000;
 const EXPORT_FETCH_SIZE = 500;
 /**
  * The whole download's budget. Every successful `FETCH` resets both PostgreSQL timeouts, so a reader that accepts one
@@ -528,6 +546,35 @@ function expectedTotalOf(value: unknown): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error("INVALID_EXPORT_SELECTION");
   return value;
+}
+/**
+ * The expected-state guard of an explicit selection: `never` / `exported` / null ("ทั้งหมด"), or undefined for no guard.
+ * It belongs to `ids` only (a filter selection is pinned by `expectedTotal`); anything else is INVALID_EXPORT_SELECTION.
+ */
+function expectStateOf(value: unknown, filter: DocumentFilter): ExportState | null | undefined {
+  if (value === undefined) return undefined;
+  if (filter.ids === undefined || (value !== null && value !== "never" && value !== "exported")) throw new Error("INVALID_EXPORT_SELECTION");
+  return value;
+}
+/**
+ * The count of a selection, and with an expected state also how many of those rows are in it. Both come from ONE
+ * statement, so they read the same snapshot as whatever follows in that transaction (the cursor, or the insert).
+ */
+function selectionCountSql(condition: string, expectState: ExportState | null | undefined): string {
+  const inState = expectState === undefined || expectState === null ? "" : `, count(*) FILTER (WHERE ${EXPORT_STATE_PREDICATE[expectState]})::int AS in_state`;
+  return `SELECT count(*)::int AS total${inState} FROM documents d WHERE ${condition}`;
+}
+/**
+ * H1 (review of 0021): an explicit selection is exact. Every ticked id (de-duplicated) must still be a visible row and,
+ * unless the tab was "ทั้งหมด", still be in the state of the tab it was ticked in; otherwise the selection no longer
+ * describes the rows on screen (another person exported or marked them meanwhile) and nothing may be exported or
+ * written. Called after EXPORT_SELECTION_EMPTY, so a selection that vanished entirely keeps its own code.
+ */
+function assertExpectedState(filter: DocumentFilter, expectState: ExportState | null | undefined, total: number, inState: unknown): void {
+  if (expectState === undefined) return;
+  const requested = selectionIds(filter.ids).length;
+  if (total !== requested) throw new Error("EXPORT_SELECTION_CHANGED");
+  if (expectState !== null && num(inState) !== total) throw new Error("EXPORT_SELECTION_CHANGED");
 }
 
 function isRow(value: unknown): value is Row { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -1074,6 +1121,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     if (!Number.isFinite(options.maxRows) || options.maxRows < 1) throw new Error("EXPORT_MAX_ROWS_INVALID");
     const maxRows = Math.trunc(options.maxRows);
     const expectedTotal = expectedTotalOf(options.expectedTotal);
+    const expectState = expectStateOf(options.expectState, filter);
     const batchSize = clampInt(options.batchSize, EXPORT_FETCH_SIZE, 1, EXPORT_FETCH_SIZE);
     const deadline = (options.now ?? Date.now)() + EXPORT_MAX_DURATION_MS;
     const params: unknown[] = [];
@@ -1112,13 +1160,15 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       await client.query("SELECT set_config('app.current_org', $1, true)", [tenantId]);
       await client.query("SELECT set_config('statement_timeout', $1, true)", [String(EXPORT_STATEMENT_TIMEOUT_MS)]);
       await client.query("SELECT set_config('idle_in_transaction_session_timeout', $1, true)", [String(EXPORT_IDLE_TIMEOUT_MS)]);
-      const count = await client.query<{ total: number }>(`SELECT count(*)::int AS total FROM documents d WHERE ${condition}`, params);
+      const count = await client.query<{ total: number; in_state?: number }>(selectionCountSql(condition, expectState), params);
       const total = count.rows[0]?.total ?? 0;
       if (total > maxRows) throw new Error("EXPORT_TOO_LARGE");
       // Selection checks, in this order, still before a single byte (0021, D6): a "select all N" whose N moved, then an
-      // explicit selection that matches nothing any more. The GET path passes neither and keeps its empty file.
+      // explicit selection that matches nothing any more, then (H1) an explicit selection whose rows are no longer all
+      // there or no longer in the tab's state, in this same snapshot. The GET path passes none and keeps its empty file.
       if (expectedTotal !== undefined && total !== expectedTotal) throw new Error("EXPORT_SELECTION_CHANGED");
       if (total === 0 && filter.ids !== undefined) throw new Error("EXPORT_SELECTION_EMPTY");
+      assertExpectedState(filter, expectState, total, count.rows[0]?.in_state);
       await client.query(`DECLARE export_cur NO SCROLL CURSOR FOR ${EXPORT_SELECT} WHERE ${condition} ${EXPORT_ORDER}`, params);
       declared = true;
       const now = options.now ?? Date.now;
@@ -1192,7 +1242,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       versions.push(row.rowVersion);
     }
     if (ids.length === 0) return 0;
-    return this.tenantTransaction(tenantId, async (client) => {
+    return withTenant(this.pool, tenantId, async (client) => {
       let inserted = 0;
       for (let start = 0; start < ids.length; start += EXPORT_MARK_CHUNK) {
         const result = await client.query(
@@ -1204,7 +1254,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
         inserted += result.rowCount ?? 0;
       }
       return inserted;
-    });
+    }, { statementTimeoutMs: EXPORT_MARK_STATEMENT_TIMEOUT_MS, lockTimeoutMs: EXPORT_MARK_LOCK_TIMEOUT_MS });
   }
 
   /**
@@ -1223,16 +1273,18 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     const maxRows = Math.trunc(input.maxRows);
     const expectedTotal = expectedTotalOf(input.expectedTotal);
     const filter = input.filter ?? {};
+    const expectState = expectStateOf(input.expectState, filter);
     const params: unknown[] = [];
     const condition = documentFilterSql(tenantId, filter, params);
     const needed = input.action === "mark" ? `NOT (${EXPORT_STATE_PREDICATE.exported} AND NOT ${EXPORT_CHANGED_SQL})` : EXPORT_STATE_PREDICATE.exported;
     const kind = input.action === "mark" ? "marked" : "unmarked";
     return withTenant(this.pool, tenantId, async (client) => {
-      const count = await client.query<{ total: number }>(`SELECT count(*)::int AS total FROM documents d WHERE ${condition}`, params);
+      const count = await client.query<{ total: number; in_state?: number }>(selectionCountSql(condition, expectState), params);
       const total = num(count.rows[0]?.total);
       if (total > maxRows) throw new Error("EXPORT_TOO_LARGE");
       if (expectedTotal !== undefined && total !== expectedTotal) throw new Error("EXPORT_SELECTION_CHANGED");
       if (total === 0 && filter.ids !== undefined) throw new Error("EXPORT_SELECTION_EMPTY");
+      assertExpectedState(filter, expectState, total, count.rows[0]?.in_state);
       if (total === 0) return { total: 0, affected: 0, skipped: 0 };
       const n = params.length;
       const result = await client.query(
@@ -1241,7 +1293,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
          FROM documents d WHERE ${condition} AND ${needed}`, [...params, kind, input.actorUserId, input.requestId]);
       const affected = result.rowCount ?? 0;
       return { total, affected, skipped: total - affected };
-    }, { isolation: "REPEATABLE READ", statementTimeoutMs: EXPORT_STATEMENT_TIMEOUT_MS });
+    }, { isolation: "REPEATABLE READ", statementTimeoutMs: EXPORT_MARK_STATEMENT_TIMEOUT_MS, lockTimeoutMs: EXPORT_MARK_LOCK_TIMEOUT_MS });
   }
 
   /**

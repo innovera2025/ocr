@@ -50,7 +50,21 @@ test("withTenant refuses an unknown isolation level or a timeout that is not pla
     await assert.rejects(withTenant(pool, tenant, work, { statementTimeoutMs }), /TENANT_TIMEOUT_INVALID/, String(statementTimeoutMs));
   }
   await assert.rejects(withTenant(pool, tenant, work, { idleInTransactionTimeoutMs: 0 }), /TENANT_TIMEOUT_INVALID/);
+  for (const lockTimeoutMs of [0, 2.5, 3_600_001]) {
+    await assert.rejects(withTenant(pool, tenant, work, { lockTimeoutMs }), /TENANT_TIMEOUT_INVALID/, `lock ${lockTimeoutMs}`);
+  }
   assert.equal(connects(), 0);
+});
+
+test("withTenant bounds lock waits transaction-locally when asked (lockTimeoutMs), as a parameter", async () => {
+  const { pool, calls } = fakePool();
+  await withTenant(pool, "11111111-2222-3333-4444-555555555555", async () => undefined, { statementTimeoutMs: 30_000, lockTimeoutMs: 5_000 });
+  assert.deepEqual(calls.map((call) => call.sql), ["BEGIN", "SELECT set_config('app.current_org', $1, true)",
+    "SELECT set_config('statement_timeout', $1, true)", "SELECT set_config('lock_timeout', $1, true)", "COMMIT"]);
+  assert.deepEqual(calls[3]!.values, ["5000"], "SET LOCAL semantics (is_local = true): the pooled connection keeps nothing");
+  const plain = fakePool();
+  await withTenant(plain.pool, "11111111-2222-3333-4444-555555555555", async () => undefined);
+  assert.ok(!plain.calls.some((call) => call.sql.includes("lock_timeout")), "no lock bound unless a caller asks for one");
 });
 
 test("withTenant rolls back and releases the client when the work throws", async () => {

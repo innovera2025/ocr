@@ -161,7 +161,7 @@ test("every code the export routes can answer the dialog with has Thai text (002
   for (const internal of ["EXPORT_ABORTED", "EXPORT_TRUNCATED"]) routeCodes.delete(internal);
   // The store's selection codes (persistence) and the script's own EXPORT_INCOMPLETE / INVALID_EXPORT_RANGE.
   const codes = [...routeCodes, "EXPORT_SELECTION_EMPTY", "EXPORT_SELECTION_CHANGED", "EXPORT_NOT_CONFIGURED", "EXPORT_INCOMPLETE", "INVALID_EXPORT_RANGE"];
-  for (const code of ["INVALID_EXPORT_SELECTION", "INVALID_EXPORT_FILTER", "EXPORT_MARK_FAILED", "EXPORT_BUSY", "EXPORT_THROTTLED", "EXPORT_TOO_LARGE"]) {
+  for (const code of ["INVALID_EXPORT_SELECTION", "INVALID_EXPORT_FILTER", "EXPORT_MARK_FAILED", "EXPORT_BUSY", "EXPORT_BUSY_ORG", "EXPORT_THROTTLED", "EXPORT_TOO_LARGE"]) {
     assert.ok(codes.includes(code), `${code} is expected among the route codes`);
   }
   for (const code of codes) assert.match(errors[code] ?? "", /[\u0E00-\u0E7F]/, `${code} has no Thai text`);
@@ -169,6 +169,11 @@ test("every code the export routes can answer the dialog with has Thai text (002
   assert.equal(errors.INVALID_EXPORT_SELECTION, 'รายการที่เลือกไม่ถูกต้องหรือมากเกินไป (เลือกเองได้ไม่เกิน 5,000 แถว) กรุณาใช้ "เลือกทั้งหมด" หรือเลือกใหม่');
   assert.equal(errors.EXPORT_SELECTION_EMPTY, "ไม่พบแถวที่เลือกแล้ว (อาจถูกลบหรือเปลี่ยนไป) กรุณาโหลดรายการใหม่");
   assert.equal(errors.EXPORT_SELECTION_CHANGED, "รายการเปลี่ยนไประหว่างที่คุณเลือก (มีเอกสารเข้ามาใหม่หรือสถานะเปลี่ยน) กรุณาตรวจรายการแล้วเลือกใหม่อีกครั้ง");
-  assert.equal(errors.EXPORT_MARK_FAILED, "บันทึกสถานะ Export ไม่สำเร็จ จึงไม่ได้บันทึกไฟล์ กรุณาลองใหม่อีกครั้ง");
+  // Review of 0021: EXPORT_MARK_FAILED is now also the answer of ทำเครื่องหมาย / ย้ายกลับ (M1), so it speaks of rows, not a
+  // file; another person's download in the same organization has its own text (H1); the limiter's text fits the
+  // mark/unmark buttons as well as the filters (L4).
+  assert.equal(errors.EXPORT_MARK_FAILED, "บันทึกสถานะ Export ไม่สำเร็จ ยังไม่มีแถวใดเปลี่ยนสถานะ กรุณาลองใหม่อีกครั้ง");
+  assert.equal(errors.EXPORT_BUSY_ORG, "มีคนอื่นกำลัง Export อยู่ตอนนี้ กรุณารอสักครู่แล้วลองใหม่");
+  assert.equal(errors.EXPORT_THROTTLED, "ทำรายการบ่อยเกินไป กรุณารอประมาณ 15 นาทีแล้วลองใหม่");
   assert.ok(errors.EXPORT_INCOMPLETE?.includes("หรือบันทึกสถานะ Export ไม่สำเร็จ"));
 });

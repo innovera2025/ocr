@@ -52,6 +52,15 @@ export const CANDIDATES_MAX_LIMIT = 100;
 export const CANDIDATES_MAX_OFFSET = 1_000_000;
 /** §10 H5: one open download per user, two per process (the store enforces the process cap — it owns the connections). */
 export const EXPORT_PER_USER = 1;
+/**
+ * H1 (review of 0021): one MARKING download (the dialog's POST) per organization at a time. Two staff who ticked the
+ * same "ยังไม่เคย Export" rows would otherwise both pass the expected-state check in their own snapshots, both stream and
+ * both mark: the double import this feature exists to prevent. Serialized, the second one opens its snapshot only
+ * after the first one's marks committed (the slot is released after them), so its check sees the rows as exported and
+ * answers 409 EXPORT_SELECTION_CHANGED. The GET download never marks and keeps only the per-user gate. Per process:
+ * production runs one web process (a second one would need this gate in the database).
+ */
+export const EXPORT_MARKING_PER_TENANT = 1;
 /** The gate's wall clock. The cursor enforces the same budget itself, so neither half can be the only thing holding. */
 export const EXPORT_WALL_CLOCK_MS = 600_000;
 export const CSV_BOM = "\uFEFF";
@@ -177,11 +186,13 @@ export function parseCandidatesQuery(params: URLSearchParams): CandidatesQuery {
 }
 
 /**
- * D6: what the user selected. `ids` is what they ticked (at most `EXPORT_SELECTION_MAX` distinct UUIDs, lower-cased);
- * `filter` is "select all N matching", carrying the N they saw so a moved count is refused before anything happens.
+ * D6: what the user selected. `ids` is what they ticked (at most `EXPORT_SELECTION_MAX` distinct UUIDs, lower-cased),
+ * with `expectState`, the tab they ticked them in (`never` / `exported`, null for "ทั้งหมด"): H1, an id that is gone or
+ * no longer in that state is refused before anything happens. `filter` is "select all N matching", carrying the N they
+ * saw so a moved count is refused before anything happens.
  */
 export type ExportSelection =
-  | Readonly<{ mode: "ids"; ids: readonly string[] }>
+  | Readonly<{ mode: "ids"; ids: readonly string[]; expectState: ExportState | null }>
   | Readonly<{ mode: "filter"; filter: DocumentFilter; expectedTotal: number }>;
 export type ExportBody = Readonly<{ columns: ExportColumnSet; headers: ExportHeaders; selection: ExportSelection }>;
 export type MarksBody = Readonly<{ action: "mark" | "unmark"; selection: ExportSelection }>;
@@ -227,14 +238,17 @@ function filterFromBody(value: unknown): DocumentFilter {
 }
 
 /**
- * C2/C3 `selection`, strictly: `{ mode: "ids", ids }` with 1..5,000 distinct UUIDs, or
- * `{ mode: "filter", filter, expectedTotal }` with an integer 0..maxRows. Everything is checked before the store is
- * touched; the ids reach SQL only as one bound `uuid[]`.
+ * C2/C3 `selection`, strictly: `{ mode: "ids", ids, expectState }` with 1..5,000 distinct UUIDs and the REQUIRED tab
+ * state (`"never"`, `"exported"` or null), or `{ mode: "filter", filter, expectedTotal }` with an integer 0..maxRows.
+ * Everything is checked before the store is touched; the ids reach SQL only as one bound `uuid[]`.
  */
 export function parseSelectionBody(value: unknown, maxRows: number): ExportSelection {
   if (!isPlainObject(value)) throw new Error("INVALID_EXPORT_SELECTION");
   if (value.mode === "ids") {
-    onlyKeys(value, ["mode", "ids"]);
+    onlyKeys(value, ["mode", "ids", "expectState"]);
+    // Required, not defaulted: a client that does not say which tab it ticked in must not get an unguarded export.
+    const expectState = value.expectState;
+    if (expectState !== null && expectState !== "never" && expectState !== "exported") throw new Error("INVALID_EXPORT_SELECTION");
     if (!Array.isArray(value.ids) || value.ids.length === 0) throw new Error("INVALID_EXPORT_SELECTION");
     const ids = new Set<string>();
     for (const id of value.ids) {
@@ -242,7 +256,7 @@ export function parseSelectionBody(value: unknown, maxRows: number): ExportSelec
       ids.add(id.toLowerCase());
       if (ids.size > EXPORT_SELECTION_MAX) throw new Error("INVALID_EXPORT_SELECTION");
     }
-    return { mode: "ids", ids: [...ids] };
+    return { mode: "ids", ids: [...ids], expectState };
   }
   if (value.mode === "filter") {
     onlyKeys(value, ["mode", "filter", "expectedTotal"]);
@@ -275,9 +289,13 @@ export function parseMarksBody(value: unknown, maxRows: number): MarksBody {
   return { action: value.action, selection: parseSelectionBody(value.selection, maxRows) };
 }
 
-/** What the store is asked for: an explicit selection is ONLY its ids (D6), "select all" is the filter plus N. */
-function selectionFilter(selection: ExportSelection): { filter: DocumentFilter; expectedTotal?: number } {
-  return selection.mode === "ids" ? { filter: { ids: selection.ids } } : { filter: selection.filter, expectedTotal: selection.expectedTotal };
+/**
+ * What the store is asked for: an explicit selection is ONLY its ids (D6) plus the state they must still be in (H1),
+ * "select all" is the filter plus N.
+ */
+function selectionFilter(selection: ExportSelection): { filter: DocumentFilter; expectedTotal?: number; expectState?: ExportState | null } {
+  return selection.mode === "ids" ? { filter: { ids: selection.ids }, expectState: selection.expectState }
+    : { filter: selection.filter, expectedTotal: selection.expectedTotal };
 }
 
 /** §7: how the rows were chosen, as counts only. `filter_get` is the Release 2 GET download, which never marks. */
@@ -361,7 +379,8 @@ export function jsonlDocumentLine(document: ExportDocument, columns: readonly Ex
 // ---- the gate (§10 H5) ----------------------------------------------------------------------------------------
 
 /**
- * One open download per user. The two-per-process cap lives in the store, which owns the pooled connections; this half
+ * One open download per key: per user (`gate`, every download), and per organization for the marking POST downloads
+ * (`tenantGate`, H1). The two-per-process cap lives in the store, which owns the pooled connections; the per-user half
  * stops one staff member taking both slots and denying the export to everyone else.
  */
 export class ExportGate {
@@ -392,6 +411,8 @@ export type ExportRouteDeps = Readonly<{
   store: ExportStore;
   users: UserStore;
   gate: ExportGate;
+  /** H1: one marking (POST) download per organization, keyed by tenant (`EXPORT_MARKING_PER_TENANT`). */
+  tenantGate: ExportGate;
   previewLimit: SlidingWindow;
   /** `EXPORT_LIST_LIMIT` candidates requests per user per window (D9). */
   listLimit: SlidingWindow;
@@ -416,7 +437,7 @@ export function exportFilename(format: ExportFormat, at: number): string {
  * `throttled` the preview limiter (429, `Retry-After: 900`): two different remedies, so two different labels.
  */
 const RESULTS: ReadonlyMap<string, string> = new Map([
-  ["EXPORT_TOO_LARGE", "too_large"], ["EXPORT_BUSY", "busy"], ["EXPORT_THROTTLED", "throttled"], ["EXPORT_ABORTED", "aborted"],
+  ["EXPORT_TOO_LARGE", "too_large"], ["EXPORT_BUSY", "busy"], ["EXPORT_BUSY_ORG", "busy"], ["EXPORT_THROTTLED", "throttled"], ["EXPORT_ABORTED", "aborted"],
   ["EXPORT_TIMEOUT", "aborted"], ["INVALID_EXPORT_FILTER", "error"]
 ]);
 function resultOf(error: unknown): string {
@@ -490,9 +511,9 @@ export async function handleExportRoutes(request: IncomingMessage, response: Ser
     } else if (format !== undefined) {
       // Everything is validated before the gate or the store: a bad body is a clean 400 that costs nothing.
       const body = parseExportBody(await readJson(request), deps.maxRows);
-      const { filter, expectedTotal } = selectionFilter(body.selection);
+      const { filter, expectedTotal, expectState } = selectionFilter(body.selection);
       await download(response, ctx, { filter, columns: body.columns, headers: body.headers, selection: body.selection,
-        ...(expectedTotal === undefined ? {} : { expectedTotal }) }, format, deps);
+        ...(expectedTotal === undefined ? {} : { expectedTotal }), ...(expectState === undefined ? {} : { expectState }) }, format, deps);
     }
     return true;
   } catch (error) {
@@ -534,16 +555,22 @@ async function marks(request: IncomingMessage, response: ServerResponse, ctx: We
   deps.markLimit.record(ctx.userId, deps.now());
   const body = parseMarksBody(await readJson(request), deps.maxRows);
   const kind = body.action === "mark" ? "marked" : "unmarked";
-  const { filter, expectedTotal } = selectionFilter(body.selection);
+  const { filter, expectedTotal, expectState } = selectionFilter(body.selection);
   let result: ExportMarkResult;
   try {
     result = await deps.store.markExportState(ctx.tenantId, {
       action: body.action, filter, maxRows: deps.maxRows, actorUserId: ctx.userId, requestId: deps.traceId,
-      ...(expectedTotal === undefined ? {} : { expectedTotal })
+      ...(expectedTotal === undefined ? {} : { expectedTotal }), ...(expectState === undefined ? {} : { expectState })
     });
   } catch (error) {
     metrics.increment("export_marks_total", { kind, result: "error" });
-    throw error;
+    // A refusal is the store's own code (409 / 400). Anything else is the write itself failing: a lock wait or a
+    // statement past EXPORT_MARK_*_TIMEOUT_MS, a pg error. The transaction rolled back, so nothing changed: that is
+    // EXPORT_MARK_FAILED (503), and the pg message is only logged, truncated.
+    if (errorCodeOf(error) !== "INTERNAL_ERROR") throw error;
+    logEvent("export_mark_failed", { level: "error", trace_id: deps.traceId, user_id: ctx.userId, action: body.action,
+      error: error instanceof Error ? error.message.slice(0, 120) : "unknown" });
+    throw new Error("EXPORT_MARK_FAILED");
   }
   metrics.increment("export_marks_total", { kind, result: "ok" });
   metrics.increment("export_marked_rows_total", { kind }, result.affected);
@@ -576,15 +603,20 @@ async function preview(response: ServerResponse, ctx: WebAuthContext, query: Exp
  */
 type DownloadRequest = Readonly<{
   filter: DocumentFilter; columns: ExportColumnSet; headers: ExportHeaders;
-  selection: ExportSelection | null; expectedTotal?: number;
+  selection: ExportSelection | null; expectedTotal?: number; expectState?: ExportState | null;
 }>;
 
 async function download(response: ServerResponse, ctx: WebAuthContext, request: DownloadRequest, format: ExportFormat,
   deps: ExportRouteDeps): Promise<void> {
-  const release = deps.gate.acquire(ctx.userId);
-  if (release === null) throw new Error("EXPORT_BUSY");
-  const startedAt = deps.now();
   const mark = request.selection !== null;
+  const releaseUser = deps.gate.acquire(ctx.userId);
+  if (releaseUser === null) throw new Error("EXPORT_BUSY");
+  // H1: a marking download also holds its organization's one slot, taken BEFORE the snapshot opens and given back only
+  // after its marks committed (the finally below), so the next marking download sees them.
+  const releaseTenant = mark ? deps.tenantGate.acquire(ctx.tenantId) : () => undefined;
+  if (releaseTenant === null) { releaseUser(); throw new Error("EXPORT_BUSY_ORG"); }
+  const release = (): void => { releaseTenant(); releaseUser(); };
+  const startedAt = deps.now();
   const detail = { ...filterDetail(request.filter, request.columns, request.headers), ...selectionDetail(request.selection, request.filter) };
   let cursor: ExportCursor | null = null;
   let rows = 0;
@@ -593,8 +625,9 @@ async function download(response: ServerResponse, ctx: WebAuthContext, request: 
   try {
     // Step 1: the count runs before anything is written, so EXPORT_TOO_LARGE, EXPORT_SELECTION_CHANGED and
     // EXPORT_SELECTION_EMPTY are still clean 4xx answers.
-    cursor = await deps.store.openExport(ctx.tenantId, request.filter,
-      { maxRows: deps.maxRows, ...(request.expectedTotal === undefined ? {} : { expectedTotal: request.expectedTotal }) });
+    cursor = await deps.store.openExport(ctx.tenantId, request.filter, { maxRows: deps.maxRows,
+      ...(request.expectedTotal === undefined ? {} : { expectedTotal: request.expectedTotal }),
+      ...(request.expectState === undefined ? {} : { expectState: request.expectState }) });
     const open = cursor;
     // Step 2: the audit row is committed BEFORE the first byte. Only `export.started` is guaranteed — a crash, a
     // redeploy or an OOM kill during the stream would otherwise let the data leave with no audit row at all.
@@ -645,6 +678,10 @@ async function download(response: ServerResponse, ctx: WebAuthContext, request: 
         // destroyed and the browser saves nothing.
         if (response.destroyed || response.writableEnded) throw new Error("EXPORT_ABORTED");
         marked = await recordMarks(ctx, format, streamed, deps);
+        // The documented residual window (D4): the client left WHILE the marks were being written. They are committed,
+        // but no file was saved, so this is no completed export: export.failed EXPORT_ABORTED carrying `marked` tells
+        // the operator which request left rows to move back (ย้ายกลับเป็นยังไม่ Export).
+        if (response.destroyed) throw new Error("EXPORT_ABORTED");
       }
       complete = true;
       response.end();
@@ -664,7 +701,7 @@ async function download(response: ServerResponse, ctx: WebAuthContext, request: 
     metrics.increment("export_rows_total", { format }, rows);
     // Both the metric bucket and the code: `aborted` alone cannot tell a statement timeout from a client walking away.
     await audit(deps, ctx, "export.failed", "failure",
-      { ...detail, format, rows, complete, duration_ms: deps.now() - startedAt, result: resultOf(error), error: errorCodeOf(error) });
+      { ...detail, format, rows, complete, marked, duration_ms: deps.now() - startedAt, result: resultOf(error), error: errorCodeOf(error) });
     throw error;
   } finally {
     await cursor?.close();
