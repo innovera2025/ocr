@@ -24,6 +24,8 @@ class FakeElement {
   open = false;
   value = "";
   checked = false;
+  /** The export list's page checkbox shows a partly ticked page as indeterminate. */
+  indeterminate = false;
   type = "";
   readOnly = false;
   maxLength = 0;
@@ -112,6 +114,7 @@ type Workbench = {
     openSeq: number; originalSig: string; user: { id: string } | null; csrf: string; dirty: boolean; leaving: boolean;
     timer: number; users: unknown[]; tempPass: string; q: string; status: string; parentFilter: string; parentName: string;
     exQ: string; exParent: string; exTotal: number | null; exMax: number; batchFilter: string;
+    exTab: string; exOffset: number; exSel: Set<string>; exWarnIds: Set<string>; exAll: boolean; exRows: unknown[];
   };
 };
 
@@ -901,21 +904,63 @@ test("a missing original is explained by what is open; after a Retry re-renders 
   assert.equal(($("p-content").children[0] as FakeElement).tagName, "IMG");
 });
 
-// ---- the export dialog (§10 H6) -------------------------------------------------------------------------------------
+// ---- the export dialog (§10 H6; selection and history, 0021) --------------------------------------------------------
 
-const EXPORT_PREVIEW = {
-  columns: [{ key: "original_file_name", label: "ชื่อไฟล์ต้นฉบับ" }, { key: "page", label: "หน้า" },
-    { key: "page_count", label: "จำนวนหน้า" }, { key: "uploaded_at", label: "อัปโหลดเมื่อ" }],
-  total: 240, maxRows: 50_000,
-  rows: [["ใบลูกค้า 22-09-2026.pdf", "3", "95", "2026-09-22 14:05:00"]]
+type Candidate = {
+  documentId: string; filename: string; pageNumber: number | null; pageCount: number | null; statusCategory: string; needsReview: boolean;
+  customerName: string | null; formNumber: string | null; createdAt: string; reviewedAt: string | null; exportState: "never" | "exported";
+  changedAfterExport: boolean; lastExportedAt: string | null; lastExportKind: "exported" | "marked" | null; lastExportedByName: string | null;
 };
-const previewRoutes = (body: unknown = EXPORT_PREVIEW): Routes =>
-  (url) => url.startsWith("/api/exports/preview") ? json(200, body) : null;
-/** The dialog's preview is debounced, so a case fires whatever timer the script armed last. */
+const exId = (n: number): string => `20000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+function candidate(n: number, over: Partial<Candidate> = {}): Candidate {
+  return {
+    documentId: exId(n), filename: `ใบลูกค้า-${n}.pdf`, pageNumber: 3, pageCount: 95, statusCategory: "confirmed", needsReview: false,
+    customerName: `ลูกค้า ${n}`, formNumber: `F-${n}`, createdAt: "2026-09-22T07:05:00.000Z", reviewedAt: "2026-09-22T08:00:00.000Z",
+    exportState: "never", changedAfterExport: false, lastExportedAt: null, lastExportKind: null, lastExportedByName: null, ...over
+  };
+}
+const many = (count: number, over: Partial<Candidate> = {}): Candidate[] => Array.from({ length: count }, (_, index) => candidate(index + 1, over));
+/** A fake C1 over `rows`: the tab is `exportState`, paging is limit/offset, and the counts follow the contract. */
+function candidatesRoute(data: { rows: Candidate[]; maxRows?: number }): Routes {
+  return (url) => {
+    if (!url.startsWith("/api/exports/candidates?")) return null;
+    const params = new URL(url, "http://127.0.0.1").searchParams;
+    const tab = params.get("exportState");
+    const inTab = data.rows.filter((row) => !tab || row.exportState === tab);
+    const limit = Number(params.get("limit")), offset = Number(params.get("offset"));
+    return json(200, {
+      total: inTab.length, limit, offset, maxRows: data.maxRows ?? 50_000, selectionMax: 5000,
+      counts: { never: data.rows.filter((row) => row.exportState === "never").length, exported: data.rows.filter((row) => row.exportState === "exported").length,
+        all: data.rows.length, unconfirmed: inTab.filter((row) => row.statusCategory !== "confirmed").length },
+      rows: inTab.slice(offset, offset + limit)
+    });
+  };
+}
+const either = (...routes: Routes[]): Routes => (url, init) => routes.reduce<FakeResponse | null>((found, route) => found ?? route(url, init), null);
+type Ctx = Awaited<ReturnType<typeof bootedIn>>;
+/** The list is debounced after a filter or tab change, so a case fires whatever timer the script armed last. */
 function runLastTimer(ctx: { clock: FakeClock }): void {
   const id = [...ctx.clock.timers.keys()].at(-1);
   if (id !== undefined) ctx.clock.run(id);
 }
+const candidateCalls = (ctx: Ctx) => ctx.calls.filter((call) => call.url.startsWith("/api/exports/candidates?"))
+  .map((call) => new URL(call.url, "http://127.0.0.1").searchParams);
+const rowBox = (ctx: Ctx, index: number): FakeElement => ctx.$("ex-rows").children[index]!.children[0]!.children[0]!;
+function tick(ctx: Ctx, index: number): void { const box = rowBox(ctx, index); box.checked = !box.checked; box.dispatch("change"); }
+function tickPage(ctx: Ctx, on = true): void { ctx.$("ex-page").checked = on; ctx.$("ex-page").dispatch("change"); }
+async function openList(rows: Candidate[], extra?: Routes, maxRows?: number, state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }): Promise<Ctx> {
+  const ctx = await bootedIn(state, either(...(extra ? [extra] : []), candidatesRoute({ rows, ...(maxRows === undefined ? {} : { maxRows }) })));
+  ctx.wb.openExportDialog();
+  await settle();
+  return ctx;
+}
+const csvFile = (headers: Record<string, string> = {}): FakeResponse => ({
+  ok: true, status: 200, json: async () => ({}), blob: async () => new Blob(["﻿a,b\r\n"]),
+  headers: { get: (name: string) => ({ "content-disposition": 'attachment; filename="ocr-export-20261002-1405.csv"', ...headers })[name.toLowerCase()] ?? null }
+});
+const downloadRoute = (answer: () => FakeResponse): Routes => (url, init) =>
+  url.startsWith("/api/exports/documents.") && String(init.method) === "POST" ? answer() : null;
+const bodyOf = (call: Call | undefined): Record<string, unknown> => JSON.parse(call?.body ?? "{}") as Record<string, unknown>;
 
 test("the ส่งออก pill follows the EFFECTIVE export right, not the raw can_export flag", async () => {
   const staff = await bootedIn({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 });
@@ -928,128 +973,377 @@ test("the ส่งออก pill follows the EFFECTIVE export right, not the ra
   assert.equal(admin.$("export-open").hidden, false);
 });
 
-test("the preview table shows the file's own cells: the original name first, 3 in หน้า and 95 in จำนวนหน้า", async () => {
-  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, previewRoutes());
+test("the dialog opens on ยังไม่เคย Export with the tab counts, the page's filters and identifying cells only", async () => {
+  const rows = [candidate(1, { statusCategory: "review", needsReview: true }), candidate(2, { pageNumber: null, pageCount: null, filename: "single.jpg", customerName: null }),
+    candidate(3, { exportState: "exported", lastExportedAt: "2026-09-30T03:00:00.000Z", lastExportKind: "exported", lastExportedByName: "บอส" })];
+  const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
+  const ctx = await bootedIn(state, candidatesRoute({ rows }));
+  ctx.wb.state.status = "review";
   ctx.wb.openExportDialog();
   await settle();
   assert.equal(ctx.$("export-dlg").open, true);
-  assert.deepEqual(ctx.$("ex-head").children.map((cell) => cell.textContent), ["ชื่อไฟล์ต้นฉบับ", "หน้า", "จำนวนหน้า", "อัปโหลดเมื่อ"]);
-  const cells = ctx.$("ex-rows").children[0]!.children;
-  assert.deepEqual(cells.map((cell) => cell.textContent), ["ใบลูกค้า 22-09-2026.pdf", "3", "95", "2026-09-22 14:05:00"]);
-  // pageLabel() is deliberately not reused: it returns the prefixed "หน้า 3/95", which would make the preview's หน้า
-  // column differ from the downloaded file's while จำนวนหน้า repeated the same 95.
-  assert.equal((cells[1] as FakeElement & { title?: string }).title, "หน้า 3/95");
-  assert.equal(ctx.$("ex-count").textContent, "พบ 240 แถว · แสดง 1 แถวแรก");
-  assert.equal(ctx.$("ex-download").disabled, false);
-  assert.equal(ctx.$("ex-limit").textContent, "");
+  const [first] = candidateCalls(ctx);
+  assert.equal(first?.get("exportState"), "never", "the default tab is what has never been exported");
+  assert.equal(first?.get("status"), "review", "the page's status checkbox is pre-ticked");
+  assert.deepEqual([first?.get("dateField"), first?.get("limit"), first?.get("offset"), first?.get("columns")], ["created_at", "50", "0", null],
+    "the list does not depend on the file's column set");
+  assert.deepEqual(["ex-tab-never", "ex-tab-exported", "ex-tab-all"].map((id) => ctx.$(id).textContent),
+    ["ยังไม่เคย Export (2)", "Export แล้ว (1)", "ทั้งหมด (3)"]);
+  assert.deepEqual(["ex-tab-never", "ex-tab-exported", "ex-tab-all"].map((id) => ctx.$(id).getAttribute("aria-pressed")), ["true", "false", "false"]);
+  assert.equal(ctx.$("ex-count").textContent, "พบ 2 แถว · แสดงแถวที่ 1–2");
+  const cells = (index: number) => ctx.$("ex-rows").children[index]!.children.slice(1).map((cell) => cell.textContent);
+  // Original name, หน้า n/N, customer, form number, status badge, Export ล่าสุด ("—" when never exported).
+  assert.deepEqual(cells(0), ["ใบลูกค้า-1.pdf", "3/95", "ลูกค้า 1", "F-1", "รอตรวจสอบ", "—"]);
+  assert.deepEqual(cells(1), ["single.jpg", "—", "—", "F-2", "ยืนยันแล้ว", "—"]);
+  assert.equal(rowBox(ctx, 0).getAttribute("aria-label"), "เลือก ใบลูกค้า-1.pdf หน้า 3");
+  assert.equal(rowBox(ctx, 1).getAttribute("aria-label"), "เลือก single.jpg");
+  assert.deepEqual([ctx.$("ex-picked").textContent, ctx.$("ex-download").textContent, ctx.$("ex-download").disabled], ["เลือกแล้ว 0 แถว", "ดาวน์โหลด (0 แถว)", true]);
+  assert.equal(ctx.$("ex-mark").disabled, true);
+  assert.equal(ctx.$("ex-unmark").disabled, true);
+  assert.equal(ctx.$("ex-warn").hidden, true);
 });
 
 test("the inherited search and PDF filters are removable chips that narrow only the export", async () => {
-  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, previewRoutes());
+  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, candidatesRoute({ rows: many(3) }));
   ctx.wb.state.q = "สมชาย";
-  ctx.wb.state.status = "confirmed";
   ctx.wb.state.parentFilter = ID;
   ctx.wb.state.parentName = "ใบลูกค้า 22-09-2026.pdf";
   ctx.wb.openExportDialog();
   await settle();
-  const first = ctx.calls.find((call) => call.url.startsWith("/api/exports/preview"))!.url;
-  assert.match(first, /q=%E0%B8%AA/, "the page's search still applies unless it is removed");
-  assert.ok(first.includes(`parentId=${ID}`));
-  assert.ok(first.includes("status=confirmed"), "the page's status checkbox is pre-ticked");
-  assert.ok(first.includes("dateField=created_at") && first.includes("columns=compact"));
+  const first = candidateCalls(ctx)[0]!;
+  assert.equal(first.get("q"), "สมชาย", "the page's search still applies unless it is removed");
+  assert.equal(first.get("parentId"), ID);
   const chips = ctx.$("ex-chips");
   assert.equal(chips.hidden, false);
-  assert.deepEqual(chips.children.map((chip) => chip.children[0]!.textContent),
-    ["ค้นหา: สมชาย", "เฉพาะหน้าของ ใบลูกค้า 22-09-2026.pdf"]);
+  assert.deepEqual(chips.children.map((chip) => chip.children[0]!.textContent), ["ค้นหา: สมชาย", "เฉพาะหน้าของ ใบลูกค้า 22-09-2026.pdf"]);
+  tick(ctx, 0);
+  assert.equal(ctx.wb.state.exSel.size, 1);
   ctx.calls.length = 0;
   chips.children[0]!.descendants().find((node) => node.tagName === "BUTTON")!.dispatch("click");
+  assert.equal(ctx.wb.state.exSel.size, 0, "removing a chip is a filter change: the selection goes with it");
   runLastTimer(ctx);
   await settle();
-  const second = ctx.calls.find((call) => call.url.startsWith("/api/exports/preview"))!.url;
-  assert.ok(!second.includes("q="), "the chip is gone, so the file is no longer narrowed by it");
-  assert.ok(second.includes(`parentId=${ID}`), "the other chip is untouched");
+  const second = candidateCalls(ctx)[0]!;
+  assert.equal(second.get("q"), null, "the chip is gone, so the list and the file are no longer narrowed by it");
+  assert.equal(second.get("parentId"), ID, "the other chip is untouched");
   assert.equal(ctx.wb.state.q, "สมชาย", "and the page's own filter is unchanged");
 });
 
-test("more rows than OCR_EXPORT_MAX_ROWS disables the download and says so in Thai", async () => {
-  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 },
-    previewRoutes({ ...EXPORT_PREVIEW, total: 60_000, maxRows: 50_000 }));
-  ctx.wb.openExportDialog();
-  await settle();
+test("ticking rows drives the counter, the page checkbox (indeterminate) and the three actions", async () => {
+  const ctx = await openList(many(3));
+  tick(ctx, 0);
+  assert.equal(ctx.$("ex-picked").textContent, "เลือกแล้ว 1 แถว");
+  assert.deepEqual([ctx.$("ex-page").checked, ctx.$("ex-page").indeterminate], [false, true], "part of the page is ticked");
+  assert.deepEqual([ctx.$("ex-download").textContent, ctx.$("ex-download").disabled, ctx.$("ex-mark").disabled, ctx.$("ex-unmark").disabled],
+    ["ดาวน์โหลด (1 แถว)", false, false, false]);
+  tickPage(ctx);
+  assert.deepEqual([ctx.$("ex-page").checked, ctx.$("ex-page").indeterminate], [true, false]);
+  assert.deepEqual([0, 1, 2].map((index) => rowBox(ctx, index).checked), [true, true, true]);
+  assert.equal(ctx.$("ex-picked").textContent, "เลือกแล้ว 3 แถว");
+  assert.equal(ctx.$("ex-all").hidden, true, "nothing beyond this page to offer");
+  tickPage(ctx, false);
+  assert.deepEqual([ctx.$("ex-page").checked, ctx.$("ex-page").indeterminate, ctx.wb.state.exSel.size], [false, false, 0]);
   assert.equal(ctx.$("ex-download").disabled, true);
-  assert.equal(ctx.$("ex-limit").textContent, "เกิน 50000 แถว กรุณาเลือกช่วงวันที่ให้แคบลง");
-  assert.equal(ctx.wb.state.exTotal, 60_000);
+  // Format and columns shape the file, not the list: neither clears what was ticked nor asks the server again.
+  tick(ctx, 1);
+  ctx.calls.length = 0;
+  for (const id of ["ex-format", "ex-columns"]) { ctx.$(id).value = id === "ex-format" ? "jsonl" : "detailed"; ctx.$(id).dispatch("change"); }
+  assert.equal(ctx.wb.state.exSel.size, 1);
+  assert.deepEqual(candidateCalls(ctx), []);
 });
 
-test("an empty result disables the download instead of handing over an empty file", async () => {
-  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 },
-    previewRoutes({ ...EXPORT_PREVIEW, total: 0, rows: [] }));
-  ctx.wb.openExportDialog();
+test("paging keeps the ticked ids; a tab or filter change resets to the first page and clears them", async () => {
+  const ctx = await openList([...many(120), candidate(500, { exportState: "exported" })]);
+  assert.equal(ctx.$("ex-prev").disabled, true);
+  assert.equal(ctx.$("ex-next").disabled, false);
+  tick(ctx, 0);
+  ctx.$("ex-next").dispatch("click");
   await settle();
+  assert.equal(candidateCalls(ctx).at(-1)?.get("offset"), "50");
+  assert.equal(ctx.$("ex-count").textContent, "พบ 120 แถว · แสดงแถวที่ 51–100");
+  assert.equal(ctx.$("ex-rows").children[0]!.children[1]!.textContent, "ใบลูกค้า-51.pdf");
+  tick(ctx, 0);
+  assert.equal(ctx.$("ex-picked").textContent, "เลือกแล้ว 2 แถว", "a tick is an id, so the first page's tick survives the page change");
+  ctx.$("ex-next").dispatch("click");
+  await settle();
+  assert.equal(ctx.$("ex-count").textContent, "พบ 120 แถว · แสดงแถวที่ 101–120");
+  assert.equal(ctx.$("ex-next").disabled, true);
+  ctx.$("ex-tab-exported").dispatch("click");
+  assert.equal(ctx.wb.state.exSel.size, 0, "a tab is a different list: nothing ticked carries over");
+  assert.equal(ctx.$("ex-tab-exported").getAttribute("aria-pressed"), "true");
+  runLastTimer(ctx);
+  await settle();
+  const exported = candidateCalls(ctx).at(-1)!;
+  assert.deepEqual([exported.get("exportState"), exported.get("offset")], ["exported", "0"]);
+  ctx.$("ex-tab-all").dispatch("click");
+  runLastTimer(ctx);
+  await settle();
+  assert.equal(candidateCalls(ctx).at(-1)?.get("exportState"), null, "ทั้งหมด sends no exportState");
+  assert.equal(ctx.$("ex-count").textContent, "พบ 121 แถว · แสดงแถวที่ 1–50");
+  tick(ctx, 0);
+  ctx.$("ex-confirmed").checked = true;
+  ctx.$("ex-confirmed").dispatch("change");
+  assert.equal(ctx.wb.state.exSel.size, 0, "a filter change clears the selection before the debounce fires");
   assert.equal(ctx.$("ex-download").disabled, true);
-  assert.equal(ctx.$("ex-limit").textContent, "ไม่มีเอกสารที่ตรงกับตัวกรองนี้");
+  runLastTimer(ctx);
+  await settle();
+  assert.deepEqual([candidateCalls(ctx).at(-1)?.get("confirmedOnly"), candidateCalls(ctx).at(-1)?.get("offset")], ["1", "0"]);
 });
 
-test("the download goes through the session cookie and releases its blob URL", async () => {
+test("unconfirmed rows stay selectable with a warning badge, and one warning line counts them", async () => {
+  const rows = [candidate(1, { statusCategory: "review" }), candidate(2, { statusCategory: "succeeded" }), candidate(3, { statusCategory: "processing" }),
+    candidate(4, { statusCategory: "queued" }), candidate(5, { statusCategory: "failed" }), candidate(6)];
+  const ctx = await openList(rows);
+  const status = (index: number) => ctx.$("ex-rows").children[index]!.children[5]!.descendants().find((node) => node.className.startsWith("badge"))!;
+  assert.deepEqual([0, 1, 2, 3, 4, 5].map((index) => status(index).textContent),
+    ["รอตรวจสอบ", "ยังไม่ยืนยัน", "ยังอ่านไม่เสร็จ", "ยังอ่านไม่เสร็จ", "ไม่สำเร็จ", "ยืนยันแล้ว"]);
+  assert.equal(status(0).className, "badge ex-warn");
+  assert.equal(status(4).className, "badge ex-warn b-failed", "failed is the red one");
+  assert.equal(status(5).className, "badge b-confirmed");
+  assert.equal(rowBox(ctx, 0).disabled, false, "a row that still needs review is selectable");
+  tick(ctx, 5);
+  assert.equal(ctx.$("ex-warn").hidden, true, "a confirmed row needs no warning");
+  tick(ctx, 0);
+  tick(ctx, 4);
+  assert.equal(ctx.$("ex-warn").hidden, false);
+  assert.equal(ctx.$("ex-warn").textContent, "มี 2 แถวที่ยังไม่ยืนยันหรืออ่านยังไม่เสร็จ ข้อมูลในไฟล์อาจยังไม่ถูกต้อง");
+  assert.equal(ctx.$("ex-download").disabled, false, "the warning never blocks the download");
+  tick(ctx, 0);
+  assert.equal(ctx.$("ex-warn").textContent, "มี 1 แถวที่ยังไม่ยืนยันหรืออ่านยังไม่เสร็จ ข้อมูลในไฟล์อาจยังไม่ถูกต้อง");
+});
+
+test("exported rows show who and when, แก้ไขหลัง Export when changed, and the state badge on ทั้งหมด", async () => {
+  const at = "2026-09-30T03:00:00.000Z";
+  const rows = [candidate(1, { exportState: "exported", lastExportedAt: at, lastExportKind: "exported", lastExportedByName: "บอส", changedAfterExport: true }),
+    candidate(2, { exportState: "exported", lastExportedAt: at, lastExportKind: "marked", lastExportedByName: "นก" }), candidate(3)];
+  const ctx = await openList(rows);
+  ctx.$("ex-tab-exported").dispatch("click");
+  runLastTimer(ctx);
+  await settle();
+  const when = new Intl.DateTimeFormat("th-TH", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(at));
+  const row = (index: number) => ctx.$("ex-rows").children[index]!.children;
+  assert.equal(row(0)[6]!.textContent, `${when} · บอส`);
+  assert.equal(row(1)[6]!.textContent, `ทำเครื่องหมายเอง · ${when} · นก`, "a manual mark says so");
+  const badges = (index: number) => row(index)[5]!.descendants().filter((node) => node.className.startsWith("badge")).map((node) => [node.className, node.textContent]);
+  assert.deepEqual(badges(0), [["badge b-confirmed", "ยืนยันแล้ว"], ["badge ex-chg", "แก้ไขหลัง Export"]], "a changed row stays in Export แล้ว with a badge");
+  assert.deepEqual(badges(1), [["badge b-confirmed", "ยืนยันแล้ว"]]);
+  ctx.$("ex-tab-all").dispatch("click");
+  runLastTimer(ctx);
+  await settle();
+  assert.deepEqual(badges(0).slice(1), [["badge ex-chg", "แก้ไขหลัง Export"], ["badge ex-done", "Export แล้ว"]]);
+  assert.deepEqual(badges(2).slice(1), [["badge", "ยังไม่เคย Export"]]);
+});
+
+test("an empty ยังไม่เคย Export tab points at Export แล้ว; an empty filter says so and offers nothing", async () => {
+  const ctx = await openList([candidate(1, { exportState: "exported", lastExportedAt: "2026-09-30T03:00:00.000Z", lastExportKind: "exported" })]);
+  assert.equal(ctx.$("ex-count").textContent, 'ไม่มีแถวที่ยังไม่เคย Export · ดูแถวที่ Export แล้วได้ที่แท็บ "Export แล้ว"');
+  assert.deepEqual([ctx.$("ex-page").disabled, ctx.$("ex-download").disabled, ctx.$("ex-next").disabled], [true, true, true]);
+  const none = await openList([]);
+  assert.equal(none.$("ex-count").textContent, "ไม่มีเอกสารที่ตรงกับตัวกรองนี้");
+  assert.equal(none.$("ex-tab-never").textContent, "ยังไม่เคย Export (0)");
+});
+
+test("เลือกทั้งหมด N switches to filter mode: rows locked, the body carries the filter and the N the user saw", async () => {
+  const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
+  const rows = [...many(70), ...many(5, { statusCategory: "review" }).map((row, index) => ({ ...row, documentId: exId(900 + index) }))];
+  const ctx = await openList(rows, downloadRoute(() => csvFile({ "x-export-rows": "75" })), undefined, state);
+  assert.equal(ctx.$("ex-all").hidden, true, "offered only once the whole page is ticked");
+  tickPage(ctx);
+  assert.equal(ctx.$("ex-all").hidden, false);
+  assert.equal(ctx.$("ex-all").textContent, "เลือกทั้งหมด 75 แถวที่ตรงกับตัวกรอง");
+  ctx.$("ex-all").dispatch("click");
+  assert.equal(ctx.$("ex-picked").textContent, "เลือกทั้งหมด 75 แถวที่ตรงกับตัวกรองแล้ว");
+  assert.deepEqual([ctx.$("ex-all").hidden, ctx.$("ex-clear").hidden], [true, false]);
+  assert.ok([0, 1, 49].every((index) => rowBox(ctx, index).checked && rowBox(ctx, index).disabled), "every row is in, and none can be unticked one by one");
+  assert.deepEqual([ctx.$("ex-page").checked, ctx.$("ex-page").disabled], [true, true]);
+  assert.equal(ctx.$("ex-download").textContent, "ดาวน์โหลด (75 แถว)");
+  assert.equal(ctx.$("ex-warn").textContent, "มี 5 แถวที่ยังไม่ยืนยันหรืออ่านยังไม่เสร็จ ข้อมูลในไฟล์อาจยังไม่ถูกต้อง", "counts.unconfirmed of the tab");
+  ctx.$("ex-next").dispatch("click");
+  await settle();
+  assert.equal(rowBox(ctx, 0).checked, true, "the mode survives paging");
+  ctx.$("ex-download").dispatch("click");
+  await settle();
+  const post = ctx.calls.find((call) => call.url === "/api/exports/documents.csv");
+  assert.deepEqual(bodyOf(post), { columns: "compact", selection: { mode: "filter", filter: { dateField: "created_at", exportState: "never" }, expectedTotal: 75 } });
+  // ล้างการเลือก goes back to explicit ticking with nothing ticked.
+  const again = await openList(many(60));
+  tickPage(again);
+  again.$("ex-all").dispatch("click");
+  again.$("ex-clear").dispatch("click");
+  assert.deepEqual([again.wb.state.exAll, again.wb.state.exSel.size, rowBox(again, 0).checked, rowBox(again, 0).disabled], [false, 0, false, false]);
+  assert.equal(again.$("ex-clear").hidden, true);
+});
+
+test("more matching rows than OCR_EXPORT_MAX_ROWS: เลือกทั้งหมด is disabled and says why in Thai", async () => {
+  const ctx = await openList(many(60), undefined, 55);
+  tickPage(ctx);
+  assert.equal(ctx.$("ex-all").hidden, false);
+  assert.equal(ctx.$("ex-all").disabled, true);
+  assert.equal(ctx.$("ex-limit").textContent, ctx.wb.ERRORS.EXPORT_TOO_LARGE);
+  ctx.$("ex-all").dispatch("click");
+  assert.equal(ctx.wb.state.exAll, false);
+});
+
+test("explicit ticking stops at 5,000 rows and points at เลือกทั้งหมด", async () => {
+  const ctx = await openList(many(5_001));
+  for (let page = 0; page < 100; page += 1) {
+    tickPage(ctx);
+    ctx.$("ex-next").dispatch("click");
+    await settle();
+  }
+  assert.equal(ctx.wb.state.exSel.size, 5000);
+  assert.equal(ctx.$("ex-limit").textContent, 'เลือกเองได้ไม่เกิน 5,000 แถวต่อครั้ง ใช้ "เลือกทั้งหมด" แทน');
+  tick(ctx, 0);
+  assert.equal(rowBox(ctx, 0).checked, false, "the 5,001st tick is put back");
+  assert.equal(ctx.wb.state.exSel.size, 5000);
+  ctx.$("ex-prev").dispatch("click");
+  await settle();
+  tick(ctx, 0);
+  assert.equal(ctx.wb.state.exSel.size, 4999, "unticking still works at the cap");
+  assert.equal(ctx.$("ex-limit").textContent, "");
+});
+
+test("a download POSTs the ticked ids with the CSRF token, saves the file, then reloads the list from the first page", async () => {
   const blobs = { created: 0, revoked: 0 };
   const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
-  const download = (url: string): FakeResponse | null => url.startsWith("/api/exports/documents.csv")
-    ? { ok: true, status: 200, headers: { get: (name) => name === "content-disposition" ? 'attachment; filename="ocr-export-20260922-1405.csv"' : null },
-      json: async () => ({}), blob: async () => new Blob(["﻿a,b\r\n"]) }
-    : null;
-  const ctx = load(server(state, (url) => download(url) ?? previewRoutes()(url, {})), undefined, { blobs });
+  const rows = many(60);
+  let downloaded = false;
+  const routes = either(downloadRoute(() => { downloaded = true; return csvFile({ "x-export-rows": "1" }); }),
+    (url) => url.startsWith("/api/exports/candidates?") && downloaded
+      ? candidatesRoute({ rows: rows.map((row, index) => index < 2 ? { ...row, exportState: "exported" as const } : row) })(url, {}) : null,
+    candidatesRoute({ rows }));
+  const ctx = load(server(state, routes), undefined, { blobs });
   await ctx.wb.init();
   await settle();
   ctx.wb.openExportDialog();
   await settle();
-  const armed = [...ctx.clock.timers.keys()];
-  ctx.$("ex-download").dispatch("click");
+  ctx.$("ex-next").dispatch("click");
   await settle();
-  const call = ctx.calls.find((entry) => entry.url.startsWith("/api/exports/documents.csv"));
-  assert.ok(call, "the file is fetched, not linked: a plain <a href> would carry no credentials check we can retry");
-  assert.equal(call.method, "GET");
+  tick(ctx, 0);
+  ctx.$("ex-prev").dispatch("click");
+  await settle();
+  tick(ctx, 0);
+  ctx.$("ex-format").value = "csv";
+  ctx.$("ex-columns").value = "detailed";
+  const armed = [...ctx.clock.timers.keys()];
+  ctx.calls.length = 0;
+  ctx.$("ex-download").dispatch("click");
+  ctx.$("ex-download").dispatch("click");
+  assert.equal(ctx.$("ex-download").textContent, "กำลังเตรียมไฟล์…");
+  assert.equal(ctx.$("ex-mark").disabled, true, "nothing else runs while the file is being prepared");
+  await settle();
+  const posts = ctx.calls.filter((call) => call.url.startsWith("/api/exports/documents."));
+  assert.equal(posts.length, 1, "a double click is one download");
+  assert.equal(posts[0]?.method, "POST");
+  assert.equal(posts[0]?.url, "/api/exports/documents.csv", "the selection travels in the body, not the URL");
+  assert.equal(posts[0]?.headers["X-CSRF-Token"], "csrf-1");
+  assert.equal(posts[0]?.headers["Content-Type"], "application/json");
+  assert.deepEqual(bodyOf(posts[0]), { columns: "detailed", selection: { mode: "ids", ids: [exId(51), exId(1)] } });
   // The anchor is in the document when it is clicked and gone afterwards, and the blob URL outlives the click by a
   // turn: a detached anchor and a same-tick revoke are only reliable in Chromium.
-  const anchors = ctx.body.children.filter((node) => node.tagName === "A");
-  assert.deepEqual(anchors, [], "the anchor does not stay in the document");
+  assert.deepEqual(ctx.body.children.filter((node) => node.tagName === "A"), [], "the anchor does not stay in the document");
   assert.deepEqual([blobs.created, blobs.revoked], [1, 0], "the object URL survives the click");
-  // The first timer armed by the click is the deferred revoke (the one after it is the notice's own auto-hide).
   ctx.clock.run([...ctx.clock.timers.keys()].find((id) => !armed.includes(id))!);
   assert.deepEqual([blobs.created, blobs.revoked], [1, 1], "and is revoked on the next turn, so none is left alive");
+  assert.match(ctx.$("notice").textContent, /ดาวน์โหลดไฟล์ส่งออก 1 แถวแล้ว และทำเครื่องหมายว่า Export แล้ว \(ไม่พบอีก 1 แถว\)/,
+    "X-Export-Rows below the selection: a ticked row no longer exists");
+  // The rows moved to Export แล้ว: the list starts again from the first page with nothing ticked and fresh counts.
+  const reload = candidateCalls(ctx).at(-1)!;
+  assert.deepEqual([reload.get("exportState"), reload.get("offset")], ["never", "0"]);
+  assert.deepEqual([ctx.wb.state.exSel.size, ctx.$("ex-picked").textContent], [0, "เลือกแล้ว 0 แถว"]);
+  assert.equal(ctx.$("ex-tab-exported").textContent, "Export แล้ว (2)");
   assert.equal(ctx.$("ex-error").textContent, "");
-  assert.equal(ctx.$("ex-download").textContent, "ดาวน์โหลด", "the button goes back from กำลังเตรียมไฟล์…");
+  assert.deepEqual([ctx.$("ex-download").textContent, ctx.$("ex-download").disabled], ["ดาวน์โหลด (0 แถว)", true]);
+});
+
+test("ทำเครื่องหมายว่า Export แล้ว and ย้ายกลับ ask first, POST /api/exports/marks, report skips and reload", async () => {
+  const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
+  const answers = { mark: { action: "mark", affected: 1, skipped: 1, total: 2 }, unmark: { action: "unmark", affected: 2, skipped: 0, total: 2 } };
+  const ctx = await openList(many(3), (url, init) => url === "/api/exports/marks" && String(init.method) === "POST"
+    ? json(200, answers[(JSON.parse(String(init.body)) as { action: "mark" | "unmark" }).action]) : null, undefined, state);
+  tick(ctx, 0);
+  tick(ctx, 1);
+  ctx.$("ex-mark").dispatch("click");
+  await settle();
+  assert.equal(ctx.$("confirm-dlg").open, true, "the top-level confirm, not the drawer's overlay");
+  assert.equal(ctx.$("cf-title").textContent, "ทำเครื่องหมายว่า Export แล้ว?");
+  assert.equal(ctx.$("cf-text").textContent, '2 แถวจะย้ายไปอยู่ในกลุ่ม "Export แล้ว" โดยไม่สร้างไฟล์ ใช้เมื่อคุณนำข้อมูลเหล่านี้เข้าระบบปลายทางไปแล้ว');
+  assert.equal(ctx.$("cf-yes").textContent, "ทำเครื่องหมาย");
+  ctx.$("cf-no").dispatch("click");
+  await settle();
+  assert.deepEqual(ctx.calls.filter((call) => call.url === "/api/exports/marks"), [], "ยกเลิก sends nothing");
+  assert.equal(ctx.wb.state.exSel.size, 2, "and keeps the selection");
+  ctx.$("ex-mark").dispatch("click");
+  await settle();
+  ctx.$("cf-yes").dispatch("click");
+  await settle();
+  const marks = ctx.calls.filter((call) => call.url === "/api/exports/marks");
+  assert.equal(marks.length, 1);
+  assert.equal(marks[0]?.headers["X-CSRF-Token"], "csrf-1");
+  assert.deepEqual(bodyOf(marks[0]), { action: "mark", selection: { mode: "ids", ids: [exId(1), exId(2)] } });
+  assert.match(ctx.$("notice").textContent, /ทำเครื่องหมายว่า Export แล้ว 1 แถว · ข้าม 1 แถวที่ทำเครื่องหมายไว้แล้ว/);
+  assert.deepEqual([ctx.wb.state.exSel.size, candidateCalls(ctx).at(-1)?.get("offset")], [0, "0"], "reloaded from the first page, nothing ticked");
+  tick(ctx, 2);
+  tick(ctx, 0);
+  ctx.$("ex-unmark").dispatch("click");
+  await settle();
+  assert.equal(ctx.$("cf-title").textContent, "ย้ายกลับเป็นยังไม่ Export?");
+  assert.equal(ctx.$("cf-text").textContent, '2 แถวจะกลับไปอยู่ในกลุ่ม "ยังไม่เคย Export" และจะถูกเสนอให้ Export อีกครั้ง ใช้เมื่อนำเข้าระบบปลายทางไม่สำเร็จ');
+  assert.equal(ctx.$("cf-yes").textContent, "ย้ายกลับ");
+  ctx.$("cf-yes").dispatch("click");
+  await settle();
+  assert.deepEqual(bodyOf(ctx.calls.filter((call) => call.url === "/api/exports/marks").at(-1)), { action: "unmark", selection: { mode: "ids", ids: [exId(3), exId(1)] } });
+  assert.match(ctx.$("notice").textContent, /ย้ายกลับเป็นยังไม่ Export 2 แถว/);
+  assert.ok(!ctx.$("notice").textContent.includes("ข้าม"), "no skip clause when nothing was skipped");
+});
+
+test("EXPORT_SELECTION_CHANGED or _EMPTY: the Thai reason stays, the selection clears and the list reloads", async () => {
+  for (const [route, code, status] of [["documents", "EXPORT_SELECTION_CHANGED", 409], ["marks", "EXPORT_SELECTION_EMPTY", 400], ["marks", "EXPORT_SELECTION_CHANGED", 409]] as const) {
+    const ctx = await openList(many(60), (url, init) => String(init.method) === "POST" && url.startsWith(`/api/exports/${route}`) ? json(status, { error: code }) : null);
+    tickPage(ctx);
+    ctx.$("ex-all").dispatch("click");
+    ctx.calls.length = 0;
+    if (route === "documents") ctx.$("ex-download").dispatch("click");
+    else { ctx.$("ex-mark").dispatch("click"); await settle(); ctx.$("cf-yes").dispatch("click"); }
+    await settle();
+    assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS[code], `${route} ${code}`);
+    assert.deepEqual([ctx.wb.state.exAll, ctx.wb.state.exSel.size], [false, 0], `${route} ${code}: the selection described rows that changed`);
+    assert.equal(candidateCalls(ctx).length, 1, "the list is asked again");
+    assert.equal(ctx.$("ex-count").textContent, "พบ 60 แถว · แสดงแถวที่ 1–50");
+    assert.ok(!ctx.$("notice").textContent.includes("แถวแล้ว"), "no success notice");
+  }
 });
 
 test("every export error the routes can answer with has a Thai message, never the raw code", async () => {
-  // Each of these is reachable from the dialog: the per-user gate, the preview limiter, the row cap and a bad range.
-  for (const [status, code] of [[429, "EXPORT_BUSY"], [429, "EXPORT_THROTTLED"], [400, "EXPORT_TOO_LARGE"], [400, "INVALID_EXPORT_FILTER"]] as const) {
-    const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
-    const ctx = await bootedIn(state, (url) => url.startsWith("/api/exports/documents.csv")
-      ? json(status, { error: code }) : previewRoutes()(url, {}));
-    ctx.wb.openExportDialog();
-    await settle();
+  // Each of these is reachable from the dialog: the per-user gate, the limiters, the row cap, bad filters or selections.
+  for (const [status, code] of [[429, "EXPORT_BUSY"], [429, "EXPORT_THROTTLED"], [400, "EXPORT_TOO_LARGE"], [400, "INVALID_EXPORT_FILTER"],
+    [400, "INVALID_EXPORT_SELECTION"], [503, "EXPORT_NOT_CONFIGURED"]] as const) {
+    const ctx = await openList(many(2), downloadRoute(() => json(status, { error: code })));
+    tick(ctx, 0);
     ctx.$("ex-download").dispatch("click");
     await settle();
     // Equality, not a match: an alternation on the code would pass on the untranslated fallback.
     assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS[code], code);
     assert.ok(!ctx.$("ex-error").textContent.includes(code), `${code} must not reach staff as a raw code`);
-    assert.equal(ctx.$("ex-download").disabled, false);
+    assert.equal(ctx.$("ex-download").disabled, false, `${code}: the selection is kept for a retry`);
+    assert.equal(ctx.wb.state.exSel.size, 1);
   }
 });
 
-test("a stream cut off after the 200 headers is a Thai error and no success notice", async () => {
-  // What the route does on EXPORT_TRUNCATED / EXPORT_TIMEOUT: the headers are out, so it destroys the socket and the
-  // browser rejects the body read with its own English TypeError.
-  const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
-  const ctx = await bootedIn(state, (url) => url.startsWith("/api/exports/documents.csv")
-    ? { ok: true, status: 200, headers: { get: () => null }, json: async () => ({}),
-      blob: async () => { throw new TypeError("terminated"); } } : previewRoutes()(url, {}));
-  ctx.wb.openExportDialog();
-  await settle();
+test("a stream cut off after the 200 headers (incl. a failed mark) is a Thai error, no notice and no reload", async () => {
+  // What the route does on EXPORT_TRUNCATED / EXPORT_TIMEOUT / EXPORT_MARK_FAILED: the headers are out, so it destroys
+  // the socket and the browser rejects the body read with its own English TypeError.
+  const ctx = await openList(many(2), downloadRoute(() => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => ({}),
+    blob: async () => { throw new TypeError("terminated"); } })));
+  tick(ctx, 0);
+  ctx.calls.length = 0;
   ctx.$("ex-download").dispatch("click");
   await settle();
   assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS.EXPORT_INCOMPLETE);
-  assert.ok(!ctx.$("notice").textContent.includes("ดาวน์โหลดไฟล์ส่งออกแล้ว"), "nothing was saved, so nothing is announced");
+  assert.ok(ctx.$("ex-error").textContent.includes("หรือบันทึกสถานะ Export ไม่สำเร็จ"));
+  assert.ok(!ctx.$("notice").textContent.includes("ดาวน์โหลดไฟล์ส่งออก"), "nothing was saved, so nothing is announced");
+  assert.deepEqual(candidateCalls(ctx), [], "nothing was marked, so the list on screen is still right");
+  assert.equal(ctx.wb.state.exSel.size, 1);
   assert.equal(ctx.$("ex-download").disabled, false);
 });
 
@@ -1057,80 +1351,143 @@ test("a batch the /api/batches page does not carry still narrows the export", as
   // ensureBatch() sets the filter to a batch just created; loadBatches() lists only the newest 20 and swallows its
   // own errors. A <select> set to a value no <option> holds reads back as '', which would export every batch.
   const held = "99999999-9999-4999-8999-999999999999";
-  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, previewRoutes());
+  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, candidatesRoute({ rows: many(60) }));
   ctx.wb.state.batchFilter = held;
   ctx.wb.openExportDialog();
   await settle();
   assert.equal(ctx.$("ex-batch").value, held, "the fallback option keeps the selection");
   assert.ok(ctx.$("ex-batch").children.some((option) => option.value === held));
-  const url = ctx.calls.find((call) => call.url.startsWith("/api/exports/preview"))!.url;
-  assert.ok(url.includes(`batchId=${held}`), "the export covers the batch the table is showing, not every batch");
+  assert.equal(candidateCalls(ctx)[0]?.get("batchId"), held, "the list covers the batch the table is showing, not every batch");
+  tickPage(ctx);
+  ctx.$("ex-all").dispatch("click");
+  ctx.$("ex-download").dispatch("click");
+  await settle();
+  const post = ctx.calls.find((call) => call.url === "/api/exports/documents.csv");
+  assert.equal((bodyOf(post).selection as { filter: { batchId?: string } }).filter.batchId, held, "and so does the file");
 });
 
 test("the dialog makes no claim about the data before a count has answered, and none beside an error", async () => {
   const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
   let refuse = false;
-  const ctx = await bootedIn(state, (url) => url.startsWith("/api/exports/preview")
-    ? (refuse ? json(429, { error: "EXPORT_THROTTLED" }) : json(200, EXPORT_PREVIEW)) : null);
+  const ctx = await bootedIn(state, (url) => url.startsWith("/api/exports/candidates?")
+    ? (refuse ? json(429, { error: "EXPORT_THROTTLED" }) : candidatesRoute({ rows: many(3) })(url, {})) : null);
   ctx.wb.openExportDialog();
+  assert.equal(ctx.$("ex-count").textContent, "กำลังนับจำนวนแถว…");
+  assert.equal(ctx.$("ex-tab-never").textContent, "ยังไม่เคย Export (…)", "the tab counts wait for the server");
   assert.equal(ctx.$("ex-limit").textContent, "", "ไม่มีเอกสาร… is a claim about the data, and nothing has been counted");
-  assert.equal(ctx.$("ex-download").disabled, true);
+  assert.deepEqual([ctx.$("ex-next").disabled, ctx.$("ex-download").disabled], [true, true]);
   await settle();
-  assert.equal(ctx.$("ex-download").disabled, false);
-  // A filter change invalidates the count on screen before the debounce even fires: the request at click time would
-  // carry the new filters while the enabled/disabled decision came from the old count.
+  assert.equal(ctx.$("ex-tab-never").textContent, "ยังไม่เคย Export (3)");
   refuse = true;
-  ctx.$("ex-columns").value = "detailed";
-  ctx.$("ex-columns").dispatch("change");
-  assert.equal(ctx.$("ex-download").disabled, true, "the button dies with the count it was based on");
+  ctx.$("ex-datefield").value = "reviewed_at";
+  ctx.$("ex-datefield").dispatch("change");
+  assert.equal(ctx.$("ex-tab-never").textContent, "ยังไม่เคย Export (…)", "the counts on screen belonged to the old filter");
+  assert.deepEqual(ctx.$("ex-rows").children, [], "and so did the rows");
   runLastTimer(ctx);
   await settle();
   assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS.EXPORT_THROTTLED);
+  assert.equal(ctx.$("ex-count").textContent, "");
   assert.equal(ctx.$("ex-limit").textContent, "", "waiting is the remedy, not widening a filter that was never counted");
   assert.equal(ctx.$("ex-download").disabled, true);
 });
 
-test("ถึงวันที่ before ตั้งแต่วันที่ is named in Thai and never reaches the server", async () => {
-  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, previewRoutes());
+/** Boots the page with `hold(url)` answers parked until the case releases them. */
+async function bootedWithGate(state: Server, routes: Routes, hold: (url: string) => boolean) {
+  const parked: Array<() => void> = [];
+  const base = server(state, routes);
+  const ctx = load(async (url, init) => {
+    if (hold(url)) await new Promise<void>((resolve) => { parked.push(resolve); });
+    return base(url, init);
+  });
+  await ctx.wb.init();
+  await settle();
+  ctx.fetches.length = 0;
+  ctx.calls.length = 0;
+  return { ctx, release: async () => { parked.splice(0).forEach((resolve) => resolve()); await settle(); } };
+}
+
+test("a late answer for the old filter never lands on the new one", async () => {
+  let holding = true;
+  const { ctx, release } = await bootedWithGate({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 },
+    (url) => url.startsWith("/api/exports/candidates?") ? candidatesRoute({ rows: url.includes("confirmedOnly") ? many(1) : many(3) })(url, {}) : null,
+    (url) => holding && url.startsWith("/api/exports/candidates?"));
   ctx.wb.openExportDialog();
   await settle();
+  holding = false;
+  ctx.$("ex-confirmed").checked = true;
+  ctx.$("ex-confirmed").dispatch("change");
+  await release();
+  assert.deepEqual(ctx.$("ex-rows").children, [], "the answer for the old filter was dropped");
+  assert.equal(ctx.$("ex-count").textContent, "กำลังนับจำนวนแถว…");
+  runLastTimer(ctx);
+  await settle();
+  assert.equal(ctx.$("ex-count").textContent, "พบ 1 แถว · แสดงแถวที่ 1–1");
+});
+
+test("ถึงวันที่ before ตั้งแต่วันที่ is named in Thai and never reaches the server", async () => {
+  const ctx = await openList(many(3));
   ctx.calls.length = 0;
   ctx.$("ex-from").value = "2026-09-22";
   ctx.$("ex-to").value = "2026-09-01";
   ctx.$("ex-to").dispatch("change");
   runLastTimer(ctx);
   await settle();
-  // parseExportQuery throws INVALID_EXPORT_FILTER for from > to, which names none of the dialog's six filters.
+  // parseExportFilter throws INVALID_EXPORT_FILTER for from > to, which names none of the dialog's filters.
   assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS.INVALID_EXPORT_RANGE);
+  assert.equal(ctx.$("ex-limit").textContent, ctx.wb.ERRORS.INVALID_EXPORT_RANGE);
   assert.equal(ctx.$("ex-download").disabled, true);
   assert.deepEqual(ctx.calls.filter((call) => call.url.startsWith("/api/exports/")), [], "nothing is asked of the server");
 });
 
-test("closing the dialog takes the previewed customer rows with it", async () => {
-  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, previewRoutes());
+test("closing the dialog takes the listed customer rows, the selection and the chips with it; reopening starts clean", async () => {
+  const ctx = await bootedIn({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 }, candidatesRoute({ rows: many(3) }));
   ctx.wb.state.q = "สมชาย";
   ctx.wb.openExportDialog();
   await settle();
-  assert.match(ctx.dom(), /ใบลูกค้า 22-09-2026\.pdf/);
+  assert.match(ctx.dom(), /ลูกค้า 1/);
+  tick(ctx, 0);
+  ctx.$("ex-tab-all").dispatch("click");
+  runLastTimer(ctx);
+  await settle();
+  tick(ctx, 1);
   ctx.$("ex-close").dispatch("click");
   await settle();
   assert.equal(ctx.$("export-dlg").open, false);
-  assert.ok(!ctx.dom().includes("ใบลูกค้า 22-09-2026.pdf"), "ปิด is not a weaker clear than logging out");
+  assert.ok(!ctx.dom().includes("ลูกค้า 1") && !ctx.dom().includes("ใบลูกค้า-1.pdf"), "ปิด is not a weaker clear than logging out");
   assert.ok(!ctx.dom().includes("ค้นหา: สมชาย"), "the chip carries the staff member's search text");
+  assert.deepEqual([ctx.wb.state.exSel.size, ctx.wb.state.exWarnIds.size, ctx.wb.state.exRows.length], [0, 0, 0]);
+  ctx.wb.openExportDialog();
+  assert.deepEqual([ctx.wb.state.exTab, ctx.$("ex-tab-never").getAttribute("aria-pressed"), ctx.$("ex-picked").textContent], ["never", "true", "เลือกแล้ว 0 แถว"]);
 });
 
 test("an expired session leaves no exported customer data on screen", async () => {
   const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
-  const ctx = await bootedIn(state, previewRoutes());
-  ctx.wb.openExportDialog();
-  await settle();
-  assert.match(ctx.dom(), /ใบลูกค้า 22-09-2026\.pdf/);
+  const ctx = await openList(many(3), undefined, undefined, state);
+  tick(ctx, 0);
+  assert.match(ctx.dom(), /ลูกค้า 1/);
   state.sessionStatus = 401;
   void ctx.wb.requireLogin();
   await settle();
-  assert.ok(!ctx.dom().includes("ใบลูกค้า 22-09-2026.pdf"), "the preview holds the same data the table does");
+  assert.ok(!ctx.dom().includes("ลูกค้า 1"), "the list holds the same data the table does");
+  assert.equal(ctx.wb.state.exSel.size, 0);
   assert.equal(ctx.$("export-dlg").open, false);
   assert.equal(ctx.$("export-open").hidden, true);
+});
+
+test("a download that finishes after the dialog closed does not refill it", async () => {
+  const { ctx, release } = await bootedWithGate({ user: ADMIN, csrf: "csrf-1", sessionStatus: 200 },
+    either(downloadRoute(() => csvFile()), candidatesRoute({ rows: many(3) })), (url) => url.startsWith("/api/exports/documents."));
+  ctx.wb.openExportDialog();
+  await settle();
+  tick(ctx, 0);
+  ctx.$("ex-download").dispatch("click");
+  await settle();
+  ctx.$("ex-close").dispatch("click");
+  ctx.calls.length = 0;
+  await release();
+  assert.match(ctx.$("notice").textContent, /ดาวน์โหลดไฟล์ส่งออก 1 แถวแล้ว/, "the file was saved, so it is announced");
+  assert.deepEqual(candidateCalls(ctx), [], "but the closed dialog is not refilled with customer rows");
+  assert.ok(!ctx.dom().includes("ลูกค้า 1"));
 });
 
 test("the users table shows the effective export right and offers no pointless grant on an admin row", async () => {

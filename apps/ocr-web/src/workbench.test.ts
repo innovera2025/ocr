@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { Script } from "node:vm";
 import { CATEGORY_LABELS_TH, DELIVERY_LABELS_TH, FIELD_LABELS_TH, LEGACY_REVIEWER_LABEL } from "@innovera/ocr-persistence";
@@ -76,7 +77,7 @@ test("every element id the script looks up exists in the markup", () => {
 });
 
 test("script follows the HTTP contract of spec §5", () => {
-  for (const needle of ["'/api/auth/session'", "'/api/auth/login'", "'/api/auth/logout'", "'/api/auth/password'", "'/api/users'", "'/api/exports/preview?'", "'/api/exports/documents.'", "'X-CSRF-Token'", "'X-OCR-Background'", "'/api/batches'", "'/api/batches?limit=20'", "'/api/documents?'", "'/ocr/review'", "'/retry'", "'/content'", "'X-Batch-Id'", "'X-Upload-Filename'", "encodeURIComponent(u.file.name)", "'X-Upload-Filename-Encoding','uri'", "'Idempotency-Key'", "expectedUpdatedAt", "structuredResult:state.draft", "CONCURRENCY=3", "MAX_FILES=100", "'document'"]) {
+  for (const needle of ["'/api/auth/session'", "'/api/auth/login'", "'/api/auth/logout'", "'/api/auth/password'", "'/api/users'", "'/api/exports/candidates?'", "'/api/exports/marks'", "'/api/exports/documents.'", "'X-CSRF-Token'", "'X-OCR-Background'", "'/api/batches'", "'/api/batches?limit=20'", "'/api/documents?'", "'/ocr/review'", "'/retry'", "'/content'", "'X-Batch-Id'", "'X-Upload-Filename'", "encodeURIComponent(u.file.name)", "'X-Upload-Filename-Encoding','uri'", "'Idempotency-Key'", "expectedUpdatedAt", "structuredResult:state.draft", "CONCURRENCY=3", "MAX_FILES=100", "'document'"]) {
     assert.ok(inlineScript.includes(needle), `missing ${needle}`);
   }
   for (const key of ["name", "gender", "nationality", "hotelName", "referralSources", "healthConditions", "pressure", "massageOilScrub", "preferredAreas", "avoidAreas", "treatments", "therapistName", "roomNo", "duration"]) {
@@ -118,4 +119,56 @@ test("nothing in the header or the dialogs can outgrow a 375px viewport", () => 
 test("search box never exceeds the server's q limit (100 characters → otherwise 400 INVALID_QUERY)", () => {
   assert.match(markup, /<input id="q"[^>]*maxlength="100"/);
   assert.doesNotMatch(inlineScript, /\$\('q'\)\.value\.trim\(\)\.slice\(0,(?!100\))/);
+});
+
+test("the export dialog is the selectable list of 0021, not the 20-row column preview (D8)", () => {
+  const dialog = /<dialog id="export-dlg"[\s\S]*?<\/dialog>/.exec(markup)?.[0] ?? "";
+  for (const id of ["ex-tab-never", "ex-tab-exported", "ex-tab-all", "ex-count", "ex-page", "ex-picked", "ex-all", "ex-clear", "ex-warn",
+    "ex-rows", "ex-prev", "ex-next", "ex-limit", "ex-error", "ex-unmark", "ex-mark", "ex-download"]) {
+    assert.match(dialog, new RegExp(`id="${id}"`), `missing #${id}`);
+  }
+  assert.doesNotMatch(markup, /id="ex-head"|ตัวอย่าง 20 แถวแรก/);
+  assert.equal(inlineScript.includes("/api/exports/preview"), false, "the UI no longer calls the preview route");
+  // The tabs are toggle buttons in a labelled group; the script looks them up as 'ex-tab-'+key, which the id test above
+  // cannot see, so they are pinned here.
+  assert.match(dialog, /<div class="ex-tabs" role="group" aria-label="สถานะการ Export">/);
+  assert.ok(inlineScript.includes("const EX_TABS=['never','exported','all'];"));
+  for (const tab of ["never", "exported", "all"]) assert.match(dialog, new RegExp(`<button id="ex-tab-${tab}" class="btn sm" type="button" aria-pressed="(true|false)">`));
+  assert.match(dialog, /<label class="chk"><input id="ex-page" type="checkbox"><span>เลือกทั้งหน้านี้<\/span><\/label>/);
+  assert.match(dialog, /<p id="ex-warn" role="status" hidden><\/p>/);
+  const head = /<thead>([\s\S]*?)<\/thead>/.exec(dialog)?.[1] ?? "";
+  const headers = [...head.matchAll(/<th[^>]*>(?:<span class="sr-only">)?([^<]*)/g)].map((match) => match[1]);
+  assert.deepEqual(headers, ["เลือก", "ชื่อไฟล์ต้นฉบับ", "หน้า", "ลูกค้า", "เลขที่ฟอร์ม", "สถานะ", "Export ล่าสุด"]);
+  assert.match(dialog, /<div class="x-scroll"><table><caption class="sr-only">รายการเอกสารที่เลือกส่งออกได้<\/caption>/);
+  assert.match(dialog, /<button id="ex-download" class="btn primary" type="button" disabled>ดาวน์โหลด \(0 แถว\)<\/button>/);
+  // The state names and limits the plan fixes (§6), so the behaviour tests and a reviewer can find them.
+  for (const name of ["exTab:'never'", "exOffset:0", "exRows:[]", "exCounts:null", "exSel:new Set()", "exWarnIds:new Set()", "exAll:false", "exSig:''", "exPending:false", "EX_PAGE=50,EX_PICK_MAX=5000"]) {
+    assert.ok(inlineScript.includes(name), name);
+  }
+  // At 375px the tabs and the selection bar wrap, and the list scrolls inside .x-scroll instead of widening the card.
+  assert.match(html, /\.ex-tabs\{[^}]*flex-wrap:wrap/);
+  assert.match(html, /\.ex-tabs\{[^}]*max-width:100%/);
+  assert.match(html, /\.ex-bar\{[^}]*flex-wrap:wrap/);
+});
+
+test("every code the export routes can answer the dialog with has Thai text (0021 included)", () => {
+  const source = /const ERRORS=\{([\s\S]*?)\};\nconst state=/.exec(inlineScript)?.[1] ?? "";
+  const errors = Object.fromEntries([...source.matchAll(/([A-Z_]+):'([^']*)'/g)].map((entry) => [entry[1]!, entry[2]!]));
+  // The route module's own codes, read from its source so a new one cannot ship without copy. EXPORT_ABORTED (the
+  // client left), EXPORT_TRUNCATED (a cut socket, read as EXPORT_INCOMPLETE) and INTERNAL_ERROR never reach the dialog.
+  const route = readFileSync(new URL("./export.ts", import.meta.url), "utf8");
+  const routeCodes = new Set([...route.matchAll(/"((?:INVALID_)?EXPORT_[A-Z_]+)"/g)].map((match) => match[1]!));
+  for (const internal of ["EXPORT_ABORTED", "EXPORT_TRUNCATED"]) routeCodes.delete(internal);
+  // The store's selection codes (persistence) and the script's own EXPORT_INCOMPLETE / INVALID_EXPORT_RANGE.
+  const codes = [...routeCodes, "EXPORT_SELECTION_EMPTY", "EXPORT_SELECTION_CHANGED", "EXPORT_NOT_CONFIGURED", "EXPORT_INCOMPLETE", "INVALID_EXPORT_RANGE"];
+  for (const code of ["INVALID_EXPORT_SELECTION", "INVALID_EXPORT_FILTER", "EXPORT_MARK_FAILED", "EXPORT_BUSY", "EXPORT_THROTTLED", "EXPORT_TOO_LARGE"]) {
+    assert.ok(codes.includes(code), `${code} is expected among the route codes`);
+  }
+  for (const code of codes) assert.match(errors[code] ?? "", /[\u0E00-\u0E7F]/, `${code} has no Thai text`);
+  // The four new texts are the plan's (Public Contracts), and a cut socket names the mark failure too.
+  assert.equal(errors.INVALID_EXPORT_SELECTION, 'รายการที่เลือกไม่ถูกต้องหรือมากเกินไป (เลือกเองได้ไม่เกิน 5,000 แถว) กรุณาใช้ "เลือกทั้งหมด" หรือเลือกใหม่');
+  assert.equal(errors.EXPORT_SELECTION_EMPTY, "ไม่พบแถวที่เลือกแล้ว (อาจถูกลบหรือเปลี่ยนไป) กรุณาโหลดรายการใหม่");
+  assert.equal(errors.EXPORT_SELECTION_CHANGED, "รายการเปลี่ยนไประหว่างที่คุณเลือก (มีเอกสารเข้ามาใหม่หรือสถานะเปลี่ยน) กรุณาตรวจรายการแล้วเลือกใหม่อีกครั้ง");
+  assert.equal(errors.EXPORT_MARK_FAILED, "บันทึกสถานะ Export ไม่สำเร็จ จึงไม่ได้บันทึกไฟล์ กรุณาลองใหม่อีกครั้ง");
+  assert.ok(errors.EXPORT_INCOMPLETE?.includes("หรือบันทึกสถานะ Export ไม่สำเร็จ"));
 });
