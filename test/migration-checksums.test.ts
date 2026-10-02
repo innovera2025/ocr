@@ -41,7 +41,10 @@ const CHECKSUMS: Readonly<Record<string, string>> = {
   "0019_user_auth": "45700e3814d1c3472dc017ae1b7384af9de81cede0d8ae26ee0b592895bda58c",
   // Applied by NO deploy yet — Deploy B applies it and freezes it. Until then an edit is allowed: regenerate this
   // line in the same commit (`sha256sum prisma/migrations/0020_batch_round_clock/migration.sql`).
-  "0020_batch_round_clock": "a8a351fd40364a96c60b67672a0e83de3073de2ccfb02cd5af1053e4d3e6ecd9"
+  "0020_batch_round_clock": "a8a351fd40364a96c60b67672a0e83de3073de2ccfb02cd5af1053e4d3e6ecd9",
+  // Applied by NO deploy yet — the export-selection deploy applies it and freezes it. Until then an edit is allowed:
+  // regenerate this line in the same commit (`sha256sum prisma/migrations/0021_document_export_marks/migration.sql`).
+  "0021_document_export_marks": "6a4026d137820a627d6f5070a2ebf1a5e91d62f078a196d0147f722326819919"
 };
 
 function sha256(version: string): string {

@@ -4,7 +4,8 @@ import { applyReviewEdits, legacyTreatmentIndex, markReviewed, normalizeStructur
 import { insertAudit, type AuditContext } from "./audit.js";
 import { isUuid, withTenant } from "./tenant.js";
 import { DOCUMENT_STATUS_CATEGORIES, type DeliveryStatus, type DocumentStatusCategory } from "./labels.js";
-import type { DocumentFilter, ExportDocument } from "./export.js";
+import { EXPORT_SELECTION_MAX, type DocumentFilter, type ExportCandidate, type ExportCandidatesResult, type ExportDocument, type ExportMarkInput,
+  type ExportMarkResult, type ExportState, type ExportStateChangeInput } from "./export.js";
 
 export * from "./document-view.js";
 export * from "./tenant.js";
@@ -127,7 +128,8 @@ export type DocumentListItem = { documentId: string; batchId: string | null; fil
 export type ListDocumentsQuery = DocumentFilter & { limit?: number | undefined; offset?: number | undefined };
 /** `maxRows` is `OCR_EXPORT_MAX_ROWS`: above it the export is refused with EXPORT_TOO_LARGE before anything is read. */
 /** `now` is the wall clock behind `EXPORT_MAX_DURATION_MS`; only the tests pass it. */
-export type OpenExportOptions = { maxRows: number; batchSize?: number | undefined; now?: (() => number) | undefined };
+/** `expectedTotal`: the row count the user saw ("select all N matching"); a different count is EXPORT_SELECTION_CHANGED. */
+export type OpenExportOptions = { maxRows: number; batchSize?: number | undefined; now?: (() => number) | undefined; expectedTotal?: number | undefined };
 /**
  * A streaming export in progress. `total` is the exact row count of the snapshot the rows come from (the audit row and
  * the `X-Export-Rows` header quote it). `rows()` may be consumed once; `close()` is idempotent and releases the
@@ -141,6 +143,9 @@ export type SaveReviewResult = { corrections: number; delivery: "PENDING" | "NOT
 
 /** Everything the web workbench needs from the store (fakes in tests can implement this shape). */
 export type WorkbenchStore = ReviewStore & Pick<PostgresOcrDocumentStore, "createBatch" | "getBatch" | "listBatches" | "listDocuments" | "retryDocument" | "saveReview">;
+/** The export history methods (dialog list, mark on a completed download, manual mark/unmark), for the web's export routes. */
+export type ExportHistoryStore = Pick<PostgresOcrDocumentStore, "listExportCandidates" | "recordExportMarks" | "markExportState">;
+export type ExportCandidatesPage = { limit?: number | undefined; offset?: number | undefined };
 
 /** True when any object inside `value` has `needsReview: true` (apply to the canonical view). */
 export function hasReviewFields(response: unknown): boolean {
@@ -209,6 +214,26 @@ const DELIVERY_SQL = `(SELECT CASE WHEN count(x.status) = 0 THEN 'NONE'
         LEFT JOIN ocr_confirm_outbox o ON o.correction_id = c.id AND o.organization_id = c.organization_id
         WHERE c.organization_id = d.organization_id AND c.document_id = d.id ORDER BY c.field, c.verified_at DESC, (o.id IS NOT NULL) DESC, c.id) x)`;
 
+/**
+ * The export history of document `d` (0021, D1): its latest `document_export_marks` event, by `seq`, same tenant. The
+ * index `(organization_id, document_id, seq DESC)` answers it with one probe. Used as a subquery body (`lm`).
+ */
+const EXPORT_LATEST_MARK_SQL = `SELECT m.kind, m.document_updated_at, m.occurred_at, m.actor_user_id FROM document_export_marks m
+  WHERE m.organization_id = d.organization_id AND m.document_id = d.id ORDER BY m.seq DESC LIMIT 1`;
+/** `exported` while the latest event is a download or a manual mark; `never` with no event or after an unmark. */
+const EXPORT_STATE_SQL = `COALESCE((SELECT CASE WHEN lm.kind = 'unmarked' THEN 'never' ELSE 'exported' END FROM (${EXPORT_LATEST_MARK_SQL}) lm), 'never')`;
+/**
+ * D2: exported, and the row changed since: `updated_at` is later than the value the latest download or mark saw. The
+ * comparison stays in SQL (microseconds on both sides); false whenever the state is `never`.
+ */
+const EXPORT_CHANGED_SQL = `COALESCE((SELECT lm.kind <> 'unmarked' AND d.updated_at > lm.document_updated_at FROM (${EXPORT_LATEST_MARK_SQL}) lm), false)`;
+/** `documents.updated_at` as exact-microsecond UTC text: the export's `rowVersion`, written back with `::timestamptz`. */
+const ROW_VERSION_SQL = `to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+/** The two state predicates, from a closed set: nothing user-supplied is ever interpolated. */
+const EXPORT_STATE_PREDICATE: Readonly<Record<ExportState, string>> = {
+  never: `${EXPORT_STATE_SQL} = 'never'`, exported: `${EXPORT_STATE_SQL} = 'exported'`
+};
+
 /** Rows of the document list: not deleted, and not a PDF parent that was split into page rows (its pages are the rows). */
 const VISIBLE_SQL = "d.deleted_at IS NULL AND d.status NOT IN ('DELETED','SPLIT')";
 /** The parent (original PDF) of a page row `d`, same tenant. */
@@ -224,11 +249,28 @@ function exportDate(value: string | undefined): string | null {
 }
 
 /**
+ * An explicit selection, checked before it reaches a `::uuid[]` cast: every id a UUID, lower-cased and de-duplicated,
+ * at most EXPORT_SELECTION_MAX of them. Anything else is INVALID_EXPORT_SELECTION.
+ */
+function selectionIds(ids: unknown): string[] {
+  if (!Array.isArray(ids)) throw new Error("INVALID_EXPORT_SELECTION");
+  const unique = new Set<string>();
+  for (const id of ids) {
+    if (!isUuid(id)) throw new Error("INVALID_EXPORT_SELECTION");
+    unique.add(id.toLowerCase());
+    if (unique.size > EXPORT_SELECTION_MAX) throw new Error("INVALID_EXPORT_SELECTION");
+  }
+  return [...unique];
+}
+
+/**
  * The WHERE of both the document list and the export (§10 H2), so a preview, a download and the table on screen can
  * never disagree about which rows exist. Pushes its values onto `params` (starting with the tenant) and returns the
  * condition; `VISIBLE_SQL` always applies, so SPLIT parents and deleted rows are excluded from every caller.
- * Errors: INVALID_QUERY (status), BATCH_NOT_FOUND / DOCUMENT_NOT_FOUND (ids, as the list has always reported them)
- * and INVALID_EXPORT_FILTER for a malformed or inverted date range.
+ * `exportState` and `ids` (0021) are independent predicates after the others; the API layer never sends both kinds.
+ * Errors: INVALID_QUERY (status), BATCH_NOT_FOUND / DOCUMENT_NOT_FOUND (ids, as the list has always reported them),
+ * INVALID_EXPORT_FILTER for a malformed or inverted date range or an unknown export state, and
+ * INVALID_EXPORT_SELECTION for a malformed or oversized `ids` list.
  */
 export function documentFilterSql(tenantId: string, filter: DocumentFilter, params: unknown[]): string {
   params.push(tenantId);
@@ -270,6 +312,14 @@ export function documentFilterSql(tenantId: string, filter: DocumentFilter, para
   if (from !== null && to !== null && from > to) throw new Error("INVALID_EXPORT_FILTER");
   if (from !== null) { params.push(from); where.push(`${column} >= ($${params.length}::date::timestamp AT TIME ZONE 'Asia/Bangkok')`); }
   if (to !== null) { params.push(to); where.push(`${column} < (($${params.length}::date + 1)::timestamp AT TIME ZONE 'Asia/Bangkok')`); }
+  if (filter.exportState !== undefined) {
+    if (filter.exportState !== "never" && filter.exportState !== "exported") throw new Error("INVALID_EXPORT_FILTER");
+    where.push(EXPORT_STATE_PREDICATE[filter.exportState]);
+  }
+  if (filter.ids !== undefined) {
+    params.push(selectionIds(filter.ids));
+    where.push(`d.id = ANY($${params.length}::uuid[])`);
+  }
   return where.join(" AND ");
 }
 
@@ -299,7 +349,8 @@ const EXPORT_ACTOR_SQL = "COALESCE(d.reviewed_by, lc.verified_by)";
 const EXPORT_SELECT = `SELECT d.id, d.batch_id, b.label AS batch_label, d.filename, d.status::text AS status, d.needs_review, d.error_message,
   d.created_at, d.processed_at, ${REVIEWED_AT_SQL} AS reviewed_at, ${EXPORT_ACTOR_SQL} AS reviewed_by,
   (SELECT u.display_name FROM users u WHERE u.organization_id = d.organization_id AND u.id::text = ${EXPORT_ACTOR_SQL}) AS reviewed_by_name,
-  d.structured_result, ${DELIVERY_SQL} AS delivery_status, (d.raw_response #>> '{layout,detection,verdict}') AS template, ${PAGE_COLUMNS}
+  d.structured_result, ${DELIVERY_SQL} AS delivery_status, (d.raw_response #>> '{layout,detection,verdict}') AS template, ${PAGE_COLUMNS},
+  ${ROW_VERSION_SQL} AS row_version
 FROM documents d ${PARENT_JOIN}
 LEFT JOIN ocr_batches b ON b.id = d.batch_id AND b.organization_id = d.organization_id
 ${CORRECTION_ACTOR_JOIN}`;
@@ -358,6 +409,9 @@ const MAX_CONCURRENT_EXPORTS = 2;
 /** §10 H2: the shared filter's `q`. The HTTP parsers reject anything longer; the store slices as a backstop. */
 export const MAX_FILTER_QUERY_LENGTH = 100;
 const EXPORT_PREVIEW_ROWS = 20;
+/** The export dialog's list pages (D9): 50 rows by default, 100 at most. */
+const EXPORT_CANDIDATES_DEFAULT = 50;
+const EXPORT_CANDIDATES_MAX = 100;
 function iso(value: unknown): string | null { return value instanceof Date ? value.toISOString() : typeof value === "string" ? new Date(value).toISOString() : null; }
 function ms(value: unknown): number | null { return value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : null; }
 function str(value: unknown): string | null { return typeof value === "string" ? value : null; }
@@ -447,7 +501,33 @@ function toExportDocument(row: Row): ExportDocument {
     status, statusCategory: statusCategoryOf(status, row.reviewed_at), needsReview: row.needs_review === true, errorMessage: str(row.error_message),
     createdAt: iso(row.created_at) ?? "", processedAt: iso(row.processed_at), reviewedAt: iso(row.reviewed_at), reviewedBy: str(row.reviewed_by),
     reviewedByName: str(row.reviewed_by_name), deliveryStatus: delivery(row.delivery_status), template: str(row.template),
-    structuredResult: viewOf(row), ...pageFields(row) };
+    structuredResult: viewOf(row), ...pageFields(row), rowVersion: str(row.row_version) ?? "" };
+}
+
+/** A candidates row → the export dialog's list row. The history fields are null unless the row is exported now. */
+function toExportCandidate(row: Row): ExportCandidate {
+  const status = String(row.status);
+  const category = statusCategoryOf(status, row.reviewed_at);
+  const page = pageFields(row);
+  const summary = summarizeDocument(viewOf(row));
+  const exported = row.export_state === "exported";
+  const kind = row.last_kind === "exported" || row.last_kind === "marked" ? row.last_kind : null;
+  return { documentId: String(row.id), filename: page.parentFilename ?? String(row.filename), pageNumber: page.pageNumber, pageCount: page.pageCount,
+    statusCategory: category === null || category === "split" ? "failed" : category, needsReview: row.needs_review === true,
+    customerName: summary.customerName, formNumber: summary.formNumber, createdAt: iso(row.created_at) ?? "", reviewedAt: iso(row.reviewed_at),
+    exportState: exported ? "exported" : "never", changedAfterExport: exported && row.changed_after_export === true,
+    lastExportedAt: exported ? iso(row.last_at) : null, lastExportKind: exported ? kind : null, lastExportedByName: exported ? str(row.last_by_name) : null };
+}
+
+/** The `rowVersion` shape ROW_VERSION_SQL produces; anything else never reaches a `::timestamptz` cast. */
+const ROW_VERSION = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+/** recordExportMarks inserts this many events per statement (two bound arrays each). */
+const EXPORT_MARK_CHUNK = 1000;
+/** A non-negative integer row count the user saw, or undefined when the selection carries none. */
+function expectedTotalOf(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error("INVALID_EXPORT_SELECTION");
+  return value;
 }
 
 function isRow(value: unknown): value is Row { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -993,6 +1073,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     // `Number(process.env.OCR_EXPORT_MAX_ROWS)` with the variable unset or malformed would stream the whole tenant.
     if (!Number.isFinite(options.maxRows) || options.maxRows < 1) throw new Error("EXPORT_MAX_ROWS_INVALID");
     const maxRows = Math.trunc(options.maxRows);
+    const expectedTotal = expectedTotalOf(options.expectedTotal);
     const batchSize = clampInt(options.batchSize, EXPORT_FETCH_SIZE, 1, EXPORT_FETCH_SIZE);
     const deadline = (options.now ?? Date.now)() + EXPORT_MAX_DURATION_MS;
     const params: unknown[] = [];
@@ -1034,6 +1115,10 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       const count = await client.query<{ total: number }>(`SELECT count(*)::int AS total FROM documents d WHERE ${condition}`, params);
       const total = count.rows[0]?.total ?? 0;
       if (total > maxRows) throw new Error("EXPORT_TOO_LARGE");
+      // Selection checks, in this order, still before a single byte (0021, D6): a "select all N" whose N moved, then an
+      // explicit selection that matches nothing any more. The GET path passes neither and keeps its empty file.
+      if (expectedTotal !== undefined && total !== expectedTotal) throw new Error("EXPORT_SELECTION_CHANGED");
+      if (total === 0 && filter.ids !== undefined) throw new Error("EXPORT_SELECTION_EMPTY");
       await client.query(`DECLARE export_cur NO SCROLL CURSOR FOR ${EXPORT_SELECT} WHERE ${condition} ${EXPORT_ORDER}`, params);
       declared = true;
       const now = options.now ?? Date.now;
@@ -1054,6 +1139,109 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       }
       return { total, rows, close };
     } catch (error) { await close(); throw error; }
+  }
+
+  /**
+   * The export dialog's list (0021, D9): one page of the rows the export would contain, in the export's own order, with
+   * each row's export history, plus the tab counts. One read-only REPEATABLE READ snapshot with the preview's timeouts,
+   * so the counts and the page agree. `never`/`exported`/`all` count the filter without `exportState` (the tab labels
+   * stay put while switching tabs); `total` and `unconfirmed` belong to the current tab. limit 1..100 (default 50) and
+   * offset 0..1,000,000 are clamped. Errors are documentFilterSql's.
+   */
+  async listExportCandidates(tenantId: string, filter: DocumentFilter = {}, page: ExportCandidatesPage = {}): Promise<ExportCandidatesResult> {
+    const limit = clampInt(page.limit, EXPORT_CANDIDATES_DEFAULT, 1, EXPORT_CANDIDATES_MAX);
+    const offset = clampInt(page.offset, 0, 0, 1_000_000);
+    const { exportState, ...base } = filter;
+    const baseParams: unknown[] = [];
+    const baseCondition = documentFilterSql(tenantId, base, baseParams);
+    const params: unknown[] = [];
+    const condition = documentFilterSql(tenantId, filter, params);
+    // The tab predicate comes from the closed set documentFilterSql just validated; nothing user-supplied is interpolated.
+    const inTab = exportState === undefined ? "true" : `x.state = '${exportState}'`;
+    return withTenant(this.pool, tenantId, async (client) => {
+      const counts = await client.query<{ all: number; never: number; exported: number; unconfirmed: number }>(
+        `SELECT count(*)::int AS "all", count(*) FILTER (WHERE x.state = 'never')::int AS never, count(*) FILTER (WHERE x.state = 'exported')::int AS exported,
+                count(*) FILTER (WHERE ${inTab} AND NOT x.confirmed)::int AS unconfirmed
+         FROM (SELECT ${EXPORT_STATE_SQL} AS state, (${CATEGORY_SQL.confirmed}) AS confirmed FROM documents d WHERE ${baseCondition}) x`, baseParams);
+      const rows = await client.query<Row>(
+        `SELECT d.id, d.filename, d.status::text AS status, d.needs_review, d.created_at, ${REVIEWED_AT_SQL} AS reviewed_at, d.structured_result, ${PAGE_COLUMNS},
+                ${EXPORT_STATE_SQL} AS export_state, ${EXPORT_CHANGED_SQL} AS changed_after_export, lm.kind AS last_kind, lm.occurred_at AS last_at,
+                (SELECT u.display_name FROM users u WHERE u.organization_id = d.organization_id AND u.id::text = lm.actor_user_id::text) AS last_by_name
+         FROM documents d ${PARENT_JOIN} LEFT JOIN LATERAL (${EXPORT_LATEST_MARK_SQL}) lm ON true
+         WHERE ${condition} ${EXPORT_ORDER} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`, [...params, limit, offset]);
+      const count = counts.rows[0] ?? { all: 0, never: 0, exported: 0, unconfirmed: 0 };
+      const tally = { never: num(count.never), exported: num(count.exported), all: num(count.all), unconfirmed: num(count.unconfirmed) };
+      return { total: exportState === undefined ? tally.all : tally[exportState], limit, offset, counts: tally, rows: rows.rows.map(toExportCandidate) };
+    }, { readOnly: true, isolation: "REPEATABLE READ", statementTimeoutMs: EXPORT_STATEMENT_TIMEOUT_MS, idleInTransactionTimeoutMs: EXPORT_IDLE_TIMEOUT_MS });
+  }
+
+  /**
+   * Records a COMPLETED download (0021, D4): one `exported` event per streamed row, its snapshot being the `rowVersion`
+   * the cursor itself read (D2), so a row edited between the cursor's snapshot and now still reads as changed. One
+   * transaction, separate from the export's read-only one; inserts go in chunks of 1,000. A row deleted meanwhile is
+   * skipped (the join), never an FK error. The input is checked before a connection is taken (EXPORT_MARK_INVALID).
+   * Returns the number of events written.
+   */
+  async recordExportMarks(tenantId: string, input: ExportMarkInput): Promise<number> {
+    if (!isUuid(tenantId) || input.kind !== "exported" || (input.source !== "csv" && input.source !== "jsonl")
+      || !isUuid(input.actorUserId) || !isUuid(input.requestId) || !Array.isArray(input.rows)) throw new Error("EXPORT_MARK_INVALID");
+    const ids: string[] = [], versions: string[] = [];
+    for (const row of input.rows) {
+      if (!isUuid(row?.documentId) || typeof row.rowVersion !== "string" || !ROW_VERSION.test(row.rowVersion)) throw new Error("EXPORT_MARK_INVALID");
+      ids.push(row.documentId);
+      versions.push(row.rowVersion);
+    }
+    if (ids.length === 0) return 0;
+    return this.tenantTransaction(tenantId, async (client) => {
+      let inserted = 0;
+      for (let start = 0; start < ids.length; start += EXPORT_MARK_CHUNK) {
+        const result = await client.query(
+          `INSERT INTO document_export_marks(organization_id, document_id, kind, source, document_updated_at, actor_user_id, request_id)
+           SELECT d.organization_id, d.id, 'exported', $2::varchar, t.version::timestamptz, $3::uuid, $4::uuid
+           FROM unnest($5::uuid[], $6::text[]) AS t(id, version)
+           JOIN documents d ON d.id = t.id AND d.organization_id = $1::uuid AND d.deleted_at IS NULL`,
+          [tenantId, input.source, input.actorUserId, input.requestId, ids.slice(start, start + EXPORT_MARK_CHUNK), versions.slice(start, start + EXPORT_MARK_CHUNK)]);
+        inserted += result.rowCount ?? 0;
+      }
+      return inserted;
+    });
+  }
+
+  /**
+   * A manual mark or unmark (0021, D5, D6) of an explicit selection (`filter.ids`) or of "all N matching" (`filter` plus
+   * `expectedTotal`). One REPEATABLE READ transaction: the count and the insert see one snapshot. Checks, in order:
+   * EXPORT_TOO_LARGE (above `maxRows`), EXPORT_SELECTION_CHANGED (the count is not `expectedTotal`), then
+   * EXPORT_SELECTION_EMPTY (an explicit selection that matches nothing). Then ONE insert, only for rows that need it:
+   * `mark` skips rows already exported and unchanged (a changed row may be re-marked as handled), `unmark` skips rows
+   * that are not exported. A manual event's snapshot is `updated_at` read by that same statement. Any error rolls the
+   * whole call back, so nothing is half-written.
+   */
+  async markExportState(tenantId: string, input: ExportStateChangeInput): Promise<ExportMarkResult> {
+    if (input.action !== "mark" && input.action !== "unmark") throw new Error("INVALID_EXPORT_SELECTION");
+    if (!Number.isFinite(input.maxRows) || input.maxRows < 1) throw new Error("EXPORT_MAX_ROWS_INVALID");
+    if (!isUuid(input.actorUserId) || !isUuid(input.requestId)) throw new Error("EXPORT_MARK_INVALID");
+    const maxRows = Math.trunc(input.maxRows);
+    const expectedTotal = expectedTotalOf(input.expectedTotal);
+    const filter = input.filter ?? {};
+    const params: unknown[] = [];
+    const condition = documentFilterSql(tenantId, filter, params);
+    const needed = input.action === "mark" ? `NOT (${EXPORT_STATE_PREDICATE.exported} AND NOT ${EXPORT_CHANGED_SQL})` : EXPORT_STATE_PREDICATE.exported;
+    const kind = input.action === "mark" ? "marked" : "unmarked";
+    return withTenant(this.pool, tenantId, async (client) => {
+      const count = await client.query<{ total: number }>(`SELECT count(*)::int AS total FROM documents d WHERE ${condition}`, params);
+      const total = num(count.rows[0]?.total);
+      if (total > maxRows) throw new Error("EXPORT_TOO_LARGE");
+      if (expectedTotal !== undefined && total !== expectedTotal) throw new Error("EXPORT_SELECTION_CHANGED");
+      if (total === 0 && filter.ids !== undefined) throw new Error("EXPORT_SELECTION_EMPTY");
+      if (total === 0) return { total: 0, affected: 0, skipped: 0 };
+      const n = params.length;
+      const result = await client.query(
+        `INSERT INTO document_export_marks(organization_id, document_id, kind, source, document_updated_at, actor_user_id, request_id)
+         SELECT d.organization_id, d.id, $${n + 1}::varchar, 'manual', d.updated_at, $${n + 2}::uuid, $${n + 3}::uuid
+         FROM documents d WHERE ${condition} AND ${needed}`, [...params, kind, input.actorUserId, input.requestId]);
+      const affected = result.rowCount ?? 0;
+      return { total, affected, skipped: total - affected };
+    }, { isolation: "REPEATABLE READ", statementTimeoutMs: EXPORT_STATEMENT_TIMEOUT_MS });
   }
 
   /**

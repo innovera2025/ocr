@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Pool } from "pg";
-import { documentFilterSql, EXPORT_MAX_DURATION_MS, hasReviewFields, isUuid, legacyFieldPath, pageJobPriority, PostgresOcrDocumentStore, statusCategoryOf, structuredStaffResult, structuredDocumentResult, toBatchSummary, toStructuredResult } from "./index.js";
+import { documentFilterSql, EXPORT_MAX_DURATION_MS, EXPORT_SELECTION_MAX, hasReviewFields, isUuid, legacyFieldPath, pageJobPriority, PostgresOcrDocumentStore, statusCategoryOf, structuredStaffResult, structuredDocumentResult, toBatchSummary, toStructuredResult } from "./index.js";
 
 test("needsReview mapping detects any staff field requiring review", () => {
   const response = { documentId: "d", staffOnly: { therapistName: { needsReview: false }, treatment: { needsReview: true } } };
@@ -375,4 +375,109 @@ test("documentFilterSql is the one WHERE the list and the export share", () => {
   assert.throws(() => documentFilterSql(tenant, { status: ["nope" as never] }, []), { message: "INVALID_QUERY" });
   assert.throws(() => documentFilterSql(tenant, { batchId: "x" }, []), { message: "BATCH_NOT_FOUND" });
   assert.throws(() => documentFilterSql(tenant, { parentId: "x" }, []), { message: "DOCUMENT_NOT_FOUND" });
+});
+
+// ---- the export history (0021): selection and export-state predicates, selection checks, input guards -----------
+
+test("documentFilterSql: an explicit selection is one bound uuid[] after the other predicates, de-duplicated and capped", () => {
+  const tenant = "11111111-1111-4111-8111-111111111111";
+  const a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const params: unknown[] = [];
+  const sql = documentFilterSql(tenant, { ids: [a, b, a.toUpperCase(), b] }, params);
+  assert.match(sql, /^d\.organization_id = \$1::uuid AND d\.deleted_at IS NULL AND d\.status NOT IN \('DELETED','SPLIT'\) AND d\.id = ANY\(\$2::uuid\[\]\)$/,
+    "tenant and visibility stay first; the ids are one parameter, never interpolated");
+  assert.deepEqual(params, [tenant, [a, b]], "lower-cased and de-duplicated, first occurrence order");
+  const mixed: unknown[] = [];
+  const both = documentFilterSql(tenant, { batchId: b, q: "x", ids: [a] }, mixed);
+  assert.match(both, /d\.batch_id = \$2::uuid .* AND d\.id = ANY\(\$4::uuid\[\]\)$/s, "independent predicates: the ids come last");
+  assert.deepEqual(mixed, [tenant, b, "%x%", [a]]);
+  const max = Array.from({ length: EXPORT_SELECTION_MAX }, (_unused, index) => `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`);
+  const capped: unknown[] = [];
+  documentFilterSql(tenant, { ids: [...max, ...max] }, capped);
+  assert.equal((capped[1] as string[]).length, EXPORT_SELECTION_MAX, "5,000 distinct ids are accepted, duplicates do not count");
+  const over = [...max, "00000000-0000-4000-8000-999999999999"];
+  for (const bad of [over, ["not-a-uuid"], [a, "1; DROP TABLE documents"], [42], [null], "a,b" as never, {} as never]) {
+    assert.throws(() => documentFilterSql(tenant, { ids: bad as readonly string[] }, []), { message: "INVALID_EXPORT_SELECTION" },
+      Array.isArray(bad) ? `${bad.length} ids` : typeof bad);
+  }
+  const empty: unknown[] = [];
+  assert.match(documentFilterSql(tenant, { ids: [] }, empty), /d\.id = ANY\(\$2::uuid\[\]\)$/, "an empty selection matches nothing (the store reports EXPORT_SELECTION_EMPTY)");
+  assert.deepEqual(empty, [tenant, []]);
+});
+
+test("documentFilterSql: exportState adds the latest-event predicate from a closed set and binds nothing", () => {
+  const tenant = "11111111-1111-4111-8111-111111111111";
+  for (const state of ["never", "exported"] as const) {
+    const params: unknown[] = [];
+    const sql = documentFilterSql(tenant, { status: "confirmed", exportState: state, from: "2026-09-01" }, params);
+    assert.ok(sql.endsWith(`'never') = '${state}'`), `${state}: the state predicate follows the date range`);
+    assert.match(sql, /FROM document_export_marks m\s+WHERE m\.organization_id = d\.organization_id AND m\.document_id = d\.id ORDER BY m\.seq DESC LIMIT 1/,
+      "the latest event of this row, same tenant, by seq");
+    assert.deepEqual(params, [tenant, "2026-09-01"], "the parameter order of the other filters is unchanged");
+  }
+  assert.ok(!documentFilterSql(tenant, {}, []).includes("document_export_marks"), "no state filter, no history lookup in the WHERE");
+  for (const bad of ["all", "NEVER", "' OR 1=1 --"]) {
+    assert.throws(() => documentFilterSql(tenant, { exportState: bad as never }, []), { message: "INVALID_EXPORT_FILTER" }, bad);
+  }
+});
+
+test("openExport selection checks run after the count and before the cursor: too large, then changed, then empty", async () => {
+  const tenant = "11111111-1111-4111-8111-111111111111";
+  const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const refused = async (total: number, filter: Parameters<PostgresOcrDocumentStore["openExport"]>[1], options: { maxRows: number; expectedTotal?: number }, message: string) => {
+    const client = new FakeExportClient([], total);
+    const { store, pool } = exportStore([client]);
+    await assert.rejects(store.openExport(tenant, filter, options), { message }, message);
+    assert.ok(!client.texts.some((text) => text.startsWith("DECLARE")), `${message}: no cursor, so no byte`);
+    assert.deepEqual(client.released, [false], `${message}: the connection goes back intact`);
+    await pool.end();
+  };
+  await refused(11, {}, { maxRows: 10, expectedTotal: 7 }, "EXPORT_TOO_LARGE");
+  await refused(8, {}, { maxRows: 10, expectedTotal: 7 }, "EXPORT_SELECTION_CHANGED");
+  await refused(0, { ids: [id] }, { maxRows: 10 }, "EXPORT_SELECTION_EMPTY");
+  await refused(0, { ids: [id] }, { maxRows: 10, expectedTotal: 1 }, "EXPORT_SELECTION_CHANGED");
+  // The GET path (no expectedTotal, no ids) still streams an empty file, and a matching expectedTotal streams.
+  for (const [total, options] of [[0, { maxRows: 10 }], [3, { maxRows: 10, expectedTotal: 3 }]] as const) {
+    const client = new FakeExportClient([], total);
+    const { store, pool } = exportStore([client]);
+    const cursor = await store.openExport(tenant, {}, options);
+    assert.equal(cursor.total, total);
+    await cursor.close();
+    await pool.end();
+  }
+  const client = new FakeExportClient([], 0);
+  const { store, pool } = exportStore([client]);
+  for (const bad of [-1, 1.5, Number.NaN, "3" as never]) {
+    await assert.rejects(store.openExport(tenant, {}, { maxRows: 10, expectedTotal: bad }), { message: "INVALID_EXPORT_SELECTION" }, String(bad));
+  }
+  assert.deepEqual(client.queries, [], "a malformed expectedTotal never opens a transaction");
+  await pool.end();
+});
+
+test("the export history methods refuse malformed input without touching the database", async () => {
+  const pool = new Pool();
+  const store = new PostgresOcrDocumentStore(pool);
+  Object.assign(pool, { connect: async () => { throw new Error("database must not be used"); } });
+  const tenant = "11111111-1111-4111-8111-111111111111";
+  const user = "22222222-2222-4222-8222-222222222222", request = "33333333-3333-4333-8333-333333333333";
+  const doc = "44444444-4444-4444-8444-444444444444";
+  const record = { kind: "exported" as const, source: "csv" as const, actorUserId: user, requestId: request, rows: [{ documentId: doc, rowVersion: "2026-09-22T08:00:00.123456Z" }] };
+  assert.equal(await store.recordExportMarks(tenant, { ...record, rows: [] }), 0, "nothing streamed, nothing written, no connection");
+  for (const bad of [{ kind: "marked" }, { source: "manual" }, { actorUserId: "admin" }, { requestId: "forged-by-the-client" }, { rows: "x" },
+    { rows: [{ documentId: "x", rowVersion: "2026-09-22T08:00:00.123456Z" }] },
+    { rows: [{ documentId: doc, rowVersion: "2026-09-22T08:00:00.123Z" }] },
+    { rows: [{ documentId: doc, rowVersion: "now()" }] }, { rows: [null] }]) {
+    await assert.rejects(store.recordExportMarks(tenant, { ...record, ...bad } as never), { message: "EXPORT_MARK_INVALID" }, JSON.stringify(bad));
+  }
+  await assert.rejects(store.recordExportMarks("t", record), { message: "EXPORT_MARK_INVALID" });
+  const change = { action: "mark" as const, filter: { ids: [doc] }, maxRows: 10, actorUserId: user, requestId: request };
+  await assert.rejects(store.markExportState(tenant, { ...change, action: "delete" as never }), { message: "INVALID_EXPORT_SELECTION" });
+  await assert.rejects(store.markExportState(tenant, { ...change, maxRows: Number.NaN }), { message: "EXPORT_MAX_ROWS_INVALID" });
+  await assert.rejects(store.markExportState(tenant, { ...change, actorUserId: "admin" }), { message: "EXPORT_MARK_INVALID" });
+  await assert.rejects(store.markExportState(tenant, { ...change, expectedTotal: -1 }), { message: "INVALID_EXPORT_SELECTION" });
+  await assert.rejects(store.markExportState(tenant, { ...change, filter: { ids: ["x"] } }), { message: "INVALID_EXPORT_SELECTION" });
+  await assert.rejects(store.markExportState(tenant, { ...change, filter: { exportState: "all" as never } }), { message: "INVALID_EXPORT_FILTER" });
+  await assert.rejects(store.listExportCandidates(tenant, { exportState: "all" as never }), { message: "INVALID_EXPORT_FILTER" });
+  await assert.rejects(store.listExportCandidates(tenant, { batchId: "x" }), { message: "BATCH_NOT_FOUND" });
+  await pool.end();
 });

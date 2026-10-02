@@ -14,7 +14,8 @@ import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { Pool } from "pg";
 import { flattenDocument, hasReviewFields, LEGACY_REVIEWER_LABEL, PostgresOcrDocumentStore, PostgresUserStore, reviewerLabel, toStructuredResult, withTenant,
-  type AuditContext, type DocumentFilter, type DocumentView, type ExportDocument, type PageDocumentInput, type SessionRevokeReason, type UserRole } from "./index.js";
+  type AuditContext, type DocumentFilter, type DocumentView, type ExportCandidate, type ExportDocument, type OpenExportOptions, type PageDocumentInput,
+  type SessionRevokeReason, type UserRole } from "./index.js";
 
 type Claimed = { jobId: string; organizationId: string; runId: string; kind: string; leaseToken: string };
 type Queue = {
@@ -1320,5 +1321,357 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     assert.equal(new Set(rows.documents.map((document) => document.documentId)).size, 600);
     const ids = rows.documents.map((document) => document.documentId);
     assert.deepEqual(ids, [...ids].sort(), "the tie-break on d.id is what makes the paging order total");
+  });
+
+  // ---- 0021: the export history behind the export dialog (append-only marks, selection, changed-after-export) -----
+
+  let marker = "", markerB = "";
+  const markerName = "Staff export.marker";
+  const exportHistory: Record<string, string> = {};
+  const history = () => ({ actorUserId: marker, requestId: randomUUID() });
+  /** Drains an export with any options (expectedTotal, ids) and always releases its connection. */
+  async function drain(tenantId: string, filter: DocumentFilter, options: OpenExportOptions = { maxRows: 1000 }): Promise<{ total: number; documents: ExportDocument[] }> {
+    const cursor = await app.openExport(tenantId, filter, options);
+    const documents: ExportDocument[] = [];
+    try { for await (const page of cursor.rows()) documents.push(...page); } finally { await cursor.close(); }
+    return { total: cursor.total, documents };
+  }
+  /** What a completed POST download will do in Phase 2: stream, then record one `exported` event per streamed row. */
+  async function download(filter: DocumentFilter, source: "csv" | "jsonl" = "csv", options: OpenExportOptions = { maxRows: 1000 }) {
+    const rows = await drain(TENANT_A, filter, options);
+    const marked = await app.recordExportMarks(TENANT_A, { kind: "exported", source, ...history(),
+      rows: rows.documents.map((document) => ({ documentId: document.documentId, rowVersion: document.rowVersion })) });
+    return { ...rows, marked };
+  }
+  async function candidates(filter: DocumentFilter, tenantId = TENANT_A): Promise<Map<string, ExportCandidate>> {
+    const result = await app.listExportCandidates(tenantId, filter, { limit: 100 });
+    return new Map(result.rows.map((row) => [row.documentId, row]));
+  }
+  const candidate = async (documentId: string) => (await candidates({ ids: [documentId] })).get(documentId)!;
+  const events = async (documentId: string) => (await superDb.query<{ kind: string; source: string }>(
+    "SELECT kind, source FROM document_export_marks WHERE document_id=$1 ORDER BY seq", [documentId])).rows;
+  const eventCount = async () => (await superDb.query<{ count: number }>("SELECT count(*)::int AS count FROM document_export_marks")).rows[0]!.count;
+  async function images(batchId: string, prefix: string, count: number): Promise<string[]> {
+    const ids: string[] = [];
+    for (let index = 1; index <= count; index += 1) ids.push((await uploadFile(TENANT_A, `${prefix}-${index}.png`, "image/png", batchId)).documentId);
+    return ids;
+  }
+
+  test("0021 applies after 0020; FORCE RLS, owner, tenant policy, and the web runtime may only read and append the history", async () => {
+    assert.ok(applied.indexOf("0021_document_export_marks") > applied.indexOf("0020_batch_round_clock"), applied.join(","));
+    assert.equal(applied.at(-1), NEWEST_MIGRATION, applied.join(","));
+    // The worker's startup gate (REQUIRED_SCHEMA_VERSION stays 0020) still finds its row as ocr_worker.
+    assert.equal((await workerPool.query("SELECT 1 FROM schema_migrations WHERE version = $1", ["0020_batch_round_clock"])).rowCount, 1);
+    marker = await createUser(TENANT_A, "export.marker");
+    markerB = await createUser(TENANT_B, "export.marker.b");
+    const table = await superDb.query("SELECT relrowsecurity, relforcerowsecurity, pg_get_userbyid(relowner) AS owner FROM pg_class WHERE relname = 'document_export_marks'");
+    assert.deepEqual(table.rows, [{ relrowsecurity: true, relforcerowsecurity: true, owner: "ocr_migrator" }]);
+    const policies = await superDb.query<{ policyname: string; cmd: string; qual: string; with_check: string | null }>(
+      "SELECT policyname, cmd, qual, with_check FROM pg_policies WHERE tablename IN ('document_export_marks','ocr_batches') ORDER BY tablename");
+    assert.deepEqual(policies.rows.map((row) => [row.policyname, row.cmd, row.with_check]), [["export_mark_scope", "ALL", null], ["batch_scope", "ALL", null]]);
+    assert.equal(policies.rows[0]!.qual, policies.rows[1]!.qual, "the same tenant predicate as batch_scope");
+    // The privilege matrix: ocr_app reads and appends, and that is all; nobody else holds anything.
+    const privileges = await superDb.query<{ role: string; privilege: string; granted: boolean }>(
+      `SELECT r AS role, p AS privilege, has_table_privilege(r, 'document_export_marks', p) AS granted
+       FROM unnest(ARRAY['ocr_app','ocr_worker','ocr_queue','ocr_queue_definer']) r
+       CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER']) p ORDER BY r, p`);
+    assert.deepEqual(privileges.rows.filter((row) => row.granted).map((row) => `${row.role}:${row.privilege}`), ["ocr_app:INSERT", "ocr_app:SELECT"]);
+    const columns = await superDb.query<{ app_update: boolean; others: boolean; sequence: boolean }>(
+      `SELECT has_any_column_privilege('ocr_app', 'document_export_marks', 'UPDATE') AS app_update,
+              (SELECT bool_or(has_any_column_privilege(r, 'document_export_marks', p)) FROM unnest(ARRAY['ocr_worker','ocr_queue','ocr_queue_definer']) r
+                 CROSS JOIN unnest(ARRAY['SELECT','INSERT','UPDATE','REFERENCES']) p) AS others,
+              has_sequence_privilege('ocr_app', pg_get_serial_sequence('document_export_marks', 'seq'), 'USAGE') AS sequence`);
+    assert.deepEqual(columns.rows[0], { app_update: false, others: false, sequence: false }, "no column UPDATE, nothing for other roles, no sequence grant");
+    const functions = await superDb.query<{ proname: string; owner: string }>(
+      "SELECT proname, pg_get_userbyid(proowner) AS owner FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND prokind = 'f' AND proname LIKE 'ocr%' ORDER BY proname");
+    assert.deepEqual(functions.rows.map((row) => row.proname), ["ocr_claim_confirm_outbox_v1", "ocr_claim_v1", "ocr_finish_confirm_outbox_v1", "ocr_finish_retry_v1",
+      "ocr_finish_v1", "ocr_heartbeat_v1", "ocr_recover_confirm_outbox_v1", "ocr_recover_expired_v1"], "0021 created no function");
+    await assert.rejects(asWorker(TENANT_A, "SELECT count(*) FROM document_export_marks"), { code: "42501" });
+    await assert.rejects(queueRolePool.query("SELECT count(*) FROM document_export_marks"), { code: "42501" });
+    // An INSERT as ocr_app works without any sequence grant (identity), and the row cannot be changed or removed after.
+    const probe = await uploadFile(TENANT_A, "history-probe.png", "image/png");
+    const insert = "INSERT INTO document_export_marks(organization_id, document_id, kind, source, document_updated_at, actor_user_id, request_id) VALUES ($1,$2,$3,$4,now(),$5,$6) RETURNING seq";
+    const inserted = await asApp<{ seq: string }>(TENANT_A, insert, [TENANT_A, probe.documentId, "marked", "manual", marker, randomUUID()]);
+    assert.ok(Number(inserted[0]!.seq) > 0);
+    await assert.rejects(asApp(TENANT_A, "UPDATE document_export_marks SET kind = 'unmarked'"), { code: "42501" });
+    await assert.rejects(asApp(TENANT_A, "UPDATE document_export_marks SET document_updated_at = now()"), { code: "42501" });
+    await assert.rejects(asApp(TENANT_A, "DELETE FROM document_export_marks"), { code: "42501" });
+    await assert.rejects(asApp(TENANT_A, "TRUNCATE document_export_marks"), { code: "42501" });
+    await assert.rejects(asApp(TENANT_A, "INSERT INTO document_export_marks(seq, organization_id, document_id, kind, source, document_updated_at, actor_user_id, request_id) VALUES (1,$1,$2,'marked','manual',now(),$3,$4)",
+      [TENANT_A, probe.documentId, marker, randomUUID()]), { code: "428C9" }, "seq is GENERATED ALWAYS: the order cannot be forged");
+    for (const [kind, source] of [["exported", "manual"], ["marked", "csv"], ["unmarked", "jsonl"], ["deleted", "manual"], ["marked", "xlsx"]]) {
+      await assert.rejects(asApp(TENANT_A, insert, [TENANT_A, probe.documentId, kind, source, marker, randomUUID()]), { code: "23514" }, `${kind}/${source}`);
+    }
+    // The file runs again, as the migrator and inside one transaction, without raising: it is idempotent.
+    const migrator = new Pool({ connectionString: roleUrl("ocr_migrator", passwords.ocr_migrator, database), max: 1 });
+    try {
+      const client = await migrator.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(readFileSync(new URL("prisma/migrations/0021_document_export_marks/migration.sql", repo), "utf8"));
+        await client.query("ROLLBACK");
+      } finally { client.release(); }
+    } finally { await migrator.end(); }
+  });
+
+  test("0021 tenant scope: tenant B can neither see nor write tenant A's history, and its store calls match nothing", async () => {
+    const doc = await uploadFile(TENANT_A, "history-tenant.png", "image/png");
+    assert.deepEqual(await app.markExportState(TENANT_A, { action: "mark", filter: { ids: [doc.documentId] }, maxRows: 10, ...history() }), { total: 1, affected: 1, skipped: 0 });
+    const count = async (tenantId: string | null) => (await asApp<{ count: number }>(tenantId, "SELECT count(*)::int AS count FROM document_export_marks"))[0]!.count;
+    assert.equal(await count(null), 0, "no GUC hides every row");
+    assert.equal(await count(TENANT_B), 0, "tenant B sees none of tenant A's events");
+    assert.ok(await count(TENANT_A) >= 2);
+    const insert = "INSERT INTO document_export_marks(organization_id, document_id, kind, source, document_updated_at, actor_user_id, request_id) VALUES ($1,$2,'marked','manual',now(),$3,$4)";
+    await assert.rejects(asApp(TENANT_B, insert, [TENANT_A, doc.documentId, marker, randomUUID()]), /row-level security/, "a row for another tenant is refused by the policy");
+    await assert.rejects(asApp(TENANT_B, insert, [TENANT_B, doc.documentId, markerB, randomUUID()]), { code: "23503" }, "composite FK: never another tenant's document");
+    await assert.rejects(asApp(TENANT_A, insert, [TENANT_A, doc.documentId, markerB, randomUUID()]), { code: "23503" }, "composite FK: never another tenant's actor");
+    await assert.rejects(app.markExportState(TENANT_B, { action: "unmark", filter: { ids: [doc.documentId] }, maxRows: 10, actorUserId: markerB, requestId: randomUUID() }),
+      { message: "EXPORT_SELECTION_EMPTY" }, "tenant A's document is no row of tenant B");
+    assert.equal(await app.recordExportMarks(TENANT_B, { kind: "exported", source: "csv", actorUserId: markerB, requestId: randomUUID(),
+      rows: [{ documentId: doc.documentId, rowVersion: "2026-09-22T08:00:00.000000Z" }] }), 0, "the join under tenant B finds nothing to mark");
+    assert.equal((await candidates({ ids: [doc.documentId] }, TENANT_B)).size, 0);
+    assert.equal((await candidate(doc.documentId)).exportState, "exported", "tenant A's state is untouched");
+  });
+
+  test("the state machine: never → exported → unmarked → marked, latest by seq, and the tabs, the list and the export agree", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3 });
+    const [h1, h2, h3] = await images(batch.batchId, "history-state", 3) as [string, string, string];
+    exportHistory.stateBatch = batch.batchId;
+    const tab = (exportState?: "never" | "exported") => app.listExportCandidates(TENANT_A, { batchId: batch.batchId, exportState }, { limit: 100 });
+    const initial = await tab("never");
+    assert.deepEqual([initial.total, initial.counts], [3, { never: 3, exported: 0, all: 3, unconfirmed: 3 }]);
+    assert.ok(initial.rows.every((row) => row.exportState === "never" && !row.changedAfterExport && row.lastExportedAt === null && row.lastExportKind === null));
+
+    const { marked } = await download({ ids: [h1] });
+    assert.equal(marked, 1);
+    const exportedTab = await tab("exported");
+    assert.deepEqual([exportedTab.total, exportedTab.counts, exportedTab.rows.map((row) => row.documentId)], [1, { never: 2, exported: 1, all: 3, unconfirmed: 1 }, [h1]]);
+    assert.deepEqual((await tab("never")).counts, { never: 2, exported: 1, all: 3, unconfirmed: 2 }, "the tab labels stay put; unconfirmed follows the tab");
+    assert.deepEqual((await tab()).counts, { never: 2, exported: 1, all: 3, unconfirmed: 3 });
+    const row = exportedTab.rows[0]!;
+    assert.deepEqual([row.exportState, row.changedAfterExport, row.lastExportKind, row.lastExportedByName], ["exported", false, "exported", markerName]);
+    assert.ok(row.lastExportedAt && Date.parse(row.lastExportedAt) > 0);
+    // One WHERE builder: the list, the export and the tabs agree about which rows are in which state.
+    assert.equal((await app.listDocuments(TENANT_A, { batchId: batch.batchId, exportState: "exported" })).total, 1);
+    assert.deepEqual((await drain(TENANT_A, { batchId: batch.batchId, exportState: "never" })).documents.map((document) => document.documentId), [h2, h3]);
+
+    assert.deepEqual(await app.markExportState(TENANT_A, { action: "unmark", filter: { ids: [h1] }, maxRows: 10, ...history() }), { total: 1, affected: 1, skipped: 0 });
+    const unmarked = await candidate(h1);
+    assert.deepEqual([unmarked.exportState, unmarked.lastExportedAt, unmarked.lastExportKind, unmarked.lastExportedByName, unmarked.changedAfterExport],
+      ["never", null, null, null, false], "after an unmark the row is offered again and shows no last export");
+    assert.deepEqual(await app.markExportState(TENANT_A, { action: "mark", filter: { ids: [h1] }, maxRows: 10, ...history() }), { total: 1, affected: 1, skipped: 0 });
+    assert.deepEqual([(await candidate(h1)).lastExportKind, (await candidate(h1)).lastExportedByName], ["marked", markerName]);
+    // Latest means highest seq, not latest occurred_at: an event backdated by a day still wins if it came last.
+    await superDb.query(`INSERT INTO document_export_marks(organization_id, document_id, kind, source, document_updated_at, occurred_at, actor_user_id, request_id)
+      VALUES ($1, $2, 'unmarked', 'manual', now(), now() - interval '1 day', $3, $4)`, [TENANT_A, h1, marker, randomUUID()]);
+    assert.equal((await candidate(h1)).exportState, "never");
+    await app.markExportState(TENANT_A, { action: "mark", filter: { ids: [h1] }, maxRows: 10, ...history() });
+    assert.deepEqual((await events(h1)).map((event) => `${event.kind}/${event.source}`),
+      ["exported/csv", "unmarked/manual", "marked/manual", "unmarked/manual", "marked/manual"], "every flip is kept: the table is the history");
+    assert.equal((await candidate(h1)).exportState, "exported");
+  });
+
+  test("changed after export: review, re-read and retry flip it; a re-export clears it; a microsecond updated_at never false-positives", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 2 });
+    const doc = await uploadFile(TENANT_A, "history-changed.png", "image/png", batch.batchId);
+    await appQueue.enqueue({ organizationId: TENANT_A, runId: doc.runId });
+    await worker.markProcessing(TENANT_A, doc.documentId);
+    await saveResult(TENANT_A, doc.documentId, { ...reviewResponse, documentId: `local-${randomUUID()}` });
+    const changed = async () => (await candidate(doc.documentId)).changedAfterExport;
+    await download({ ids: [doc.documentId] });
+    assert.equal(await changed(), false, "exported and untouched");
+    const stored = (await app.getReviewDocument(TENANT_A, doc.documentId))!;
+    await app.saveReview(TENANT_A, doc.documentId, { structuredResult: stored.structuredResult, reviewedBy: marker, audit: history() });
+    assert.deepEqual([(await candidate(doc.documentId)).exportState, await changed()], ["exported", true], "a review keeps the row in Export แล้ว, flagged");
+    await download({ ids: [doc.documentId] });
+    assert.equal(await changed(), false, "a re-export refreshes the snapshot");
+    await saveResult(TENANT_A, doc.documentId, { ...cleanResponse, documentId: `local-${randomUUID()}` });
+    assert.equal(await changed(), true, "a re-read (saveOcrResult) flips it");
+    await download({ ids: [doc.documentId] }, "jsonl");
+    assert.equal(await changed(), false);
+    await worker.markFailure(TENANT_A, doc.documentId, "HTTP 503");
+    await download({ ids: [doc.documentId] });
+    assert.equal(await changed(), false);
+    await app.retryDocument(TENANT_A, doc.documentId);
+    assert.equal(await changed(), true, "retryDocument flips it: the row will be read again");
+
+    // Microseconds survive the round trip: the snapshot is SQL text, never a millisecond JS Date.
+    const micro = await uploadFile(TENANT_A, "history-micro.png", "image/png", batch.batchId);
+    await superDb.query("UPDATE documents SET updated_at = '2026-09-20T02:00:00.123456Z' WHERE id = $1", [micro.documentId]);
+    const { documents } = await download({ ids: [micro.documentId] });
+    assert.equal(documents[0]!.rowVersion, "2026-09-20T02:00:00.123456Z");
+    assert.equal((await candidate(micro.documentId)).changedAfterExport, false, "an unchanged row with a microsecond updated_at is not flagged");
+    const exact = await superDb.query<{ same: boolean }>(`SELECT m.document_updated_at = d.updated_at AS same FROM document_export_marks m JOIN documents d ON d.id = m.document_id
+      WHERE m.document_id = $1 ORDER BY m.seq DESC LIMIT 1`, [micro.documentId]);
+    assert.equal(exact.rows[0]!.same, true);
+    // The trap a millisecond snapshot falls into: the same row would read as changed.
+    await superDb.query(`INSERT INTO document_export_marks(organization_id, document_id, kind, source, document_updated_at, actor_user_id, request_id)
+      VALUES ($1, $2, 'exported', 'csv', $3::timestamptz, $4, $5)`, [TENANT_A, micro.documentId, new Date("2026-09-20T02:00:00.123456Z").toISOString(), marker, randomUUID()]);
+    assert.equal((await candidate(micro.documentId)).changedAfterExport, true);
+    await download({ ids: [micro.documentId] });
+    assert.equal((await candidate(micro.documentId)).changedAfterExport, false);
+  });
+
+  test("snapshot semantics: a review saved after the cursor opened but before the marks are written leaves the row flagged changed", async () => {
+    const doc = await uploadFile(TENANT_A, "history-snapshot.png", "image/png");
+    await worker.markProcessing(TENANT_A, doc.documentId);
+    await saveResult(TENANT_A, doc.documentId, { ...reviewResponse, documentId: `local-${randomUUID()}` });
+    const cursor = await app.openExport(TENANT_A, { ids: [doc.documentId] }, { maxRows: 10 });
+    const streamed: ExportDocument[] = [];
+    try {
+      // A reviewer saves while the download is in flight: after the export's snapshot, before its rows are read.
+      const stored = (await app.getReviewDocument(TENANT_A, doc.documentId))!;
+      const edited = structuredClone(stored.structuredResult) as DocumentView;
+      (edited.staffOnly.therapistName as Record<string, unknown>).value = "สายฝน";
+      await app.saveReview(TENANT_A, doc.documentId, { structuredResult: edited, reviewedBy: marker, audit: history() });
+      for await (const page of cursor.rows()) streamed.push(...page);
+    } finally { await cursor.close(); }
+    assert.equal(streamed.length, 1);
+    assert.notEqual(flattenDocument(streamed[0]!).therapist, "สายฝน", "the file holds the snapshot's (old) content");
+    await app.recordExportMarks(TENANT_A, { kind: "exported", source: "csv", ...history(), rows: [{ documentId: doc.documentId, rowVersion: streamed[0]!.rowVersion }] });
+    const row = await candidate(doc.documentId);
+    assert.deepEqual([row.exportState, row.changedAfterExport], ["exported", true], "the review the file does not contain is not hidden");
+  });
+
+  test("an explicit selection: only the listed rows, never a SPLIT parent or a deleted row, never another tenant's, at most 5,000", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3 });
+    const pdf = await uploadFile(TENANT_A, "history-pages.pdf", "application/pdf", batch.batchId);
+    await worker.markProcessing(TENANT_A, pdf.documentId);
+    await worker.setPageCount(TENANT_A, pdf.documentId, 2);
+    await worker.createPageDocuments(TENANT_A, pdf.documentId, 2, pageInputs(TENANT_A, pdf.documentId, [1, 2]));
+    await worker.markSplit(TENANT_A, pdf.documentId, 2);
+    const [page1, page2] = (await superDb.query<{ id: string }>("SELECT id FROM documents WHERE parent_document_id = $1 ORDER BY page_number", [pdf.documentId])).rows.map((row) => row.id) as [string, string];
+    const image = (await uploadFile(TENANT_A, "history-image.png", "image/png", batch.batchId)).documentId;
+    const removed = (await uploadFile(TENANT_A, "history-removed.png", "image/png", batch.batchId)).documentId;
+    await asApp(TENANT_A, "UPDATE documents SET status='DELETED', deleted_at=now() WHERE id=$1::uuid", [removed]);
+    Object.assign(exportHistory, { pagesBatch: batch.batchId, page1, page2, image });
+
+    const ids = [image, page2, pdf.documentId, removed, page2.toUpperCase()];
+    const selected = await drain(TENANT_A, { ids });
+    assert.equal(selected.total, 2, "the SPLIT parent and the deleted row are no rows; a duplicate counts once");
+    assert.deepEqual(selected.documents.map((document) => document.documentId), [page2, image], "in the export's order, not the order ticked");
+    const listed = await app.listExportCandidates(TENANT_A, { ids });
+    assert.deepEqual(listed.rows.map((row) => row.documentId), [page2, image]);
+    assert.deepEqual([listed.rows[0]!.filename, listed.rows[0]!.pageNumber, listed.rows[0]!.pageCount], ["history-pages.pdf", 2, 2], "a page is listed under its PDF");
+    await assert.rejects(app.openExport(TENANT_B, { ids: [image] }, { maxRows: 10 }), { message: "EXPORT_SELECTION_EMPTY" }, "tenant A's ids are no rows of tenant B");
+    assert.equal((await app.listExportCandidates(TENANT_B, { ids: [image, page1] })).total, 0);
+    await assert.rejects(app.markExportState(TENANT_A, { action: "mark", filter: { ids: [pdf.documentId, removed] }, maxRows: 10, ...history() }), { message: "EXPORT_SELECTION_EMPTY" });
+    const tooMany: string[] = Array.from({ length: 5001 }, () => randomUUID());
+    await assert.rejects(app.openExport(TENANT_A, { ids: tooMany }, { maxRows: 50_000 }), { message: "INVALID_EXPORT_SELECTION" });
+    await assert.rejects(app.listExportCandidates(TENANT_A, { ids: tooMany }), { message: "INVALID_EXPORT_SELECTION" });
+    await assert.rejects(app.markExportState(TENANT_A, { action: "mark", filter: { ids: tooMany }, maxRows: 50_000, ...history() }), { message: "INVALID_EXPORT_SELECTION" });
+    assert.equal((await drain(TENANT_A, { ids: [...tooMany.slice(0, 4999), image] })).total, 1, "5,000 ids are accepted");
+  });
+
+  test("manual mark and unmark are idempotent by skipping; a filter selection checks its size and count and writes nothing on refusal", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3 });
+    const [m1, m2, m3] = await images(batch.batchId, "history-manual", 3) as [string, string, string];
+    const change = (action: "mark" | "unmark", filter: DocumentFilter, extra: { expectedTotal?: number; maxRows?: number } = {}) =>
+      app.markExportState(TENANT_A, { action, filter, maxRows: 1000, ...history(), ...extra });
+    await download({ ids: [m2] });
+    assert.deepEqual(await change("mark", { ids: [m1, m2] }), { total: 2, affected: 1, skipped: 1 }, "m2 is already exported and unchanged");
+    assert.deepEqual(await change("mark", { ids: [m1, m2] }), { total: 2, affected: 0, skipped: 2 }, "a repeat writes nothing");
+    await superDb.query("UPDATE documents SET updated_at = now() WHERE id = $1", [m2]);
+    assert.equal((await candidate(m2)).changedAfterExport, true);
+    assert.deepEqual(await change("mark", { ids: [m2] }), { total: 1, affected: 1, skipped: 0 }, "a changed row can be marked as handled");
+    assert.equal((await candidate(m2)).changedAfterExport, false);
+    assert.deepEqual(await change("unmark", { ids: [m1, m3] }), { total: 2, affected: 1, skipped: 1 }, "m3 was never exported");
+    assert.deepEqual(await change("unmark", { ids: [m1, m3] }), { total: 2, affected: 0, skipped: 2 });
+
+    const before = await eventCount();
+    await assert.rejects(change("mark", { batchId: batch.batchId }, { expectedTotal: 2 }), { message: "EXPORT_SELECTION_CHANGED" });
+    await assert.rejects(change("mark", { batchId: batch.batchId }, { expectedTotal: 3, maxRows: 2 }), { message: "EXPORT_TOO_LARGE" });
+    await assert.rejects(app.markExportState(TENANT_A, { action: "mark", filter: { batchId: batch.batchId }, expectedTotal: 3, maxRows: 1000, actorUserId: markerB, requestId: randomUUID() }),
+      { code: "23503" }, "an actor of another tenant fails the insert");
+    assert.equal(await eventCount(), before, "every refusal and the failed insert left nothing behind");
+    assert.deepEqual(await change("mark", { batchId: batch.batchId }, { expectedTotal: 3 }), { total: 3, affected: 2, skipped: 1 }, "select all 3 matching");
+    assert.deepEqual((await app.listExportCandidates(TENANT_A, { batchId: batch.batchId })).counts, { never: 0, exported: 3, all: 3, unconfirmed: 3 });
+    assert.deepEqual(await change("unmark", { batchId: batch.batchId, exportState: "exported" }, { expectedTotal: 3 }), { total: 3, affected: 3, skipped: 0 });
+    assert.deepEqual(await change("mark", { batchId: batch.batchId, exportState: "exported" }, { expectedTotal: 0 }), { total: 0, affected: 0, skipped: 0 },
+      "an empty filter selection is a no-op, not an error");
+    const manual = await superDb.query<{ source: string; same: boolean }>(`SELECT DISTINCT m.source, m.document_updated_at = d.updated_at AS same
+      FROM document_export_marks m JOIN documents d ON d.id = m.document_id WHERE d.batch_id = $1 AND m.kind <> 'exported'`, [batch.batchId]);
+    assert.deepEqual(manual.rows, [{ source: "manual", same: true }], "a manual event's snapshot is updated_at as that statement read it");
+  });
+
+  test("recordExportMarks writes in chunks of 1,000 and skips a row deleted after it was streamed", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 1 });
+    await superDb.query(`INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, batch_id, created_at)
+      SELECT gen_random_uuid(), $1::uuid, md5(random()::text || g::text), 'SUCCEEDED', 'history-bulk-' || g || '.png', 'image/png', 1, repeat('b', 64), $2::uuid, $3::timestamptz
+      FROM generate_series(1, 1205) g`, [TENANT_A, batch.batchId, new Date("2026-09-21T02:00:00Z").toISOString()]);
+    exportHistory.bulkBatch = batch.batchId;
+    const rows = await drain(TENANT_A, { batchId: batch.batchId }, { maxRows: 5000 });
+    assert.equal(rows.total, 1205);
+    const gone = rows.documents[700]!.documentId;
+    await superDb.query("UPDATE documents SET status = 'DELETED', deleted_at = now() WHERE id = $1", [gone]);
+    const audit = history();
+    const marked = await app.recordExportMarks(TENANT_A, { kind: "exported", source: "jsonl", ...audit,
+      rows: rows.documents.map((document) => ({ documentId: document.documentId, rowVersion: document.rowVersion })) });
+    assert.equal(marked, 1204, "two chunks of 1,000 and one of 205, minus the deleted row: no FK error, no partial write");
+    const written = await superDb.query<{ count: number; requests: number; sources: string[]; gone: number }>(
+      `SELECT count(*)::int AS count, count(DISTINCT m.request_id)::int AS requests, array_agg(DISTINCT m.source) AS sources,
+              count(*) FILTER (WHERE m.document_id = $2)::int AS gone
+       FROM document_export_marks m JOIN documents d ON d.id = m.document_id WHERE d.batch_id = $1`, [batch.batchId, gone]);
+    assert.deepEqual(written.rows[0], { count: 1204, requests: 1, sources: ["jsonl"], gone: 0 });
+    assert.equal((await superDb.query<{ id: string }>("SELECT request_id::text AS id FROM document_export_marks m JOIN documents d ON d.id = m.document_id WHERE d.batch_id = $1 LIMIT 1",
+      [batch.batchId])).rows[0]!.id, audit.requestId, "the request's trace id joins the events to its audit rows");
+    assert.deepEqual((await app.listExportCandidates(TENANT_A, { batchId: batch.batchId })).counts, { never: 0, exported: 1204, all: 1204, unconfirmed: 1204 });
+  });
+
+  test("concurrent flips on the same rows all succeed without a deadlock; the latest event decides", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 1 });
+    const inserted = await superDb.query<{ id: string }>(`INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, batch_id)
+      SELECT gen_random_uuid(), $1::uuid, md5(random()::text || g::text), 'NEEDS_REVIEW', 'history-race-' || g || '.png', 'image/png', 1, repeat('r', 64), $2::uuid
+      FROM generate_series(1, 20) g RETURNING id`, [TENANT_A, batch.batchId]);
+    const ids = inserted.rows.map((row) => row.id);
+    const rows = (await drain(TENANT_A, { ids })).documents.map((document) => ({ documentId: document.documentId, rowVersion: document.rowVersion }));
+    const results = await Promise.all([
+      app.markExportState(TENANT_A, { action: "mark", filter: { ids }, maxRows: 100, ...history() }),
+      app.markExportState(TENANT_A, { action: "mark", filter: { ids }, maxRows: 100, ...history() }),
+      app.recordExportMarks(TENANT_A, { kind: "exported", source: "csv", ...history(), rows })
+    ]);
+    const [first, second, recorded] = results as [{ total: number; affected: number }, { total: number; affected: number }, number];
+    assert.deepEqual([first.total, second.total, recorded], [20, 20, 20]);
+    assert.ok(first.affected + second.affected >= 20 && first.affected + second.affected <= 40, "at worst both wrote: duplicates are harmless");
+    assert.deepEqual((await app.listExportCandidates(TENANT_A, { batchId: batch.batchId })).counts, { never: 0, exported: 20, all: 20, unconfirmed: 20 });
+    const unmarks = await Promise.all([1, 2].map(() => app.markExportState(TENANT_A, { action: "unmark", filter: { ids }, maxRows: 100, ...history() })));
+    assert.ok(unmarks.every((result) => result.total === 20));
+    assert.deepEqual((await app.listExportCandidates(TENANT_A, { batchId: batch.batchId })).counts, { never: 20, exported: 0, all: 20, unconfirmed: 20 });
+  });
+
+  test("listExportCandidates pages in the export's own order, and the tab counts do not move between tabs", async () => {
+    const batchId = exportHistory.bulkBatch!;
+    const order = (await drain(TENANT_A, { batchId }, { maxRows: 5000 })).documents.map((document) => document.documentId);
+    const paged: string[] = [];
+    for (let offset = 0; offset < order.length; offset += 100) {
+      const page = await app.listExportCandidates(TENANT_A, { batchId }, { limit: 100, offset });
+      assert.deepEqual([page.limit, page.offset, page.total], [100, offset, 1204]);
+      paged.push(...page.rows.map((row) => row.documentId));
+    }
+    assert.deepEqual(paged, order, "13 pages of 100 are exactly the file's rows, in the file's order");
+    const pages = exportHistory.pagesBatch!;
+    const small = [0, 2].map((offset) => app.listExportCandidates(TENANT_A, { batchId: pages }, { limit: 2, offset }));
+    assert.deepEqual((await Promise.all(small)).flatMap((page) => page.rows.map((row) => row.documentId)), [exportHistory.page1, exportHistory.page2, exportHistory.image],
+      "the pages of a PDF stay together in page order, as in the file");
+    await app.markExportState(TENANT_A, { action: "mark", filter: { ids: [exportHistory.page2!] }, maxRows: 10, ...history() });
+    const tabs = await Promise.all([undefined, "never", "exported"].map((exportState) =>
+      app.listExportCandidates(TENANT_A, { batchId: pages, exportState: exportState as "never" | "exported" | undefined })));
+    assert.deepEqual(tabs.map((tab) => [tab.total, tab.counts.never, tab.counts.exported, tab.counts.all]), [[3, 2, 1, 3], [2, 2, 1, 3], [1, 2, 1, 3]]);
+    assert.deepEqual(tabs[2]!.rows.map((row) => row.documentId), [exportHistory.page2]);
+    const clamped = await app.listExportCandidates(TENANT_A, { batchId }, { limit: 1000, offset: 5_000_000 });
+    assert.deepEqual([clamped.limit, clamped.offset, clamped.rows.length, clamped.total], [100, 1_000_000, 0, 1204], "limit ≤ 100 and offset ≤ 1,000,000");
+    assert.equal((await app.listExportCandidates(TENANT_A, { batchId })).rows.length, 50, "50 rows by default");
+  });
+
+  test("openExport with expectedTotal and ids: a moved count or an empty selection is refused before the cursor, and frees its slot", async () => {
+    const batchId = exportHistory.stateBatch!;
+    assert.equal((await drain(TENANT_A, { batchId }, { maxRows: 10, expectedTotal: 3 })).total, 3);
+    await assert.rejects(app.openExport(TENANT_A, { batchId }, { maxRows: 10, expectedTotal: 4 }), { message: "EXPORT_SELECTION_CHANGED" });
+    await assert.rejects(app.openExport(TENANT_A, { batchId }, { maxRows: 2, expectedTotal: 3 }), { message: "EXPORT_TOO_LARGE" }, "too large is reported first");
+    await assert.rejects(app.openExport(TENANT_A, { ids: [randomUUID()] }, { maxRows: 10 }), { message: "EXPORT_SELECTION_EMPTY" });
+    assert.deepEqual(await drain(TENANT_A, { batchId: randomUUID() }), { total: 0, documents: [] }, "a filter without a selection still yields an empty file (the GET path)");
+    // Every refusal released its slot: both export slots open at once.
+    const open = await Promise.all([app.openExport(TENANT_A, { batchId }, { maxRows: 10 }), app.openExport(TENANT_A, { batchId }, { maxRows: 10 })]);
+    await Promise.all(open.map((cursor) => cursor.close()));
   });
 });

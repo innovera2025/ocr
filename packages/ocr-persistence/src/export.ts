@@ -32,6 +32,12 @@ export type ExportDocument = Readonly<{
   /** `raw_response #>> '{layout,detection,verdict}'`, the detected form template. Never the whole jsonb. */
   template: string | null;
   structuredResult: DocumentView;
+  /**
+   * `documents.updated_at` exactly as the export's own snapshot read it: an opaque, exact-microsecond UTC string made in
+   * SQL (a JS `Date` keeps milliseconds only, and a truncated snapshot would make every exported row look changed). It
+   * travels from the cursor to `recordExportMarks` and is never rendered: no column reads it, so the file is unchanged.
+   */
+  rowVersion: string;
 }>;
 
 export type FlattenOptions = Readonly<{ publicBaseUrl?: string | undefined }>;
@@ -299,9 +305,59 @@ export function exportCells(document: ExportDocument, set: ExportColumnSet = "co
  * them (OR-ed) for the export; `from`/`to` are `YYYY-MM-DD` Bangkok days applied to `dateField`.
  */
 export type ExportDateField = "created_at" | "reviewed_at";
+/** A document's export history state: `exported` while its latest event is a download or a manual mark, else `never`. */
+export type ExportState = "never" | "exported";
+/**
+ * `exportState` keeps only rows in that history state. `ids` is an explicit selection (the rows a staff member ticked):
+ * at most `EXPORT_SELECTION_MAX` distinct UUIDs, matched under the tenant and the visibility rule like everything else.
+ * Its presence is what tells the store a selection was made (an empty match is then EXPORT_SELECTION_EMPTY).
+ */
 export type DocumentFilter = {
   status?: DocumentStatusCategory | readonly DocumentStatusCategory[] | undefined;
   q?: string | undefined; batchId?: string | undefined; parentId?: string | undefined;
   confirmedOnly?: boolean | undefined; from?: string | undefined; to?: string | undefined;
   dateField?: ExportDateField | undefined;
+  exportState?: ExportState | undefined;
+  ids?: readonly string[] | undefined;
 };
+
+/** The most rows one explicit (`ids`) selection may name, after de-duplication. "Select all matching" uses a filter instead. */
+export const EXPORT_SELECTION_MAX = 5000;
+
+/** One row of the export dialog's list: identifying fields only (what the document list shows) plus its export history. */
+export type ExportCandidate = Readonly<{
+  documentId: string;
+  /** The ORIGINAL uploaded file name: the PDF's name for a page of a split PDF. */
+  filename: string;
+  pageNumber: number | null; pageCount: number | null;
+  statusCategory: DocumentStatusCategory; needsReview: boolean;
+  customerName: string | null; formNumber: string | null;
+  createdAt: string; reviewedAt: string | null;
+  exportState: ExportState;
+  /** Exported, and `documents.updated_at` moved past the value the latest download or mark saw. */
+  changedAfterExport: boolean;
+  /** The latest download or manual mark; all three are null while the row is `never` exported (incl. after an unmark). */
+  lastExportedAt: string | null; lastExportKind: "exported" | "marked" | null; lastExportedByName: string | null;
+}>;
+/** `never`/`exported`/`all` count the filter WITHOUT `exportState` (stable tab labels); `unconfirmed` counts the current tab. */
+export type ExportCandidateCounts = Readonly<{ never: number; exported: number; all: number; unconfirmed: number }>;
+/** `total` is the number of rows in the current tab (the filter WITH `exportState`). */
+export type ExportCandidatesResult = Readonly<{ total: number; limit: number; offset: number; counts: ExportCandidateCounts; rows: ExportCandidate[] }>;
+/**
+ * What a completed download records (`recordExportMarks`): one `exported` event per streamed row, each with the
+ * `rowVersion` the cursor read. `requestId` is the server-minted trace id that also stamps the request's audit rows.
+ */
+export type ExportMarkInput = Readonly<{
+  kind: "exported"; source: "csv" | "jsonl"; actorUserId: string; requestId: string;
+  rows: readonly Readonly<{ documentId: string; rowVersion: string }>[];
+}>;
+/**
+ * A manual flip (`markExportState`). The selection is `filter`: an explicit one carries `ids`, "select all matching"
+ * carries the filter and the `expectedTotal` the user saw. `maxRows` is `OCR_EXPORT_MAX_ROWS`.
+ */
+export type ExportStateChangeInput = Readonly<{
+  action: "mark" | "unmark"; filter: DocumentFilter; expectedTotal?: number | undefined; maxRows: number;
+  actorUserId: string; requestId: string;
+}>;
+/** `total` rows matched the selection; `affected` got an event, `skipped` already were in the requested state. */
+export type ExportMarkResult = Readonly<{ total: number; affected: number; skipped: number }>;

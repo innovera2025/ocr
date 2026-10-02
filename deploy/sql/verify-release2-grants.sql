@@ -4,9 +4,10 @@
 -- Every role is named explicitly, so one connection answers for all of them. The last line must read FAIL=0.
 -- `ok` is three-valued: true prints PASS, false prints FAIL, NULL prints SKIP — a check whose migration is not
 -- applied to THIS database yet. A skip is not a pass: it says the question could not be asked.
-WITH applied(round_clock) AS (
+WITH applied(round_clock, export_marks) AS (
   SELECT EXISTS (SELECT 1 FROM pg_attribute
-                 WHERE attrelid = to_regclass('public.ocr_batches') AND attname = 'round_opened_at' AND NOT attisdropped)
+                 WHERE attrelid = to_regclass('public.ocr_batches') AND attname = 'round_opened_at' AND NOT attisdropped),
+         to_regclass('public.document_export_marks') IS NOT NULL
 ), checks(seq, name, ok) AS (
   SELECT * FROM (VALUES
     -- The web runtime reads and appends; it never deletes, and it cannot move a user between tenants or rename one.
@@ -46,6 +47,39 @@ WITH applied(round_clock) AS (
   UNION ALL
   SELECT 20, 'app:no-update-batch-label',
          CASE WHEN round_clock THEN NOT has_column_privilege('ocr_app','public.ocr_batches','label','UPDATE') END
+  FROM applied
+  -- 0021: the export history is append-only for the web runtime (read and append, never update, delete or truncate)
+  -- and invisible to every other role, the BYPASSRLS definer included. All seven SKIP until 0021 is applied: asking
+  -- about a table that is not there raises 42P01 and would abort the whole statement, exactly like the 0020 pair above.
+  UNION ALL
+  SELECT 21, 'app:select-export-marks',
+         CASE WHEN export_marks THEN has_table_privilege('ocr_app','public.document_export_marks','SELECT')
+                                 AND has_table_privilege('ocr_app','public.document_export_marks','INSERT') END
+  FROM applied
+  UNION ALL
+  SELECT 22, 'app:no-update-export-marks',
+         CASE WHEN export_marks THEN NOT has_any_column_privilege('ocr_app','public.document_export_marks','UPDATE') END
+  FROM applied
+  UNION ALL
+  SELECT 23, 'app:no-delete-export-marks',
+         CASE WHEN export_marks THEN NOT has_table_privilege('ocr_app','public.document_export_marks','DELETE')
+                                 AND NOT has_table_privilege('ocr_app','public.document_export_marks','TRUNCATE') END
+  FROM applied
+  UNION ALL
+  SELECT 24, 'worker:no-select-export-marks',
+         CASE WHEN export_marks THEN NOT has_any_column_privilege('ocr_worker','public.document_export_marks','SELECT') END
+  FROM applied
+  UNION ALL
+  SELECT 25, 'queue:no-select-export-marks',
+         CASE WHEN export_marks THEN NOT has_any_column_privilege('ocr_queue','public.document_export_marks','SELECT') END
+  FROM applied
+  UNION ALL
+  SELECT 26, 'definer:no-export-marks',
+         CASE WHEN export_marks THEN NOT has_any_column_privilege('ocr_queue_definer','public.document_export_marks','SELECT') END
+  FROM applied
+  UNION ALL
+  SELECT 27, 'force-rls:export-marks',
+         CASE WHEN export_marks THEN (SELECT relforcerowsecurity FROM pg_class WHERE oid = to_regclass('public.document_export_marks')) END
   FROM applied
 )
 SELECT line FROM (

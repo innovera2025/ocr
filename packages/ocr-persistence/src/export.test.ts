@@ -29,7 +29,8 @@ const pageDocument: ExportDocument = {
   pageNumber: 2, pageCount: 5, status: "SUCCEEDED", statusCategory: "confirmed", needsReview: false, errorMessage: null,
   createdAt: "2026-09-22T07:05:00.000Z", processedAt: "2026-09-22T07:09:30.000Z",
   reviewedAt: "2026-09-22T08:00:00.000Z", reviewedBy: "44444444-4444-4444-8444-444444444444", reviewedByName: "นก พนักงาน",
-  deliveryStatus: "DELIVERED", template: "makkha-v3", structuredResult: normalizeStructuredResult(v31)
+  deliveryStatus: "DELIVERED", template: "makkha-v3", structuredResult: normalizeStructuredResult(v31),
+  rowVersion: "2026-09-22T08:00:00.123456Z"
 };
 
 const cells = (document: ExportDocument, set: "compact" | "detailed" = "compact") => {
@@ -168,4 +169,15 @@ test("flattenDocument keeps typed values for JSONL: numbers, booleans and the IS
   assert.equal(values.uploaded_at, "2026-09-22T07:05:00.000Z", "the writers render Bangkok time; the value stays the UTC instant");
   assert.equal(values.min_confidence, 0.8);
   assert.equal(flattenDocument(pageDocument).review_url, null, "no configured base URL: no link, never one built from Host");
+});
+
+test("rowVersion is never rendered: the file is identical whatever snapshot the row carries (0021, D3)", () => {
+  const other: ExportDocument = { ...pageDocument, rowVersion: "1999-01-01T00:00:00.000001Z" };
+  for (const set of ["compact", "detailed"] as const) {
+    assert.deepEqual(flattenDocument(other, set, { publicBaseUrl: "https://ocr.example.test" }),
+      flattenDocument(pageDocument, set, { publicBaseUrl: "https://ocr.example.test" }), set);
+    assert.deepEqual(exportCells(other, set), exportCells(pageDocument, set), set);
+    assert.ok(!exportColumns(set).some((column) => /version/i.test(column.key)), `no ${set} column carries the snapshot`);
+    assert.ok(!Object.values(flattenDocument(pageDocument, set)).includes(pageDocument.rowVersion), `no ${set} value is the snapshot`);
+  }
 });

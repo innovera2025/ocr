@@ -15,6 +15,8 @@ check_sql() { local name="$1" url="$2" sql="$3" expected="$4" guard="${5:-}"; lo
   actual="$(psql "$url" -AtX -v ON_ERROR_STOP=1 -c "$sql" 2>/dev/null || true)"; if [ "$actual" = "$expected" ]; then printf 'PASS %s\n' "$name"; pass=$((pass+1)); else printf 'FAIL %s\n' "$name"; fail=$((fail+1)); fi; }
 # 0020 is applied by Deploy B. Between Deploy A and Deploy B this is false and the two checks it guards are skipped.
 round_clock="EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('public.ocr_batches') AND attname = 'round_opened_at' AND NOT attisdropped)"
+# 0021 is applied by the export-selection deploy. Until then this is false and the seven export-history checks are skipped.
+export_marks="to_regclass('public.document_export_marks') IS NOT NULL"
 check_sql "app:not-superuser" "$DATABASE_URL_APP" "SELECT rolsuper::int FROM pg_roles WHERE rolname=current_user" 0
 check_sql "worker:not-superuser" "$DATABASE_URL_WORKER" "SELECT rolsuper::int FROM pg_roles WHERE rolname=current_user" 0
 check_sql "queue:not-superuser" "$DATABASE_URL_QUEUE" "SELECT rolsuper::int FROM pg_roles WHERE rolname=current_user" 0
@@ -60,5 +62,15 @@ check_sql "force-rls:release2" "$DATABASE_URL_BOOTSTRAP" "SELECT bool_and(relfor
 # be a FAIL — and a non-zero exit out of deploy/go-live-check.sh — on the schema production carries until Deploy B.
 check_sql "app:update-batch-round" "$DATABASE_URL_BOOTSTRAP" "SELECT has_column_privilege('ocr_app','public.ocr_batches','round_opened_at','UPDATE')::int" 1 "$round_clock"
 check_sql "app:no-update-batch-label" "$DATABASE_URL_BOOTSTRAP" "SELECT has_column_privilege('ocr_app','public.ocr_batches','label','UPDATE')::int" 0 "$round_clock"
+# 0021: the export history is append-only for the web runtime (read and append; never update, delete or truncate) and
+# invisible to every other role, the BYPASSRLS definer included. Guarded on 0021 like the 0020 pair above: asking about
+# a table that is not there raises 42P01, and the empty result would read as a FAIL.
+check_sql "app:select-export-marks" "$DATABASE_URL_BOOTSTRAP" "SELECT (has_table_privilege('ocr_app','public.document_export_marks','SELECT') AND has_table_privilege('ocr_app','public.document_export_marks','INSERT'))::int" 1 "$export_marks"
+check_sql "app:no-update-export-marks" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_app','public.document_export_marks','UPDATE')::int" 0 "$export_marks"
+check_sql "app:no-delete-export-marks" "$DATABASE_URL_BOOTSTRAP" "SELECT (has_table_privilege('ocr_app','public.document_export_marks','DELETE') OR has_table_privilege('ocr_app','public.document_export_marks','TRUNCATE'))::int" 0 "$export_marks"
+check_sql "worker:no-select-export-marks" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_worker','public.document_export_marks','SELECT')::int" 0 "$export_marks"
+check_sql "queue:no-select-export-marks" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_queue','public.document_export_marks','SELECT')::int" 0 "$export_marks"
+check_sql "definer:no-export-marks" "$DATABASE_URL_BOOTSTRAP" "SELECT has_any_column_privilege('ocr_queue_definer','public.document_export_marks','SELECT')::int" 0 "$export_marks"
+check_sql "force-rls:export-marks" "$DATABASE_URL_BOOTSTRAP" "SELECT relforcerowsecurity FROM pg_class WHERE oid = to_regclass('public.document_export_marks')" t "$export_marks"
 printf 'SUMMARY PASS=%s SKIP=%s FAIL=%s\n' "$pass" "$skip" "$fail"
 [ "$fail" -eq 0 ]

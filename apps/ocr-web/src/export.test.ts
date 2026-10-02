@@ -39,6 +39,7 @@ function document(overrides: Partial<ExportDocument> = {}): ExportDocument {
     createdAt: "2026-09-22T07:05:00.000Z", processedAt: null, reviewedAt: null, reviewedBy: null, reviewedByName: null,
     deliveryStatus: "NONE", template: null,
     structuredResult: normalizeStructuredResult({ schemaVersion: 3, staffOnly: { roomNo: field("007"), therapistName: field("อันนา") } }),
+    rowVersion: "2026-09-22T07:05:00.000000Z",
     ...overrides
   };
 }
