@@ -42,8 +42,8 @@ const CHECKSUMS: Readonly<Record<string, string>> = {
   // Applied by NO deploy yet — Deploy B applies it and freezes it. Until then an edit is allowed: regenerate this
   // line in the same commit (`sha256sum prisma/migrations/0020_batch_round_clock/migration.sql`).
   "0020_batch_round_clock": "a8a351fd40364a96c60b67672a0e83de3073de2ccfb02cd5af1053e4d3e6ecd9",
-  // Applied by NO deploy yet — the export-selection deploy applies it and freezes it. Until then an edit is allowed:
-  // regenerate this line in the same commit (`sha256sum prisma/migrations/0021_document_export_marks/migration.sql`).
+  // Applied in production by the export-selection deploy (2026-10-05) and frozen there: a fix takes 0022, never an
+  // edit to this file.
   "0021_document_export_marks": "6a4026d137820a627d6f5070a2ebf1a5e91d62f078a196d0147f722326819919"
 };
 
@@ -57,7 +57,7 @@ function sha256(version: string): string {
  * still be edited; the pin is simply regenerated in the same commit, because the pin is what freezes it the moment
  * the deploy that applies it runs. Move this line in the same commit as the deploy that applies the next one.
  */
-export const APPLIED_IN_PRODUCTION = "0020_batch_round_clock";
+export const APPLIED_IN_PRODUCTION = "0021_document_export_marks";
 
 test("every applied migration still hashes to the value production recorded", () => {
   for (const [version, expected] of Object.entries(CHECKSUMS)) {
