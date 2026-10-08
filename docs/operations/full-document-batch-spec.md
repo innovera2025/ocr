@@ -447,3 +447,21 @@ has re-rendered and read the page) and "ดูทุกหน้าของไ�
 by link says "ไฟล์นี้ถูกแยกเป็น N หน้า"; the editor shows the header section (form number, date, time) and the branch when
 the result has them; split error codes are shown in Thai.
 
+
+## 10. Export columns and confidence (2026-10-08, `export-full-confidence-1`)
+
+`GET|POST /api/exports/documents.{csv,jsonl}` and `GET /api/exports/preview` take `columns=compact|detailed`;
+**the default is `detailed`** (query and POST body alike; any other value is 400 `INVALID_EXPORT_FILTER`). The dialog
+labels them "ทั้งหมด (รวม % ความมั่นใจ)" (`detailed`, selected by default) and "สรุป" (`compact`).
+
+- **compact = 57 columns**: the 54 earlier columns in the same positions, then the OCR-only summary
+  `handwriting_confidence`, `handwriting_read` (`"N จาก M"`), `checkbox_confidence` (`ocrReadSummary`).
+- **detailed = 180 columns**: compact + per scalar (13) `_raw, _confidence, _ocr_confidence, _needs_review, _source,
+  _edited`, per checkbox list (5) `_raw, _confidence, _ocr_confidence, _needs_review, _edited`, per treatment slot
+  1-4 `_raw, _confidence, _ocr_confidence, _edited, _guests`.
+- Every confidence is an integer percent rounded like the drawer's `pct()` (`displayedConfidencePercent`). Effective
+  `_confidence` is 100 for a leaf with `source:"human"`, null for an unread leaf (`isUnread`), else the OCR %;
+  `_ocr_confidence` is the OCR % (for a human leaf the kept OCR confidence, only when the OCR had text there);
+  `min_confidence` = `displayedConfidencePercent(summarizeDocument(view).minConfidence)`.
+- Every key is present in every row (CSV empty cell, JSONL `null`). The full column list, the source codes, the Excel
+  recipe and the column-shift notice are in `docs/operations/real-data/export-columns-guide.md`.

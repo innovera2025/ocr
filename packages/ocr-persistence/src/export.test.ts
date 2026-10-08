@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { displayedConfidencePercent } from "./document-sort.js";
 import { applyReviewEdits, normalizeStructuredResult, summarizeDocument, type DocumentView } from "./document-view.js";
@@ -499,4 +500,11 @@ test("T10 Excel: text columns keep their leading zeros, and the read count is wo
     customerInformation: { name: field("a", "a", 0.9), nationality: field("a", "a", 0.9), hotelName: field("a", "a", 0.9), healthOther: unreadInk() },
     staffOnly: { therapistName: field("a", "a", 0.9), roomNo: field("1", "1", 0.9) } });
   assert.equal(cells(seven).handwriting_read, "7 จาก 9");
+});
+
+test("the column guide lists every column of the full set, in order (the guide is part of the contract)", () => {
+  const guide = readFileSync(new URL("../../../docs/operations/real-data/export-columns-guide.md", import.meta.url), "utf8");
+  const table = guide.split("<!-- columns:start -->")[1]?.split("<!-- columns:end -->")[0] ?? "";
+  const keys = [...table.matchAll(/^\|\s*\d+\s*\|\s*`([a-z0-9_]+)`/gm)].map((match) => match[1]);
+  assert.deepEqual(keys, EXPORT_COLUMNS_DETAILED.map((column) => column.key));
 });

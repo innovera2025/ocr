@@ -1248,3 +1248,17 @@ test("an empty, legacy or malformed result still writes every column: empty CSV 
     }
   }
 });
+
+test("Excel: the CSV body starts with the UTF-8 BOM bytes EF BB BF exactly once, and JSONL carries none", async () => {
+  const instance = app(fakeStore([document()]));
+  await withServer(instance, async (base) => {
+    const csv = new Uint8Array(await (await fetch(`${base}/api/exports/documents.csv`)).arrayBuffer());
+    assert.deepEqual([...csv.slice(0, 3)], [0xef, 0xbb, 0xbf]);
+    assert.notDeepEqual([...csv.slice(3, 6)], [0xef, 0xbb, 0xbf], "one BOM, not two");
+    const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(csv);
+    assert.ok(text.slice(1).startsWith("ชื่อไฟล์ต้นฉบับ,"), "Thai headers right after it");
+    assert.ok(text.includes(",007,"), "a room number is written exactly as stored");
+    const jsonl = new Uint8Array(await (await fetch(`${base}/api/exports/documents.jsonl`)).arrayBuffer());
+    assert.equal(jsonl[0], "{".charCodeAt(0), "JSONL starts with the first object, no BOM");
+  });
+});
