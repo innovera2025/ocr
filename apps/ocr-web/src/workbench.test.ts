@@ -124,7 +124,7 @@ test("search box never exceeds the server's q limit (100 characters → otherwis
 test("the export dialog is the selectable list of 0021, not the 20-row column preview (D8)", () => {
   const dialog = /<dialog id="export-dlg"[\s\S]*?<\/dialog>/.exec(markup)?.[0] ?? "";
   for (const id of ["ex-tab-never", "ex-tab-exported", "ex-tab-all", "ex-count", "ex-page", "ex-picked", "ex-all", "ex-clear", "ex-warn",
-    "ex-rows", "ex-prev", "ex-next", "ex-limit", "ex-error", "ex-unmark", "ex-mark", "ex-download"]) {
+    "ex-rows", "ex-prev", "ex-next", "ex-size", "ex-limit", "ex-error", "ex-unmark", "ex-mark", "ex-download"]) {
     assert.match(dialog, new RegExp(`id="${id}"`), `missing #${id}`);
   }
   assert.doesNotMatch(markup, /id="ex-head"|ตัวอย่าง 20 แถวแรก/);
@@ -136,13 +136,17 @@ test("the export dialog is the selectable list of 0021, not the 20-row column pr
   for (const tab of ["never", "exported", "all"]) assert.match(dialog, new RegExp(`<button id="ex-tab-${tab}" class="btn sm" type="button" aria-pressed="(true|false)">`));
   assert.match(dialog, /<label class="chk"><input id="ex-page" type="checkbox"><span>เลือกทั้งหน้านี้<\/span><\/label>/);
   assert.match(dialog, /<p id="ex-warn" role="status" hidden><\/p>/);
+  // แสดงต่อหน้า offers exactly the sizes the script accepts (EX_SIZES) and the server allows (≤ CANDIDATES_MAX_LIMIT 500).
+  const sizes = /<select id="ex-size">([\s\S]*?)<\/select>/.exec(dialog)?.[1] ?? "";
+  assert.deepEqual([...sizes.matchAll(/<option value="(\d+)"( selected)?>(\d+) แถว<\/option>/g)].map((match) => [match[1], match[2] ?? "", match[3]]),
+    [["50", "", "50"], ["100", " selected", "100"], ["200", "", "200"], ["500", "", "500"]]);
   const head = /<thead>([\s\S]*?)<\/thead>/.exec(dialog)?.[1] ?? "";
   const headers = [...head.matchAll(/<th[^>]*>(?:<span class="sr-only">)?([^<]*)/g)].map((match) => match[1]);
   assert.deepEqual(headers, ["เลือก", "ชื่อไฟล์ต้นฉบับ", "หน้า", "ลูกค้า", "เลขที่ฟอร์ม", "สถานะ", "Export ล่าสุด"]);
   assert.match(dialog, /<div class="x-scroll"><table><caption class="sr-only">รายการเอกสารที่เลือกส่งออกได้<\/caption>/);
   assert.match(dialog, /<button id="ex-download" class="btn primary" type="button" disabled>ดาวน์โหลด \(0 แถว\)<\/button>/);
   // The state names and limits the plan fixes (§6), so the behaviour tests and a reviewer can find them.
-  for (const name of ["exTab:'never'", "exOffset:0", "exRows:[]", "exCounts:null", "exSel:new Set()", "exWarnIds:new Set()", "exAll:false", "exSig:''", "exPending:false", "EX_PAGE=50,EX_PICK_MAX=5000"]) {
+  for (const name of ["exTab:'never'", "exOffset:0", "exRows:[]", "exCounts:null", "exSel:new Set()", "exWarnIds:new Set()", "exAll:false", "exSig:''", "exPending:false", "exSize:100", "EX_SIZES=[50,100,200,500],EX_PICK_MAX=5000"]) {
     assert.ok(inlineScript.includes(name), name);
   }
   // At 375px the tabs and the selection bar wrap, and the list scrolls inside .x-scroll instead of widening the card.

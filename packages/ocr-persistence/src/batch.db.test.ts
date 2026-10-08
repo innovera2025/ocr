@@ -1659,7 +1659,7 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     assert.deepEqual(tabs.map((tab) => [tab.total, tab.counts.never, tab.counts.exported, tab.counts.all]), [[3, 2, 1, 3], [2, 2, 1, 3], [1, 2, 1, 3]]);
     assert.deepEqual(tabs[2]!.rows.map((row) => row.documentId), [exportHistory.page2]);
     const clamped = await app.listExportCandidates(TENANT_A, { batchId }, { limit: 1000, offset: 5_000_000 });
-    assert.deepEqual([clamped.limit, clamped.offset, clamped.rows.length, clamped.total], [100, 1_000_000, 0, 1204], "limit ≤ 100 and offset ≤ 1,000,000");
+    assert.deepEqual([clamped.limit, clamped.offset, clamped.rows.length, clamped.total], [500, 1_000_000, 0, 1204], "limit ≤ 500 and offset ≤ 1,000,000");
     assert.equal((await app.listExportCandidates(TENANT_A, { batchId })).rows.length, 50, "50 rows by default");
   });
 

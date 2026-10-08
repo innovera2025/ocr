@@ -263,6 +263,8 @@ legend{padding:0}
 .ex-tabs .btn[aria-pressed="true"]{background:var(--card);box-shadow:var(--ring)}
 .ex-bar{display:flex;align-items:center;gap:8px 16px;flex-wrap:wrap;margin-top:12px}
 .ex-bar .chk{margin-top:0}
+.ex-size{display:flex;align-items:center;gap:8px}
+.ex-size select{width:auto}
 #ex-warn{margin-top:12px;padding:8px 12px;border-radius:6px;background:var(--amber-row);box-shadow:0 0 0 1px var(--amber-line);color:var(--fg);font-size:13px}
 .modal th.ex-ck,.modal td.ex-ck{width:44px;min-width:44px;padding-right:0}
 .badge.ex-warn{background:var(--amber-bg)}.badge.ex-warn .dot{background:var(--amber)}
@@ -384,7 +386,7 @@ const BODY = String.raw`<a class="skip" href="#docs-title">ข้ามไปท
 <div class="ex-bar"><label class="chk"><input id="ex-page" type="checkbox"><span>เลือกทั้งหน้านี้</span></label><span id="ex-picked" class="sub" role="status">เลือกแล้ว 0 แถว</span><button id="ex-all" class="btn sm" type="button" hidden></button><button id="ex-clear" class="btn sm ghost" type="button" hidden>ล้างการเลือก</button></div>
 <p id="ex-warn" role="status" hidden></p>
 <div class="x-scroll"><table><caption class="sr-only">รายการเอกสารที่เลือกส่งออกได้</caption><thead><tr><th scope="col" class="ex-ck"><span class="sr-only">เลือก</span></th><th scope="col">ชื่อไฟล์ต้นฉบับ</th><th scope="col">หน้า</th><th scope="col">ลูกค้า</th><th scope="col">เลขที่ฟอร์ม</th><th scope="col">สถานะ</th><th scope="col">Export ล่าสุด</th></tr></thead><tbody id="ex-rows"></tbody></table></div>
-<nav class="pager" aria-label="เปลี่ยนหน้ารายการส่งออก"><div class="acts"><button id="ex-prev" class="btn sm" type="button" disabled>ก่อนหน้า</button><button id="ex-next" class="btn sm" type="button" disabled>ถัดไป</button></div></nav>
+<nav class="pager" aria-label="เปลี่ยนหน้ารายการส่งออก"><label class="ex-size sub">แสดงต่อหน้า<select id="ex-size"><option value="50">50 แถว</option><option value="100" selected>100 แถว</option><option value="200">200 แถว</option><option value="500">500 แถว</option></select></label><div class="acts"><button id="ex-prev" class="btn sm" type="button" disabled>ก่อนหน้า</button><button id="ex-next" class="btn sm" type="button" disabled>ถัดไป</button></div></nav>
 <p class="sub">เปิดไฟล์ CSV ใน Excel ด้วยเมนู Data ▸ From Text/CSV แล้วตั้งคอลัมน์ ห้อง และ เลขที่ฟอร์ม เป็น “ข้อความ” มิฉะนั้น Excel จะตัดเลข 0 ข้างหน้าทิ้ง (007 จะกลายเป็น 7)</p>
 <p id="ex-limit" class="sub" role="status"></p>
 <p id="ex-error" class="err" role="alert"></p>
@@ -426,9 +428,10 @@ const USER_STATUS={active:'ใช้งานอยู่',disabled:'ปิด�
 const MODALS=['auth-dlg','pw-dlg','users-dlg','me-dlg','confirm-dlg','export-dlg'];
 /* The export's status checkboxes, in the order they appear; each has a checkbox with the id 'ex-st-'+key. */
 const EXPORT_STATUSES=['queued','processing','review','succeeded','confirmed','failed'];
-/* The export list (0021): one page of candidates, and how many rows staff may tick by hand (the server's
-   EXPORT_SELECTION_MAX); more than that is "เลือกทั้งหมด", which sends the filter instead of the ids. */
-const EX_PAGE=50,EX_PICK_MAX=5000;
+/* The export list (0021): the page sizes แสดงต่อหน้า offers (the server's CANDIDATES_MAX_LIMIT is 500), and how many
+   rows staff may tick by hand (the server's EXPORT_SELECTION_MAX); more than that is "เลือกทั้งหมด", which sends the
+   filter instead of the ids. */
+const EX_SIZES=[50,100,200,500],EX_PICK_MAX=5000;
 const EX_TABS=['never','exported','all'];
 const EX_TAB_LABEL={never:'ยังไม่เคย Export',exported:'Export แล้ว',all:'ทั้งหมด'};
 /* The list's warning badges for rows that are not confirmed. A map of its own, so CATEGORY stays the shared vocabulary. */
@@ -441,7 +444,7 @@ EXPORT_TOO_LARGE:'ข้อมูลที่เลือกมีจำนว�
 /* The selection and history codes (0021). A download whose marks fail is a cut socket, so staff read that through
    EXPORT_INCOMPLETE; EXPORT_MARK_FAILED itself is what ทำเครื่องหมาย / ย้ายกลับ answer when the write was rolled back. */
 INVALID_EXPORT_SELECTION:'รายการที่เลือกไม่ถูกต้องหรือมากเกินไป (เลือกเองได้ไม่เกิน 5,000 แถว) กรุณาใช้ "เลือกทั้งหมด" หรือเลือกใหม่',EXPORT_SELECTION_EMPTY:'ไม่พบแถวที่เลือกแล้ว (อาจถูกลบหรือเปลี่ยนไป) กรุณาโหลดรายการใหม่',EXPORT_SELECTION_CHANGED:'รายการเปลี่ยนไประหว่างที่คุณเลือก (มีเอกสารเข้ามาใหม่หรือสถานะเปลี่ยน) กรุณาตรวจรายการแล้วเลือกใหม่อีกครั้ง',EXPORT_MARK_FAILED:'บันทึกสถานะ Export ไม่สำเร็จ ยังไม่มีแถวใดเปลี่ยนสถานะ กรุณาลองใหม่อีกครั้ง'};
-const state={exSeq:0,exAbort:null,exTimer:0,exBusy:false,exTotal:null,exMax:0,exQ:'',exParent:'',exParentName:'',exTab:'never',exOffset:0,exRows:[],exCounts:null,exSel:new Set(),exWarnIds:new Set(),exAll:false,exAllTotal:null,exDlg:0,exGen:0,exSig:'',exPending:false,
+const state={exSeq:0,exAbort:null,exTimer:0,exBusy:false,exTotal:null,exMax:0,exQ:'',exParent:'',exParentName:'',exTab:'never',exOffset:0,exSize:100,exRows:[],exCounts:null,exSel:new Set(),exWarnIds:new Set(),exAll:false,exAllTotal:null,exDlg:0,exGen:0,exSig:'',exPending:false,
 user:null,csrf:'',authWait:null,authSettle:null,authBefore:null,csrfWait:null,rearm:null,leaving:false,started:false,bg:0,xhrs:new Set(),users:[],tempPass:'',pwForced:false,pwBusy:false,pwResolve:null,loginBusy:false,confirmResolve:null,confirmReturn:null,conn:'',docs:[],total:0,offset:0,q:'',status:'',batchFilter:'',parentFilter:'',parentName:'',pdfView:false,batches:[],batchId:null,batch:null,listSeq:0,listAbort:null,listSig:'',loaded:false,uploads:[],active:0,timer:0,ticking:false,soon:0,searchTimer:0,noticeTimer:0,current:null,draft:null,originalSig:'',editable:false,dirty:false,saving:false,blobUrl:'',previewSeq:0,previewAbort:null,previewMissing:false,zoom:1,openSeq:0,lastFocus:null,askResolve:null,askReturn:null,uid:0,inputs:new WeakMap()};
 const $=id=>document.getElementById(id);
 const dateFmt=new Intl.DateTimeFormat('th-TH',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
@@ -725,14 +728,14 @@ function renderExportBar(){const rows=state.exRows,total=typeof state.exTotal===
 const onPage=rows.filter(r=>state.exSel.has(r.documentId)).length,full=rows.length>0&&onPage===rows.length;
 const page=$('ex-page');page.checked=state.exAll||full;page.indeterminate=!state.exAll&&onPage>0&&!full;page.disabled=state.exAll||!rows.length;
 $('ex-picked').textContent=state.exAll?'เลือกทั้งหมด '+x+' แถวที่ตรงกับตัวกรองแล้ว':'เลือกแล้ว '+x+' แถว';
-const offer=!state.exAll&&full&&total>rows.length,over=state.exMax>0&&total>state.exMax;
+const offer=!state.exAll&&total>0,over=state.exMax>0&&total>state.exMax;
 const all=$('ex-all');all.hidden=!offer;all.disabled=over;all.textContent='เลือกทั้งหมด '+total+' แถวที่ตรงกับตัวกรอง';
 $('ex-clear').hidden=!state.exAll;
 /* Unconfirmed rows stay selectable; one line says so, and nothing blocks the download. */
 const warned=exWarned(),warn=$('ex-warn');warn.hidden=!warned;warn.textContent=warned?'มี '+warned+' แถวที่ยังไม่ยืนยันหรืออ่านยังไม่เสร็จ ข้อมูลในไฟล์อาจยังไม่ถูกต้อง':'';
 $('ex-limit').textContent=bad?ERRORS.INVALID_EXPORT_RANGE:!state.exAll&&state.exSel.size>=EX_PICK_MAX?'เลือกเองได้ไม่เกิน 5,000 แถวต่อครั้ง ใช้ "เลือกทั้งหมด" แทน':offer&&over?ERRORS.EXPORT_TOO_LARGE:'';
 const loading=state.exTotal===null||!!state.exAbort;
-$('ex-prev').disabled=loading||state.exOffset<=0;$('ex-next').disabled=loading||state.exOffset+EX_PAGE>=total;
+$('ex-prev').disabled=loading||state.exOffset<=0;$('ex-next').disabled=loading||state.exOffset+state.exSize>=total;
 $('ex-download').disabled=busy||!x||bad;if(!state.exBusy)$('ex-download').textContent='ดาวน์โหลด ('+x+' แถว)';
 $('ex-mark').disabled=busy||!x;$('ex-unmark').disabled=busy||!x;}
 function warnBadge(cat){const b=el('span','badge ex-warn'+(cat==='failed'?' b-failed':''));b.append(el('span','dot'),document.createTextNode(EX_WARN[cat]||CATEGORY[cat]||CATEGORY.queued));return b;}
@@ -777,8 +780,13 @@ function exportListSoon(){stopExportList();state.exOffset=0;state.exTotal=null;s
 $('ex-rows').replaceChildren();$('ex-count').textContent=badExportRange()?'':'กำลังนับจำนวนแถว…';renderExportTabs();renderExportBar();
 state.exTimer=setTimeout(()=>{loadExportList();},300);}
 function setExportTab(tab){if(!EX_TABS.includes(tab)||tab===state.exTab)return;state.exTab=tab;exportListSoon();}
-function pageExport(step){if(state.exAbort||typeof state.exTotal!=='number')return;const next=state.exOffset+step*EX_PAGE;
+function pageExport(step){if(state.exAbort||typeof state.exTotal!=='number')return;const next=state.exOffset+step*state.exSize;
 if(next<0||next>=state.exTotal)return;state.exOffset=next;setExportError('');loadExportList();}
+/* แสดงต่อหน้า changes only how many rows one page shows: the filter is the same and ticks are ids, so the selection
+   stays and the list starts again from its first page. A list still waiting for its debounce picks the size up itself. */
+function setExportSize(){const n=Number($('ex-size').value);if(!EX_SIZES.includes(n)){$('ex-size').value=String(state.exSize);return;}
+if(n===state.exSize)return;state.exSize=n;if(typeof state.exTotal!=='number'&&!state.exAbort)return;
+state.exOffset=0;setExportError('');loadExportList();}
 /* After a download or a mark the rows have moved between tabs: start again from the first page with no selection,
    which also sidesteps the offset shift of a page whose rows just left it. The old rows leave the screen at once, so
    none of them (some now in the other tab) can be ticked while the new page is on its way. */
@@ -803,7 +811,7 @@ if(sig!==state.exSig){state.exSig=sig;state.exOffset=0;state.exTotal=null;state.
 if(badExportRange()){state.exRows=[];state.exTotal=null;$('ex-rows').replaceChildren();$('ex-count').textContent='';renderExportTabs();renderExportBar();setExportError(ERRORS.INVALID_EXPORT_RANGE);return;}
 const ctrl=new AbortController();state.exAbort=ctrl;
 $('ex-count').textContent='กำลังนับจำนวนแถว…';renderExportTabs();renderExportBar();
-const p=exportParams(f);p.set('limit',String(EX_PAGE));p.set('offset',String(state.exOffset));
+const p=exportParams(f);p.set('limit',String(state.exSize));p.set('offset',String(state.exOffset));
 try{const data=await getJson('/api/exports/candidates?'+p,{signal:ctrl.signal});if(seq!==state.exSeq)return;state.exAbort=null;renderExportList(isObj(data)?data:{});}
 catch(e){if(e&&e.name==='AbortError')return;if(seq!==state.exSeq)return;state.exAbort=null;
 state.exTotal=null;state.exRows=[];$('ex-rows').replaceChildren();$('ex-count').textContent='';renderExportBar();setExportError(e.message);}
@@ -814,7 +822,7 @@ EXPORT_STATUSES.forEach(s=>{$('ex-st-'+s).checked=state.status===s;});
 /* The same fallback option as the toolbar's filter: /api/batches?limit=20 may not hold the selected batch, and a
    <select> given a value that matches no <option> reads back as '' — the export would silently cover every batch. */
 fillBatchOptions($('ex-batch'),state.batchFilter||'');
-$('ex-confirmed').checked=false;$('ex-datefield').value='created_at';$('ex-from').value='';$('ex-to').value='';$('ex-format').value='csv';$('ex-columns').value='compact';
+$('ex-confirmed').checked=false;$('ex-datefield').value='created_at';$('ex-from').value='';$('ex-to').value='';$('ex-format').value='csv';$('ex-columns').value='compact';$('ex-size').value=String(state.exSize);
 state.exDlg++;stopExportList();state.exTab='never';blankExportList();
 renderExportChips();
 const d=$('export-dlg');if(!d.open)d.showModal();
@@ -1146,6 +1154,7 @@ $('ex-page').addEventListener('change',pickExportPage);
 $('ex-all').addEventListener('click',pickAllMatching);
 $('ex-clear').addEventListener('click',clearAllMatching);
 $('ex-prev').addEventListener('click',()=>pageExport(-1));$('ex-next').addEventListener('click',()=>pageExport(1));
+$('ex-size').addEventListener('change',setExportSize);
 /* Format and คอลัมน์ shape the file, not the list: they move neither the rows nor the selection. */
 ['ex-batch','ex-datefield','ex-from','ex-to','ex-confirmed'].forEach(id=>$(id).addEventListener('change',exportListSoon));
 EXPORT_STATUSES.forEach(s=>$('ex-st-'+s).addEventListener('change',exportListSoon));

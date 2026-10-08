@@ -114,7 +114,7 @@ type Workbench = {
     openSeq: number; originalSig: string; user: { id: string } | null; csrf: string; dirty: boolean; leaving: boolean;
     timer: number; users: unknown[]; tempPass: string; q: string; status: string; parentFilter: string; parentName: string;
     exQ: string; exParent: string; exTotal: number | null; exMax: number; batchFilter: string;
-    exTab: string; exOffset: number; exSel: Set<string>; exWarnIds: Set<string>; exAll: boolean; exAllTotal: number | null; exRows: unknown[];
+    exTab: string; exOffset: number; exSize: number; exSel: Set<string>; exWarnIds: Set<string>; exAll: boolean; exAllTotal: number | null; exRows: unknown[];
   };
 };
 
@@ -985,8 +985,9 @@ test("the dialog opens on ยังไม่เคย Export with the tab counts
   const [first] = candidateCalls(ctx);
   assert.equal(first?.get("exportState"), "never", "the default tab is what has never been exported");
   assert.equal(first?.get("status"), "review", "the page's status checkbox is pre-ticked");
-  assert.deepEqual([first?.get("dateField"), first?.get("limit"), first?.get("offset"), first?.get("columns")], ["created_at", "50", "0", null],
-    "the list does not depend on the file's column set");
+  assert.deepEqual([first?.get("dateField"), first?.get("limit"), first?.get("offset"), first?.get("columns")], ["created_at", "100", "0", null],
+    "the list does not depend on the file's column set; 100 rows a page by default");
+  assert.equal(ctx.$("ex-size").value, "100", "แสดงต่อหน้า shows the size the list asked for");
   assert.deepEqual(["ex-tab-never", "ex-tab-exported", "ex-tab-all"].map((id) => ctx.$(id).textContent),
     ["ยังไม่เคย Export (2)", "Export แล้ว (1)", "ทั้งหมด (3)"]);
   assert.deepEqual(["ex-tab-never", "ex-tab-exported", "ex-tab-all"].map((id) => ctx.$(id).getAttribute("aria-pressed")), ["true", "false", "false"]);
@@ -1040,7 +1041,8 @@ test("ticking rows drives the counter, the page checkbox (indeterminate) and the
   assert.deepEqual([ctx.$("ex-page").checked, ctx.$("ex-page").indeterminate], [true, false]);
   assert.deepEqual([0, 1, 2].map((index) => rowBox(ctx, index).checked), [true, true, true]);
   assert.equal(ctx.$("ex-picked").textContent, "เลือกแล้ว 3 แถว");
-  assert.equal(ctx.$("ex-all").hidden, true, "nothing beyond this page to offer");
+  assert.deepEqual([ctx.$("ex-all").hidden, ctx.$("ex-all").textContent], [false, "เลือกทั้งหมด 3 แถวที่ตรงกับตัวกรอง"],
+    "offered even when every matching row is on this page");
   tickPage(ctx, false);
   assert.deepEqual([ctx.$("ex-page").checked, ctx.$("ex-page").indeterminate, ctx.wb.state.exSel.size], [false, false, 0]);
   assert.equal(ctx.$("ex-download").disabled, true);
@@ -1059,14 +1061,11 @@ test("paging keeps the ticked ids; a tab or filter change resets to the first pa
   tick(ctx, 0);
   ctx.$("ex-next").dispatch("click");
   await settle();
-  assert.equal(candidateCalls(ctx).at(-1)?.get("offset"), "50");
-  assert.equal(ctx.$("ex-count").textContent, "พบ 120 แถว · แสดงแถวที่ 51–100");
-  assert.equal(ctx.$("ex-rows").children[0]!.children[1]!.textContent, "ใบลูกค้า-51.pdf");
+  assert.equal(candidateCalls(ctx).at(-1)?.get("offset"), "100");
+  assert.equal(ctx.$("ex-count").textContent, "พบ 120 แถว · แสดงแถวที่ 101–120");
+  assert.equal(ctx.$("ex-rows").children[0]!.children[1]!.textContent, "ใบลูกค้า-101.pdf");
   tick(ctx, 0);
   assert.equal(ctx.$("ex-picked").textContent, "เลือกแล้ว 2 แถว", "a tick is an id, so the first page's tick survives the page change");
-  ctx.$("ex-next").dispatch("click");
-  await settle();
-  assert.equal(ctx.$("ex-count").textContent, "พบ 120 แถว · แสดงแถวที่ 101–120");
   assert.equal(ctx.$("ex-next").disabled, true);
   ctx.$("ex-tab-exported").dispatch("click");
   assert.equal(ctx.wb.state.exSel.size, 0, "a tab is a different list: nothing ticked carries over");
@@ -1079,7 +1078,7 @@ test("paging keeps the ticked ids; a tab or filter change resets to the first pa
   runLastTimer(ctx);
   await settle();
   assert.equal(candidateCalls(ctx).at(-1)?.get("exportState"), null, "ทั้งหมด sends no exportState");
-  assert.equal(ctx.$("ex-count").textContent, "พบ 121 แถว · แสดงแถวที่ 1–50");
+  assert.equal(ctx.$("ex-count").textContent, "พบ 121 แถว · แสดงแถวที่ 1–100");
   tick(ctx, 0);
   ctx.$("ex-confirmed").checked = true;
   ctx.$("ex-confirmed").dispatch("change");
@@ -1088,6 +1087,44 @@ test("paging keeps the ticked ids; a tab or filter change resets to the first pa
   runLastTimer(ctx);
   await settle();
   assert.deepEqual([candidateCalls(ctx).at(-1)?.get("confirmedOnly"), candidateCalls(ctx).at(-1)?.get("offset")], ["1", "0"]);
+});
+
+test("แสดงต่อหน้า: 50 to 500 rows a page; a change keeps the ticks and the filter, and starts again from the first page", async () => {
+  const ctx = await openList(many(650));
+  const size = (value: string) => { ctx.$("ex-size").value = value; ctx.$("ex-size").dispatch("change"); };
+  tick(ctx, 0);
+  ctx.$("ex-next").dispatch("click");
+  await settle();
+  tick(ctx, 0);
+  ctx.calls.length = 0;
+  size("500");
+  await settle();
+  const asked = candidateCalls(ctx);
+  assert.deepEqual(asked.map((call) => [call.get("limit"), call.get("offset"), call.get("exportState")]), [["500", "0", "never"]], "one request, from the first page");
+  assert.equal(ctx.$("ex-count").textContent, "พบ 650 แถว · แสดงแถวที่ 1–500");
+  assert.equal(ctx.$("ex-rows").children.length, 500);
+  assert.deepEqual([ctx.wb.state.exSel.size, rowBox(ctx, 0).checked, rowBox(ctx, 100).checked], [2, true, true], "a tick is an id: both survive the new page size");
+  ctx.$("ex-next").dispatch("click");
+  await settle();
+  assert.deepEqual([candidateCalls(ctx).at(-1)?.get("offset"), ctx.$("ex-count").textContent, ctx.$("ex-next").disabled], ["500", "พบ 650 แถว · แสดงแถวที่ 501–650", true]);
+  // A value the control does not offer is put back and asks nothing (the server would refuse more than 500).
+  ctx.calls.length = 0;
+  size("1000");
+  assert.deepEqual([ctx.$("ex-size").value, ctx.wb.state.exSize, candidateCalls(ctx).length], ["500", 500, 0]);
+  // While a filter change waits for its debounce, the size is simply taken up by the request that follows.
+  ctx.$("ex-confirmed").checked = true;
+  ctx.$("ex-confirmed").dispatch("change");
+  size("200");
+  assert.equal(candidateCalls(ctx).length, 0, "no request jumps the debounce");
+  runLastTimer(ctx);
+  await settle();
+  assert.deepEqual(candidateCalls(ctx).map((call) => [call.get("limit"), call.get("offset"), call.get("confirmedOnly")]), [["200", "0", "1"]]);
+  // The choice outlives the dialog for this page load.
+  ctx.$("ex-close").dispatch("click");
+  ctx.calls.length = 0;
+  ctx.wb.openExportDialog();
+  await settle();
+  assert.deepEqual([ctx.$("ex-size").value, candidateCalls(ctx).at(-1)?.get("limit")], ["200", "200"]);
 });
 
 test("unconfirmed rows stay selectable with a warning badge, and one warning line counts them", async () => {
@@ -1145,18 +1182,18 @@ test("an empty ยังไม่เคย Export tab points at Export แล้
 
 test("เลือกทั้งหมด N switches to filter mode: rows locked, the body carries the filter and the N the user saw", async () => {
   const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
-  const rows = [...many(70), ...many(5, { statusCategory: "review" }).map((row, index) => ({ ...row, documentId: exId(900 + index) }))];
-  const ctx = await openList(rows, downloadRoute(() => csvFile({ "x-export-rows": "75" })), undefined, state);
-  assert.equal(ctx.$("ex-all").hidden, true, "offered only once the whole page is ticked");
-  tickPage(ctx);
-  assert.equal(ctx.$("ex-all").hidden, false);
-  assert.equal(ctx.$("ex-all").textContent, "เลือกทั้งหมด 75 แถวที่ตรงกับตัวกรอง");
+  const rows = [...many(170), ...many(5, { statusCategory: "review" }).map((row, index) => ({ ...row, documentId: exId(900 + index) }))];
+  const ctx = await openList(rows, downloadRoute(() => csvFile({ "x-export-rows": "175" })), undefined, state);
+  assert.equal(ctx.$("ex-all").hidden, false, "offered as soon as the list has answered, with nothing ticked");
+  assert.equal(ctx.$("ex-all").textContent, "เลือกทั้งหมด 175 แถวที่ตรงกับตัวกรอง");
+  tick(ctx, 0);
+  assert.equal(ctx.$("ex-all").hidden, false, "and still offered beside a partly ticked page");
   ctx.$("ex-all").dispatch("click");
-  assert.equal(ctx.$("ex-picked").textContent, "เลือกทั้งหมด 75 แถวที่ตรงกับตัวกรองแล้ว");
+  assert.equal(ctx.$("ex-picked").textContent, "เลือกทั้งหมด 175 แถวที่ตรงกับตัวกรองแล้ว");
   assert.deepEqual([ctx.$("ex-all").hidden, ctx.$("ex-clear").hidden], [true, false]);
-  assert.ok([0, 1, 49].every((index) => rowBox(ctx, index).checked && rowBox(ctx, index).disabled), "every row is in, and none can be unticked one by one");
+  assert.ok([0, 1, 99].every((index) => rowBox(ctx, index).checked && rowBox(ctx, index).disabled), "every row is in, and none can be unticked one by one");
   assert.deepEqual([ctx.$("ex-page").checked, ctx.$("ex-page").disabled], [true, true]);
-  assert.equal(ctx.$("ex-download").textContent, "ดาวน์โหลด (75 แถว)");
+  assert.equal(ctx.$("ex-download").textContent, "ดาวน์โหลด (175 แถว)");
   assert.equal(ctx.$("ex-warn").textContent, "มี 5 แถวที่ยังไม่ยืนยันหรืออ่านยังไม่เสร็จ ข้อมูลในไฟล์อาจยังไม่ถูกต้อง", "counts.unconfirmed of the tab");
   ctx.$("ex-next").dispatch("click");
   await settle();
@@ -1164,7 +1201,7 @@ test("เลือกทั้งหมด N switches to filter mode: rows locke
   ctx.$("ex-download").dispatch("click");
   await settle();
   const post = ctx.calls.find((call) => call.url === "/api/exports/documents.csv");
-  assert.deepEqual(bodyOf(post), { columns: "compact", selection: { mode: "filter", filter: { dateField: "created_at", exportState: "never" }, expectedTotal: 75 } });
+  assert.deepEqual(bodyOf(post), { columns: "compact", selection: { mode: "filter", filter: { dateField: "created_at", exportState: "never" }, expectedTotal: 175 } });
   // ล้างการเลือก goes back to explicit ticking with nothing ticked.
   const again = await openList(many(60));
   tickPage(again);
@@ -1176,8 +1213,7 @@ test("เลือกทั้งหมด N switches to filter mode: rows locke
 
 test("more matching rows than OCR_EXPORT_MAX_ROWS: เลือกทั้งหมด is disabled and says why in Thai", async () => {
   const ctx = await openList(many(60), undefined, 55);
-  tickPage(ctx);
-  assert.equal(ctx.$("ex-all").hidden, false);
+  assert.equal(ctx.$("ex-all").hidden, false, "shown without ticking the page, so the reason is visible");
   assert.equal(ctx.$("ex-all").disabled, true);
   assert.equal(ctx.$("ex-limit").textContent, ctx.wb.ERRORS.EXPORT_TOO_LARGE);
   ctx.$("ex-all").dispatch("click");
@@ -1206,7 +1242,7 @@ test("explicit ticking stops at 5,000 rows and points at เลือกทั�
 test("a download POSTs the ticked ids with the CSRF token, saves the file, then reloads the list from the first page", async () => {
   const blobs = { created: 0, revoked: 0 };
   const state: Server = { user: ADMIN, csrf: "csrf-1", sessionStatus: 200 };
-  const rows = many(60);
+  const rows = many(160);
   let downloaded = false;
   const routes = either(downloadRoute(() => { downloaded = true; return csvFile({ "x-export-rows": "1" }); }),
     (url) => url.startsWith("/api/exports/candidates?") && downloaded
@@ -1238,7 +1274,7 @@ test("a download POSTs the ticked ids with the CSRF token, saves the file, then 
   assert.equal(posts[0]?.url, "/api/exports/documents.csv", "the selection travels in the body, not the URL");
   assert.equal(posts[0]?.headers["X-CSRF-Token"], "csrf-1");
   assert.equal(posts[0]?.headers["Content-Type"], "application/json");
-  assert.deepEqual(bodyOf(posts[0]), { columns: "detailed", selection: { mode: "ids", ids: [exId(51), exId(1)], expectState: "never" } },
+  assert.deepEqual(bodyOf(posts[0]), { columns: "detailed", selection: { mode: "ids", ids: [exId(101), exId(1)], expectState: "never" } },
     "H1: the tab the rows were ticked in travels with them");
   // The anchor is in the document when it is clicked and gone afterwards, and the blob URL outlives the click by a
   // turn: a detached anchor and a same-tick revoke are only reliable in Chromium.
@@ -1310,7 +1346,7 @@ test("EXPORT_SELECTION_CHANGED or _EMPTY: the Thai reason stays, the selection c
     assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS[code], `${route} ${code}`);
     assert.deepEqual([ctx.wb.state.exAll, ctx.wb.state.exSel.size], [false, 0], `${route} ${code}: the selection described rows that changed`);
     assert.equal(candidateCalls(ctx).length, 1, "the list is asked again");
-    assert.equal(ctx.$("ex-count").textContent, "พบ 60 แถว · แสดงแถวที่ 1–50");
+    assert.equal(ctx.$("ex-count").textContent, "พบ 60 แถว · แสดงแถวที่ 1–60");
     assert.ok(!ctx.$("notice").textContent.includes("แถวแล้ว"), "no success notice");
   }
 });
@@ -1519,22 +1555,22 @@ test("H1: an explicit selection carries the tab it was ticked in: never, exporte
 });
 
 test("M2: เลือกทั้งหมด pins the N the user agreed to; a later page that counts differently drops the selection and says why", async () => {
-  const rows = many(70);
-  const ctx = await openList(rows, downloadRoute(() => csvFile({ "x-export-rows": "70" })));
+  const rows = many(170);
+  const ctx = await openList(rows, downloadRoute(() => csvFile({ "x-export-rows": "170" })));
   tickPage(ctx);
   ctx.$("ex-all").dispatch("click");
-  assert.deepEqual([ctx.wb.state.exAll, ctx.wb.state.exAllTotal], [true, 70]);
+  assert.deepEqual([ctx.wb.state.exAll, ctx.wb.state.exAllTotal], [true, 170]);
   ctx.$("ex-next").dispatch("click");
   await settle();
-  assert.deepEqual([ctx.wb.state.exAll, ctx.$("ex-error").textContent], [true, ""], "the same 70 on the next page: still all of them");
-  // A document arrives in the tab while the user pages: the 70 they agreed to are no longer "all matching".
-  rows.push(candidate(71));
+  assert.deepEqual([ctx.wb.state.exAll, ctx.$("ex-error").textContent], [true, ""], "the same 170 on the next page: still all of them");
+  // A document arrives in the tab while the user pages: the 170 they agreed to are no longer "all matching".
+  rows.push(candidate(171));
   ctx.$("ex-prev").dispatch("click");
   await settle();
   assert.deepEqual([ctx.wb.state.exAll, ctx.wb.state.exAllTotal, ctx.wb.state.exSel.size], [false, null, 0]);
   assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS.EXPORT_SELECTION_CHANGED);
   assert.deepEqual([ctx.$("ex-picked").textContent, ctx.$("ex-download").disabled, rowBox(ctx, 0).disabled], ["เลือกแล้ว 0 แถว", true, false]);
-  assert.equal(ctx.$("ex-count").textContent, "พบ 71 แถว · แสดงแถวที่ 1–50", "the new count is shown, nothing is downloaded");
+  assert.equal(ctx.$("ex-count").textContent, "พบ 171 แถว · แสดงแถวที่ 1–100", "the new count is shown, nothing is downloaded");
   ctx.$("ex-download").dispatch("click");
   await settle();
   assert.deepEqual(ctx.calls.filter((call) => call.url.startsWith("/api/exports/documents.")), []);
@@ -1544,7 +1580,7 @@ test("M2: เลือกทั้งหมด pins the N the user agreed to; a 
   ctx.$("ex-download").dispatch("click");
   await settle();
   const selection = bodyOf(ctx.calls.find((call) => call.url === "/api/exports/documents.csv")).selection as Record<string, unknown>;
-  assert.deepEqual([selection.mode, selection.expectedTotal], ["filter", 71]);
+  assert.deepEqual([selection.mode, selection.expectedTotal], ["filter", 171]);
 });
 
 test("L2: after a download the old rows leave the screen at once, and no tick lands while the list reloads", async () => {

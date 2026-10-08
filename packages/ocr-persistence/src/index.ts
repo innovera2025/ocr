@@ -427,9 +427,9 @@ const MAX_CONCURRENT_EXPORTS = 2;
 /** §10 H2: the shared filter's `q`. The HTTP parsers reject anything longer; the store slices as a backstop. */
 export const MAX_FILTER_QUERY_LENGTH = 100;
 const EXPORT_PREVIEW_ROWS = 20;
-/** The export dialog's list pages (D9): 50 rows by default, 100 at most. */
+/** The export dialog's list pages (D9): 50 rows by default, 500 at most. */
 const EXPORT_CANDIDATES_DEFAULT = 50;
-const EXPORT_CANDIDATES_MAX = 100;
+const EXPORT_CANDIDATES_MAX = 500;
 function iso(value: unknown): string | null { return value instanceof Date ? value.toISOString() : typeof value === "string" ? new Date(value).toISOString() : null; }
 function ms(value: unknown): number | null { return value instanceof Date ? value.getTime() : typeof value === "string" ? Date.parse(value) : null; }
 function str(value: unknown): string | null { return typeof value === "string" ? value : null; }
@@ -1195,7 +1195,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
    * The export dialog's list (0021, D9): one page of the rows the export would contain, in the export's own order, with
    * each row's export history, plus the tab counts. One read-only REPEATABLE READ snapshot with the preview's timeouts,
    * so the counts and the page agree. `never`/`exported`/`all` count the filter without `exportState` (the tab labels
-   * stay put while switching tabs); `total` and `unconfirmed` belong to the current tab. limit 1..100 (default 50) and
+   * stay put while switching tabs); `total` and `unconfirmed` belong to the current tab. limit 1..500 (default 50) and
    * offset 0..1,000,000 are clamped. Errors are documentFilterSql's.
    */
   async listExportCandidates(tenantId: string, filter: DocumentFilter = {}, page: ExportCandidatesPage = {}): Promise<ExportCandidatesResult> {

@@ -660,9 +660,9 @@ test("parseExportBody and parseMarksBody: defaults, strict keys, and the GET's o
 test("parseCandidatesQuery pages strictly, and every export query now understands exportState", () => {
   const params = (query: string) => new URLSearchParams(query);
   assert.deepEqual(parseCandidatesQuery(params("")), { filter: {}, limit: 50, offset: 0 });
-  assert.deepEqual(parseCandidatesQuery(params("exportState=exported&status=review&limit=100&offset=1000000")),
-    { filter: { status: ["review"], exportState: "exported" }, limit: 100, offset: 1_000_000 });
-  for (const bad of ["limit=0", "limit=101", "limit=-1", "limit=1.5", "limit=ten", "offset=1000001", "offset=-1", "exportState=all", "status=nope"]) {
+  assert.deepEqual(parseCandidatesQuery(params("exportState=exported&status=review&limit=500&offset=1000000")),
+    { filter: { status: ["review"], exportState: "exported" }, limit: 500, offset: 1_000_000 });
+  for (const bad of ["limit=0", "limit=501", "limit=-1", "limit=1.5", "limit=ten", "offset=1000001", "offset=-1", "exportState=all", "status=nope"]) {
     assert.throws(() => parseCandidatesQuery(params(bad)), { message: "INVALID_EXPORT_FILTER" }, bad);
   }
   assert.equal(parseExportQuery(params("exportState=never")).exportState, "never", "the GET download accepts it too (and still never marks)");
@@ -917,7 +917,7 @@ test("candidates: the C1 shape, the filters and page reach the store, metered an
     assert.deepEqual(instance.store.listCalls, [{ filter: { status: ["review", "failed"], q: "ทดสอบ", exportState: "exported" }, page: { limit: 2, offset: 4 } }]);
     assert.equal(instance.audits.length, 0, "D9: metered, not audited per call");
     assert.deepEqual([await counter(base, READ) - before[0]!, await counter(base, OK) - before[1]!], [1, 1]);
-    const bad = await fetch(`${base}/api/exports/candidates?limit=500`);
+    const bad = await fetch(`${base}/api/exports/candidates?limit=501`);
     assert.equal(bad.status, 400);
     assert.deepEqual(await bad.json(), { error: "INVALID_EXPORT_FILTER" });
     assert.equal(instance.store.listCalls.length, 1, "a bad query never reaches the store");

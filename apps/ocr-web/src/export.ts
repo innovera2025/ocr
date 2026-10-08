@@ -46,9 +46,9 @@ export const PREVIEW_WINDOW_MS = 900_000;
  */
 export const EXPORT_LIST_LIMIT = 300;
 export const EXPORT_MARK_LIMIT = 60;
-/** C1 paging: `limit` 1..100 (default 50), `offset` 0..1,000,000. */
+/** C1 paging: `limit` 1..500 (default 50), `offset` 0..1,000,000. */
 export const CANDIDATES_DEFAULT_LIMIT = 50;
-export const CANDIDATES_MAX_LIMIT = 100;
+export const CANDIDATES_MAX_LIMIT = 500;
 export const CANDIDATES_MAX_OFFSET = 1_000_000;
 /** §10 H5: one open download per user, two per process (the store enforces the process cap — it owns the connections). */
 export const EXPORT_PER_USER = 1;
@@ -177,7 +177,7 @@ function intParam(value: string | null, fallback: number, min: number, max: numb
 }
 
 export type CandidatesQuery = Readonly<{ filter: DocumentFilter; limit: number; offset: number }>;
-/** C1: the shared filters (with `exportState`), then `limit` 1..100 (default 50) and `offset` 0..1,000,000. */
+/** C1: the shared filters (with `exportState`), then `limit` 1..500 (default 50) and `offset` 0..1,000,000. */
 export function parseCandidatesQuery(params: URLSearchParams): CandidatesQuery {
   const filter = parseExportFilter(params);
   const limit = intParam(params.get("limit"), CANDIDATES_DEFAULT_LIMIT, 1, CANDIDATES_MAX_LIMIT);
