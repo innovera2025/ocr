@@ -189,7 +189,10 @@ export function applyReviewEdits(current: DocumentView, edited: unknown): { merg
 
 `applyReviewEdits` rules: only `value` and `duration` leaves are editable, plus adding/removing items of
 known arrays (`staffOnly.treatments`, `customerInformation.referralSources|healthConditions`,
-`recommendationCard.massageOilScrub|preferredAreas|avoidAreas`). All other keys come from `current`
+`recommendationCard.massageOilScrub|preferredAreas|avoidAreas`). The handwritten "Others" lines of the two customer checkbox
+groups are the scalar Fields `customerInformation.referralOther` and `customerInformation.healthOther` (2026-10): absent
+until staff type a value (an empty value stores nothing), exported as `referral_other` / `health_other` right after
+`referral_sources` / `health_conditions`. All other keys come from `current`
 (raw/confidence/source preserved; unknown keys preserved). Values are strings ≤ 500 chars without NUL or unpaired
 surrogates (else `REVIEW_INVALID`), at most 50 items per array. Removed items are reported at their original index as
 `<array>[i].removed`, so they never share a correction field with the item edited at that index. A changed duration
@@ -222,7 +225,8 @@ type DocumentListItem = { documentId: string; batchId: string|null; filename: st
   reviewedAt: string|null; deliveryStatus: DeliveryStatus; summary: DocumentSummary };
 type DeliveryStatus = "NONE"|"PENDING"|"DELIVERED"|"RETRYING"|"FAILED"; // derived from ocr_confirm_outbox rows of the document
 // (latest correction per field; ties within one review prefer the correction that has an outbox row)
-listDocuments(tenantId, { limit /*1..200, default 50*/, offset, status?: statusCategory, q?: string, batchId?: string }):
+listDocuments(tenantId, { limit /*1..200, default 50*/, offset, status?: statusCategory, q?: string, batchId?: string,
+  sort?: "file"|"customer"|"gender"|"nationality"|"treatment"|"duration"|"therapist"|"room"|"status"|"confidence", dir?: "asc"|"desc" }):
   Promise<{ total: number; documents: DocumentListItem[] }>
 // q: case-insensitive match on filename, customerInformation.name.value, staffOnly.therapistName.value (escape % _ \)
 retryDocument(tenantId, documentId): Promise<{ jobId: string }>
@@ -282,7 +286,7 @@ confirmation → `INVALID_CONFIRMATION`).
 | GET | `/api/batches` | `?limit` | 200 `{ batches: BatchSummary[] }` |
 | GET | `/api/batches/:id` | – | 200 `BatchSummary` / 404 |
 | POST | `/api/documents` | raw body (existing) + optional `X-Batch-Id: <uuid>`; `X-Upload-Filename-Encoding: uri` ⇒ filename is `encodeURIComponent`-encoded | 202 (existing shape + `batchId`) |
-| GET | `/api/documents` | `?limit&offset&status&q&batchId` | 200 `{ total, limit, offset, documents: DocumentListItem[] }` |
+| GET | `/api/documents` | `?limit&offset&status&q&batchId&parentId&sort&dir` (`sort` orders the whole filtered set, empty values last, ties in the default order; unknown `sort`/`dir` → 400 `INVALID_SORT`; `sort=confidence` over 2,000 rows → 400 `SORT_TOO_LARGE`) | 200 `{ total, limit, offset, documents: DocumentListItem[] }` |
 | GET | `/api/documents/:id/ocr` | – | 200 `{ document: ReviewDocument }` (extended) |
 | GET | `/api/documents/:id/content` | – | original bytes (existing); 409 `DOCUMENT_QUARANTINED` for QUARANTINED, `DOCUMENT_NOT_SCANNED` for VALIDATING/SCANNING (quarantined bytes never reach a browser) |
 | POST | `/api/documents/:id/ocr/review` | `{ structuredResult, expectedUpdatedAt? }` (≤1 MiB) | 200 `{ status:"confirmed", delivery, corrections, document }` |
