@@ -192,6 +192,7 @@ dialog.drawer::backdrop{background:rgba(0,0,0,.4)}
 .flag::before{content:"!";display:inline-grid;place-items:center;width:14px;height:14px;border-radius:50%;background:var(--fg);color:#FFFFFF;font:700 10px/1 var(--sans)}
 .f-meta{display:flex;flex-wrap:wrap;gap:2px 12px;margin-top:6px;font-size:12px;line-height:1.5;color:var(--fg3)}
 .f-meta q{color:var(--fg);font-family:var(--mono);overflow-wrap:anywhere}
+.ocr-sum{margin:0;padding:8px 24px;background:var(--card);box-shadow:0 1px 0 var(--line)}
 .edited{display:none;color:var(--fg);font-weight:500}
 .is-edited>.f-meta .edited,.is-edited .t-meta .edited{display:inline}
 .missing{font-size:13px;color:var(--fg4)}
@@ -294,7 +295,7 @@ body[data-auth="checking"] #checking{display:grid}
 body[data-auth="checking"] main,body[data-auth="checking"] .top-right{visibility:hidden}
 body[data-auth="out"] #me,body[data-auth="out"] #me-open{display:none!important}
 @media (max-width:1180px){.stats{grid-template-columns:repeat(5,minmax(0,1fr))}}
-@media (max-width:860px){.d-body{display:block;overflow:auto}.d-preview{height:42vh;height:42dvh;box-shadow:inset 0 -1px 0 var(--line)}.d-editor{overflow:visible;padding:16px}.d-head{padding:12px 16px}.d-alert{padding:10px 16px}.d-foot{flex-direction:column;align-items:stretch;gap:8px;padding:10px 16px}.d-foot .draft{font-size:12px}.d-foot .draft:empty{display:none}.d-foot .acts{flex-wrap:wrap}.d-foot #d-cancel{order:1}.d-foot #d-save{order:2;flex:1}.d-foot #d-next{order:3;flex:1 1 100%}.p-content iframe{min-height:0}}
+@media (max-width:860px){.d-body{display:block;overflow:auto}.d-preview{height:42vh;height:42dvh;box-shadow:inset 0 -1px 0 var(--line)}.d-editor{overflow:visible;padding:16px}.d-head{padding:12px 16px}.d-alert{padding:10px 16px}.ocr-sum{padding:8px 16px}.d-foot{flex-direction:column;align-items:stretch;gap:8px;padding:10px 16px}.d-foot .draft{font-size:12px}.d-foot .draft:empty{display:none}.d-foot .acts{flex-wrap:wrap}.d-foot #d-cancel{order:1}.d-foot #d-save{order:2;flex:1}.d-foot #d-next{order:3;flex:1 1 100%}.p-content iframe{min-height:0}}
 @media (max-width:720px){main{padding:24px 16px 80px}.top{padding:0 16px}.brand .crumb,.brand .here{display:none}.hero{flex-direction:column;align-items:stretch;gap:16px}.hero h1{font-size:32px}.drop-inner{flex-direction:column;align-items:stretch;padding:16px}.up-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"name act" "state act" "bar bar";row-gap:4px;padding:8px 12px}.up-name{grid-area:name}.up-size{display:none}.up-state{grid-area:state}.bar{grid-area:bar}.up-act{grid-area:act}.batch{padding:16px}.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.stat dd{font-size:20px}.fld,.fld.grow{flex:1 1 100%;max-width:none;min-width:0}.toolbar .btn{flex:1}.t-grid{grid-template-columns:1fr}.notice{left:16px;right:16px;bottom:16px}th:first-child,td:first-child{width:168px;min-width:168px;max-width:168px}.c-file .m-only{display:inline-flex!important;margin-top:6px}
 /* The 56px header must fit 375px: the brand, the connection chip and the one #me-open pill. The pill carries the whole
    display name, and .btn is nowrap, so without a cap a long Thai name gives the page a horizontal scrollbar. The
@@ -327,6 +328,7 @@ const BODY = String.raw`<a class="skip" href="#docs-title">ข้ามไปท
 <dialog id="drawer" class="drawer" aria-labelledby="d-title"><div class="d-shell">
 <header id="d-head" class="d-head"><div class="d-titles"><p class="eyebrow">ตรวจสอบเอกสาร</p><h2 id="d-title">กำลังโหลด…</h2><div id="d-status" class="d-status"></div></div><button id="d-close" class="btn sm" type="button" aria-label="ปิดหน้าตรวจสอบ">ปิด</button></header>
 <div id="d-alert" class="d-alert" role="status" hidden></div>
+<p id="ocr-summary" class="f-meta ocr-sum" aria-label="สรุปผลการอ่านของ OCR" hidden></p>
 <div id="d-body" class="d-body"><section class="d-preview" aria-label="เอกสารต้นฉบับ"><div class="p-tools"><span id="z-tools" class="acts"><button id="z-out" class="btn sm" type="button" aria-label="ย่อภาพ">−</button><span id="z-level" class="z-level" aria-live="polite">100%</span><button id="z-in" class="btn sm" type="button" aria-label="ขยายภาพ">+</button><button id="z-fit" class="btn sm ghost" type="button">พอดีกรอบ</button></span><span class="spacer"></span><button id="p-pdf" class="btn sm" type="button" hidden></button><a id="p-open" class="btn sm ghost" target="_blank" rel="noopener" hidden>เปิดในแท็บใหม่</a></div><div id="p-content" class="p-content"></div></section><section id="editor" class="d-editor" aria-label="ข้อมูลที่อ่านได้จากเอกสาร"></section></div>
 <footer id="d-foot" class="d-foot"><span id="d-draft" class="draft" role="status"></span><div class="acts"><button id="d-next" class="btn" type="button" hidden>ตรวจเอกสารถัดไป</button><button id="d-cancel" class="btn" type="button">ปิด</button><button id="d-save" class="btn primary" type="button" disabled>บันทึกและยืนยัน</button></div></footer>
 <div id="ask" class="ask" hidden><div class="ask-card" role="alertdialog" aria-modal="true" aria-labelledby="ask-title" aria-describedby="ask-text"><h3 id="ask-title"></h3><p id="ask-text"></p><div class="acts"><button id="ask-no" class="btn" type="button">กลับไปแก้ไขต่อ</button><button id="ask-yes" class="btn danger" type="button">ทิ้งการแก้ไข</button></div></div></div>
@@ -376,7 +378,7 @@ const BODY = String.raw`<a class="skip" href="#docs-title">ข้ามไปท
 <label class="fld"><span class="fld-l">ชุดอัปโหลด</span><select id="ex-batch"><option value="">ทุกชุดอัปโหลด</option></select></label>
 <label class="fld"><span class="fld-l">รูปแบบไฟล์</span><select id="ex-format"><option value="csv">Excel (CSV)</option><option value="jsonl">JSONL (ข้อมูลครบทุกรายละเอียด)</option></select></label>
 <label class="fld"><span class="fld-l">ช่วงวันที่ตาม</span><select id="ex-datefield"><option value="created_at">วันที่อัปโหลด</option><option value="reviewed_at">วันที่ยืนยัน</option></select></label>
-<label class="fld"><span class="fld-l">คอลัมน์</span><select id="ex-columns"><option value="compact">สรุป</option><option value="detailed">ละเอียด</option></select></label>
+<label class="fld"><span class="fld-l">คอลัมน์</span><select id="ex-columns"><option value="detailed" selected>ทั้งหมด (รวม % ความมั่นใจ)</option><option value="compact">สรุป</option></select></label>
 <label class="fld"><span class="fld-l">ตั้งแต่วันที่</span><input id="ex-from" type="date"></label>
 <label class="fld"><span class="fld-l">ถึงวันที่</span><input id="ex-to" type="date"></label>
 </div>
@@ -842,7 +844,7 @@ EXPORT_STATUSES.forEach(s=>{$('ex-st-'+s).checked=state.status===s;});
 /* The same fallback option as the toolbar's filter: /api/batches?limit=20 may not hold the selected batch, and a
    <select> given a value that matches no <option> reads back as '' — the export would silently cover every batch. */
 fillBatchOptions($('ex-batch'),state.batchFilter||'');
-$('ex-confirmed').checked=false;$('ex-datefield').value='created_at';$('ex-from').value='';$('ex-to').value='';$('ex-format').value='csv';$('ex-columns').value='compact';$('ex-size').value=String(state.exSize);
+$('ex-confirmed').checked=false;$('ex-datefield').value='created_at';$('ex-from').value='';$('ex-to').value='';$('ex-format').value='csv';$('ex-columns').value='detailed';$('ex-size').value=String(state.exSize);
 state.exDlg++;stopExportList();state.exTab='never';blankExportList();
 renderExportChips();
 const d=$('export-dlg');if(!d.open)d.showModal();
@@ -857,7 +859,7 @@ async function downloadExport(){if(state.exBusy||state.exPending)return;
 const x=exPicked();if(!x||badExportRange())return;
 /* The dialog this download belongs to: closed and reopened meanwhile, the new one keeps its own selection and list. */
 const dlg=state.exDlg,here=()=>state.exDlg===dlg&&$('export-dlg').open;
-const format=$('ex-format').value==='jsonl'?'jsonl':'csv',columns=$('ex-columns').value==='detailed'?'detailed':'compact',selection=exportSelection();
+const format=$('ex-format').value==='jsonl'?'jsonl':'csv',columns=$('ex-columns').value==='compact'?'compact':'detailed',selection=exportSelection();
 state.exBusy=true;$('ex-download').textContent='กำลังเตรียมไฟล์…';renderExportBar();setExportError('');
 let reload=false;
 try{const r=await api('/api/exports/documents.'+format,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({columns,selection})});
@@ -1091,7 +1093,10 @@ function nextReview(){const id=state.current&&state.current.documentId;return st
 function flag(){return el('span','flag','ต้องตรวจสอบ');}
 function textInput(id,value,editable){const i=el('input');i.type='text';i.id=id;i.value=str(value);i.maxLength=MAX_LEN;i.autocomplete='off';i.spellcheck=false;if(!editable)i.readOnly=true;return i;}
 function meta(f,needs,cls){const m=el('div','f-meta'+(cls?' '+cls:''));const raw=f.raw;if(needs||(raw!==null&&raw!==undefined&&str(raw)!==str(f.value))){const r=el('span');r.append(document.createTextNode('OCR อ่านได้ '),el('q',null,raw===null||raw===undefined||raw===''?'(ไม่มีข้อความ)':String(raw)));m.append(r);}
-if(typeof f.confidence==='number')m.append(el('span',null,'ความมั่นใจ '+pct(f.confidence)));if(typeof f.source==='string'&&has(SOURCE,f.source))m.append(el('span',null,SOURCE[f.source]));m.append(el('span','edited','· แก้ไขแล้ว'));return m;}
+/* A field staff changed or added (source human) is 100 %: a person set it. The OCR's own % stays visible beside it when
+   the OCR had text there (the save keeps raw and confidence), exactly like the export's _confidence / _ocr_confidence. */
+const human=f.source==='human';if(human)m.append(el('span',null,'ความมั่นใจ 100%'));else if(typeof f.confidence==='number')m.append(el('span',null,'ความมั่นใจ '+pct(f.confidence)));if(typeof f.source==='string'&&has(SOURCE,f.source))m.append(el('span',null,SOURCE[f.source]));
+if(human&&typeof f.confidence==='number'&&str(raw).trim()!=='')m.append(el('span',null,'OCR เดิม '+pct(f.confidence)));m.append(el('span','edited','· แก้ไขแล้ว'));return m;}
 function fieldRow(obj,key,editable){const f=obj[key],wrap=el('div','field'),head=el('div','f-head'),other=has(OTHER_OF,key),title=other?OTHER_LABEL:LABEL[key]||key;
 if(!isObj(f)){head.append(el('span','f-label',title));wrap.append(head,el('p','missing','ไม่มีช่องนี้ในผลการอ่าน'));return wrap;}
 const needs=f.needsReview===true,id='f'+(++state.uid),label=el('label','f-label',title);label.htmlFor=id;head.append(label);if(needs){wrap.classList.add('needs');head.append(flag());}
@@ -1107,7 +1112,7 @@ function listBlock(obj,key,editable){const title=LABEL[key]||key,wrap=el('div','
 function paint(focusLast){const arr=Array.isArray(obj[key])?obj[key]:[];const needs=arr.some(it=>isObj(it)&&it.needsReview===true);head.replaceChildren(lab);if(needs)head.append(flag());
 const items=arr.map((it,i)=>{if(!isObj(it))return el('li','chip',str(it));const li=el('li','chip'+(it.needsReview===true?' needs':'')),input=textInput('f'+(++state.uid),it.value,editable),orig=str(it.value);input.setAttribute('aria-label',title+' รายการที่ '+(i+1));input.placeholder='ระบุ'+title;input.addEventListener('input',()=>{it.value=input.value===''?null:input.value;li.classList.toggle('is-edited',input.value!==orig);changed();});state.inputs.set(it,input);li.append(input);
 if(editable)li.append(btn('ลบ','sm ghost',()=>{arr.splice(i,1);changed();paint(false);if(add)add.focus();},'ลบ '+title+' รายการที่ '+(i+1)+(orig?' ('+orig+')':'')));
-if(it.needsReview===true||(it.raw!==null&&it.raw!==undefined&&str(it.raw)!==orig))li.append(meta(it,it.needsReview===true,''));if(focusLast&&i===arr.length-1)setTimeout(()=>input.focus(),0);return li;});
+if(it.needsReview===true||(it.raw!==null&&it.raw!==undefined&&str(it.raw)!==orig)||it.source==='human')li.append(meta(it,it.needsReview===true,''));if(focusLast&&i===arr.length-1)setTimeout(()=>input.focus(),0);return li;});
 ul.replaceChildren(...(items.length?items:[el('li','chip-empty','ไม่มีรายการ')]));if(add)add.disabled=arr.length>=MAX_ITEMS;}
 if(editable){add=btn('+ เพิ่มรายการ','sm',()=>{if(!Array.isArray(obj[key]))obj[key]=[];if(obj[key].length>=MAX_ITEMS)return;obj[key].push({raw:null,value:null,checked:true,confidence:null,source:'human',needsReview:false});changed();paint(true);},'เพิ่มรายการใน'+title);wrap.append(add);}
 paint(false);return wrap;}
@@ -1132,7 +1137,28 @@ p.append(el('p',null,(d.parentFilename||d.filename||'ไฟล์ PDF')+' · '+p
 function pendingPanel(d,cat){const p=el('div','panel');if(cat==='split')return pagesPanel(d);if(cat==='failed'){p.append(el('p',null,'อ่านเอกสารไม่สำเร็จ · '+failText(d)));if(String(d.status||'').toUpperCase()==='FAILED')p.append(btn('ลองอ่านอีกครั้ง','sm primary',async e=>{const seq=state.openSeq;if(await retryDocument(d.documentId,e.currentTarget)&&seq===state.openSeq)loadReview(seq);}));}
 else if(cat==='queued'||cat==='processing')p.append(el('p',null,cat==='queued'?'เอกสารอยู่ในคิวรออ่าน ข้อมูลจะแสดงที่นี่เมื่ออ่านเสร็จ (อัปเดตอัตโนมัติ)':'ระบบกำลังอ่านเอกสารนี้ ข้อมูลจะแสดงที่นี่เมื่ออ่านเสร็จ (อัปเดตอัตโนมัติ)'));else p.append(el('p',null,'ยังไม่มีข้อมูลจากการอ่านเอกสารนี้'));return p;}
 function summaryPanel(cat){const n=countNeeds(),p=el('div','panel'+(n?' needs':''));if(!state.editable)p.append(el('p',null,'แก้ไขเอกสารนี้ไม่ได้ในสถานะปัจจุบัน'));else if(n){p.append(el('p',null,'มี '+n+' ช่องที่ระบบไม่แน่ใจ กรุณาเทียบกับต้นฉบับ แก้ไขถ้าจำเป็น แล้วกดบันทึกและยืนยัน'),btn('ไปยังช่องที่ต้องตรวจ','sm',jumpNext));}else p.append(el('p',null,cat==='confirmed'?'เอกสารนี้ยืนยันแล้ว หากพบข้อผิดพลาดให้แก้ไขแล้วกดบันทึกอีกครั้ง':'ไม่มีช่องที่ระบบไม่แน่ใจ ตรวจทานแล้วกดบันทึกและยืนยัน'));return p;}
-function renderEditor(){const root=$('editor'),d=state.current||{},cat=categoryOf(d);state.inputs=new WeakMap();state.others=[];const page=d.parentDocumentId?[pagesPanel(d)]:[];if(!state.draft){root.replaceChildren(pendingPanel(d,cat),...page,rawBlock(d));return;}root.replaceChildren(summaryPanel(cat),...page,...SECTIONS.filter(sec=>!sec.optional||Object.keys(state.draft[sec.key]||{}).length>0).map(sectionBlock),rawBlock(d));syncOtherHints();}
+/* The OCR-only reading summary (the export's handwriting_confidence, handwriting_read and checkbox_confidence): a
+   line-for-line port of ocrReadSummary in packages/ocr-persistence/src/export.ts, pinned to it by a parity test. Groups
+   are SLOTS (an edit overwrites source with human); it reads the original OCR confidence only, never the 100 % of an
+   edit, and runs on the view as loaded from the server, so typing never moves it. */
+const OCR_HW=[['header','formNumber'],['header','date'],['header','time'],['customerInformation','name'],['customerInformation','nationality'],['customerInformation','hotelName'],['customerInformation','referralOther'],['customerInformation','healthOther'],['staffOnly','therapistName'],['staffOnly','roomNo']];
+const OCR_CB=[['customerInformation','gender'],['recommendationCard','pressure']];
+const OCR_CBL=[['customerInformation','referralSources'],['customerInformation','healthConditions'],['recommendationCard','massageOilScrub'],['recommendationCard','preferredAreas'],['recommendationCard','avoidAreas']];
+function ocrText(v){const s=typeof v==='string'?v:typeof v==='number'&&isFinite(v)?String(v):null;return s===null||s.trim()===''?null:s;}
+function ocrPct(f){const c=f.confidence;if(typeof c!=='number'||!isFinite(c))return 0;return c<=1?c*100:c;}
+function ocrMean(a){return a.length?Math.round(a.reduce((sum,v)=>sum+v,0)/a.length):null;}
+function ocrSummary(view){const v=isObj(view)?view:{},sec=k=>isObj(v[k])?v[k]:{},leaf=(s,k)=>isObj(sec(s)[k])?sec(s)[k]:null,items=(s,k)=>Array.isArray(sec(s)[k])?sec(s)[k].filter(isObj):[];
+const hw=[];let read=0;
+const count=(f,t,written)=>{let w=false,r=false;if(f.source==='human'){w=t!==null;r=w;}else if(f.source!=='ink-mark'){if(written){w=true;r=ocrText(f.value)!==null;}else w=f.source==='none'&&f.needsReview===true;}if(!w)return;hw.push(r?ocrPct(f):0);if(r)read++;};
+OCR_HW.forEach(p=>{const f=leaf(p[0],p[1]);if(f)count(f,ocrText(f.raw),ocrText(f.raw)!==null||ocrText(f.value)!==null);});
+items('staffOnly','treatments').forEach(t=>{const x=ocrText(t.nameRaw)!==null?ocrText(t.nameRaw):ocrText(t.raw);count(t,x,x!==null||ocrText(t.value)!==null||ocrText(t.duration)!==null);});
+const cb=[];const mark=f=>{if(f.checked===false)return;let on;if(f.source==='human'){const p=ocrPct(f);on=ocrText(f.raw)!==null||(p>0&&p<100);}else on=f.source==='checkbox'||f.source==='ink-mark';if(on)cb.push(ocrPct(f));};
+OCR_CB.forEach(p=>{const f=leaf(p[0],p[1]);if(f)mark(f);});OCR_CBL.forEach(p=>items(p[0],p[1]).forEach(mark));
+return {handwritingConfidence:ocrMean(hw),handwritingRead:{read:read,withWriting:hw.length},checkboxConfidence:ocrMean(cb)};}
+function renderOcrSummary(){const box=$('ocr-summary'),d=state.current;if(!state.draft||!d||!isObj(d.structuredResult)){box.hidden=true;box.textContent='';return;}
+const s=ocrSummary(d.structuredResult),hw=s.handwritingRead,cb=' · ช่องติ๊ก '+(s.checkboxConfidence===null?'—':s.checkboxConfidence+'%');
+box.textContent=(hw.withWriting?'ลายมือ: อ่านได้ '+hw.read+'/'+hw.withWriting+' ช่อง · ความมั่นใจเฉลี่ย '+(s.handwritingConfidence===null?'—':s.handwritingConfidence+'%'):'ลายมือ: ไม่พบลายมือในแบบฟอร์ม')+cb;box.hidden=false;}
+function renderEditor(){const root=$('editor'),d=state.current||{},cat=categoryOf(d);state.inputs=new WeakMap();state.others=[];renderOcrSummary();const page=d.parentDocumentId?[pagesPanel(d)]:[];if(!state.draft){root.replaceChildren(pendingPanel(d,cat),...page,rawBlock(d));return;}root.replaceChildren(summaryPanel(cat),...page,...SECTIONS.filter(sec=>!sec.optional||Object.keys(state.draft[sec.key]||{}).length>0).map(sectionBlock),rawBlock(d));syncOtherHints();}
 function validate(){const blank=(v)=>str(v).trim()==='';for(const sec of SECTIONS){const obj=state.draft[sec.key]||{};for(const f of sec.fields){const arr=obj[f[0]];if(!Array.isArray(arr))continue;if(arr.length>MAX_ITEMS)return {msg:(LABEL[f[0]]||f[0])+' มีได้ไม่เกิน '+MAX_ITEMS+' รายการ'};for(const it of arr){if(!isObj(it)||(it.raw!==null&&it.raw!==undefined))continue;if(blank(it.value)&&(f[1]!=='treatments'||blank(it.duration)))return {msg:'มีรายการที่เพิ่มไว้แต่ยังว่างใน '+(LABEL[f[0]]||f[0])+' กรุณากรอกหรือลบออกก่อนบันทึก',input:state.inputs.get(it)};}}}return null;}
 function setBusy(on){['d-save','d-cancel','d-close','d-next'].forEach(id=>{$(id).disabled=on||(id==='d-save'&&!state.editable);});}
 async function save(){if(state.saving||!state.editable||!state.draft||!state.current)return;const problem=validate();if(problem){showAlert(problem.msg,'error');if(problem.input)problem.input.focus();return;}

@@ -233,3 +233,22 @@ test("the sort errors have the plan's Thai text, and the cap names the narrowing
   assert.equal(errors.INVALID_SORT, "เรียงลำดับตามคอลัมน์นี้ไม่ได้");
   assert.equal(errors.SORT_TOO_LARGE, "มีเอกสารมากเกินไปที่จะเรียงตามความมั่นใจ (เกิน 2,000 รายการ) กรุณากรองให้แคบลงก่อน");
 });
+
+test("the export's column choice: ทั้งหมด (the full set) first and selected, then สรุป; the script resets and reads it the same way", () => {
+  const select = /<select id="ex-columns">([\s\S]*?)<\/select>/.exec(markup)?.[1] ?? "";
+  assert.deepEqual([...select.matchAll(/<option value="([a-z]+)"( selected)?>([^<]*)<\/option>/g)].map((match) => [match[1], match[2] ?? "", match[3]]),
+    [["detailed", " selected", "ทั้งหมด (รวม % ความมั่นใจ)"], ["compact", "", "สรุป"]]);
+  assert.ok(inlineScript.includes("$('ex-columns').value='detailed';"), "openExportDialog resets to the full set");
+  assert.ok(inlineScript.includes("columns=$('ex-columns').value==='compact'?'compact':'detailed'"), "anything but สรุป is the full set, like the server");
+  assert.equal(inlineScript.includes("value==='detailed'?'detailed':'compact'"), false);
+});
+
+test("the drawer's OCR summary line sits under the alert, neutral gray, labelled; the edited-field rule is in meta()", () => {
+  assert.match(markup, /<div id="d-alert" class="d-alert" role="status" hidden><\/div>\n<p id="ocr-summary" class="f-meta ocr-sum" aria-label="สรุปผลการอ่านของ OCR" hidden><\/p>\n<div id="d-body" class="d-body">/);
+  const css = /\.ocr-sum\{([^}]*)\}/.exec(html)?.[1] ?? "";
+  assert.doesNotMatch(css, /--(red|amber|teal|blue)/, "no color: the line is information, not a warning");
+  for (const needle of ["'ความมั่นใจ 100%'", "'OCR เดิม '+pct(f.confidence)", "||it.source==='human')li.append(meta(", "function ocrSummary(view)", "renderOcrSummary();",
+    "'ลายมือ: ไม่พบลายมือในแบบฟอร์ม'", "' · ช่องติ๊ก '"]) {
+    assert.ok(inlineScript.includes(needle), needle);
+  }
+});

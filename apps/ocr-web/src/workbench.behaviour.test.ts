@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { test } from "node:test";
 import { createContext, Script } from "node:vm";
+import { applyReviewEdits, normalizeStructuredResult, ocrReadSummary, type DocumentView } from "@innovera/ocr-persistence";
 import { workbenchPage } from "./workbench.js";
 
 type Listener = (event: Record<string, unknown>) => unknown;
@@ -116,6 +117,7 @@ type Workbench = {
   listUrl(): string;
   clearFilters(): void;
   showPages(parentId: string, name: string): Promise<void>;
+  ocrSummary(view: unknown): unknown;
   ERRORS: Record<string, string>;
   state: {
     uploads: Upload[]; batch: unknown; batchId: string | null; current: unknown; draft: unknown; editable: boolean;
@@ -129,7 +131,7 @@ type Workbench = {
 
 const inline = /<script\b[^>]*>([\s\S]*?)<\/script>/.exec(workbenchPage({ nonce: "n" }))?.[1] ?? "";
 const EXPOSE = "globalThis.__wb={wire,init,checkSession,requireLogin,api,loadDocuments,logout,openUsers,openExportDialog,downloadExport,applyUser,renderHead,reviewerLabel,"
-  + "row,renderBatch,addFiles,loadPreview,save,ERRORS,state,applyDocument,failText,toggleOriginal,toDraft,renderEditor,countNeeds,cycleSort,renderSort,listUrl,clearFilters,showPages};";
+  + "row,renderBatch,addFiles,loadPreview,save,ERRORS,state,applyDocument,failText,toggleOriginal,toDraft,renderEditor,countNeeds,cycleSort,renderSort,listUrl,clearFilters,showPages,ocrSummary};";
 
 /** setTimeout/clearTimeout with no wall clock: a test decides when an armed timer fires (and can see that one is armed). */
 class FakeClock {
@@ -1210,7 +1212,8 @@ test("เลือกทั้งหมด N switches to filter mode: rows locke
   ctx.$("ex-download").dispatch("click");
   await settle();
   const post = ctx.calls.find((call) => call.url === "/api/exports/documents.csv");
-  assert.deepEqual(bodyOf(post), { columns: "compact", selection: { mode: "filter", filter: { dateField: "created_at", exportState: "never" }, expectedTotal: 175 } });
+  assert.deepEqual(bodyOf(post), { columns: "detailed", selection: { mode: "filter", filter: { dateField: "created_at", exportState: "never" }, expectedTotal: 175 } },
+    "the dialog's default is the full set");
   // ล้างการเลือก goes back to explicit ticking with nothing ticked.
   const again = await openList(many(60));
   tickPage(again);
@@ -1957,4 +1960,130 @@ test("SORT_TOO_LARGE (or INVALID_SORT) resets to the default order once: one not
     assert.equal(ctx.$("notice").hidden, true, "and no repeated notice");
   }
   assert.match(load(server({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 })).wb.ERRORS.SORT_TOO_LARGE ?? "", /กรุณากรองให้แคบลงก่อน/, "the cap tells staff to narrow the filter");
+});
+
+// ---- export-full-confidence: the dialog's default, the edited-field confidence and the OCR summary line -------------
+
+test("the export dialog opens on ทั้งหมด (รวม % ความมั่นใจ), resets to it, and สรุป posts compact", async () => {
+  const ctx = await openList(many(3), downloadRoute(() => csvFile({ "x-export-rows": "1" })));
+  assert.equal(ctx.$("ex-columns").value, "detailed", "the full set is the default");
+  ctx.$("ex-columns").value = "compact";
+  ctx.$("ex-close").dispatch("click");
+  ctx.wb.openExportDialog();
+  await settle();
+  assert.equal(ctx.$("ex-columns").value, "detailed", "re-opening resets the choice");
+  tick(ctx, 0);
+  ctx.calls.length = 0;
+  ctx.$("ex-download").dispatch("click");
+  await settle();
+  assert.equal(bodyOf(ctx.calls.find((call) => call.url === "/api/exports/documents.csv")).columns, "detailed");
+  ctx.$("ex-columns").value = "compact";
+  tick(ctx, 0);
+  ctx.calls.length = 0;
+  ctx.$("ex-download").dispatch("click");
+  await settle();
+  assert.equal(bodyOf(ctx.calls.find((call) => call.url === "/api/exports/documents.csv")).columns, "compact", "สรุป is still one choice away");
+  ctx.$("ex-columns").value = "something-else";
+  tick(ctx, 0);
+  ctx.calls.length = 0;
+  ctx.$("ex-download").dispatch("click");
+  await settle();
+  assert.equal(bodyOf(ctx.calls.find((call) => call.url === "/api/exports/documents.csv")).columns, "detailed", "an unknown value falls to the default, like the server");
+});
+
+const reviewDoc = (structuredResult: Record<string, unknown>) => ({ documentId: ID, filename: "intake.png", status: "NEEDS_REVIEW", statusCategory: "review",
+  updatedAt: "2026-10-08T01:00:00.000Z", structuredResult: { schemaVersion: 3, header: {}, customerInformation: {}, recommendationCard: {}, staffOnly: {}, ...structuredResult } });
+/** The f-meta line of the scalar field labelled `label`, as the texts of its spans in screen order. */
+function scalarMeta(ctx: { $: (id: string) => FakeElement }, label: string): string[] {
+  const wrap = ctx.$("editor").descendants().find((node) => node.tagName === "DIV" && node.className.split(" ").includes("field") && node.children[0]?.children[0]?.textContent === label)!;
+  return wrap.children.find((node) => node.className.startsWith("f-meta"))!.children.map((node) => node.textContent);
+}
+const metaSpans = (node: FakeElement | undefined): string[] | null => {
+  const meta = node?.children.find((child) => child.className.startsWith("f-meta"));
+  return meta ? meta.children.map((child) => child.textContent) : null;
+};
+
+test("the drawer shows an edited field at 100 % with the original OCR % beside it, an added one without, others unchanged", () => {
+  const ctx = load(server({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }));
+  ctx.wb.applyDocument(reviewDoc({ customerInformation: {
+    name: { raw: "X", value: "Y", confidence: 0.62, source: "human", needsReview: false },
+    nationality: { raw: null, value: "Thai", confidence: 1, source: "human", needsReview: false },
+    hotelName: { raw: "Bay", value: "Bay", confidence: 0.62, source: "ocr", needsReview: false },
+    referralSources: [{ raw: "Walk-in", value: "Walk-in", confidence: 0.9, source: "checkbox", needsReview: false, checked: true },
+      { raw: "Hotel", value: "Hotel staff", confidence: 0.5, source: "human", needsReview: false, checked: true },
+      { raw: null, value: "Chat", confidence: 1, source: "human", needsReview: false, checked: true }] },
+  staffOnly: { treatments: [{ raw: "ฟุต", nameRaw: "ฟุต", value: "นวดเท้า", duration: "60 นาที", durationMinutes: 60, confidence: 0.55, source: "human", needsReview: false }] } }));
+  const edited = scalarMeta(ctx, "ชื่อลูกค้า");
+  assert.deepEqual(edited.slice(1), ["ความมั่นใจ 100%", "แก้ไขโดยพนักงาน", "OCR เดิม 62%", "· แก้ไขแล้ว"], "(c) 100 %, who, then the OCR's own %");
+  assert.ok(edited[0]!.startsWith("OCR อ่านได้ "), "the OCR text is still shown first");
+  assert.ok(!edited.slice(0, 3).some((text) => text.includes("62%")), "the stale % is never shown as the field's confidence");
+  assert.deepEqual(scalarMeta(ctx, "สัญชาติ"), ["ความมั่นใจ 100%", "แก้ไขโดยพนักงาน", "· แก้ไขแล้ว"], "(d) added by staff: no OCR เดิม");
+  assert.deepEqual(scalarMeta(ctx, "โรงแรมที่พัก"), ["ความมั่นใจ 62%", "อ่านด้วย OCR", "· แก้ไขแล้ว"], "(e) not edited: unchanged");
+  const chips = ctx.$("editor").descendants().filter((node) => node.tagName === "LI" && node.className.split(" ").includes("chip"));
+  assert.equal(metaSpans(chips[0]), null, "(f) an unflagged, unedited item stays quiet");
+  assert.deepEqual(metaSpans(chips[1])!.slice(1), ["ความมั่นใจ 100%", "แก้ไขโดยพนักงาน", "OCR เดิม 50%", "· แก้ไขแล้ว"], "(f) an edited item now shows its line");
+  assert.deepEqual(metaSpans(chips[2]), ["ความมั่นใจ 100%", "แก้ไขโดยพนักงาน", "· แก้ไขแล้ว"], "(f) an added item: two spans");
+  const card = ctx.$("editor").descendants().find((node) => node.tagName === "DIV" && node.className.split(" ")[0] === "t-item");
+  assert.deepEqual(metaSpans(card), ["OCR อ่านได้ ฟุต", "ความมั่นใจ 100%", "แก้ไขโดยพนักงาน", "OCR เดิม 55%", "· แก้ไขแล้ว"], "(g) a treatment goes through the same meta()");
+});
+
+/** 9 handwritten slots with writing, 7 read; one checkbox. Nothing here is a `none` reading a save would unflag. */
+const SUMMARY_VIEW = {
+  header: { formNumber: { raw: "0123", value: "0123", confidence: 0.9, source: "ocr", needsReview: false }, date: { raw: "1/10", value: "2026-10-01", confidence: 0.8, source: "ocr", needsReview: false },
+    time: { raw: null, value: null, confidence: 0.95, source: "ink-mark", needsReview: false } },
+  customerInformation: { name: { raw: "Somchai", value: "Somchai", confidence: 0.92, source: "ocr", needsReview: false },
+    nationality: { raw: "Thai", value: "Thai", confidence: 0.9, source: "master-fuzzy", needsReview: false },
+    hotelName: { raw: "✓", value: null, confidence: 0.3, source: "ocr", needsReview: true },
+    gender: { raw: "Male", value: "Male", confidence: 0.95, source: "checkbox", needsReview: false } },
+  staffOnly: { therapistName: { raw: "อันนา", value: "Anna", confidence: 0.6, source: "master-fuzzy", needsReview: false }, roomNo: { raw: "7", value: "7", confidence: 0.95, source: "ocr", needsReview: false },
+    treatments: [{ raw: "ไทย", nameRaw: "ไทย", value: "นวดไทย", duration: "60 นาที", durationMinutes: 60, confidence: 0.9, source: "master-fuzzy", needsReview: false },
+      { raw: "xx", nameRaw: "xx", value: null, duration: null, durationMinutes: null, confidence: 0, source: "none", needsReview: true }] }
+};
+const SUMMARY_LINE = "ลายมือ: อ่านได้ 7/9 ช่อง · ความมั่นใจเฉลี่ย 66% · ช่องติ๊ก 95%";
+
+test("the drawer's OCR summary line: read count, mean OCR % and checkbox %, from the view as loaded", () => {
+  const ctx = load(server({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }));
+  ctx.wb.applyDocument(reviewDoc(SUMMARY_VIEW));
+  const line = ctx.$("ocr-summary");
+  assert.deepEqual([line.textContent, line.hidden], [SUMMARY_LINE, false], "(a) (90+80+92+90+0+60+95+90+0)/9 = 66");
+  // (b) typing never moves it: it reads state.current, not the draft.
+  const input = ctx.$("editor").descendants().find((node) => node.tagName === "INPUT" && node.value === "Somchai")!;
+  input.value = "Somchai Jaidee";
+  input.dispatch("input");
+  assert.equal(ctx.wb.state.dirty, true);
+  assert.equal(line.textContent, SUMMARY_LINE);
+  // (c) what the server sends back after saving that edit (the real merge) gives the same line.
+  const draft = JSON.parse(JSON.stringify(ctx.wb.state.draft)) as Record<string, unknown>;
+  const merged = applyReviewEdits(normalizeStructuredResult(reviewDoc(SUMMARY_VIEW).structuredResult), draft).merged;
+  assert.equal(((merged.customerInformation as Record<string, Record<string, unknown>>).name)!.source, "human");
+  ctx.wb.applyDocument({ ...reviewDoc({}), status: "SUCCEEDED", statusCategory: "confirmed", structuredResult: merged });
+  assert.equal(line.textContent, SUMMARY_LINE, "a review does not move the OCR's own numbers");
+  // (d) the fallbacks.
+  ctx.wb.applyDocument(reviewDoc({ header: { date: { raw: null, value: null, confidence: 0.95, source: "ink-mark", needsReview: false } } }));
+  assert.equal(line.textContent, "ลายมือ: ไม่พบลายมือในแบบฟอร์ม · ช่องติ๊ก —");
+  ctx.wb.applyDocument(reviewDoc({ customerInformation: { name: { raw: "A", value: "A", confidence: 0.894, source: "ocr", needsReview: false } } }));
+  assert.equal(line.textContent, "ลายมือ: อ่านได้ 1/1 ช่อง · ความมั่นใจเฉลี่ย 89% · ช่องติ๊ก —");
+  ctx.wb.applyDocument({ documentId: ID, filename: "q.png", status: "QUEUED", statusCategory: "queued" });
+  assert.deepEqual([line.hidden, line.textContent], [true, ""], "no reading yet, no line");
+});
+
+test("parity: the drawer's ocrSummary and the export's ocrReadSummary agree number for number", () => {
+  const ctx = load(server({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }));
+  const f = (raw: string | null, value: string | null, confidence: unknown, source: string, needsReview = false, extra: Record<string, unknown> = {}) => ({ raw, value, confidence, source, needsReview, ...extra });
+  const fixtures: unknown[] = [
+    { schemaVersion: 3, ...SUMMARY_VIEW },
+    { schemaVersion: 3 }, "garbage", { treatment: { raw: "ไทย", durations: [], needsReview: true, items: [] }, roomNo: f("7", null, 0, "ocr", true) },
+    { schemaVersion: 3, header: { formNumber: f("1", "1", 85, "ocr"), date: f(null, null, 0, "none", true), time: f(null, null, 0, "none") },
+      customerInformation: { name: f("X", "Y", 0.5, "human"), nationality: f(null, "Thai", 1, "human"), hotelName: f(null, "B", 0, "human"), referralOther: f("C", "C", 0.6, "ocr"),
+        healthOther: f(" ", null, 0.2, "ocr"), gender: f(null, "F", 0.88, "human"), referralSources: [f("A", "A", 0.9, "checkbox", false, { checked: true }), f("B", "B", 0.99, "checkbox", false, { checked: false }),
+          f(null, null, 0, "none", true, { checked: true }), f(null, "Z", 1, "human", false, { checked: true }), f("W", "V", 0.7, "human", false, { checked: true })],
+        healthConditions: [f("H", "H", 0.6, "ink-mark", true, { checked: true })] },
+      recommendationCard: { pressure: f(null, "Soft", 1, "human"), massageOilScrub: [f("L", "L", "0.8", "checkbox", false, { checked: true })], preferredAreas: [f("Back", "Back", 0.895, "ink-mark")], avoidAreas: [] },
+      staffOnly: { therapistName: f(null, null, 0, "none", true), roomNo: f("12a", null, 0, "ocr", true), branch: f("R", "R", 0.1, "rule"),
+        treatments: [1, 2, 3, 4, 5].map((n) => ({ raw: n === 5 ? null : `t${n}`, nameRaw: n === 3 ? null : `n${n}`, value: n % 2 ? `T${n}` : null, duration: n === 4 ? "60" : null, confidence: n / 10, source: n === 5 ? "human" : "ocr", needsReview: n === 2 })) } }
+  ];
+  for (const fixture of fixtures) {
+    const view: DocumentView = typeof fixture === "object" && fixture !== null ? normalizeStructuredResult(fixture) : fixture as unknown as DocumentView;
+    assert.deepEqual(JSON.parse(JSON.stringify(ctx.wb.ocrSummary(view))), ocrReadSummary(view), JSON.stringify(fixture).slice(0, 80));
+  }
 });
