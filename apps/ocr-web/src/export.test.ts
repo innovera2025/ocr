@@ -9,7 +9,7 @@ import { connect } from "node:net";
 import { AuthenticationError, csrfTokenFor } from "@innovera/ocr-auth";
 import type { WebConfig } from "@innovera/ocr-config";
 import {
-  normalizeStructuredResult, type AuditEvent, type DocumentFilter, type ExportCandidate, type ExportCandidatesPage,
+  EXPORT_COLUMNS, EXPORT_COLUMNS_DETAILED, normalizeStructuredResult, type AuditEvent, type DocumentFilter, type ExportCandidate, type ExportCandidatesPage,
   type ExportCandidatesResult, type ExportCursor, type ExportDocument, type ExportMarkInput, type ExportMarkResult,
   type ExportStateChangeInput, type OpenExportOptions
 } from "@innovera/ocr-persistence";
@@ -17,7 +17,7 @@ import type { UserStore, WebAuthContext } from "./auth.js";
 import { SlidingWindow } from "./auth.js";
 import {
   bangkokOffsetIso, csvCell, csvRow, EXPORT_LIST_LIMIT, EXPORT_MARK_LIMIT, exportFilename, exportFormatLabel, ExportGate,
-  guardFormula, handleExportRoutes, parseCandidatesQuery, parseExportBody, parseExportQuery, parseMarksBody, parseSelectionBody,
+  guardFormula, handleExportRoutes, jsonlDocumentLine, csvDocumentRow, parseCandidatesQuery, parseExportBody, parseExportQuery, parseMarksBody, parseSelectionBody,
   PREVIEW_LIMIT, PREVIEW_WINDOW_MS, type ExportRouteDeps, type ExportStore
 } from "./export.js";
 import { createAppServer } from "./server.js";
@@ -498,7 +498,9 @@ test("the search text never reaches an audit row, only the fact that there was o
 
 test("parseExportQuery is strict, and every bad value is one error code", () => {
   const params = (query: string) => new URLSearchParams(query);
-  assert.deepEqual(parseExportQuery(params("")), { columns: "compact", headers: "th" });
+  assert.deepEqual(parseExportQuery(params("")), { columns: "detailed", headers: "th" }, "the full set is the default");
+  assert.deepEqual(parseExportQuery(params("columns=compact")), { columns: "compact", headers: "th" }, "สรุป is still one parameter away");
+  assert.deepEqual(parseExportQuery(params("columns=%20")), { columns: "detailed", headers: "th" }, "blank is the default too");
   assert.deepEqual(parseExportQuery(params("status=review,failed,review&confirmedOnly=1&dateField=reviewed_at&from=2026-09-01&to=2026-09-22&columns=detailed&headers=en&batchId=22222222-2222-4222-8222-222222222222")), {
     status: ["review", "failed"], confirmedOnly: true, dateField: "reviewed_at", from: "2026-09-01", to: "2026-09-22",
     batchId: "22222222-2222-4222-8222-222222222222", columns: "detailed", headers: "en"
@@ -644,7 +646,9 @@ test("parseSelectionBody: ids are 1..5,000 distinct UUIDs, filter mode needs exp
 
 test("parseExportBody and parseMarksBody: defaults, strict keys, and the GET's own error for a bad column set", () => {
   const ids = { mode: "ids", ids: [docId(1)], expectState: "never" };
-  assert.deepEqual(parseExportBody({ selection: ids }, 50_000), { columns: "compact", headers: "th", selection: { mode: "ids", ids: [docId(1)], expectState: "never" } });
+  assert.deepEqual(parseExportBody({ selection: ids }, 50_000), { columns: "detailed", headers: "th", selection: { mode: "ids", ids: [docId(1)], expectState: "never" } });
+  assert.deepEqual(parseExportBody({ columns: "compact", selection: ids }, 50_000).columns, "compact", "an explicit compact is honoured");
+  assert.deepEqual(parseExportBody({ columns: "", selection: ids }, 50_000).columns, "detailed");
   assert.deepEqual(parseExportBody({ columns: "detailed", headers: "en", selection: ids }, 50_000).columns, "detailed");
   assert.throws(() => parseExportBody({ columns: "all", selection: ids }, 50_000), { message: "INVALID_EXPORT_FILTER" });
   assert.throws(() => parseExportBody({ headers: "de", selection: ids }, 50_000), { message: "INVALID_EXPORT_FILTER" });
@@ -1191,4 +1195,56 @@ test("a client that leaves WHILE the marks are written: the marks stand, export.
     assert.ok(!seen.audits.some((event) => event.action === "export.completed"), "no file was saved, so no completed export");
     assert.deepEqual([seen.gate.size, seen.tenantGate.size, store.closed], [0, 0, 1]);
   });
+});
+
+// ---- the full format is the default (export-full-confidence) ------------------------------------------------------
+
+/** A CSV line split on its separators (the fixture has no quoted cells). */
+const csvFields = (line: string): string[] => line.split(",");
+
+test("a POST without columns downloads the full set (180), its first 57 headers are compact's, and compact is 57", async () => {
+  const instance = app(fakeStore(distinctDocuments(2)));
+  await withServer(instance, async (base) => {
+    const selection = { mode: "ids", ids: idList(2), expectState: "never" };
+    const full = (await bodyText(await post(base, "/api/exports/documents.csv", { selection }))).slice(1).split("\r\n").filter(Boolean);
+    assert.equal(csvFields(full[0]!).length, 180, "the header row of the default file");
+    assert.deepEqual(csvFields(full[0]!).slice(0, 57), EXPORT_COLUMNS.map((column) => column.th));
+    assert.deepEqual(csvFields(full[0]!), EXPORT_COLUMNS_DETAILED.map((column) => column.th));
+    for (const line of full.slice(1)) assert.equal(csvFields(line).length, 180, "every row has every column");
+    const compact = (await bodyText(await post(base, "/api/exports/documents.csv", { columns: "compact", selection }))).slice(1).split("\r\n").filter(Boolean);
+    assert.deepEqual(csvFields(compact[0]!), EXPORT_COLUMNS.map((column) => column.th));
+    assert.equal(csvFields(compact[1]!).length, 57);
+    const started = instance.audits.filter((event) => event.action === "export.started").map((event) => event.detail?.columns);
+    assert.deepEqual(started, ["detailed", "compact"], "the audit names the set that was really exported");
+    const jsonl = (await bodyText(await post(base, "/api/exports/documents.jsonl", { selection }))).split("\n").filter(Boolean);
+    const keys = Object.keys(JSON.parse(jsonl[0]!) as Record<string, unknown>);
+    const expected = EXPORT_COLUMNS_DETAILED.flatMap((column) => column.kind === "datetime" ? [column.key, `${column.key}_utc`] : [column.key]);
+    assert.deepEqual(keys, [...expected, "structured_result"], "JSONL keys: the full set (plus each _utc twin) and the canonical result");
+  });
+});
+
+test("a GET without columns is the full set too, and columns=compact still gives the 57 compact columns", async () => {
+  const instance = app(fakeStore([document()]));
+  await withServer(instance, async (base) => {
+    const header = async (query: string) => csvFields((await bodyText(await fetch(`${base}/api/exports/documents.csv${query}`))).slice(1).split("\r\n")[0]!);
+    assert.equal((await header("")).length, 180);
+    assert.equal((await header("?columns=compact")).length, 57);
+    assert.deepEqual(await header("?headers=en"), EXPORT_COLUMNS_DETAILED.map((column) => column.key));
+  });
+});
+
+test("an empty, legacy or malformed result still writes every column: empty CSV cells, JSONL nulls", () => {
+  const shapes: [string, ExportDocument["structuredResult"]][] = [["empty", normalizeStructuredResult({ schemaVersion: 3 })],
+    ["legacy", normalizeStructuredResult({ roomNo: field("7") })], ["garbage", "garbage" as unknown as ExportDocument["structuredResult"]]];
+  for (const [name, structuredResult] of shapes) {
+    const row = document({ structuredResult });
+    for (const [set, columns] of [["detailed", EXPORT_COLUMNS_DETAILED], ["compact", EXPORT_COLUMNS]] as const) {
+      const line = csvDocumentRow(row, columns, set, "https://ocr.example.test");
+      assert.equal(csvFields(line.replace(/\r\n$/, "")).length, columns.length, `${set}: ${columns.length} CSV fields`);
+      const parsed = JSON.parse(jsonlDocumentLine(row, columns, set, "https://ocr.example.test")) as Record<string, unknown>;
+      for (const column of columns) assert.ok(column.key in parsed, `${set}: ${column.key} present in JSONL`);
+      if (name === "legacy") continue; // its room reading fills room_* and the summary; presence is what is checked here
+      for (const column of columns.slice(54)) assert.equal(parsed[column.key], null, `${name} ${set}: ${column.key} is null, not missing or false`);
+    }
+  }
 });

@@ -150,6 +150,7 @@ export function parseExportFilter(params: URLSearchParams): DocumentFilter {
   return filter;
 }
 
+/** `detailed` is the full set (the dialog's "ทั้งหมด (รวม % ความมั่นใจ)") and the default; `compact` is "สรุป". */
 function columnsParam(value: string): ExportColumnSet {
   if (value !== "compact" && value !== "detailed") throw new Error("INVALID_EXPORT_FILTER");
   return value;
@@ -159,10 +160,10 @@ function headersParam(value: string): ExportHeaders {
   return value;
 }
 
-/** The GET download and the preview: the shared filters plus the column set and the header language. */
+/** The GET download and the preview: the shared filters plus the column set (default detailed) and the header language. */
 export function parseExportQuery(params: URLSearchParams): ExportQuery {
   const filter = parseExportFilter(params);
-  const columns = columnsParam(params.get("columns")?.trim() || "compact");
+  const columns = columnsParam(params.get("columns")?.trim() || "detailed");
   const headers = headersParam(params.get("headers")?.trim() || "th");
   return { ...filter, columns, headers };
 }
@@ -269,14 +270,14 @@ export function parseSelectionBody(value: unknown, maxRows: number): ExportSelec
   throw new Error("INVALID_EXPORT_SELECTION");
 }
 
-/** C2 body: `columns` (default compact), `headers` (default th) and the `selection`. A bad column/header value is the GET's error. */
+/** C2 body: `columns` (default detailed), `headers` (default th) and the `selection`. A bad column/header value is the GET's error. */
 export function parseExportBody(value: unknown, maxRows: number): ExportBody {
   if (!isPlainObject(value)) throw new Error("INVALID_EXPORT_SELECTION");
   onlyKeys(value, ["columns", "headers", "selection"]);
   for (const key of ["columns", "headers"] as const) {
     if (value[key] !== undefined && typeof value[key] !== "string") throw new Error("INVALID_EXPORT_SELECTION");
   }
-  const columns = columnsParam((value.columns as string | undefined)?.trim() || "compact");
+  const columns = columnsParam((value.columns as string | undefined)?.trim() || "detailed");
   const headers = headersParam((value.headers as string | undefined)?.trim() || "th");
   return { columns, headers, selection: parseSelectionBody(value.selection, maxRows) };
 }

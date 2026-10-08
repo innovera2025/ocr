@@ -13,7 +13,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { Pool } from "pg";
-import { CONFIDENCE_SORT_MAX_ROWS, DEFAULT_ORDER_SQL, displayedConfidencePercent, DOCUMENT_SORT_KEYS, EXPORT_MARK_LOCK_TIMEOUT_MS, EXPORT_MARK_STATEMENT_TIMEOUT_MS, flattenDocument, hasReviewFields, LEGACY_REVIEWER_LABEL, PostgresOcrDocumentStore, PostgresUserStore, reviewerLabel, toStructuredResult, withTenant,
+import { CONFIDENCE_SORT_MAX_ROWS, DEFAULT_ORDER_SQL, displayedConfidencePercent, DOCUMENT_SORT_KEYS, EXPORT_MARK_LOCK_TIMEOUT_MS, EXPORT_MARK_STATEMENT_TIMEOUT_MS, flattenDocument, hasReviewFields, LEGACY_REVIEWER_LABEL, ocrReadSummary, PostgresOcrDocumentStore, PostgresUserStore, reviewerLabel, toStructuredResult, withTenant,
   type AuditContext, type DocumentFilter, type DocumentListItem, type DocumentSortDir, type DocumentSortKey, type DocumentView, type ExportCandidate, type ExportDocument, type OpenExportOptions, type PageDocumentInput,
   type SessionRevokeReason, type UserRole } from "./index.js";
 
@@ -1791,6 +1791,41 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
 
     assert.equal(await app.getReviewDocument(TENANT_B, typed.documentId), null, "tenant B cannot read them");
     await assert.rejects(app.openExport(TENANT_B, { ids: [typed.documentId] }, { maxRows: 10 }), { message: "EXPORT_SELECTION_EMPTY" });
+  });
+
+  test("full export after a real review: an edit reads 100 % with its OCR % kept, an accepted field keeps its OCR %, an untouched row has no edits", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 2 });
+    const reviewed = await processed("full-edited.png", { ...reviewResponse, documentId: `local-${randomUUID()}` }, undefined, batch.batchId);
+    const untouched = await processed("full-untouched.png", { ...cleanResponse, documentId: `local-${randomUUID()}` }, undefined, batch.batchId);
+    const before = (await app.getReviewDocument(TENANT_A, reviewed.documentId))!;
+    const draft = structuredClone(before.structuredResult) as DocumentView;
+    (draft.customerInformation.name as Record<string, unknown>).value = "Chun Li W.";
+    (draft.customerInformation.healthConditions as unknown[]).push({ value: "Asthma" });
+    ((draft.staffOnly.treatments as unknown[])[0] as Record<string, unknown>).duration = "60 นาที";
+    // therapistName (flagged, 50 %) and the second treatment (flagged, 41 %) are posted back unchanged: accepted.
+    const saved = await app.saveReview(TENANT_A, reviewed.documentId, { structuredResult: draft, reviewedBy: "user-a", expectedUpdatedAt: before.updatedAt });
+    assert.equal(saved.corrections, 3, "a changed name, an added list item and a changed duration");
+
+    const rows = Object.fromEntries((await exported(TENANT_A, { batchId: batch.batchId })).documents.map((document) => [document.documentId, flattenDocument(document, "detailed")]));
+    const edited = rows[reviewed.documentId]!;
+    const pick = (key: string) => [edited[`${key}_confidence`], edited[`${key}_ocr_confidence`], edited[`${key}_edited`]];
+    assert.deepEqual([...pick("customer_name"), edited.customer_name_raw, edited.customer_name_source], [100, 88, true, "Chun Li", "human"], "changed scalar");
+    assert.deepEqual(pick("treatment_1"), [100, 95, true], "changed duration");
+    assert.deepEqual([...pick("therapist"), edited.therapist_needs_review, edited.therapist_source], [50, 50, false, false, "master-fuzzy"], "accepted without a change");
+    assert.deepEqual(pick("treatment_2"), [41, 41, false]);
+    assert.deepEqual([...pick("health_conditions"), edited.health_conditions_raw], [90, 90, true, "Menstruation"], "an added item: 100 %, no OCR %, the list is edited");
+    assert.equal(edited.min_confidence, 41);
+    assert.equal(edited.handwriting_read, "3 จาก 5", "name, room and treatment 1 read; therapist and treatment 2 written but not read");
+    assert.deepEqual(ocrReadSummary(saved.document.structuredResult), ocrReadSummary(before.structuredResult), "the review moved none of the OCR summary");
+
+    const clean = rows[untouched.documentId]!;
+    const editedKeys = Object.keys(clean).filter((key) => key.endsWith("_edited"));
+    assert.ok(editedKeys.length > 0);
+    assert.ok(editedKeys.every((key) => clean[key] !== true), "a document nobody reviewed has no edited field");
+    assert.deepEqual([clean.customer_name_confidence, clean.customer_name_ocr_confidence, clean.min_confidence], [92, 92, 90]);
+
+    await assert.rejects(app.openExport(TENANT_B, { ids: [reviewed.documentId] }, { maxRows: 10 }), { message: "EXPORT_SELECTION_EMPTY" }, "tenant B cannot export tenant A's rows");
+    assert.equal((await exported(TENANT_B, { batchId: batch.batchId })).total, 0);
   });
 
   // ---- server-side sort of the document list (review-others-and-sort, Phase 2) ------------------------------------
