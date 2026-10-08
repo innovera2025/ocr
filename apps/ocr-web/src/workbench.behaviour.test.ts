@@ -111,11 +111,17 @@ type Workbench = {
   toDraft(structuredResult: unknown): Record<string, Record<string, unknown>>;
   renderEditor(): void;
   countNeeds(): number;
+  cycleSort(key: string): void;
+  renderSort(say?: boolean): void;
+  listUrl(): string;
+  clearFilters(): void;
+  showPages(parentId: string, name: string): Promise<void>;
   ERRORS: Record<string, string>;
   state: {
     uploads: Upload[]; batch: unknown; batchId: string | null; current: unknown; draft: unknown; editable: boolean;
     openSeq: number; originalSig: string; user: { id: string } | null; csrf: string; dirty: boolean; leaving: boolean;
     timer: number; users: unknown[]; tempPass: string; q: string; status: string; parentFilter: string; parentName: string;
+    sort: string; dir: string; offset: number; docs: Array<{ documentId: string }>;
     exQ: string; exParent: string; exTotal: number | null; exMax: number; batchFilter: string;
     exTab: string; exOffset: number; exSize: number; exSel: Set<string>; exWarnIds: Set<string>; exAll: boolean; exAllTotal: number | null; exRows: unknown[];
   };
@@ -123,7 +129,7 @@ type Workbench = {
 
 const inline = /<script\b[^>]*>([\s\S]*?)<\/script>/.exec(workbenchPage({ nonce: "n" }))?.[1] ?? "";
 const EXPOSE = "globalThis.__wb={wire,init,checkSession,requireLogin,api,loadDocuments,logout,openUsers,openExportDialog,downloadExport,applyUser,renderHead,reviewerLabel,"
-  + "row,renderBatch,addFiles,loadPreview,save,ERRORS,state,applyDocument,failText,toggleOriginal,toDraft,renderEditor,countNeeds};";
+  + "row,renderBatch,addFiles,loadPreview,save,ERRORS,state,applyDocument,failText,toggleOriginal,toDraft,renderEditor,countNeeds,cycleSort,renderSort,listUrl,clearFilters,showPages};";
 
 /** setTimeout/clearTimeout with no wall clock: a test decides when an armed timer fires (and can see that one is armed). */
 class FakeClock {
@@ -1792,4 +1798,163 @@ test("Others: an AI-read value is a normal flagged field; the hint is never coun
   assert.equal(hinted.wb.countNeeds(), 0, "the hint is not a review field");
   assert.deepEqual(rows.map((row) => row.wrap.className.split(" ").includes("needs")), [false, false], "jumpNext selects .field.needs only");
   assert.equal(hinted.$("editor").children[0]!.textContent, "ไม่มีช่องที่ระบบไม่แน่ใจ ตรวจทานแล้วกดบันทึกและยืนยัน", "the summary panel counts no flagged field");
+});
+
+// ---- sortable list headers (server-side sort) ----------------------------------------------------------------------
+
+const SORT_KEYS = ["file", "customer", "gender", "nationality", "treatment", "duration", "therapist", "room", "status", "confidence"];
+const listed = (count: number, prefix = "d") => ({ total: 120, limit: 50, offset: 0, documents: Array.from({ length: count }, (_unused, index) => ({
+  documentId: `${prefix}0000000-0000-4000-8000-${String(index).padStart(12, "0")}`, filename: `${prefix}-${index}.png`, status: "SUCCEEDED", statusCategory: "succeeded",
+  createdAt: "2026-10-08T01:00:00.000Z", summary: { treatments: [] } })) });
+const listCalls = (ctx: { fetches: string[] }) => ctx.fetches.filter((call) => call.startsWith("GET /api/documents?")).map((call) => call.slice(4));
+const ariaSorts = (ctx: { $: (id: string) => FakeElement }) => Object.fromEntries(SORT_KEYS.flatMap((key) => {
+  const value = ctx.$(`th-${key}`).getAttribute("aria-sort");
+  return value === null ? [] : [[key, value]];
+}));
+
+test("a header click cycles ascending, descending and back to the default order, with aria-sort, arrows and a spoken status", async () => {
+  const ctx = await bootedIn({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 });
+  assert.deepEqual(SORT_KEYS.map((key) => ctx.$(`arr-${key}`).textContent), SORT_KEYS.map(() => "↕"), "every header shows it can be sorted");
+  assert.deepEqual(ariaSorts(ctx), {});
+  ctx.$("sort-customer").dispatch("click");
+  await settle();
+  assert.deepEqual(listCalls(ctx), ["/api/documents?limit=50&offset=0&sort=customer&dir=asc"]);
+  assert.deepEqual(ariaSorts(ctx), { customer: "ascending" });
+  assert.deepEqual([ctx.$("arr-customer").textContent, ctx.$("arr-room").textContent], ["↑", "↕"]);
+  assert.equal(ctx.$("sort-live").textContent, "เรียงตาม ลูกค้า จากน้อยไปมาก");
+  ctx.$("sort-customer").dispatch("click");
+  await settle();
+  assert.equal(listCalls(ctx).at(-1), "/api/documents?limit=50&offset=0&sort=customer&dir=desc");
+  assert.deepEqual(ariaSorts(ctx), { customer: "descending" });
+  assert.equal(ctx.$("arr-customer").textContent, "↓");
+  assert.equal(ctx.$("sort-live").textContent, "เรียงตาม ลูกค้า จากมากไปน้อย");
+  ctx.$("sort-customer").dispatch("click");
+  await settle();
+  assert.equal(listCalls(ctx).at(-1), "/api/documents?limit=50&offset=0", "the third click is the plain default request");
+  assert.deepEqual(ariaSorts(ctx), {});
+  assert.equal(ctx.$("arr-customer").textContent, "↕");
+  assert.equal(ctx.$("sort-live").textContent, "กลับเป็นเรียงตามอัปโหลดล่าสุด");
+  assert.equal(listCalls(ctx).length, 3, "one request per click");
+  // (i) keyboard: each header is a <button type="button"> (static test) whose action is on click, which Enter and
+  // Space fire on a real button; nothing listens for mousedown.
+  for (const key of SORT_KEYS) {
+    assert.equal(ctx.$(`sort-${key}`).listeners.get("click")?.length, 1, key);
+    assert.equal(ctx.$(`sort-${key}`).listeners.has("mousedown"), false, key);
+  }
+});
+
+test("another column starts ascending and clears the first; a sort click always goes back to page 1", async () => {
+  const ctx = await bootedIn({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 });
+  ctx.$("sort-customer").dispatch("click");
+  ctx.$("sort-customer").dispatch("click");
+  await settle();
+  ctx.$("sort-room").dispatch("click");
+  await settle();
+  assert.equal(listCalls(ctx).at(-1), "/api/documents?limit=50&offset=0&sort=room&dir=asc");
+  assert.deepEqual(ariaSorts(ctx), { room: "ascending" });
+  ctx.wb.state.offset = 50;
+  ctx.$("sort-status").dispatch("click");
+  await settle();
+  assert.equal(listCalls(ctx).at(-1), "/api/documents?limit=50&offset=0&sort=status&dir=asc", "offset 50 -> 0");
+  assert.equal(ctx.wb.state.offset, 0);
+});
+
+test("the sort survives paging, the filters, the PDF pages view, clearFilters and the polling tick", async () => {
+  const ctx = await bootedIn({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }, (url) => url.startsWith("/api/documents?") ? json(200, listed(50)) : null);
+  ctx.$("sort-therapist").dispatch("click");
+  ctx.$("sort-therapist").dispatch("click");
+  await settle();
+  const sorted = "sort=therapist&dir=desc";
+  ctx.$("next").dispatch("click");
+  await settle();
+  assert.equal(listCalls(ctx).at(-1), `/api/documents?limit=50&offset=50&${sorted}`);
+  ctx.$("prev").dispatch("click");
+  await settle();
+  assert.equal(listCalls(ctx).at(-1), `/api/documents?limit=50&offset=0&${sorted}`);
+  ctx.$("status").value = "review";
+  ctx.$("status").dispatch("change");
+  await settle();
+  assert.equal(listCalls(ctx).at(-1), `/api/documents?limit=50&offset=0&status=review&${sorted}`);
+  ctx.$("q").value = "anna";
+  ctx.$("q").dispatch("keydown", { key: "Enter" });
+  await settle();
+  assert.equal(listCalls(ctx).at(-1), `/api/documents?limit=50&offset=0&status=review&q=anna&${sorted}`);
+  await ctx.wb.showPages(ID, "intake.pdf");
+  await settle();
+  assert.equal(listCalls(ctx).at(-1), `/api/documents?limit=50&offset=0&parentId=${ID}&${sorted}`);
+  ctx.wb.clearFilters();
+  await settle();
+  assert.equal(listCalls(ctx).at(-1), `/api/documents?limit=50&offset=0&${sorted}`);
+  const before = listCalls(ctx).length;
+  ctx.clock.run(ctx.wb.state.timer);
+  await settle();
+  assert.equal(listCalls(ctx).length, before + 1, "the poll loads the list once");
+  assert.equal(listCalls(ctx).at(-1), `/api/documents?limit=50&offset=0&${sorted}`, "the polling tick keeps the sort");
+  assert.equal(ctx.wb.listUrl(), `/api/documents?limit=50&offset=0&${sorted}`);
+  assert.deepEqual(ariaSorts(ctx), { therapist: "descending" });
+});
+
+test("the sort is part of the list signature: the same rows in a new order are rendered again", async () => {
+  const ctx = await bootedIn({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }, (url) => url.startsWith("/api/documents?") ? json(200, listed(3)) : null);
+  await ctx.wb.loadDocuments();
+  const rows = ctx.$("rows");
+  let renders = 0;
+  const original = rows.replaceChildren.bind(rows);
+  rows.replaceChildren = (...nodes) => { renders += 1; original(...nodes); };
+  await ctx.wb.loadDocuments();
+  assert.equal(renders, 0, "an unchanged answer is not re-rendered");
+  ctx.wb.cycleSort("customer");
+  await settle();
+  assert.equal(renders, 1, "same documents, different sort: rendered");
+  await ctx.wb.loadDocuments();
+  assert.equal(renders, 1);
+});
+
+test("a poll answer for the old order that lands after a header click is dropped", async () => {
+  let release: (value: FakeResponse) => void = () => undefined;
+  const stale = new Promise<FakeResponse>((resolve) => { release = resolve; });
+  let hold = false;
+  const ctx = await bootedIn({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }, (url) => {
+    if (!url.startsWith("/api/documents?")) return null;
+    if (url.includes("sort=")) return json(200, listed(2, "b"));
+    if (hold) { hold = false; return stale as unknown as FakeResponse; }
+    return null;
+  });
+  hold = true;
+  ctx.clock.run(ctx.wb.state.timer);
+  await settle();
+  assert.equal(listCalls(ctx).at(-1), "/api/documents?limit=50&offset=0", "the poll is in flight with the old order");
+  ctx.$("sort-customer").dispatch("click");
+  await settle();
+  const sortedIds = listed(2, "b").documents.map((document) => document.documentId);
+  assert.deepEqual(ctx.wb.state.docs.map((document) => document.documentId), sortedIds);
+  release(json(200, listed(2, "a")));
+  await settle();
+  assert.deepEqual(ctx.wb.state.docs.map((document) => document.documentId), sortedIds, "the late answer for the old order is dropped");
+  assert.deepEqual(ariaSorts(ctx), { customer: "ascending" });
+});
+
+test("SORT_TOO_LARGE (or INVALID_SORT) resets to the default order once: one notice, one reload, no loop", async () => {
+  for (const code of ["SORT_TOO_LARGE", "INVALID_SORT"]) {
+    const ctx = await bootedIn({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }, (url) =>
+      url.startsWith("/api/documents?") && url.includes("sort=") ? json(400, { error: code }) : null);
+    await ctx.wb.loadDocuments();
+    ctx.fetches.length = 0;
+    ctx.$("sort-confidence").dispatch("click");
+    await settle();
+    assert.deepEqual(listCalls(ctx), ["/api/documents?limit=50&offset=0&sort=confidence&dir=asc", "/api/documents?limit=50&offset=0"], `${code}: exactly one extra list fetch`);
+    assert.deepEqual([ctx.wb.state.sort, ctx.wb.state.dir], ["", ""]);
+    assert.deepEqual(ariaSorts(ctx), {});
+    assert.equal(ctx.$("arr-confidence").textContent, "↕");
+    assert.equal(ctx.$("notice").hidden, false);
+    assert.match(ctx.$("notice").textContent, new RegExp(ctx.wb.ERRORS[code]!.replace(/[()]/g, "\\$&")), `${code}: the Thai text, not the code`);
+    assert.doesNotMatch(ctx.$("notice").textContent, new RegExp(code));
+    ctx.$("notice").hidden = true;
+    ctx.clock.run(ctx.wb.state.timer);
+    await settle();
+    assert.equal(listCalls(ctx).length, 3, "the next poll is one plain request");
+    assert.equal(listCalls(ctx).at(-1), "/api/documents?limit=50&offset=0");
+    assert.equal(ctx.$("notice").hidden, true, "and no repeated notice");
+  }
+  assert.match(load(server({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 })).wb.ERRORS.SORT_TOO_LARGE ?? "", /กรุณากรองให้แคบลงก่อน/, "the cap tells staff to narrow the filter");
 });

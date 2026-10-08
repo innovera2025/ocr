@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { Script } from "node:vm";
-import { CATEGORY_LABELS_TH, DELIVERY_LABELS_TH, FIELD_LABELS_TH, LEGACY_REVIEWER_LABEL } from "@innovera/ocr-persistence";
+import { CATEGORY_LABELS_TH, DELIVERY_LABELS_TH, DOCUMENT_SORT_KEYS, FIELD_LABELS_TH, LEGACY_REVIEWER_LABEL } from "@innovera/ocr-persistence";
 import { workbenchPage } from "./workbench.js";
 
 const html = workbenchPage({ nonce: "test-nonce-123" });
@@ -64,7 +64,8 @@ test("document text never goes through HTML parsing sinks", () => {
 
 test("table exposes all 11 contract columns in order", () => {
   const head = /<thead>([\s\S]*?)<\/thead>/.exec(html)?.[1] ?? "";
-  const headers = [...head.matchAll(/<th[^>]*>([^<]*)<\/th>/g)].map((match) => match[1]);
+  // Ten headers carry a sort button: the title is the header's text with the nested tags removed.
+  const headers = [...head.matchAll(/<th[^>]*>([\s\S]*?)<\/th>/g)].map((match) => (match[1] ?? "").replace(/<[^>]*>/g, ""));
   assert.deepEqual(headers, ["ไฟล์", "ลูกค้า", "เพศ", "สัญชาติ", "ทรีตเมนต์", "ระยะเวลา", "พนักงานนวด", "ห้อง", "สถานะ", "ความมั่นใจ", "จัดการ"]);
   assert.match(html, /id="scroll" class="scroll" tabindex="0" role="region"/);
 });
@@ -195,4 +196,40 @@ test("the Others free-text fields sit right under their checkbox lists, in the s
   // The hint has the amber look of a flagged field but its own class, which jumpNext's selector does not include.
   assert.match(html, /\.field\.needs,\.field\.needs-hint,\.t-item\.needs,\.chip\.needs\{/);
   assert.ok(inlineScript.includes("querySelectorAll('.field.needs,.chip.needs,.t-item.needs')"));
+});
+
+test("ten sortable headers: real buttons in DOCUMENT_SORT_KEYS order, every id the script builds, จัดการ stays plain", () => {
+  const head = /<thead>([\s\S]*?)<\/thead>/.exec(html)?.[1] ?? "";
+  const buttons = [...head.matchAll(/<button id="sort-([a-z]+)" class="th-sort" type="button" data-sort="([a-z]+)">/g)];
+  assert.deepEqual(buttons.map((match) => match[2]), [...DOCUMENT_SORT_KEYS], "the server's whitelist, in header order");
+  assert.ok(buttons.every((match) => match[1] === match[2]));
+  const literal = /const SORT_KEYS=\[([^\]]*)\];/.exec(inlineScript)?.[1] ?? "";
+  assert.deepEqual([...literal.matchAll(/'([a-z]+)'/g)].map((match) => match[1]), [...DOCUMENT_SORT_KEYS], "the script's SORT_KEYS is the same list");
+  for (const key of DOCUMENT_SORT_KEYS) {
+    // The script reaches these as 'th-'+k, 'sort-'+k and 'arr-'+k, which the literal-id test above cannot see.
+    assert.match(head, new RegExp(`<th scope="col" id="th-${key}"><button id="sort-${key}" [^>]*>[^<]+<span id="arr-${key}" class="arr" aria-hidden="true"></span></button></th>`), key);
+  }
+  assert.match(head, /<th scope="col">จัดการ<\/th><\/tr>/, "จัดการ has no sort button");
+  assert.equal((head.match(/aria-sort/g) ?? []).length, 0, "no column claims a sort before the script sets one");
+  assert.match(markup, /<p id="sort-live" class="sr-only" aria-live="polite"><\/p>/);
+  assert.ok(inlineScript.includes("$('sort-live')"), "the live region is looked up literally (covered by the id test)");
+  // 'sort-'+key includes 'sort-status' (the status column's button): the live region must not reuse that id.
+  const ids = [...markup.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(ids.filter((id, index) => ids.indexOf(id) !== index), [], "every id in the page is unique");
+  for (const needle of ["setAttribute('aria-sort'", "removeAttribute('aria-sort')", "SORT_TOO_LARGE", "INVALID_SORT", "p.set('sort',state.sort)",
+    "JSON.stringify([docs,total,state.offset,state.sort,state.dir])", "SORT_KEYS.forEach(k=>$('sort-'+k).addEventListener('click',()=>cycleSort(k)))"]) {
+    assert.ok(inlineScript.includes(needle), needle);
+  }
+  // Neutral grays only: the header styles name no color but the gray ramp.
+  const sortCss = [...html.matchAll(/(?:^|\n)((?:th\[aria-sort\] )?\.th-sort[^{]*)\{([^}]*)\}/g)].map((match) => match[2] ?? "");
+  assert.ok(sortCss.length >= 5, "the .th-sort rules exist");
+  for (const body of sortCss) assert.doesNotMatch(body, /#|rgb|--(red|amber|teal|blue)/, body);
+  assert.match(html, /\.th-sort:focus-visible\{outline-offset:-2px\}/);
+});
+
+test("the sort errors have the plan's Thai text, and the cap names the narrowing hint", () => {
+  const source = /const ERRORS=\{([\s\S]*?)\};\nconst state=/.exec(inlineScript)?.[1] ?? "";
+  const errors = Object.fromEntries([...source.matchAll(/([A-Z_]+):'([^']*)'/g)].map((entry) => [entry[1]!, entry[2]!]));
+  assert.equal(errors.INVALID_SORT, "เรียงลำดับตามคอลัมน์นี้ไม่ได้");
+  assert.equal(errors.SORT_TOO_LARGE, "มีเอกสารมากเกินไปที่จะเรียงตามความมั่นใจ (เกิน 2,000 รายการ) กรุณากรองให้แคบลงก่อน");
 });
