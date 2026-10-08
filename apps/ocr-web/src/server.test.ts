@@ -324,6 +324,37 @@ test("documents list parses query parameters strictly", async () => {
   });
 });
 
+test("documents list parses sort and dir strictly (whitelist, INVALID_SORT before the store)", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    const args = async (query: string) => {
+      const response = await fetch(`${base}/api/documents?${query}`, { headers: auth });
+      assert.equal(response.status, 200, query);
+      return h.calls.at(-1)?.args;
+    };
+    assert.deepEqual(await args(""), [{ limit: 50, offset: 0 }], "no sort: the query object is exactly what it was");
+    assert.deepEqual(await args("sort=customer"), [{ limit: 50, offset: 0, sort: "customer", dir: "asc" }]);
+    assert.deepEqual(await args("sort=room&dir=desc"), [{ limit: 50, offset: 0, sort: "room", dir: "desc" }]);
+    for (const key of ["file", "customer", "gender", "nationality", "treatment", "duration", "therapist", "room", "status", "confidence"]) {
+      assert.deepEqual(await args(`sort=${key}&dir=asc`), [{ limit: 50, offset: 0, sort: key, dir: "asc" }], key);
+    }
+    assert.deepEqual(await args("dir=desc"), [{ limit: 50, offset: 0 }], "a valid dir without sort is ignored");
+    assert.deepEqual(await args("sort=&dir="), [{ limit: 50, offset: 0 }], "empty values count as absent");
+    assert.deepEqual(await args(`limit=20&offset=40&status=review&q=anna&batchId=${batchId}&parentId=${failedDocumentId}&sort=therapist&dir=desc`),
+      [{ limit: 20, offset: 40, status: "review", q: "anna", batchId, parentId: failedDocumentId, sort: "therapist", dir: "desc" }], "sort combines with every filter");
+    const count = h.calls.length;
+    for (const query of ["sort=bogus", "sort=CUSTOMER", "sort=customer&dir=up", "dir=bogus", "sort=customer&dir=DESC", "sort=d.id%3B%20DROP%20TABLE%20documents", "sort=confidence&dir=%20asc"]) {
+      await expectError(await fetch(`${base}/api/documents?${query}`, { headers: auth }), 400, "INVALID_SORT");
+    }
+    assert.equal(h.calls.length, count, "rejected sorts never reach the store");
+  });
+  // The store's cap answers 400 with its code, like every other client error.
+  const capped = workbenchHarness({ storeError: new Error("SORT_TOO_LARGE") });
+  await withServer(capped, async (base) => {
+    await expectError(await fetch(`${base}/api/documents?sort=confidence`, { headers: auth }), 400, "SORT_TOO_LARGE");
+  });
+});
+
 test("review save: 200, conflict, validation, size limit, and bad ids", async () => {
   const h = workbenchHarness();
   await withServer(h, async (base) => {

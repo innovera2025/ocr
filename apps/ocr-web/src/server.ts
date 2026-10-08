@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { loadConfig, loadWebConfig, redactLog, type WebConfig } from "@innovera/ocr-config";
 import { handleRawUpload, type IngestDependencies } from "@innovera/ocr-ingest/http";
 import { OcrClient } from "@innovera/ocr-client";
-import { DOCUMENT_STATUS_CATEGORIES, legacyTreatmentIndex, normalizeStructuredResult, type AuditContext, type DocumentStatusCategory, type DocumentView, type ReviewStore } from "@innovera/ocr-persistence";
+import { DOCUMENT_SORT_DIRS, DOCUMENT_SORT_KEYS, DOCUMENT_STATUS_CATEGORIES, legacyTreatmentIndex, normalizeStructuredResult, type AuditContext, type DocumentSortDir, type DocumentSortKey, type DocumentStatusCategory, type DocumentView, type ReviewStore } from "@innovera/ocr-persistence";
 import { assertDatabaseReady, createDatabasePool, runMigrationsWithPool } from "@innovera/ocr-db-runtime";
 import { resolve } from "node:path";
 import { PostgresOcrDocumentStore } from "@innovera/ocr-persistence";
@@ -26,7 +26,8 @@ import { clamAvHealthCheck } from "@innovera/ocr-ingest/clamav";
 import type { LocalStorage } from "@innovera/ocr-storage/local";
 import { createLocalStorage } from "@innovera/ocr-storage/local";
 
-export type DocumentListQuery = { limit: number; offset: number; status?: DocumentStatusCategory; q?: string; batchId?: string; parentId?: string };
+export type DocumentListQuery = { limit: number; offset: number; status?: DocumentStatusCategory; q?: string; batchId?: string; parentId?: string;
+  sort?: DocumentSortKey; dir?: DocumentSortDir };
 
 /** Structural subset of the store methods behind the workbench routes (spec §4), so tests can pass fakes. PostgresOcrDocumentStore implements it; results are passed through as JSON. */
 export type WorkbenchStore = Readonly<{
@@ -144,7 +145,11 @@ function intParam(value: string | null, fallback: number, min: number, max: numb
   return parsed;
 }
 
-/** Strict `GET /api/documents` query parsing; empty parameters count as absent. `parentId` lists the pages of one PDF. */
+/**
+ * Strict `GET /api/documents` query parsing; empty parameters count as absent. `parentId` lists the pages of one PDF.
+ * `sort`/`dir` (whitelist, INVALID_SORT): `sort` without `dir` is ascending; a valid `dir` without `sort` is ignored; the
+ * keys are present only with a sort, so a request without one parses exactly as before.
+ */
 export function parseDocumentListQuery(params: URLSearchParams): DocumentListQuery {
   const limit = intParam(params.get("limit"), 50, 1, 200, "INVALID_LIMIT");
   const offset = intParam(params.get("offset"), 0, 0, 1_000_000, "INVALID_OFFSET");
@@ -154,12 +159,17 @@ export function parseDocumentListQuery(params: URLSearchParams): DocumentListQue
   if (q !== undefined && (q.length > 100 || q.includes("\u0000"))) throw new Error("INVALID_QUERY");
   const batchId = params.get("batchId") || undefined;
   const parentId = params.get("parentId") || undefined;
+  const sort = params.get("sort") || undefined;
+  const dir = params.get("dir") || undefined;
+  if (sort !== undefined && !(DOCUMENT_SORT_KEYS as readonly string[]).includes(sort)) throw new Error("INVALID_SORT");
+  if (dir !== undefined && !(DOCUMENT_SORT_DIRS as readonly string[]).includes(dir)) throw new Error("INVALID_SORT");
   return {
     limit, offset,
     ...(status !== undefined ? { status: status as DocumentStatusCategory } : {}),
     ...(q !== undefined ? { q } : {}),
     ...(batchId !== undefined ? { batchId: uuidOr404(batchId, "BATCH_NOT_FOUND") } : {}),
-    ...(parentId !== undefined ? { parentId: uuidOr404(parentId, "DOCUMENT_NOT_FOUND") } : {})
+    ...(parentId !== undefined ? { parentId: uuidOr404(parentId, "DOCUMENT_NOT_FOUND") } : {}),
+    ...(sort !== undefined ? { sort: sort as DocumentSortKey, dir: (dir ?? "asc") as DocumentSortDir } : {})
   };
 }
 

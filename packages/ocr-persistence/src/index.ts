@@ -2,6 +2,7 @@ import { Pool, type PoolClient, type PoolConfig } from "pg";
 import type { OcrResponse } from "@innovera/ocr-client";
 import { applyReviewEdits, legacyTreatmentIndex, markReviewed, normalizeStructuredResult, summarizeDocument, type DocumentSummary, type DocumentView } from "./document-view.js";
 import { insertAudit, type AuditContext } from "./audit.js";
+import { CONFIDENCE_SORT_MAX_ROWS, DEFAULT_ORDER_SQL, documentOrderSql, parseDocumentSort, rankByDisplayedConfidence, type DocumentSort, type DocumentSortDir, type DocumentSortKey } from "./document-sort.js";
 import { isUuid, withTenant } from "./tenant.js";
 import { DOCUMENT_STATUS_CATEGORIES, type DeliveryStatus, type DocumentStatusCategory } from "./labels.js";
 import { EXPORT_SELECTION_MAX, type DocumentFilter, type ExportCandidate, type ExportCandidatesResult, type ExportDocument, type ExportMarkInput,
@@ -13,6 +14,7 @@ export * from "./audit.js";
 export * from "./labels.js";
 export * from "./users.js";
 export * from "./export.js";
+export * from "./document-sort.js";
 
 export type OcrDocumentStatus = "PROCESSING" | "SUCCEEDED" | "NEEDS_REVIEW" | "FAILED";
 export type ConfirmStatus = "PENDING" | "SUCCEEDED" | "RETRY";
@@ -125,7 +127,8 @@ export type DocumentListItem = { documentId: string; batchId: string | null; fil
   processedAt: string | null; reviewedAt: string | null; deliveryStatus: DeliveryStatus; summary: DocumentSummary;
   parentDocumentId: string | null; pageNumber: number | null; pageCount: number | null; parentFilename: string | null };
 /** `parentId`: only the pages of that (split) PDF. The filters themselves are `DocumentFilter`, shared with the export. */
-export type ListDocumentsQuery = DocumentFilter & { limit?: number | undefined; offset?: number | undefined };
+export type ListDocumentsQuery = DocumentFilter & { limit?: number | undefined; offset?: number | undefined;
+  sort?: DocumentSortKey | undefined; dir?: DocumentSortDir | undefined };
 /** `maxRows` is `OCR_EXPORT_MAX_ROWS`: above it the export is refused with EXPORT_TOO_LARGE before anything is read. */
 /** `now` is the wall clock behind `EXPORT_MAX_DURATION_MS`; only the tests pass it. */
 /** `expectedTotal`: the row count the user saw ("select all N matching"); a different count is EXPORT_SELECTION_CHANGED. */
@@ -1064,23 +1067,51 @@ export class PostgresOcrDocumentStore implements ReviewStore {
    * their upload (they share its created_at). limit 1..200 (default 50) and offset ≥ 0 are clamped. `q` matches filename,
    * customer name, therapist and form number (case-insensitive, LIKE wildcards escaped); `parentId` lists the pages of one
    * PDF. Unknown status → INVALID_QUERY; malformed batchId → BATCH_NOT_FOUND; malformed parentId → DOCUMENT_NOT_FOUND.
+   * `sort`/`dir` (document-sort.ts) order the whole filtered set: empty values last in both directions, ties in the
+   * default order; no `sort` is the default order exactly. Unknown sort or dir → INVALID_SORT (checked before any query);
+   * `sort=confidence` over more than CONFIDENCE_SORT_MAX_ROWS filtered rows → SORT_TOO_LARGE.
    */
   async listDocuments(tenantId: string, query: ListDocumentsQuery = {}): Promise<{ total: number; documents: DocumentListItem[] }> {
+    const sort = parseDocumentSort(query.sort, query.dir);
     const limit = clampInt(query.limit, 50, 1, 200);
     const offset = clampInt(query.offset, 0, 0, 1_000_000);
     const params: unknown[] = [];
     const condition = documentFilterSql(tenantId, query, params);
     return this.tenantTransaction(tenantId, async (client) => {
       const total = await client.query<{ total: number }>(`SELECT count(*)::int AS total FROM documents d WHERE ${condition}`, params);
+      const count = total.rows[0]?.total ?? 0;
+      if (sort?.sort === "confidence") return { total: count, documents: await this.listByConfidence(client, condition, params, count, sort, limit, offset) };
       const rows = await client.query<Row>(
         `SELECT d.id, d.batch_id, d.filename, d.mime_type, d.status::text AS status, d.needs_review, d.error_message, d.created_at, d.processed_at,
                 ${REVIEWED_AT_SQL} AS reviewed_at, d.structured_result, ${DELIVERY_SQL} AS delivery_status, ${PAGE_COLUMNS}
          FROM documents d ${PARENT_JOIN} WHERE ${condition}
-         ORDER BY d.created_at DESC, COALESCE(d.parent_document_id, d.id) DESC, d.page_number ASC NULLS FIRST, d.id DESC
+         ORDER BY ${documentOrderSql(sort, CATEGORY_SQL)}
          LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]);
-      return { total: total.rows[0]?.total ?? 0, documents: rows.rows.map(toListItem) };
+      return { total: count, documents: rows.rows.map(toListItem) };
     });
+  }
+
+  /**
+   * `sort=confidence`: the order is the displayed `summary.minConfidence` percentage, computed by the same
+   * `summarizeDocument(viewOf(row))` the page shows (no SQL copy that could drift). One pass reads the filtered set in the
+   * default order, ranks it, and a second reads the full rows of the requested page only; both in the caller's tenant
+   * transaction. Bounded by CONFIDENCE_SORT_MAX_ROWS.
+   */
+  private async listByConfidence(client: PoolClient, condition: string, params: unknown[], total: number, sort: DocumentSort,
+    limit: number, offset: number): Promise<DocumentListItem[]> {
+    if (total > CONFIDENCE_SORT_MAX_ROWS) throw new Error("SORT_TOO_LARGE");
+    const all = await client.query<Row>(
+      `SELECT d.id, d.status::text AS status, ${REVIEWED_AT_SQL} AS reviewed_at, d.structured_result FROM documents d WHERE ${condition} ORDER BY ${DEFAULT_ORDER_SQL}`, params);
+    const ids = rankByDisplayedConfidence(all.rows, (row) => summarizeDocument(viewOf(row)).minConfidence, sort.dir).slice(offset, offset + limit).map((row) => String(row.id));
+    if (ids.length === 0) return [];
+    const rows = await client.query<Row>(
+      `SELECT d.id, d.batch_id, d.filename, d.mime_type, d.status::text AS status, d.needs_review, d.error_message, d.created_at, d.processed_at,
+              ${REVIEWED_AT_SQL} AS reviewed_at, d.structured_result, ${DELIVERY_SQL} AS delivery_status, ${PAGE_COLUMNS}
+       FROM documents d ${PARENT_JOIN} WHERE ${condition} AND d.id = ANY($${params.length + 1}::uuid[])`,
+      [...params, ids]);
+    const byId = new Map(rows.rows.map((row) => [String(row.id), row]));
+    return ids.flatMap((id) => { const row = byId.get(id); return row ? [toListItem(row)] : []; });
   }
 
   /**

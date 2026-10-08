@@ -86,6 +86,12 @@ test("store methods reject malformed ids without touching the database", async (
   await assert.rejects(store.listDocuments("t", { batchId: "x" }), { message: "BATCH_NOT_FOUND" });
   await assert.rejects(store.listDocuments("t", { status: "bogus" as never }), { message: "INVALID_QUERY" });
   await assert.rejects(store.listDocuments("t", { parentId: "../x" }), { message: "DOCUMENT_NOT_FOUND" });
+  // The sort is validated before any query (document-sort.ts); a valid one gets as far as the (poisoned) pool.
+  await assert.rejects(store.listDocuments("t", { sort: "bogus" as never }), { message: "INVALID_SORT" });
+  await assert.rejects(store.listDocuments("t", { sort: "customer", dir: "up" as never }), { message: "INVALID_SORT" });
+  await assert.rejects(store.listDocuments("t", { dir: "sideways" as never }), { message: "INVALID_SORT" });
+  await assert.rejects(store.listDocuments("t", { sort: "customer", dir: "desc" }), { message: "database must not be used" });
+  await assert.rejects(store.listDocuments("t", { sort: "confidence" }), { message: "database must not be used" });
   const page = { pageNumber: 1, publicId: "a".repeat(32), storageKey: "org/t/original/aa/" + "a".repeat(32), mimeType: "image/png", sizeBytes: 10, contentHash: "h" };
   await assert.rejects(store.createPageDocuments("t", "x", 1, [page]), { message: "DOCUMENT_NOT_FOUND" });
   const parent = "0b7e9f5e-3b1c-4c0e-9d53-2a5f0c7c8f11";

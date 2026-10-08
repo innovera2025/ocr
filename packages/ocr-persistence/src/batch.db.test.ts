@@ -13,8 +13,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { Pool } from "pg";
-import { EXPORT_MARK_LOCK_TIMEOUT_MS, EXPORT_MARK_STATEMENT_TIMEOUT_MS, flattenDocument, hasReviewFields, LEGACY_REVIEWER_LABEL, PostgresOcrDocumentStore, PostgresUserStore, reviewerLabel, toStructuredResult, withTenant,
-  type AuditContext, type DocumentFilter, type DocumentView, type ExportCandidate, type ExportDocument, type OpenExportOptions, type PageDocumentInput,
+import { CONFIDENCE_SORT_MAX_ROWS, DEFAULT_ORDER_SQL, displayedConfidencePercent, DOCUMENT_SORT_KEYS, EXPORT_MARK_LOCK_TIMEOUT_MS, EXPORT_MARK_STATEMENT_TIMEOUT_MS, flattenDocument, hasReviewFields, LEGACY_REVIEWER_LABEL, PostgresOcrDocumentStore, PostgresUserStore, reviewerLabel, toStructuredResult, withTenant,
+  type AuditContext, type DocumentFilter, type DocumentListItem, type DocumentSortDir, type DocumentSortKey, type DocumentView, type ExportCandidate, type ExportDocument, type OpenExportOptions, type PageDocumentInput,
   type SessionRevokeReason, type UserRole } from "./index.js";
 
 type Claimed = { jobId: string; organizationId: string; runId: string; kind: string; leaseToken: string };
@@ -1791,5 +1791,188 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
 
     assert.equal(await app.getReviewDocument(TENANT_B, typed.documentId), null, "tenant B cannot read them");
     await assert.rejects(app.openExport(TENANT_B, { ids: [typed.documentId] }, { maxRows: 10 }), { message: "EXPORT_SELECTION_EMPTY" });
+  });
+
+  // ---- server-side sort of the document list (review-others-and-sort, Phase 2) ------------------------------------
+
+  test("listDocuments: sorting matches the displayed values for every key and direction, pages completely and keeps filters", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 20 });
+    const batchId = batch.batchId;
+    const v3 = (customer: Record<string, unknown>, staff: Record<string, unknown> = {}) => ({ schemaVersion: 3, header: {}, customerInformation: customer, recommendationCard: {}, staffOnly: staff });
+    const person = (name: string | null, extra: Record<string, unknown> = {}) => ({ name: field(name, name, 0.9), ...extra });
+    const stored = (filename: string, structured: Record<string, unknown>) => processed(filename, { documentId: `local-${randomUUID()}` }, structured, batchId);
+    const unreadBranch = { raw: null, value: null, confidence: 0, source: "none", needsReview: false };
+    // v3 canonical rows: Thai (leading vowels), mixed-case Latin, blanks, rooms 10 / 2 / A3 / blank, minutes summed or the form total.
+    await stored("v3-somchai.png", v3(person("สมชาย", { gender: field("Male", "Male", 0.97), nationality: field("Thai", "Thai", 0.95) }),
+      { treatments: [treatment("ไทย 90 นาที", "ไทย", "นวดไทย", "90 นาที", 0.95), treatment("ฟุต 60 นาที", "ฟุต", "นวดเท้า", "60 นาที", 0.894)], therapistName: field("Anna", "Anna", 0.9), roomNo: field("10", "10", 0.95) }));
+    await stored("v3-kesinee.png", v3(person("เกศินี", { gender: field("Female", "Female", 0.96), nationality: field("thai", "thai", 0.89) }),
+      { treatments: [treatment("ขัด 45 นาที", "ขัด", "ขัดผิว", "45 นาที", 0.7)], therapistName: field("บุญมี", "บุญมี", 0.4, true), roomNo: field("2", "2", 0.9), branch: unreadBranch }));
+    await stored("v3-pailin.png", v3({ name: { raw: "ไพริน", value: "ไพลิน", confidence: 0.1, source: "human", needsReview: false }, nationality: field("ญี่ปุ่น", "ญี่ปุ่น", 0.8) },
+      { treatments: [{ raw: "อโรมา 2 ชม.", nameRaw: "อโรมา", value: "อโรมา", duration: "2 ชม.", confidence: 0.8, source: "rule", needsReview: false }], totalMinutes: 120, roomNo: field("A3", "A3", 0.6) }));
+    await stored("v3-alice.png", v3(person("alice", { gender: field("Female", "Female", 0.99) }), { treatments: [], therapistName: field("zed", "zed", 0.95) }));
+    await stored("v3-bob-upper.png", v3(person("Bob", { nationality: field("Chinese", "Chinese", 0.5) }), { therapistName: field("Anna", "Anna", 0.9) }));
+    await stored("v3-bob-lower.png", v3(person("bob"), { treatments: [treatment("ไทย 30 นาที", "ไทย", "นวดไทย", "30 นาที", 0.9)] }));
+    await stored("v3-zed.png", v3(person("  Zed "), { totalMinutes: 30 }));
+    await stored("v3-blank.png", v3(person("   ", { gender: field("", "", 0.9) }), { roomNo: field("  ", "  ", 0.9), therapistName: field("", null, 0) }));
+    // The legacy shapes the SQL claims to understand: flat v2.2, a whole v2.2 response, a v2.2 human confirmation (treatment.value).
+    await stored("flat-legacy.png", legacyFlat);
+    await stored("whole-v22.png", { documentId: `local-${randomUUID()}`, engine: "typhoon-crop-only", version: "2.2", evidence: { staffCropRaw: "..." },
+      staffOnly: { treatment: { raw: "ฟุต 60 นาที", durations: ["60 นาที"], items: [{ raw: "ฟุต", value: "นวดเท้า", duration: "60 นาที", confidence: 0.9, source: "rule", needsReview: false }], needsReview: false },
+        therapistName: field("Somsri", "Somsri", 0.88), roomNo: field("A3", "A3", 0.9) } });
+    await stored("confirmed-legacy.png", { treatment: { raw: "ไทย 90 ฟุต 60", durations: ["90 นาที", "60 นาที"], value: "นวดไทยและเท้า", needsReview: false,
+      items: [{ raw: "ไทย", value: "นวดไทย", duration: "90 นาที", confidence: 0.95, source: "rule", needsReview: false }, { raw: "ฟุต", value: null, duration: "60 นาที", confidence: 0.4, source: "rule", needsReview: false }] },
+      therapistName: field("ก้อย", "ก้อย", 0.7), roomNo: field("2", "2", 0.9) });
+    // One row in each status category: review and succeeded come from above; confirmed, failed, processing, queued here.
+    const toConfirm = await stored("v3-confirm.png", v3(person("โชคดี", { gender: field("Male", "Male", 0.5, true) }), { therapistName: field("ใจดี", "ใจดี", 0.9), roomNo: field("10", "10", 0.9) }));
+    const review = (await app.getReviewDocument(TENANT_A, toConfirm.documentId))!;
+    await app.saveReview(TENANT_A, toConfirm.documentId, { structuredResult: review.structuredResult, reviewedBy: "user-a", expectedUpdatedAt: review.updatedAt });
+    const failed = await uploadFile(TENANT_A, "failed.png", "image/png", batchId);
+    await asApp(TENANT_A, "UPDATE documents SET status='FAILED', error_message='HTTP 503' WHERE id=$1::uuid", [failed.documentId]);
+    const processing = await uploadFile(TENANT_A, "processing.png", "image/png", batchId);
+    await worker.markProcessing(TENANT_A, processing.documentId);
+    await uploadFile(TENANT_A, "queued.png", "image/png", batchId);
+    // A split PDF (3 pages sharing its name and upload time) and a separate, not yet split upload with the same name.
+    const pdf = await uploadFile(TENANT_A, "same-name.pdf", "application/pdf", batchId);
+    await worker.markProcessing(TENANT_A, pdf.documentId);
+    await worker.setPageCount(TENANT_A, pdf.documentId, 3);
+    await worker.createPageDocuments(TENANT_A, pdf.documentId, 3, pageInputs(TENANT_A, pdf.documentId, [1, 2, 3]));
+    await worker.markSplit(TENANT_A, pdf.documentId, 3);
+    await uploadFile(TENANT_A, "same-name.pdf", "application/pdf", batchId);
+    // Tenant B has a row of its own that sorts first by name.
+    const other = await upload(app, TENANT_B, "tenant-b.png");
+    await app.updateScanStatus(TENANT_B, other.documentId, "CLEAN");
+    await worker.markProcessing(TENANT_B, other.documentId);
+    await saveResult(TENANT_B, other.documentId, { documentId: `local-${randomUUID()}` }, v3(person("กกกก"), { roomNo: field("1", "1", 0.9) }));
+
+    const base = await app.listDocuments(TENANT_A, { batchId, limit: 200 });
+    assert.equal(base.total, 19, "15 single uploads + 3 pages + the unsplit PDF; the SPLIT parent is no row");
+    const defaultIds = base.documents.map((item) => item.documentId);
+    // No sort: the very order the pre-change query (dd1500f's literal ORDER BY) returns on the same data.
+    const old = await superDb.query<{ id: string }>(`SELECT d.id FROM documents d WHERE d.organization_id = $1 AND d.deleted_at IS NULL AND d.status NOT IN ('DELETED','SPLIT') AND d.batch_id = $2
+      ORDER BY d.created_at DESC, COALESCE(d.parent_document_id, d.id) DESC, d.page_number ASC NULLS FIRST, d.id DESC`, [TENANT_A, batchId]);
+    assert.deepEqual(defaultIds, old.rows.map((row) => row.id));
+    assert.equal(DEFAULT_ORDER_SQL, "d.created_at DESC, COALESCE(d.parent_document_id, d.id) DESC, d.page_number ASC NULLS FIRST, d.id DESC");
+
+    // The JS side of the parity: keys from what the page displays (the list item's summary), btrim + lower like the SQL,
+    // ranked by PostgreSQL's own th-TH-x-icu order (the collation itself is proven in the next test).
+    const storedRows = new Map((await superDb.query<{ id: string; structured_result: unknown }>("SELECT id, structured_result FROM documents WHERE batch_id = $1", [batchId])).rows.map((row) => [row.id, row.structured_result]));
+    const norm = (value: unknown): string | null => { if (value === null || value === undefined) return null; const t = String(value).replace(/^ +| +$/g, ""); return t === "" ? null : t.toLowerCase(); };
+    const minutes = (structured: unknown): number | null => {
+      const staff = (structured as { staffOnly?: Record<string, unknown> } | null)?.staffOnly;
+      if (!staff || typeof staff !== "object") return null;
+      const numbers = Array.isArray(staff.treatments) ? staff.treatments.map((item) => (item as Record<string, unknown> | null)?.durationMinutes).filter((value): value is number => typeof value === "number") : [];
+      return numbers.length > 0 ? numbers.reduce((sum, value) => sum + value, 0) : typeof staff.totalMinutes === "number" ? staff.totalMinutes : null;
+    };
+    const STATUS_RANK: Record<string, number> = { review: 1, failed: 2, processing: 3, queued: 4, succeeded: 5, confirmed: 6 };
+    const textOf: Record<string, (item: DocumentListItem) => string | null> = {
+      file: (item) => norm(item.filename), customer: (item) => norm(item.summary.customerName), gender: (item) => norm(item.summary.gender),
+      nationality: (item) => norm(item.summary.nationality), treatment: (item) => norm(item.summary.treatments[0]?.name ?? null),
+      therapist: (item) => norm(item.summary.therapist), room: (item) => norm(item.summary.room)
+    };
+    const words = [...new Set(base.documents.flatMap((item) => Object.values(textOf).map((key) => key(item))).filter((value): value is string => value !== null))];
+    const ranked = await superDb.query<{ k: string }>(`SELECT k FROM unnest($1::text[]) k ORDER BY k COLLATE "th-TH-x-icu"`, [words]);
+    const rank = new Map(ranked.rows.map((row, index) => [row.k, index]));
+    /** A sort key: null = empty (last both ways), else numbers compared in order. A room is [leading number or +∞, text rank]. */
+    const keyOf = (sort: DocumentSortKey, item: DocumentListItem): number[] | null => {
+      if (sort === "status") return [STATUS_RANK[item.statusCategory]!];
+      if (sort === "duration") { const value = minutes(storedRows.get(item.documentId)); return value === null ? null : [value]; }
+      if (sort === "confidence") { const value = displayedConfidencePercent(item.summary.minConfidence); return value === null ? null : [value]; }
+      const text = textOf[sort]!(item);
+      if (text === null) return null;
+      if (sort !== "room") return [rank.get(text)!];
+      const digits = /^[0-9]{1,9}/.exec(text);
+      return [digits ? Number(digits[0]) : Number.POSITIVE_INFINITY, rank.get(text)!];
+    };
+    const compareParts = (a: number[], b: number[]): number => { for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return a[i]! < b[i]! ? -1 : 1; return 0; };
+    const expected = (items: readonly DocumentListItem[], sort: DocumentSortKey, dir: DocumentSortDir): string[] => items
+      .map((item, index) => ({ item, index, key: keyOf(sort, item) }))
+      .sort((a, b) => {
+        if (a.key === null || b.key === null) return a.key === b.key ? a.index - b.index : a.key === null ? 1 : -1;
+        return (dir === "asc" ? 1 : -1) * compareParts(a.key, b.key) || a.index - b.index;
+      })
+      .map((entry) => entry.item.documentId);
+    const ids = async (query: Parameters<typeof app.listDocuments>[1]) => (await app.listDocuments(TENANT_A, { batchId, limit: 200, ...query })).documents.map((item) => item.documentId);
+
+    for (const sort of DOCUMENT_SORT_KEYS) for (const dir of ["asc", "desc"] as const) {
+      const sorted = await app.listDocuments(TENANT_A, { batchId, limit: 200, sort, dir });
+      assert.equal(sorted.total, base.total, `${sort} ${dir}: total unchanged`);
+      assert.deepEqual(sorted.documents.map((item) => item.documentId), expected(base.documents, sort, dir), `${sort} ${dir}: server order = displayed-value order`);
+      // Paging: limit 2 pages concatenated are the unpaged list (no gap, no duplicate).
+      const paged: string[] = [];
+      for (let offset = 0; offset < sorted.total; offset += 2) paged.push(...await ids({ sort, dir, limit: 2, offset }));
+      assert.deepEqual(paged, sorted.documents.map((item) => item.documentId), `${sort} ${dir}: paging`);
+      // Filters keep their meaning under a sort: the filtered set, in the sorted order.
+      const all = sorted.documents.map((item) => item.documentId);
+      for (const filter of [{ status: "review" as const }, { q: "v3-" }, { parentId: pdf.documentId }]) {
+        const subset = new Set(await ids(filter));
+        const filtered = await app.listDocuments(TENANT_A, { batchId, limit: 200, ...filter, sort, dir });
+        assert.equal(filtered.total, subset.size, `${sort} ${dir} ${JSON.stringify(filter)}: total`);
+        assert.deepEqual(filtered.documents.map((item) => item.documentId), all.filter((id) => subset.has(id)), `${sort} ${dir} ${JSON.stringify(filter)}`);
+      }
+    }
+
+    // The orders the plan names, read off the displayed values.
+    const column = async <T>(sort: DocumentSortKey, dir: DocumentSortDir, pick: (item: DocumentListItem) => T): Promise<T[]> =>
+      (await app.listDocuments(TENANT_A, { batchId, limit: 200, sort, dir })).documents.map(pick);
+    const runs = (values: unknown[]) => values.filter((value, index) => index === 0 || value !== values[index - 1]);
+    const rooms = (values: unknown[]) => runs(values.map((value) => norm(value)));
+    assert.deepEqual(rooms(await column("room", "asc", (item) => item.summary.room)), ["2", "10", "a3", null], "rooms: 2, 10, A3, then empty");
+    assert.deepEqual(rooms(await column("room", "desc", (item) => item.summary.room)), ["a3", "10", "2", null], "the exact reverse, empty still last");
+    assert.deepEqual(runs(await column("status", "asc", (item) => item.statusCategory)), ["review", "failed", "processing", "queued", "succeeded", "confirmed"]);
+    assert.deepEqual(runs(await column("status", "desc", (item) => item.statusCategory)), ["confirmed", "succeeded", "queued", "processing", "failed", "review"]);
+    const names = await column("customer", "asc", (item) => item.summary.customerName);
+    assert.deepEqual(names.slice(0, 8), ["เกศินี", "โชคดี", "ไพลิน", "สมชาย", "alice", "bob", "Bob", "  Zed "],
+      "Thai dictionary order (เกศินี under ก, โชคดี under ช, ไพลิน under พ), then English A to Z; bob/Bob tie in default order (newest first)");
+    assert.ok(names.slice(8).every((name) => norm(name) === null), "blank and missing names last");
+    const files = await column("file", "desc", (item): [string, number | null] => [item.filename, item.pageNumber]);
+    const same = files.filter(([name]) => name === "same-name.pdf");
+    assert.deepEqual(same.map(([, page]) => page), [null, 1, 2, 3], "equal names keep the default order: the newer upload, then the split PDF's pages in page order");
+    assert.deepEqual((await column("file", "asc", (item): [string, number | null] => [item.filename, item.pageNumber])).filter(([name]) => name === "same-name.pdf").map(([, page]) => page), [null, 1, 2, 3], "in both directions");
+    assert.deepEqual((await column("duration", "asc", (item) => minutes(storedRows.get(item.documentId)))).filter((value) => value !== null), [30, 30, 45, 120, 150]);
+    // Confidence is the displayed percentage: human fields count as 100 %, an unread field is skipped, 89.4 % shows as 89.
+    const percents = await column("confidence", "asc", (item) => displayedConfidencePercent(item.summary.minConfidence));
+    const shown = percents.filter((value) => value !== null) as number[];
+    assert.deepEqual(shown, [...shown].sort((a, b) => a - b));
+    assert.ok(percents.slice(shown.length).every((value) => value === null), "rows without a confidence last");
+    const pailin = base.documents.find((item) => item.filename === "v3-pailin.png")!;
+    assert.equal(displayedConfidencePercent(pailin.summary.minConfidence), 60, "the human name (confidence 0.1) counts as 100 %, room 0.6 is the minimum");
+    const kesinee = base.documents.find((item) => item.filename === "v3-kesinee.png")!;
+    assert.equal(displayedConfidencePercent(kesinee.summary.minConfidence), 40, "the unread branch (confidence 0) is skipped");
+
+    // Tenant isolation: tenant B's sorted lists never carry tenant A's rows.
+    for (const sort of DOCUMENT_SORT_KEYS) {
+      const listed = await app.listDocuments(TENANT_B, { sort, dir: "asc", limit: 200 });
+      assert.ok(listed.documents.every((item) => !defaultIds.includes(item.documentId)), `${sort}: tenant B`);
+      assert.ok(listed.documents.some((item) => item.documentId === other.documentId), `${sort}: tenant B sees its own row`);
+    }
+  });
+
+  test("listDocuments: Thai dictionary collation, and sort=confidence is capped at CONFIDENCE_SORT_MAX_ROWS", async () => {
+    // th-TH-x-icu exists in this image (postgres:17.6, as in production): leading vowels sort by the consonant after them.
+    const words = ["ไก่", "เกด", "แม่", "โต", "ใจ", "ไข่", "กา", "ขิม", "ฮา", "Zed", "apple", "Bob", "alice"];
+    const thai = await superDb.query<{ k: string }>(`SELECT k FROM unnest($1::text[]) k ORDER BY lower(k) COLLATE "th-TH-x-icu", k`, [words]);
+    assert.deepEqual(thai.rows.map((row) => row.k), ["กา", "เกด", "ไก่", "ขิม", "ไข่", "ใจ", "โต", "แม่", "ฮา", "alice", "apple", "Bob", "Zed"]);
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3 });
+    for (const name of ["ไก่", "เกด", "Bob", "alice", "กา"]) await processed(`collation-${name}.png`, { documentId: `local-${randomUUID()}` }, { schemaVersion: 3, header: {}, customerInformation: { name: field(name, name, 0.9) }, recommendationCard: {}, staffOnly: {} });
+    const listed = await app.listDocuments(TENANT_A, { q: "collation-", sort: "customer", dir: "asc" });
+    assert.deepEqual(listed.documents.map((item) => item.summary.customerName), ["กา", "เกด", "ไก่", "alice", "Bob"]);
+    assert.ok(batch.batchId);
+
+    // The cap: CONFIDENCE_SORT_MAX_ROWS + 1 minimal rows (superuser, generate_series), deleted again afterwards.
+    assert.equal(CONFIDENCE_SORT_MAX_ROWS, 2000);
+    await superDb.query(`INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash)
+      SELECT gen_random_uuid(), $1::uuid, md5('cap-' || g || $2), 'CLEAN', 'bulk-cap-' || g || '.png', 'image/png', 1, 'h' FROM generate_series(1, $3::int) g`,
+      [TENANT_A, randomUUID(), CONFIDENCE_SORT_MAX_ROWS + 1]);
+    try {
+      await assert.rejects(app.listDocuments(TENANT_A, { q: "bulk-cap-", sort: "confidence" }), { message: "SORT_TOO_LARGE" });
+      const byName = await app.listDocuments(TENANT_A, { q: "bulk-cap-", sort: "customer", limit: 5 });
+      assert.deepEqual([byName.total, byName.documents.length], [CONFIDENCE_SORT_MAX_ROWS + 1, 5], "the nine SQL keys have no cap");
+      await superDb.query("DELETE FROM documents WHERE organization_id = $1 AND id = (SELECT id FROM documents WHERE organization_id = $1 AND filename LIKE 'bulk-cap-%' LIMIT 1)", [TENANT_A]);
+      const atCap = await app.listDocuments(TENANT_A, { q: "bulk-cap-", sort: "confidence", dir: "desc", limit: 3, offset: 1997 });
+      assert.deepEqual([atCap.total, atCap.documents.length], [CONFIDENCE_SORT_MAX_ROWS, 3], "exactly the cap is still sorted");
+    } finally {
+      await superDb.query("DELETE FROM documents WHERE organization_id = $1 AND filename LIKE 'bulk-cap-%'", [TENANT_A]);
+    }
+    assert.equal((await app.listDocuments(TENANT_A, { q: "bulk-cap-" })).total, 0);
   });
 });
