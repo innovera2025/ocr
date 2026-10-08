@@ -108,6 +108,9 @@ type Workbench = {
   addFiles(files: unknown[]): void;
   loadPreview(seq: number, id: string): Promise<void>;
   save(): Promise<void>;
+  toDraft(structuredResult: unknown): Record<string, Record<string, unknown>>;
+  renderEditor(): void;
+  countNeeds(): number;
   ERRORS: Record<string, string>;
   state: {
     uploads: Upload[]; batch: unknown; batchId: string | null; current: unknown; draft: unknown; editable: boolean;
@@ -120,7 +123,7 @@ type Workbench = {
 
 const inline = /<script\b[^>]*>([\s\S]*?)<\/script>/.exec(workbenchPage({ nonce: "n" }))?.[1] ?? "";
 const EXPOSE = "globalThis.__wb={wire,init,checkSession,requireLogin,api,loadDocuments,logout,openUsers,openExportDialog,downloadExport,applyUser,renderHead,reviewerLabel,"
-  + "row,renderBatch,addFiles,loadPreview,save,ERRORS,state,applyDocument,failText,toggleOriginal};";
+  + "row,renderBatch,addFiles,loadPreview,save,ERRORS,state,applyDocument,failText,toggleOriginal,toDraft,renderEditor,countNeeds};";
 
 /** setTimeout/clearTimeout with no wall clock: a test decides when an armed timer fires (and can see that one is armed). */
 class FakeClock {
@@ -1655,4 +1658,138 @@ test("the users table shows the effective export right and offers no pointless g
   const labels = (row: FakeElement) => row.descendants().filter((node) => node.tagName === "BUTTON").map((node) => node.textContent);
   assert.equal(labels(rows[0]!).includes("อนุญาตส่งออก"), false, "the flag does nothing on an admin row");
   assert.equal(labels(rows[1]!).includes("อนุญาตส่งออก"), true);
+});
+
+// ---- "Others" free text in the review drawer ----------------------------------------------------------------------
+
+const OTHER_LABEL = "อื่น ๆ (ระบุ)";
+const ticked = (label: string, extra: Record<string, unknown> = {}) => ({ raw: label, value: label, confidence: 0.97, source: "checkbox", needsReview: false, checked: true, ...extra });
+const othersDocument = (customer: Record<string, unknown>) => ({ documentId: ID, filename: "intake.png", status: "NEEDS_REVIEW", statusCategory: "review", updatedAt: "2026-10-08T01:00:00.000Z",
+  structuredResult: { schemaVersion: 3, header: {}, customerInformation: { name: { raw: "Anna", value: "Anna", confidence: 0.9, source: "ocr", needsReview: false }, ...customer }, recommendationCard: {}, staffOnly: {} } });
+/** The two "Others" rows of the editor, in screen order: the field wrapper, its input and its head's flags. */
+function otherRows(ctx: { $: (id: string) => FakeElement }) {
+  const nodes = ctx.$("editor").descendants();
+  return nodes.filter((node) => node.tagName === "DIV" && node.className.split(" ").includes("field")
+    && node.children[0]?.children[0]?.tagName === "LABEL" && node.children[0].children[0].textContent === OTHER_LABEL).map((wrap) => {
+    const label = wrap.children[0]!.children[0]!;
+    const input = wrap.children.find((node) => node.tagName === "INPUT")!;
+    assert.equal(label.htmlFor, input.id, "the label names its input");
+    return { wrap, input, flags: () => wrap.children[0]!.children.filter((node) => node.className === "flag"), hint: () => wrap.className.split(" ").includes("needs-hint") };
+  });
+}
+function type(input: FakeElement, value: string): void { input.value = value; input.dispatch("input"); }
+
+test("Others: every customer section gets two empty inputs under its lists, and opening never makes the draft dirty", () => {
+  const ctx = load(server({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }));
+  ctx.wb.applyDocument(othersDocument({ referralSources: [ticked("Hotel")], healthConditions: [] }));
+  const rows = otherRows(ctx);
+  assert.equal(rows.length, 2);
+  for (const row of rows) {
+    assert.deepEqual([row.input.value, row.input.placeholder, row.input.readOnly, row.input.maxLength], ["", "ระบุ (ถ้ามี)", false, 500]);
+    assert.equal(row.hint(), false);
+  }
+  assert.equal(ctx.wb.state.dirty, false);
+  assert.equal(JSON.stringify(ctx.wb.state.draft), ctx.wb.state.originalSig, "the seed is part of the baseline");
+  const customer = (ctx.wb.state.draft as Record<string, Record<string, unknown>>).customerInformation!;
+  assert.deepEqual(Object.keys(customer), ["name", "referralSources", "healthConditions", "referralOther", "healthOther"]);
+  assert.equal(JSON.stringify(customer.referralOther), JSON.stringify({ raw: null, value: null, needsReview: false }));
+  // Screen order: each input sits right after its own list.
+  const fields = ctx.$("editor").descendants().filter((node) => node.tagName === "DIV" && node.className.split(" ")[0] === "field").map((node) => node.children[0]!.children[0]!.textContent);
+  assert.deepEqual(fields, ["ชื่อลูกค้า", "เพศ", "สัญชาติ", "โรงแรมที่พัก", "รู้จักร้านจาก", OTHER_LABEL, "ภาวะสุขภาพ", OTHER_LABEL, "ทรีตเมนต์", "พนักงานนวด", "ห้อง"]);
+  // A document with no customer data keeps the "no data" message and gets no inputs; toDraft seeds nothing there.
+  assert.equal(JSON.stringify(ctx.wb.toDraft({ schemaVersion: 3, header: {}, customerInformation: {}, recommendationCard: {}, staffOnly: {} }).customerInformation), "{}");
+});
+
+test("Others: a stored value pre-fills its input, the other input stays empty", () => {
+  const ctx = load(server({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }));
+  ctx.wb.applyDocument(othersDocument({ referralSources: [ticked("Others")], referralOther: { raw: null, value: "Chat GPT", confidence: 1, source: "human", needsReview: false } }));
+  const [referral, health] = otherRows(ctx);
+  assert.equal(referral!.input.value, "Chat GPT");
+  assert.equal(referral!.hint(), false, "Others is ticked but the text is there");
+  assert.equal(health!.input.value, "");
+  assert.equal(ctx.wb.state.dirty, false);
+});
+
+test("Others: ticked with empty text raises the UI-only hint; typing, unticking or a checked:false item clears it", () => {
+  const ctx = load(server({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }));
+  ctx.wb.applyDocument(othersDocument({ referralSources: [ticked("Hotel"), ticked("Others")], healthConditions: [ticked(" OTHER ", { value: null }), ticked("Others", { checked: false })] }));
+  const [referral, health] = otherRows(ctx);
+  assert.equal(referral!.hint(), true);
+  assert.deepEqual(referral!.flags().map((node) => node.textContent), ["ต้องตรวจสอบ"]);
+  assert.equal(health!.hint(), true, "raw ' OTHER ' (value empty) counts; the unticked item alone would not");
+  type(referral!.input, "Chat GPT");
+  assert.equal(referral!.hint(), false);
+  assert.deepEqual(referral!.flags(), []);
+  type(referral!.input, "   ");
+  assert.equal(referral!.hint(), true, "whitespace is still empty");
+  assert.equal(referral!.flags().length, 1, "the flag is never duplicated");
+  type(referral!.input, "");
+  // Unticking = removing the "Others" chip from the list.
+  const chips = ctx.$("editor").descendants().filter((node) => node.tagName === "LI" && node.className.split(" ")[0] === "chip");
+  const othersChip = chips.find((chip) => chip.children.some((node) => node.tagName === "INPUT" && node.value === "Others"))!;
+  othersChip.children.find((node) => node.tagName === "BUTTON")!.dispatch("click");
+  assert.equal(referral!.hint(), false);
+  assert.deepEqual(referral!.flags(), []);
+  // Only the unticked "Others" left in health: no hint.
+  const healthList = (ctx.wb.state.draft as Record<string, Record<string, unknown[]>>).customerInformation!.healthConditions!;
+  healthList.splice(0, 1);
+  type(health!.input, "");
+  assert.equal(health!.hint(), false, "an Others item with checked:false does not count");
+  // Chinese label too.
+  const chinese = load(server({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }));
+  chinese.wb.applyDocument(othersDocument({ referralSources: [ticked("其他")] }));
+  assert.equal(otherRows(chinese)[0]!.hint(), true);
+});
+
+test("Others: a read-only drawer shows the input read-only with ไม่มีข้อมูล, and still hints when Others is ticked", () => {
+  const ctx = load(server({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }));
+  ctx.wb.applyDocument(othersDocument({ healthConditions: [ticked("Others")] }));
+  ctx.wb.state.editable = false;
+  ctx.wb.renderEditor();
+  const [referral, health] = otherRows(ctx);
+  for (const row of [referral!, health!]) assert.deepEqual([row.input.readOnly, row.input.placeholder], [true, "ไม่มีข้อมูล"]);
+  assert.equal(referral!.hint(), false);
+  assert.equal(health!.hint(), true);
+});
+
+test("Others: typing marks the draft dirty and the save posts the typed text; the hint never blocks it", async () => {
+  const posted: string[] = [];
+  const ctx = await bootedIn({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }, (url, init) => {
+    if (!url.endsWith("/ocr/review")) return null;
+    posted.push(String(init.body));
+    return json(200, { status: "confirmed", delivery: "NOT_REQUIRED", corrections: 1 });
+  });
+  ctx.wb.applyDocument(othersDocument({ referralSources: [ticked("Others")], healthConditions: [ticked("Others")] }));
+  const [referral, health] = otherRows(ctx);
+  type(referral!.input, "Chat GPT");
+  assert.equal(ctx.wb.state.dirty, true);
+  type(referral!.input, "");
+  assert.equal(ctx.wb.state.dirty, false, "clearing the text again returns to the baseline");
+  type(referral!.input, "Chat GPT");
+  assert.equal(health!.hint(), true, "the other group still hints");
+  await ctx.wb.save();
+  assert.equal(posted.length, 1, "saving is not blocked by the hint");
+  const body = JSON.parse(posted[0]!) as { structuredResult: { customerInformation: Record<string, { value: unknown }> } };
+  assert.equal(body.structuredResult.customerInformation.referralOther!.value, "Chat GPT");
+  assert.equal(body.structuredResult.customerInformation.healthOther!.value, null, "the empty seed goes along; the server stores nothing for it");
+});
+
+test("Others: an AI-read value is a normal flagged field; the hint is never counted or jumped to", () => {
+  const ctx = load(server({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }));
+  ctx.wb.applyDocument(othersDocument({ referralSources: [ticked("Others")], referralOther: { raw: "Chat GPT", value: "Chat GPT", confidence: 0.6, source: "ocr", needsReview: true } }));
+  const [referral] = otherRows(ctx);
+  assert.equal(referral!.input.value, "Chat GPT");
+  assert.equal(referral!.wrap.className.split(" ").includes("needs"), true);
+  assert.equal(referral!.hint(), false, "a stored flag uses the normal style, not the hint");
+  assert.equal(referral!.flags().length, 1);
+  assert.match(referral!.wrap.textContent, /ความมั่นใจ 60%/);
+  assert.equal(ctx.wb.countNeeds(), 1);
+
+  const hinted = load(server({ user: STAFF, csrf: "csrf-1", sessionStatus: 200 }));
+  hinted.wb.applyDocument(othersDocument({ referralSources: [ticked("Others")], healthConditions: [ticked("Others")] }));
+  const rows = otherRows(hinted);
+  assert.deepEqual(rows.map((row) => row.hint()), [true, true]);
+  assert.equal(hinted.wb.countNeeds(), 0, "the hint is not a review field");
+  assert.deepEqual(rows.map((row) => row.wrap.className.split(" ").includes("needs")), [false, false], "jumpNext selects .field.needs only");
+  assert.equal(hinted.$("editor").children[0]!.textContent, "ไม่มีช่องที่ระบบไม่แน่ใจ ตรวจทานแล้วกดบันทึกและยืนยัน", "the summary panel counts no flagged field");
 });

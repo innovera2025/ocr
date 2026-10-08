@@ -445,3 +445,47 @@ test("v3.1: an unread field (branch not found: source none, confidence 0) does n
   const read = summarizeDocument(normalizeStructuredResult({ staffOnly: { roomNo: { raw: "x", value: null, confidence: 0, source: "none", needsReview: false } } }));
   assert.equal(read.minConfidence, 0, "raw text without a value is a reading and counts");
 });
+
+test("Others free text: referralOther/healthOther are reviewable scalar fields (typed, cleared, kept, validated)", () => {
+  const base = normalizeStructuredResult(v3Response);
+  assert.equal("referralOther" in base.customerInformation, false, "an old document carries no Others keys");
+  // (a) a typed value on a view without the key: a human Field and one change with no old value.
+  const typed = applyReviewEdits(base, { customerInformation: { referralOther: { value: " Chat GPT " } } });
+  assert.deepEqual(typed.merged.customerInformation.referralOther, { raw: null, value: "Chat GPT", confidence: 1, source: "human", needsReview: false });
+  assert.deepEqual(typed.changes, [{ path: "customerInformation.referralOther", oldRaw: null, oldValue: null, newValue: "Chat GPT" }]);
+  assert.equal("provider" in typed.changes[0]!, false, "an Others edit is never a provider confirmation");
+  // (b) the workbench's empty seed (and an explicit null) on an absent key stores nothing and records nothing.
+  for (const seed of [{ raw: null, value: null, needsReview: false }, { value: "" }, { value: "   " }, null]) {
+    const result = applyReviewEdits(base, { customerInformation: { referralOther: seed, healthOther: seed } });
+    assert.equal("referralOther" in result.merged.customerInformation, false);
+    assert.equal("healthOther" in result.merged.customerInformation, false);
+    assert.deepEqual(result.changes, []);
+  }
+  // (c) editing an AI-written Field keeps raw and confidence, becomes human and clears the flag.
+  const read = normalizeStructuredResult({ ...v3Response, customerInformation: { ...v3Response.customerInformation, healthOther: field("Chat GPT", "Chat GPT", 0.6, true, "ocr") } });
+  const edited = applyReviewEdits(read, { customerInformation: { healthOther: { value: "ChatGPT" } } });
+  assert.deepEqual(edited.merged.customerInformation.healthOther, { raw: "Chat GPT", value: "ChatGPT", confidence: 0.6, source: "human", needsReview: false });
+  assert.deepEqual(edited.changes, [{ path: "customerInformation.healthOther", oldRaw: "Chat GPT", oldValue: "Chat GPT", newValue: "ChatGPT" }]);
+  // (d) clearing an existing value stores value null.
+  const cleared = applyReviewEdits(typed.merged, { customerInformation: { referralOther: { value: "" } } });
+  assert.equal((cleared.merged.customerInformation.referralOther as { value: unknown }).value, null);
+  assert.deepEqual(cleared.changes, [{ path: "customerInformation.referralOther", oldRaw: null, oldValue: "Chat GPT", newValue: null }]);
+  // (e) the usual length limit applies.
+  assert.throws(() => applyReviewEdits(base, { customerInformation: { referralOther: { value: "x".repeat(501) } } }), /REVIEW_INVALID/);
+  assert.doesNotThrow(() => applyReviewEdits(base, { customerInformation: { referralOther: { value: "x".repeat(500) } } }));
+});
+
+test("Others free text: normalization keeps the keys as Fields and the summary ignores empty or human Others", () => {
+  // (f) old documents are unchanged; documents with both keys keep them as Fields (string confidence coerced).
+  assert.deepEqual(Object.keys(normalizeStructuredResult(v3Response).customerInformation), Object.keys(v3Response.customerInformation), "no key is invented");
+  const withKeys = normalizeStructuredResult({ ...v3Response, customerInformation: { ...v3Response.customerInformation,
+    referralOther: { raw: "Friend", value: "Friend", confidence: "0.8", source: "ocr", needsReview: false }, healthOther: "Asthma" } });
+  assert.deepEqual(withKeys.customerInformation.referralOther, { raw: "Friend", value: "Friend", confidence: 0.8, source: "ocr", needsReview: false });
+  assert.deepEqual(withKeys.customerInformation.healthOther, { raw: "Asthma", value: "Asthma", needsReview: false });
+  // (g) an empty seed or a human Others value changes neither the minimum confidence nor the review count.
+  const plain = summarizeDocument(normalizeStructuredResult(v3Response));
+  const empty = summarizeDocument(normalizeStructuredResult({ ...v3Response, customerInformation: { ...v3Response.customerInformation, referralOther: { raw: null, value: null, needsReview: false } } }));
+  const human = summarizeDocument(normalizeStructuredResult({ ...v3Response, customerInformation: { ...v3Response.customerInformation, healthOther: { raw: null, value: "Asthma", confidence: 1, source: "human", needsReview: false } } }));
+  assert.deepEqual(empty, plain);
+  assert.deepEqual(human, plain);
+});

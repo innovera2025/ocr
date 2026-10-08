@@ -80,7 +80,7 @@ test("script follows the HTTP contract of spec §5", () => {
   for (const needle of ["'/api/auth/session'", "'/api/auth/login'", "'/api/auth/logout'", "'/api/auth/password'", "'/api/users'", "'/api/exports/candidates?'", "'/api/exports/marks'", "'/api/exports/documents.'", "'X-CSRF-Token'", "'X-OCR-Background'", "'/api/batches'", "'/api/batches?limit=20'", "'/api/documents?'", "'/ocr/review'", "'/retry'", "'/content'", "'X-Batch-Id'", "'X-Upload-Filename'", "encodeURIComponent(u.file.name)", "'X-Upload-Filename-Encoding','uri'", "'Idempotency-Key'", "expectedUpdatedAt", "structuredResult:state.draft", "CONCURRENCY=3", "MAX_FILES=100", "'document'"]) {
     assert.ok(inlineScript.includes(needle), `missing ${needle}`);
   }
-  for (const key of ["name", "gender", "nationality", "hotelName", "referralSources", "healthConditions", "pressure", "massageOilScrub", "preferredAreas", "avoidAreas", "treatments", "therapistName", "roomNo", "duration"]) {
+  for (const key of ["name", "gender", "nationality", "hotelName", "referralSources", "healthConditions", "pressure", "massageOilScrub", "preferredAreas", "avoidAreas", "treatments", "therapistName", "roomNo", "duration", "referralOther", "healthOther"]) {
     assert.match(inlineScript, new RegExp(`[{,]${key}:'[^']+'`), `no Thai label for ${key}`);
   }
   for (const section of ["ข้อมูลลูกค้า", "คำแนะนำการนวด", "สำหรับพนักงาน", "บันทึกและยืนยัน"]) assert.ok(html.includes(section), section);
@@ -180,4 +180,19 @@ test("every code the export routes can answer the dialog with has Thai text (002
   assert.equal(errors.EXPORT_BUSY_ORG, "มีคนอื่นกำลัง Export อยู่ตอนนี้ กรุณารอสักครู่แล้วลองใหม่");
   assert.equal(errors.EXPORT_THROTTLED, "ทำรายการบ่อยเกินไป กรุณารอประมาณ 15 นาทีแล้วลองใหม่");
   assert.ok(errors.EXPORT_INCOMPLETE?.includes("หรือบันทึกสถานะ Export ไม่สำเร็จ"));
+});
+
+test("the Others free-text fields sit right under their checkbox lists, in the strict SECTIONS tuple form", () => {
+  // One line, kinds field/list/treatments and an optional third element true only: the review-ledger parity test reads
+  // this line as text, so a new tuple kind or a string third element would break it.
+  const line = inlineScript.split("\n").find((text) => text.startsWith("const SECTIONS=[")) ?? "";
+  assert.ok(line.endsWith("];"), "SECTIONS stays on one line");
+  assert.ok(line.includes("['referralSources','list'],['referralOther','field',true],['healthConditions','list'],['healthOther','field',true]]"), line);
+  for (const [, , third] of line.matchAll(/\['(\w+)','(?:field|list|treatments)'(,true)?\]/g)) assert.ok(third === undefined || third === ",true");
+  assert.ok(inlineScript.includes("const OTHER_LABEL='อื่น ๆ (ระบุ)';"));
+  assert.ok(inlineScript.includes("const OTHER_OF={referralOther:'referralSources',healthOther:'healthConditions'};"));
+  assert.ok(inlineScript.includes("const OTHERS=['other','others','其他'];"));
+  // The hint has the amber look of a flagged field but its own class, which jumpNext's selector does not include.
+  assert.match(html, /\.field\.needs,\.field\.needs-hint,\.t-item\.needs,\.chip\.needs\{/);
+  assert.ok(inlineScript.includes("querySelectorAll('.field.needs,.chip.needs,.t-item.needs')"));
 });

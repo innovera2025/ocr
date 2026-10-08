@@ -36,6 +36,7 @@ export const DELIVERY_LABELS_TH: Readonly<Record<Exclude<DeliveryStatus, "NONE">
 export const FIELD_LABELS_TH: Readonly<Record<string, string>> = {
   formNumber: "เลขที่ฟอร์ม", date: "วันที่", time: "เวลา", branch: "สาขา", name: "ชื่อลูกค้า", gender: "เพศ", nationality: "สัญชาติ",
   hotelName: "โรงแรมที่พัก", referralSources: "รู้จักร้านจาก", healthConditions: "ภาวะสุขภาพ", pressure: "แรงกด",
+  referralOther: "รู้จักร้านจาก: อื่น ๆ (ระบุ)", healthOther: "ภาวะสุขภาพ: อื่น ๆ (ระบุ)",
   massageOilScrub: "น้ำมัน / สครับ", preferredAreas: "จุดที่ต้องการเน้น", avoidAreas: "จุดที่ควรหลีกเลี่ยง", treatments: "ทรีตเมนต์",
   therapistName: "พนักงานนวด", roomNo: "ห้อง", duration: "ระยะเวลา"
 };

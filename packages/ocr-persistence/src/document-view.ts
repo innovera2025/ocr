@@ -24,7 +24,7 @@ export const REVIEW_ARRAY_FIELDS: Readonly<Record<Section, readonly string[]>> =
   header: [], customerInformation: ["referralSources", "healthConditions"], recommendationCard: ["massageOilScrub", "preferredAreas", "avoidAreas"], staffOnly: ["treatments"]
 };
 export const REVIEW_SCALAR_FIELDS: Readonly<Record<Section, readonly string[]>> = {
-  header: ["formNumber", "date", "time"], customerInformation: ["name", "gender", "nationality", "hotelName"], recommendationCard: ["pressure"], staffOnly: ["therapistName", "roomNo", "branch"]
+  header: ["formNumber", "date", "time"], customerInformation: ["name", "gender", "nationality", "hotelName", "referralOther", "healthOther"], recommendationCard: ["pressure"], staffOnly: ["therapistName", "roomNo", "branch"]
 };
 export const MAX_REVIEW_VALUE_LENGTH = 500;
 export const MAX_REVIEW_ARRAY_ITEMS = 50;

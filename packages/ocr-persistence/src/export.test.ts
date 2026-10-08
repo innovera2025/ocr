@@ -46,7 +46,11 @@ test("the four required columns come first, in the order the user asked for", ()
   assert.deepEqual(EXPORT_COLUMNS_DETAILED.slice(0, EXPORT_COLUMNS.length), EXPORT_COLUMNS, "detailed only APPENDS to compact");
   assert.deepEqual(EXPORT_COLUMNS_DETAILED.slice(EXPORT_COLUMNS.length, EXPORT_COLUMNS.length + 4).map((column) => [column.key, column.kind]),
     [["form_number_raw", "text"], ["form_number_confidence", "number"], ["form_number_needs_review", "bool"], ["form_number_source", "text"]]);
-  assert.equal(EXPORT_COLUMNS_DETAILED.length, EXPORT_COLUMNS.length + 11 * 4, "four provenance columns per scalar field");
+  assert.equal(EXPORT_COLUMNS_DETAILED.length, EXPORT_COLUMNS.length + 13 * 4, "four provenance columns per scalar field");
+  // Pinned on purpose: the Others free-text change (referral_other, health_other) took compact 52 -> 54 and detailed
+  // 96 -> 106. Anyone reading the CSV by position must be told when these numbers move.
+  assert.equal(EXPORT_COLUMNS.length, 54);
+  assert.equal(EXPORT_COLUMNS_DETAILED.length, 106);
   assert.ok(EXPORT_COLUMNS.every((column) => column.th.trim().length > 0), "every column has a Thai header");
 });
 
@@ -180,4 +184,29 @@ test("rowVersion is never rendered: the file is identical whatever snapshot the 
     assert.ok(!exportColumns(set).some((column) => /version/i.test(column.key)), `no ${set} column carries the snapshot`);
     assert.ok(!Object.values(flattenDocument(pageDocument, set)).includes(pageDocument.rowVersion), `no ${set} value is the snapshot`);
   }
+});
+
+test("Others free text: two columns right after their lists, filled from the Field, empty for old documents", () => {
+  const keys = EXPORT_COLUMNS.map((column) => column.key);
+  const at = keys.indexOf("referral_sources");
+  assert.deepEqual(keys.slice(at, at + 4), ["referral_sources", "referral_other", "health_conditions", "health_other"]);
+  const th = Object.fromEntries(EXPORT_COLUMNS.map((column) => [column.key, column.th]));
+  assert.deepEqual([th.referral_other, th.health_other], ["รู้จักร้านจาก: อื่น ๆ (ระบุ)", "ภาวะสุขภาพ: อื่น ๆ (ระบุ)"]);
+  assert.equal(EXPORT_COLUMNS.find((column) => column.key === "referral_other")!.kind, "text");
+  const detailedKeys = EXPORT_COLUMNS_DETAILED.map((column) => column.key);
+  for (const key of ["referral_other", "health_other"]) for (const suffix of ["_raw", "_confidence", "_needs_review", "_source"]) assert.ok(detailedKeys.includes(`${key}${suffix}`), `${key}${suffix}`);
+
+  const withOthers = (customer: Record<string, unknown>): ExportDocument => ({ ...pageDocument,
+    structuredResult: normalizeStructuredResult({ ...v31, customerInformation: { ...v31.customerInformation, ...customer } }) });
+  const typed = flattenDocument(withOthers({ referralOther: { raw: null, value: "Chat GPT", confidence: 1, source: "human", needsReview: false } }), "detailed");
+  assert.deepEqual([typed.referral_other, typed.referral_other_source, typed.referral_other_confidence, typed.health_other], ["Chat GPT", "human", 1, null]);
+  const rawOnly = flattenDocument(withOthers({ healthOther: { raw: "Asthma", value: null, confidence: 0.4, source: "ocr", needsReview: true },
+    referralOther: { raw: "Chat GPT", value: "Chat GPT", confidence: 0.6, source: "ocr", needsReview: true } }), "detailed");
+  assert.equal(rawOnly.referral_other, "Chat GPT (?)", "a still-flagged value keeps the unverified marker");
+  assert.match(String(rawOnly.review_fields), /customerInformation\.referralOther/);
+  assert.deepEqual([rawOnly.health_other, rawOnly.health_other_raw, rawOnly.health_other_needs_review], ["Asthma (?)", "Asthma", true]);
+  assert.match(String(rawOnly.review_fields), /customerInformation\.healthOther/);
+  const old = flattenDocument(pageDocument, "detailed");
+  assert.deepEqual([old.referral_other, old.health_other, old.referral_other_raw, old.health_other_source], [null, null, null, null]);
+  assert.deepEqual([cells(pageDocument).referral_other, cells(pageDocument).health_other], ["", ""]);
 });

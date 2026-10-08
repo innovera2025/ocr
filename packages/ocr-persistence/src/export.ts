@@ -77,6 +77,8 @@ const SCALARS: readonly Scalar[] = [
   { key: "gender", th: label("gender"), section: "customerInformation", field: "gender" },
   { key: "nationality", th: label("nationality"), section: "customerInformation", field: "nationality" },
   { key: "hotel_name", th: label("hotelName"), section: "customerInformation", field: "hotelName" },
+  { key: "referral_other", th: label("referralOther"), section: "customerInformation", field: "referralOther" },
+  { key: "health_other", th: label("healthOther"), section: "customerInformation", field: "healthOther" },
   { key: "pressure", th: label("pressure"), section: "recommendationCard", field: "pressure" },
   { key: "therapist", th: label("therapistName"), section: "staffOnly", field: "therapistName" },
   { key: "room", th: label("roomNo"), section: "staffOnly", field: "roomNo" }
@@ -120,7 +122,7 @@ export const EXPORT_COLUMNS: readonly ExportColumn[] = [
   { key: "reviewed_at", th: "ยืนยันเมื่อ", kind: "datetime" },
   { key: "reviewed_by", th: "ยืนยันโดย", kind: "text" },
   ...["form_number", "form_date", "form_time", "branch", "customer_name", "gender", "nationality", "hotel_name",
-    "referral_sources", "health_conditions", "pressure", "massage_oil_scrub", "preferred_areas", "avoid_areas"].map(fieldColumn),
+    "referral_sources", "referral_other", "health_conditions", "health_other", "pressure", "massage_oil_scrub", "preferred_areas", "avoid_areas"].map(fieldColumn),
   { key: "treatments", th: label("treatments"), kind: "text" },
   ...treatmentColumns,
   { key: "treatments_more", th: `${label("treatments")} (รายการที่ ${TREATMENT_COLUMNS + 1} ขึ้นไป)`, kind: "text" },

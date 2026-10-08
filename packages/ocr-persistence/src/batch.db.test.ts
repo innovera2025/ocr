@@ -1752,4 +1752,44 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
       "SELECT current_setting('lock_timeout') AS lock, current_setting('statement_timeout') AS statement")).rows[0]);
     assert.deepEqual(bounds, { lock: "0", statement: "0" }, "SET LOCAL: the bounds did not stay on the pooled connection");
   });
+
+  // ---- "Others" free text: two scalar Fields under customerInformation (review-others-and-sort, Phase 1) ---------
+
+  test("Others free text: a review stores both texts as human Fields, records NOT_REQUIRED corrections, and the export shows them", async () => {
+    const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 2 });
+    const typed = await processed("others-typed.png", { ...reviewResponse, documentId: `local-${randomUUID()}` }, undefined, batch.batchId);
+    const untouched = await processed("others-untouched.png", { ...cleanResponse, documentId: `local-${randomUUID()}` }, undefined, batch.batchId);
+    const before = (await app.getReviewDocument(TENANT_A, typed.documentId))!;
+    assert.equal("referralOther" in before.structuredResult.customerInformation, false, "nothing is stored before a reviewer types");
+    const edited = structuredClone(before.structuredResult) as DocumentView;
+    edited.customerInformation.referralOther = { raw: null, value: "Chat GPT", needsReview: false };
+    edited.customerInformation.healthOther = { raw: null, value: "Asthma", needsReview: false };
+    const saved = await app.saveReview(TENANT_A, typed.documentId, { structuredResult: edited, reviewedBy: "user-a", expectedUpdatedAt: before.updatedAt });
+    assert.deepEqual([saved.corrections, saved.delivery], [2, "NOT_REQUIRED"], "the flagged-but-unedited fields of the fixture are weight 0");
+    const reread = (await app.getReviewDocument(TENANT_A, typed.documentId))!;
+    assert.deepEqual(reread.structuredResult.customerInformation.referralOther, { raw: null, value: "Chat GPT", confidence: 1, source: "human", needsReview: false });
+    assert.deepEqual(reread.structuredResult.customerInformation.healthOther, { raw: null, value: "Asthma", confidence: 1, source: "human", needsReview: false });
+    const corrections = await superDb.query("SELECT field, old_raw, verified_value, confirm_status FROM ocr_corrections WHERE document_id = $1 ORDER BY field", [typed.documentId]);
+    assert.deepEqual(corrections.rows, [
+      { field: "customerInformation.healthOther", old_raw: null, verified_value: "Asthma", confirm_status: "NOT_REQUIRED" },
+      { field: "customerInformation.referralOther", old_raw: null, verified_value: "Chat GPT", confirm_status: "NOT_REQUIRED" }
+    ]);
+    assert.equal((await superDb.query("SELECT 1 FROM ocr_confirm_outbox o JOIN ocr_corrections c ON c.id = o.correction_id WHERE c.document_id = $1", [typed.documentId])).rowCount, 0, "no provider, no outbox row");
+
+    const cells = async () => Object.fromEntries((await exported(TENANT_A, { batchId: batch.batchId })).documents.map((document) => {
+      const values = flattenDocument(document);
+      return [document.documentId, [values.referral_other, values.health_other]];
+    }));
+    assert.deepEqual(await cells(), { [typed.documentId]: ["Chat GPT", "Asthma"], [untouched.documentId]: [null, null] }, "a document never edited exports empty cells");
+
+    const cleared = structuredClone(reread.structuredResult) as DocumentView;
+    (cleared.customerInformation.healthOther as Record<string, unknown>).value = null;
+    const second = await app.saveReview(TENANT_A, typed.documentId, { structuredResult: cleared, reviewedBy: "user-a", expectedUpdatedAt: reread.updatedAt });
+    assert.equal(second.corrections, 1);
+    assert.equal((second.document.structuredResult.customerInformation.healthOther as Record<string, unknown>).value, null);
+    assert.deepEqual(await cells(), { [typed.documentId]: ["Chat GPT", null], [untouched.documentId]: [null, null] });
+
+    assert.equal(await app.getReviewDocument(TENANT_B, typed.documentId), null, "tenant B cannot read them");
+    await assert.rejects(app.openExport(TENANT_B, { ids: [typed.documentId] }, { maxRows: 10 }), { message: "EXPORT_SELECTION_EMPTY" });
+  });
 });
