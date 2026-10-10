@@ -15,6 +15,8 @@ export * from "./labels.js";
 export * from "./users.js";
 export * from "./export.js";
 export * from "./document-sort.js";
+export * from "./filename-key.js";
+export * from "./filename-key.vectors.js";
 
 export type OcrDocumentStatus = "PROCESSING" | "SUCCEEDED" | "NEEDS_REVIEW" | "FAILED";
 export type ConfirmStatus = "PENDING" | "SUCCEEDED" | "RETRY";
