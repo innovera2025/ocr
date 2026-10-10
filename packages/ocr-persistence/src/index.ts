@@ -5,6 +5,7 @@ import { insertAudit, type AuditContext } from "./audit.js";
 import { CONFIDENCE_SORT_MAX_ROWS, DEFAULT_ORDER_SQL, documentOrderSql, parseDocumentSort, rankByDisplayedConfidence, type DocumentSort, type DocumentSortDir, type DocumentSortKey } from "./document-sort.js";
 import { isUuid, withTenant } from "./tenant.js";
 import { DOCUMENT_STATUS_CATEGORIES, type DeliveryStatus, type DocumentStatusCategory } from "./labels.js";
+import { canonicalFilenameKey, FILENAME_KEY_SQL_WS_PATTERN, filenameKeySql } from "./filename-key.js";
 import { EXPORT_SELECTION_MAX, type DocumentFilter, type ExportCandidate, type ExportCandidatesResult, type ExportDocument, type ExportMarkInput,
   type ExportMarkResult, type ExportState, type ExportStateChangeInput } from "./export.js";
 
@@ -42,6 +43,28 @@ export type WorkerDocument = Readonly<{ documentId: string; organizationId: stri
 export type PageDocumentInput = Readonly<{ pageNumber: number; publicId: string; storageKey: string | null; mimeType: string;
   sizeBytes: number | null; contentHash: string | null }>;
 export type PageDocumentsResult = { created: number[]; existing: number[] };
+
+/**
+ * D7 (plan upload-duplicate-filename): what a refused duplicate upload, and the name pre-check, report about the
+ * existing document — exactly these five fields (no hash, size, user, storage key, extracted data or raw status).
+ * `statusCategory` is `statusCategoryOf` with null read as "failed"; `retryable` is true only for a FAILED document
+ * (QUARANTINED is "failed" too, but cannot be re-read).
+ */
+export type FilenameDuplicate = Readonly<{ documentId: string; filename: string; uploadedAt: string; statusCategory: DocumentStatusCategory | "split"; retryable: boolean }>;
+/** One entry per name of a `findFilenameDuplicates` call, in input order; `document` only when the name exists. */
+export type FilenameCheckResult = Readonly<{ index: number; exists: boolean; document?: FilenameDuplicate }>;
+/** D8: an upload whose canonical file name already exists in the organization. `errorCode()` reads the message. */
+export class DuplicateFilenameError extends Error {
+  readonly existing: FilenameDuplicate;
+  constructor(existing: FilenameDuplicate) {
+    super("DUPLICATE_FILENAME");
+    this.name = "DuplicateFilenameError";
+    this.existing = Object.freeze({ documentId: existing.documentId, filename: existing.filename, uploadedAt: existing.uploadedAt,
+      statusCategory: existing.statusCategory, retryable: existing.retryable });
+  }
+}
+/** D10: a name pre-check takes 1 to this many names (the workbench's MAX_FILES). */
+export const NAME_CHECK_MAX_NAMES = 100;
 
 export type OcrResultPatch = Readonly<{
   ocrDocumentId: string;
@@ -245,6 +268,24 @@ const ROW_VERSION_SQL = `to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"
 const EXPORT_STATE_PREDICATE: Readonly<Record<ExportState, string>> = {
   never: `${EXPORT_STATE_SQL} = 'never'`, exported: `${EXPORT_STATE_SQL} = 'exported'`
 };
+
+/**
+ * D1 + D3, the one statement body both the upload rule and the name pre-check select from, so they cannot drift: every
+ * top-level, not deleted document of the organization counts whatever its status (page rows copy their parent's name
+ * and never count), with its canonical name key. `org` is the tenant placeholder, `ws` the one bound to
+ * FILENAME_KEY_SQL_WS_PATTERN. No index: a sequential scan over one organization's top-level rows (measured at 20,000).
+ */
+function filenameMatchSql(org: string, ws: string): string {
+  return `SELECT d.id, d.filename, d.created_at, d.status::text AS status, ${REVIEWED_AT_SQL} AS reviewed_at, ${filenameKeySql("d.filename", ws)} AS name_key
+  FROM documents d WHERE d.organization_id = ${org}::uuid AND d.parent_document_id IS NULL AND d.deleted_at IS NULL AND d.status <> 'DELETED'`;
+}
+/** D7: with several (legacy) matches, the oldest is reported. */
+const FILENAME_MATCH_ORDER = "ORDER BY m.created_at, m.id";
+function toFilenameDuplicate(row: Row): FilenameDuplicate {
+  const status = String(row.status);
+  return { documentId: String(row.id), filename: String(row.filename), uploadedAt: iso(row.created_at) ?? "",
+    statusCategory: statusCategoryOf(status, row.reviewed_at) ?? "failed", retryable: status === "FAILED" };
+}
 
 /** Rows of the document list: not deleted, and not a PDF parent that was split into page rows (its pages are the rows). */
 const VISIBLE_SQL = "d.deleted_at IS NULL AND d.status NOT IN ('DELETED','SPLIT')";
@@ -680,6 +721,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
         }
         batchPosition = capacity.uploaded + 1;
       }
+      await this.assertFilenameFree(client, input);
       const document = await client.query<{ id: string; public_id: string }>(
         `INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, storage_key, batch_id)
          VALUES (gen_random_uuid(), $1::uuid, encode(gen_random_bytes(16), 'hex'), 'SCANNING', $2, $3, $4, $5, $6, $7::uuid)
@@ -714,6 +756,55 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       return { documentId: row.id, runId: run.rows[0]!.id, tenantId: input.tenantId, ...(input.batchId ? { batchId: input.batchId } : {}), ...(batchPosition ? { batchPosition } : {}) };
     } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; }
     finally { client.release(); }
+  }
+
+  /** D6: an unexpired upload already recorded under this request's idempotency key (expired ones were deleted above). */
+  private async idempotencyKeyExists(client: PoolClient, tenantId: string, idempotencyKey: string | undefined): Promise<boolean> {
+    if (!idempotencyKey) return false;
+    const found = await client.query("SELECT 1 FROM upload_idempotency_keys WHERE organization_id=$1::uuid AND idempotency_key=$2 AND expires_at > now()", [tenantId, idempotencyKey]);
+    return found.rows.length > 0;
+  }
+
+  /**
+   * The file-name rule (plan upload-duplicate-filename, D1 to D7), inside the upload's transaction: DUPLICATE_FILENAME
+   * when a top-level, not deleted document of the organization has the same canonical name, before anything is inserted
+   * (so a refused duplicate takes no batch slot). A retry of a request whose idempotency key already created an upload
+   * skips the rule (D6) and reaches the idempotency path unchanged: the original upload, or IDEMPOTENCY_CONFLICT.
+   *
+   * Lock order: the batch lock (taken before this, in createUploadedDocument) and then this filename lock, never the
+   * reverse. An upload takes at most one lock of each class and the filename lock is always its last, so no wait cycle
+   * can form. Same-name uploads of one organization serialise here; the loser waits for the winner's COMMIT and then
+   * sees its row. The lock is transaction-scoped (released at COMMIT/ROLLBACK); a hashtext collision only serialises
+   * two unrelated names for one INSERT.
+   */
+  private async assertFilenameFree(client: PoolClient, input: { tenantId: string; filename: string; idempotencyKey?: string | undefined }): Promise<void> {
+    if (await this.idempotencyKeyExists(client, input.tenantId, input.idempotencyKey)) return;
+    const key = canonicalFilenameKey(input.filename);
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('innovera_ocr:filename'), hashtext($1::text || ':' || $2::text))", [input.tenantId, key]);
+    // A concurrent request with this same key may have committed while this one waited: it is that upload's retry (D6).
+    if (await this.idempotencyKeyExists(client, input.tenantId, input.idempotencyKey)) return;
+    const match = await client.query<Row>(`SELECT * FROM (${filenameMatchSql("$1", "$2")}) m WHERE m.name_key = $3 ${FILENAME_MATCH_ORDER} LIMIT 1`,
+      [input.tenantId, FILENAME_KEY_SQL_WS_PATTERN, key]);
+    if (match.rows[0]) throw new DuplicateFilenameError(toFilenameDuplicate(match.rows[0]));
+  }
+
+  /**
+   * D10's pre-check: for each name (1 to NAME_CHECK_MAX_NAMES, else INVALID_NAME_CHECK) whether the organization already
+   * has it under the same canonical key, and the oldest such document. One statement for all names; read-only.
+   */
+  async findFilenameDuplicates(tenantId: string, names: readonly string[]): Promise<FilenameCheckResult[]> {
+    if (!Array.isArray(names) || names.length < 1 || names.length > NAME_CHECK_MAX_NAMES || names.some((name) => typeof name !== "string")) throw new Error("INVALID_NAME_CHECK");
+    const keys = names.map(canonicalFilenameKey);
+    const rows = await this.tenantTransaction(tenantId, async (client) => (await client.query<Row>(
+      `WITH matches AS MATERIALIZED (SELECT * FROM (${filenameMatchSql("$1", "$2")}) m WHERE m.name_key = ANY($3::text[]))
+       SELECT k.ord::int AS ord, x.id, x.filename, x.created_at, x.status, x.reviewed_at
+       FROM unnest($3::text[]) WITH ORDINALITY AS k(name_key, ord)
+       LEFT JOIN LATERAL (SELECT * FROM matches m WHERE m.name_key = k.name_key ${FILENAME_MATCH_ORDER} LIMIT 1) x ON true
+       ORDER BY k.ord`, [tenantId, FILENAME_KEY_SQL_WS_PATTERN, keys])).rows);
+    return rows.map((row) => {
+      const index = num(row.ord) - 1;
+      return row.id === null || row.id === undefined ? { index, exists: false } : { index, exists: true, document: toFilenameDuplicate(row) };
+    });
   }
 
   /**

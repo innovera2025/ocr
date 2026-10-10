@@ -55,7 +55,7 @@ export type IngestDependencies = Readonly<{
 
 type Persisted = { tenantId: string; documentId: string; runId: string; priority?: number };
 /** persistUpload rejections after which no document references the staged original. */
-const UNREFERENCED_UPLOAD_ERRORS: ReadonlySet<string> = new Set(["BATCH_FULL", "BATCH_NOT_FOUND", "IDEMPOTENCY_CONFLICT"]);
+const UNREFERENCED_UPLOAD_ERRORS: ReadonlySet<string> = new Set(["BATCH_FULL", "BATCH_NOT_FOUND", "IDEMPOTENCY_CONFLICT", "DUPLICATE_FILENAME"]);
 export type IngestResult = Readonly<{ status: "CLEAN" | "QUARANTINED"; stagedKey: string; jobId?: string; tenantId?: string; documentId?: string; runId?: string; reused?: boolean }>;
 
 /** Scan → status → enqueue for a persisted upload (fresh, or resumed after its request died). */

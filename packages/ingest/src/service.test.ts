@@ -149,3 +149,33 @@ test("the queue priority chosen at persistence reaches enqueuePersistent and nev
     enqueuePersistent: async (input) => { plain.push(input); return "job-2"; } });
   assert.deepEqual(plain, [{ tenantId: "t", documentId: "d", runId: "r", stagedKey: "staged" }], "no priority: the column default (100)");
 });
+
+test("a duplicate file name refused at persistence discards the staged original and rethrows the same error object", async () => {
+  // The store's DuplicateFilenameError: the message is the code, `existing` rides along for the 409 body.
+  const duplicate = Object.assign(new Error("DUPLICATE_FILENAME"), { existing: { documentId: "doc-0", filename: "a.pdf", uploadedAt: "2026-10-10T01:00:00.000Z", statusCategory: "review", retryable: false } });
+  const discarded: string[] = [];
+  const calls: string[] = [];
+  await assert.rejects(() => ingestDocument(upload, {
+    lookupUpload: async () => null,
+    stage: async () => { calls.push("stage"); return "org/t/original/ab/duplicate"; },
+    scan: async () => { calls.push("scan"); return "CLEAN" as const; },
+    enqueue: async () => { calls.push("enqueue"); return "never"; },
+    persistUpload: async () => { calls.push("persist"); throw duplicate; },
+    discard: async (key) => { discarded.push(key); }
+  }), (error: unknown) => error === duplicate);
+  assert.deepEqual(discarded, ["org/t/original/ab/duplicate"]);
+  assert.deepEqual(calls, ["stage", "persist"], "never scanned or queued");
+});
+
+test("a replay of an upload its key already created answers before staging, so the file-name rule never sees it", async () => {
+  const calls: string[] = [];
+  const result = await ingestDocument(upload, {
+    lookupUpload: async () => ({ tenantId: "t", documentId: "doc-1", runId: "run-1", jobId: "job-1", status: "PROCESSING", storageKey: "k", stale: false }),
+    stage: async () => { calls.push("stage"); return "staged"; },
+    persistUpload: async () => { calls.push("persist"); throw new Error("DUPLICATE_FILENAME"); },
+    scan: async () => { calls.push("scan"); return "CLEAN" as const; },
+    enqueue: async () => { calls.push("enqueue"); return "never"; }
+  });
+  assert.deepEqual([result.status, result.documentId, result.jobId], ["CLEAN", "doc-1", "job-1"]);
+  assert.deepEqual(calls, []);
+});

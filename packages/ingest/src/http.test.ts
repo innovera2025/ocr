@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
-import { decodeUploadFilename, readRawUpload } from "./http.js";
+import { decodeUploadFilename, handleRawUpload, readRawUpload } from "./http.js";
 
 const rawRequest = (headers: Record<string, string>, body = "pdf") => Object.assign(Readable.from([Buffer.from(body)]), { headers: { "content-type": "application/pdf", "content-length": String(Buffer.byteLength(body)), ...headers } }) as never;
 
@@ -37,4 +37,15 @@ test("decoded filenames still pass canonical filename validation", async () => {
 test("filename decoder is a no-op without an encoding", () => {
   assert.equal(decodeUploadFilename("a%41.pdf", undefined), "a%41.pdf");
   assert.equal(decodeUploadFilename("a%41.pdf", " uri "), "aA.pdf");
+});
+
+test("a DUPLICATE_FILENAME refusal propagates through handleRawUpload unchanged, after the staged bytes are discarded", async () => {
+  const duplicate = Object.assign(new Error("DUPLICATE_FILENAME"), { existing: { documentId: "doc-0" } });
+  const discarded: string[] = [];
+  await assert.rejects(() => handleRawUpload(rawRequest({ "x-upload-filename": encodeURIComponent("Makkha-B5.pdf "), "x-upload-filename-encoding": "uri" }), {
+    stage: async () => "org/t/original/ab/dup", scan: async () => "CLEAN", enqueue: async () => "never",
+    persistUpload: async () => { throw duplicate; },
+    discard: async (key) => { discarded.push(key); }
+  }, 100), (error: unknown) => error === duplicate);
+  assert.deepEqual(discarded, ["org/t/original/ab/dup"]);
 });

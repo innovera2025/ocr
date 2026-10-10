@@ -2,8 +2,9 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomBytes, randomUUID } from "node:crypto";
 import { loadConfig, loadWebConfig, redactLog, type WebConfig } from "@innovera/ocr-config";
 import { handleRawUpload, type IngestDependencies } from "@innovera/ocr-ingest/http";
+import { normalizeFilename } from "@innovera/ocr-ingest";
 import { OcrClient } from "@innovera/ocr-client";
-import { DOCUMENT_SORT_DIRS, DOCUMENT_SORT_KEYS, DOCUMENT_STATUS_CATEGORIES, legacyTreatmentIndex, normalizeStructuredResult, type AuditContext, type DocumentSortDir, type DocumentSortKey, type DocumentStatusCategory, type DocumentView, type ReviewStore } from "@innovera/ocr-persistence";
+import { DOCUMENT_SORT_DIRS, DOCUMENT_SORT_KEYS, DOCUMENT_STATUS_CATEGORIES, DuplicateFilenameError, legacyTreatmentIndex, NAME_CHECK_MAX_NAMES, normalizeStructuredResult, type AuditContext, type DocumentSortDir, type DocumentSortKey, type DocumentStatusCategory, type DocumentView, type ReviewStore } from "@innovera/ocr-persistence";
 import { assertDatabaseReady, createDatabasePool, runMigrationsWithPool } from "@innovera/ocr-db-runtime";
 import { resolve } from "node:path";
 import { PostgresOcrDocumentStore } from "@innovera/ocr-persistence";
@@ -37,6 +38,8 @@ export type WorkbenchStore = Readonly<{
   listDocuments(tenantId: string, query: DocumentListQuery): Promise<{ total: number; documents: readonly object[] }>;
   retryDocument(tenantId: string, documentId: string, audit?: AuditContext): Promise<{ jobId: string }>;
   saveReview(tenantId: string, documentId: string, input: { structuredResult: unknown; reviewedBy: string; expectedUpdatedAt?: string; audit?: AuditContext }): Promise<{ corrections: number; delivery: "PENDING" | "NOT_REQUIRED"; document: unknown }>;
+  /** D10's name pre-check, one entry per name in input order (`{index, exists, document?}`); absent → NAME_CHECK_NOT_CONFIGURED. */
+  findFilenameDuplicates?(tenantId: string, names: readonly string[]): Promise<ReadonlyArray<{ index: number; exists: boolean }>>;
 }>;
 
 export type AppDependencies = Readonly<{
@@ -62,12 +65,16 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AUTH_ERRORS = new Set(["UNAUTHENTICATED", "AUTH_NOT_CONFIGURED", "INVALID_TOKEN", "TOKEN_EXPIRED", "INVALID_ISSUER", "INVALID_AUDIENCE",
   "INVALID_PRINCIPAL", "INVALID_CREDENTIALS", "PASSWORD_EXPIRED"]);
 const FORBIDDEN_ERRORS = new Set(["CSRF_REJECTED", "FORBIDDEN", "PASSWORD_CHANGE_REQUIRED"]);
+/** D10: name pre-checks per user per window (the workbench sends one per file selection). */
+export const NAME_CHECK_LIMIT = 60;
+export const NAME_CHECK_WINDOW_MS = 60_000;
 /** Every 429 carries `Retry-After`; the login route computes its own from the window that is spent. */
 const THROTTLED_ERRORS: ReadonlyMap<string, number> = new Map([["LOGIN_THROTTLED", 900], ["LOGIN_BUSY", LOGIN_BUSY_RETRY_SECONDS],
-  ["EXPORT_BUSY", 30], ["EXPORT_BUSY_ORG", 30], ["EXPORT_THROTTLED", Math.round(PREVIEW_WINDOW_MS / 1000)]]);
+  ["EXPORT_BUSY", 30], ["EXPORT_BUSY_ORG", 30], ["EXPORT_THROTTLED", Math.round(PREVIEW_WINDOW_MS / 1000)],
+  ["NAME_CHECK_THROTTLED", Math.round(NAME_CHECK_WINDOW_MS / 1000)]]);
 /** A write the server could not complete right now and rolled back (a lock wait or a statement past its bound): retryable. */
 const UNAVAILABLE_ERRORS = new Set(["EXPORT_MARK_FAILED"]);
-const CONFLICT_ERRORS = new Set(["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT",
+const CONFLICT_ERRORS = new Set(["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DUPLICATE_FILENAME", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT",
   "DOCUMENT_QUARANTINED", "DOCUMENT_NOT_SCANNED", "CONFIRMATION_TARGET_AMBIGUOUS", "UPLOAD_IN_PROGRESS",
   "USERNAME_TAKEN", "LAST_ADMIN", "CANNOT_CHANGE_SELF", "EXPORT_SELECTION_CHANGED"]);
 /** Originals are only served once ClamAV let them through: quarantined bytes never reach a reviewer's browser. */
@@ -75,7 +82,7 @@ const UNSERVED_CONTENT: ReadonlyMap<string, string> = new Map([["QUARANTINED", "
 const TIMESTAMP = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}(:?\d{2})?)?$/;
 /** D13: Prometheus scrapes `web:3100` directly, so a request that came through nginx-proxy is not a scrape. */
 const PROXY_HEADERS = ["x-forwarded-for", "x-forwarded-host", "x-real-ip"] as const;
-const EXACT_ROUTES = ["/", "/metrics", "/health/live", "/health/ready", "/api/batches", "/api/documents", "/api/auth/login",
+const EXACT_ROUTES = ["/", "/metrics", "/health/live", "/health/ready", "/api/batches", "/api/documents", "/api/documents/name-check", "/api/auth/login",
   "/api/auth/logout", "/api/auth/session", "/api/auth/password", "/api/users", "/api/exports/preview",
   "/api/exports/documents.csv", "/api/exports/documents.jsonl", "/api/exports/candidates", "/api/exports/marks"];
 
@@ -184,6 +191,19 @@ function parseBatchInput(body: Record<string, unknown>): { expectedTotal: number
   return label ? { expectedTotal: total, label } : { expectedTotal: total };
 }
 
+/**
+ * D10: `{names}` with 1 to NAME_CHECK_MAX_NAMES non-empty strings, each within normalizeFilename's limits (120
+ * characters, 1080 bytes); anything else is INVALID_NAME_CHECK. Returns the names as an upload would store them.
+ */
+export function parseNameCheck(body: Record<string, unknown>): string[] {
+  const names = body.names;
+  if (!Array.isArray(names) || names.length < 1 || names.length > NAME_CHECK_MAX_NAMES) throw new Error("INVALID_NAME_CHECK");
+  return names.map((name: unknown) => {
+    if (typeof name !== "string" || name.length === 0) throw new Error("INVALID_NAME_CHECK");
+    try { return normalizeFilename(name); } catch { throw new Error("INVALID_NAME_CHECK"); }
+  });
+}
+
 function parseReviewInput(body: Record<string, unknown>): { structuredResult: Record<string, unknown>; expectedUpdatedAt?: string } {
   const structuredResult = body.structuredResult;
   if (typeof structuredResult !== "object" || structuredResult === null || Array.isArray(structuredResult)) throw new Error("REVIEW_INVALID");
@@ -239,6 +259,7 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
   /** 0021: 300 candidates pages and 60 manual mark/unmark requests per user per 15 minutes (D9, C3). */
   const listLimit = new SlidingWindow(EXPORT_LIST_LIMIT, PREVIEW_WINDOW_MS);
   const markLimit = new SlidingWindow(EXPORT_MARK_LIMIT, PREVIEW_WINDOW_MS);
+  const nameCheckLimit = new SlidingWindow(NAME_CHECK_LIMIT, NAME_CHECK_WINDOW_MS);
   const exportStore = (): ExportStore => { if (!app?.exportStore) throw new Error("EXPORT_NOT_CONFIGURED"); return app.exportStore; };
 
   /**
@@ -296,6 +317,18 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
       metrics.increment("uploads_total", { status: String(uploaded.status) });
       logEvent("upload_completed", { request_id: reqId, trace_id: traceId, user_id: ctx.userId, ...("documentId" in uploaded ? { document_id: uploaded.documentId } : {}), ...(batchId ? { batch_id: batchId } : {}), tenant_id: ctx.tenantId, status: uploaded.status });
       respond(response, 202, { ...publicResult, batchId: batchId ?? null });
+      return true;
+    }
+    // D10, before every /api/documents/<id> pattern: read-only, no audit row, and the log line carries counts, never names.
+    if (pathname === "/api/documents/name-check" && method === "POST") {
+      const store = workbench();
+      if (!store.findFilenameDuplicates) throw new Error("NAME_CHECK_NOT_CONFIGURED");
+      const names = parseNameCheck(await readJson(request));
+      if (nameCheckLimit.blocked(ctx.userId, clock())) throw new Error("NAME_CHECK_THROTTLED");
+      nameCheckLimit.record(ctx.userId, clock());
+      const results = await store.findFilenameDuplicates(ctx.tenantId, names);
+      logEvent("name_check", { request_id: reqId, trace_id: traceId, user_id: ctx.userId, tenant_id: ctx.tenantId, count: names.length, duplicates: results.filter((result) => result.exists).length });
+      respond(response, 200, { results });
       return true;
     }
     if (pathname === "/api/documents" && method === "GET") {
@@ -458,7 +491,9 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
       if (code === "INTERNAL_ERROR") logEvent("request_failed", { request_id: reqId, trace_id: traceId, route, method, error: error instanceof Error ? error.message.slice(0, 200) : "unknown" });
       if (response.headersSent) { response.destroy(); return; }
       const retryAfter = THROTTLED_ERRORS.get(code);
-      respond(response, errorStatus(code), { error: code }, retryAfter === undefined ? {} : { "retry-after": String(retryAfter) });
+      // D8: only a refused duplicate upload says which document it collides with (the five D7 fields, nothing else).
+      const payload = error instanceof DuplicateFilenameError && code === "DUPLICATE_FILENAME" ? { error: code, existing: error.existing } : { error: code };
+      respond(response, errorStatus(code), payload, retryAfter === undefined ? {} : { "retry-after": String(retryAfter) });
     }
   }).on("error", () => undefined);
 }

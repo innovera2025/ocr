@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createAppServer, errorStatus, routeLabel, workbenchCsp, type AppDependencies, type DocumentListQuery, type WorkbenchStore } from "./server.js";
+import { createAppServer, errorStatus, NAME_CHECK_LIMIT, routeLabel, workbenchCsp, type AppDependencies, type DocumentListQuery, type WorkbenchStore } from "./server.js";
 import { csrfTokenFor, type AuthContext } from "@innovera/ocr-auth";
 import type { IngestDependencies } from "@innovera/ocr-ingest";
-import type { ReviewDocument } from "@innovera/ocr-persistence";
+import { DuplicateFilenameError, type FilenameDuplicate, type ReviewDocument } from "@innovera/ocr-persistence";
 
 const tenant = "00000000-0000-0000-0000-000000000001";
 const documentId = "00000000-0000-0000-0000-000000000002";
@@ -95,6 +95,9 @@ const canonical = (needsReview: { therapist?: boolean; name?: boolean } = {}) =>
   staffOnly: { treatments: [], therapistName: { raw: "พิพิ", value: "พิพิ", confidence: 0.4, source: "ocr", needsReview: needsReview.therapist ?? true }, roomNo: { raw: "1", value: "1", confidence: 0.9, source: "ocr", needsReview: false } }
 });
 
+/** D7: the five fields a duplicate reports about the document it collides with. */
+const EXISTING: FilenameDuplicate = { documentId, filename: "Makkha-B5.pdf", uploadedAt: "2026-10-09T03:00:00.000Z", statusCategory: "review", retryable: false };
+
 function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; storeError?: Error; readiness?: () => Promise<boolean>; structuredResult?: unknown; originalStatus?: string; originalKey?: string | null } = {}) {
   const calls: Call[] = [];
   let contentReads = 0;
@@ -138,6 +141,10 @@ function workbenchHarness(options: { ingest?: Partial<IngestDependencies>; store
       if (input.expectedUpdatedAt === "2026-01-01T00:00:00.000Z") throw new Error("REVIEW_CONFLICT");
       if ("invalid" in (input.structuredResult as object)) throw new Error("REVIEW_INVALID");
       return { corrections: 2, delivery: "PENDING", document: { documentId, status: "SUCCEEDED", reviewedBy: input.reviewedBy } };
+    },
+    findFilenameDuplicates: async (tenantId, names) => {
+      record("findFilenameDuplicates", tenantId, [...names]);
+      return names.map((name, index) => name.trim().toLowerCase() === "makkha-b5.pdf" ? { index, exists: true, document: EXISTING } : { index, exists: false });
     }
   };
   const reviewStore = {
@@ -233,7 +240,8 @@ test("every workbench API route requires a session", async () => {
     const routes: Array<[string, string]> = [
       ["POST", "/api/batches"], ["GET", "/api/batches"], ["GET", `/api/batches/${batchId}`], ["GET", "/api/documents"],
       ["POST", "/api/documents"], ["GET", `/api/documents/${documentId}/ocr`], ["GET", `/api/documents/${documentId}/content`],
-      ["POST", `/api/documents/${documentId}/ocr/review`], ["POST", `/api/documents/${documentId}/retry`], ["POST", `/api/documents/${documentId}/ocr/confirm`]
+      ["POST", `/api/documents/${documentId}/ocr/review`], ["POST", `/api/documents/${documentId}/retry`], ["POST", `/api/documents/${documentId}/ocr/confirm`],
+      ["POST", "/api/documents/name-check"]
     ];
     for (const [method, path] of routes) {
       const response = await fetch(`${base}${path}`, { method, headers: { "x-tenant-id": tenant, "content-type": "application/json", "sec-fetch-site": "same-origin" }, ...(method === "POST" ? { body: "{}" } : {}) });
@@ -531,6 +539,7 @@ test("metrics use templated routes", async () => {
   });
   assert.equal(routeLabel("/api/documents/abc/unknown/x"), "/api/documents/:id/*");
   assert.equal(routeLabel("/wp-admin"), "unmatched");
+  assert.equal(routeLabel("/api/documents/name-check"), "/api/documents/name-check", "an exact route, not a document id");
 });
 
 test("error codes map to spec statuses", () => {
@@ -539,7 +548,7 @@ test("error codes map to spec statuses", () => {
   assert.equal(errorStatus("DOCUMENT_NOT_FOUND"), 404);
   assert.equal(errorStatus("DOCUMENT_NOT_FOUND_OR_FORBIDDEN"), 404);
   assert.equal(errorStatus("BATCH_NOT_FOUND"), 404);
-  for (const code of ["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT",
+  for (const code of ["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DUPLICATE_FILENAME", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT",
     "DOCUMENT_QUARANTINED", "DOCUMENT_NOT_SCANNED", "CONFIRMATION_TARGET_AMBIGUOUS", "UPLOAD_IN_PROGRESS"]) assert.equal(errorStatus(code), 409);
   assert.equal(errorStatus("PAYLOAD_TOO_LARGE"), 413);
   assert.equal(errorStatus("UNSUPPORTED_MEDIA_TYPE"), 415);
@@ -547,6 +556,9 @@ test("error codes map to spec statuses", () => {
   assert.equal(errorStatus("INVALID_UPLOAD_HEADERS"), 400);
   assert.equal(errorStatus("CONTENT_NOT_CONFIGURED"), 503);
   assert.equal(errorStatus("INTERNAL_ERROR"), 500);
+  assert.equal(errorStatus("INVALID_NAME_CHECK"), 400);
+  assert.equal(errorStatus("NAME_CHECK_THROTTLED"), 429);
+  assert.equal(errorStatus("NAME_CHECK_NOT_CONFIGURED"), 503);
 });
 
 test("originals are never served before a clean scan: quarantined and unscanned content is refused", async () => {
@@ -629,4 +641,62 @@ test("export selection error codes map to their statuses", () => {
   // Review of 0021: another person's marking download in the same organization (H1), and a rolled-back mark write (M1).
   assert.equal(errorStatus("EXPORT_BUSY_ORG"), 429);
   assert.equal(errorStatus("EXPORT_MARK_FAILED"), 503);
+});
+
+// ---- duplicate file names (plan upload-duplicate-filename) -----------------------------------------------------------
+
+test("a duplicate file name is 409 DUPLICATE_FILENAME with exactly the five existing-document fields", async () => {
+  const duplicate = workbenchHarness({ ingest: { persistUpload: async () => { throw new DuplicateFilenameError({ ...EXISTING, extra: "never sent" } as FilenameDuplicate); } } });
+  await withServer(duplicate, async (base) => {
+    const response = await fetch(`${base}/api/documents`, { method: "POST", headers: { ...auth, "content-type": "application/pdf", "idempotency-key": "file-9", "x-upload-filename": "makkha-b5.PDF" }, body: new Uint8Array([37, 80, 68, 70]) });
+    assert.equal(response.status, 409);
+    const payload = await body(response);
+    assert.deepEqual(Object.keys(payload).sort(), ["error", "existing"]);
+    assert.equal(payload.error, "DUPLICATE_FILENAME");
+    assert.deepEqual(payload.existing, EXISTING);
+    assert.deepEqual(Object.keys(payload.existing as object).sort(), ["documentId", "filename", "retryable", "statusCategory", "uploadedAt"]);
+  });
+  // The bare code (an error that is not the store's class) carries no details: nothing but `error` is ever added.
+  const bare = workbenchHarness({ ingest: { persistUpload: async () => { throw new Error("DUPLICATE_FILENAME"); } } });
+  await withServer(bare, async (base) => {
+    await expectError(await fetch(`${base}/api/documents`, { method: "POST", headers: { ...auth, "content-type": "image/png", "x-upload-filename": "a.png" }, body: new Uint8Array([1]) }), 409, "DUPLICATE_FILENAME");
+  });
+});
+
+test("name-check: session and CSRF required, strict shape, positional results without the names, one store call", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    const check = (payload: unknown, headers: Record<string, string> = jsonAuth) => fetch(`${base}/api/documents/name-check`, { method: "POST", headers, body: JSON.stringify(payload) });
+    await expectError(await fetch(`${base}/api/documents/name-check`, { method: "POST", headers: { "content-type": "application/json", "sec-fetch-site": "same-origin" }, body: "{}" }), 401, "UNAUTHENTICATED");
+    const { "x-csrf-token": _token, ...withoutToken } = jsonAuth;
+    await expectError(await check({ names: ["a.png"] }, withoutToken), 403, "CSRF_REJECTED");
+    for (const bad of [{}, { names: [] }, { names: Array.from({ length: 101 }, (_, index) => `f-${index}.png`) }, { names: ["ก".repeat(121)] },
+      { names: [""] }, { names: [7] }, { names: "a.png" }, { names: [`${"ก".repeat(117)}.png`] }]) {
+      await expectError(await check(bad), 400, "INVALID_NAME_CHECK");
+    }
+    assert.equal(h.calls.length, 0, "nothing invalid reaches the store");
+    const names = ["makkha-b5.PDF ", "new-form.png", "Makkha-B5.pdf"];
+    const response = await check({ names });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    for (const name of ["makkha-b5.PDF ", "new-form.png"]) assert.equal(text.includes(name), false, `the request's name ${name} is not echoed`);
+    assert.deepEqual(JSON.parse(text), { results: [{ index: 0, exists: true, document: EXISTING }, { index: 1, exists: false }, { index: 2, exists: true, document: EXISTING }] });
+    assert.deepEqual(h.calls, [{ method: "findFilenameDuplicates", tenantId: tenant, args: [names] }], "one call, the session's tenant");
+    const hundred = await check({ names: Array.from({ length: 100 }, (_, index) => `f-${index}.png`) });
+    assert.equal(((await body(hundred)).results as unknown[]).length, 100);
+  });
+});
+
+test("name-check is throttled per user: 429 NAME_CHECK_THROTTLED with Retry-After once the minute's budget is spent", async () => {
+  const h = workbenchHarness();
+  await withServer(h, async (base) => {
+    for (let index = 0; index < NAME_CHECK_LIMIT; index += 1) {
+      assert.equal((await fetch(`${base}/api/documents/name-check`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ names: ["a.png"] }) })).status, 200);
+    }
+    const throttled = await fetch(`${base}/api/documents/name-check`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ names: ["a.png"] }) });
+    assert.equal(throttled.status, 429);
+    assert.equal(throttled.headers.get("retry-after"), "60");
+    assert.deepEqual(await body(throttled), { error: "NAME_CHECK_THROTTLED" });
+    assert.equal(h.calls.length, NAME_CHECK_LIMIT, "the refused request never reached the store");
+  });
 });

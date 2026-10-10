@@ -13,6 +13,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { Pool } from "pg";
+import { canonicalFilenameKey, cleanFilename, DuplicateFilenameError, FILENAME_KEY_JS_ONLY_VECTORS, FILENAME_KEY_SQL_WS_PATTERN, FILENAME_KEY_VECTORS, filenameKeySql, toBatchSummary,
+  type FilenameDuplicate } from "./index.js";
 import { CONFIDENCE_SORT_MAX_ROWS, DEFAULT_ORDER_SQL, displayedConfidencePercent, DOCUMENT_SORT_KEYS, EXPORT_MARK_LOCK_TIMEOUT_MS, EXPORT_MARK_STATEMENT_TIMEOUT_MS, flattenDocument, hasReviewFields, LEGACY_REVIEWER_LABEL, ocrReadSummary, PostgresOcrDocumentStore, PostgresUserStore, reviewerLabel, toStructuredResult, withTenant,
   type AuditContext, type DocumentFilter, type DocumentListItem, type DocumentSortDir, type DocumentSortKey, type DocumentView, type ExportCandidate, type ExportDocument, type OpenExportOptions, type PageDocumentInput,
   type SessionRevokeReason, type UserRole } from "./index.js";
@@ -74,6 +76,8 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
   async function upload(store: PostgresOcrDocumentStore, tenantId: string, filename: string, extra: { batchId?: string; idempotencyKey?: string; requestFingerprint?: string; audit?: AuditContext } = {}) {
     return store.createUploadedDocument({ tenantId, filename, mimeType: "image/png", sizeBytes: 10, contentHash: "0".repeat(64), storageKey: `org/${tenantId}/original/ab/${randomBytes(16).toString("hex")}`, ...extra });
   }
+  /** Since the file-name rule (plan upload-duplicate-filename) a second successful upload needs a name of its own. */
+  const uniqueName = (base: string): string => `${base}-${randomBytes(4).toString("hex")}`;
   async function asApp<T>(tenantId: string | null, sql: string, values: unknown[] = []): Promise<T[]> {
     const client = await appPool.connect();
     try {
@@ -330,7 +334,7 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     (edited.staffOnly.therapistName as Record<string, unknown>).value = "พิมพ์";
     await assert.rejects(app.saveReview(TENANT_A, id, { structuredResult: edited, reviewedBy: "user-a", expectedUpdatedAt: new Date(Date.parse(before.updatedAt) - 1000).toISOString() }), { message: "REVIEW_CONFLICT" });
     await assert.rejects(app.saveReview(TENANT_A, id, { structuredResult: { customerInformation: { name: { value: "x".repeat(501) } } }, reviewedBy: "user-a" }), { message: "REVIEW_INVALID" });
-    const queued = await upload(app, TENANT_A, "queued.png");
+    const queued = await upload(app, TENANT_A, `${uniqueName("queued")}.png`);
     await assert.rejects(app.saveReview(TENANT_A, queued.documentId, { structuredResult: {}, reviewedBy: "user-a" }), { message: "DOCUMENT_NOT_REVIEWABLE" });
     const saved = await app.saveReview(TENANT_A, id, { structuredResult: edited, reviewedBy: "user-a", expectedUpdatedAt: before.updatedAt });
     assert.deepEqual([saved.corrections, saved.delivery, saved.document.status, saved.document.needsReview, saved.document.reviewedBy, saved.document.deliveryStatus, saved.document.confirmStatus],
@@ -1866,13 +1870,16 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     const processing = await uploadFile(TENANT_A, "processing.png", "image/png", batchId);
     await worker.markProcessing(TENANT_A, processing.documentId);
     await uploadFile(TENANT_A, "queued.png", "image/png", batchId);
-    // A split PDF (3 pages sharing its name and upload time) and a separate, not yet split upload with the same name.
+    // A split PDF (3 pages sharing its name and upload time) and a separate, not yet split document with the same name:
+    // since the file-name rule refuses that upload, it is a legacy row written before the rule (G6), inserted directly.
     const pdf = await uploadFile(TENANT_A, "same-name.pdf", "application/pdf", batchId);
     await worker.markProcessing(TENANT_A, pdf.documentId);
     await worker.setPageCount(TENANT_A, pdf.documentId, 3);
     await worker.createPageDocuments(TENANT_A, pdf.documentId, 3, pageInputs(TENANT_A, pdf.documentId, [1, 2, 3]));
     await worker.markSplit(TENANT_A, pdf.documentId, 3);
-    await uploadFile(TENANT_A, "same-name.pdf", "application/pdf", batchId);
+    await superDb.query(`INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, storage_key, batch_id)
+      VALUES (gen_random_uuid(), $1::uuid, $2, 'CLEAN', 'same-name.pdf', 'application/pdf', 4242, $3, $4, $5::uuid)`,
+      [TENANT_A, randomBytes(16).toString("hex"), "p".repeat(64), `org/${TENANT_A}/original/cd/${randomBytes(16).toString("hex")}`, batchId]);
     // Tenant B has a row of its own that sorts first by name.
     const other = await upload(app, TENANT_B, "tenant-b.png");
     await app.updateScanStatus(TENANT_B, other.documentId, "CLEAN");
@@ -2009,5 +2016,216 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
       await superDb.query("DELETE FROM documents WHERE organization_id = $1 AND filename LIKE 'bulk-cap-%'", [TENANT_A]);
     }
     assert.equal((await app.listDocuments(TENANT_A, { q: "bulk-cap-" })).total, 0);
+  });
+
+  // ---- the file-name rule (plan upload-duplicate-filename, D1 to D10) ------------------------------------------------
+
+  describe("upload filename rule", () => {
+    const FIVE = ["documentId", "filename", "retryable", "statusCategory", "uploadedAt"];
+    /** The DuplicateFilenameError of a refused upload, checked for its code and its exactly-five-fields details. */
+    async function duplicateOf(attempt: Promise<unknown>): Promise<FilenameDuplicate> {
+      const error = await attempt.then(() => null, (reason: unknown) => reason);
+      assert.ok(error instanceof DuplicateFilenameError, `expected DUPLICATE_FILENAME, got ${String(error)}`);
+      assert.equal(error.message, "DUPLICATE_FILENAME");
+      assert.deepEqual(Object.keys(error.existing).sort(), FIVE);
+      assert.ok(Object.isFrozen(error.existing));
+      return error.existing;
+    }
+    const counts = async (tenantId: string) => (await superDb.query<{ documents: number; runs: number; keys: number }>(
+      `SELECT (SELECT count(*)::int FROM documents WHERE organization_id = $1) AS documents, (SELECT count(*)::int FROM document_runs WHERE organization_id = $1) AS runs,
+              (SELECT count(*)::int FROM upload_idempotency_keys WHERE organization_id = $1) AS keys`, [tenantId])).rows[0]!;
+    const createdAt = async (documentId: string) => (await superDb.query<{ created_at: Date }>("SELECT created_at FROM documents WHERE id = $1", [documentId])).rows[0]!.created_at.toISOString();
+    const setStatus = (documentId: string, status: string, reviewed = false) =>
+      superDb.query(`UPDATE documents SET status = $2::document_status${reviewed ? ", reviewed_at = now(), reviewed_by = 'user-a'" : ""} WHERE id = $1`, [documentId, status]);
+    const legacyRow = (tenantId: string, filename: string, extra: { status?: string; deleted?: boolean } = {}) => superDb.query<{ id: string }>(
+      `INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, deleted_at)
+       VALUES (gen_random_uuid(), $1::uuid, $2, $3::document_status, $4, 'image/png', 1, 'h', CASE WHEN $5 THEN now() END) RETURNING id`,
+      [tenantId, randomBytes(16).toString("hex"), extra.status ?? "CLEAN", filename, extra.deleted === true]).then((result) => result.rows[0]!.id);
+
+    test("1. a second upload of the same name is DUPLICATE_FILENAME with the five fields of the existing document, and writes nothing", async () => {
+      const name = `${uniqueName("dup")}.png`;
+      const first = await upload(app, TENANT_A, name, { audit: { actorUserId: null, requestId: randomUUID() } });
+      const before = await counts(TENANT_A);
+      const existing = await duplicateOf(upload(app, TENANT_A, name, { idempotencyKey: randomUUID(), requestFingerprint: "fp-dup", audit: { actorUserId: null, requestId: randomUUID() } }));
+      assert.deepEqual({ ...existing }, { documentId: first.documentId, filename: name, uploadedAt: await createdAt(first.documentId), statusCategory: "queued", retryable: false });
+      assert.deepEqual(await counts(TENANT_A), before, "no document, run or idempotency key for the refused upload");
+      const audits = await superDb.query<{ count: number }>("SELECT count(*)::int AS count FROM audit_events WHERE organization_id = $1 AND action = 'document.uploaded' AND target_id = $2::uuid", [TENANT_A, first.documentId]);
+      assert.equal(audits.rows[0]!.count, 1, "only the first upload is recorded");
+    });
+
+    test("2. case, edge spaces and inner whitespace runs are the same name; another extension is not", async () => {
+      const stem = uniqueName("Makkha");
+      const first = await upload(app, TENANT_A, `${stem}-B5.pdf`);
+      for (const variant of [`${stem.toLowerCase()}-b5.PDF`, `${stem}-B5.pdf `, ` ${stem}-B5.pdf`, `${stem.toUpperCase()}-B5.PDF`, `${stem}-B5.pdf\u200b`]) {
+        assert.equal((await duplicateOf(upload(app, TENANT_A, variant))).documentId, first.documentId, JSON.stringify(variant));
+      }
+      const spaced = await upload(app, TENANT_A, `${stem} B5.pdf`);
+      for (const variant of [`${stem}   B5.pdf`, `${stem}\u3000B5.pdf`, `${stem}\u00a0 B5.PDF`]) {
+        assert.equal((await duplicateOf(upload(app, TENANT_A, variant))).documentId, spaced.documentId, JSON.stringify(variant));
+      }
+      assert.ok((await upload(app, TENANT_A, `${stem}-B5.png`)).documentId, "a different extension is a different name");
+    });
+
+    test("3. concurrent uploads of one name across three batches and none: exactly one wins, no deadlock", { timeout: 30_000 }, async () => {
+      const batches = await Promise.all([1, 2, 3].map(() => app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 8 })));
+      const target = (index: number) => (index % 4 < 3 ? { batchId: batches[index % 4]!.batchId } : {});
+      const name = `${uniqueName("race")}.pdf`;
+      const results = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => upload(app, TENANT_A, index % 2 ? name.toUpperCase() : name, target(index))));
+      assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+      assert.deepEqual(results.filter((result) => result.status === "rejected").map((result) => (result as PromiseRejectedResult).reason.message), Array(7).fill("DUPLICATE_FILENAME"));
+      // Two names, the second half of the requests in the opposite name order, interleaved over the same batches.
+      const [x, y] = [`${uniqueName("race-x")}.png`, `${uniqueName("race-y")}.png`];
+      const names = [x, y, x, y, y, x, y, x];
+      const mixed = await Promise.allSettled(names.map((name, index) => upload(app, TENANT_A, name, target(index))));
+      const won = mixed.flatMap((result, index) => result.status === "fulfilled" ? [names[index]] : []);
+      assert.deepEqual(won.sort(), [x, y].sort(), "exactly one upload per name");
+      assert.deepEqual(mixed.filter((result) => result.status === "rejected").map((result) => (result as PromiseRejectedResult).reason.message), Array(6).fill("DUPLICATE_FILENAME"));
+      const stored = await superDb.query<{ count: number }>("SELECT count(*)::int AS count FROM documents WHERE organization_id = $1 AND lower(filename) = ANY($2::text[])", [TENANT_A, [name, x, y]]);
+      assert.equal(stored.rows[0]!.count, 3);
+    });
+
+    test("4. a split PDF counts once: its pages carry the name but never match; the parent is reported", async () => {
+      const name = `${uniqueName("scan")}.pdf`;
+      const pdf = await uploadFile(TENANT_A, name, "application/pdf");
+      await worker.markProcessing(TENANT_A, pdf.documentId);
+      await worker.setPageCount(TENANT_A, pdf.documentId, 3);
+      await worker.createPageDocuments(TENANT_A, pdf.documentId, 3, pageInputs(TENANT_A, pdf.documentId, [1, 2, 3]));
+      await worker.markSplit(TENANT_A, pdf.documentId, 3);
+      assert.deepEqual((await pagesOf(pdf.documentId)).map((page) => page.filename), [name, name, name], "the pages copy the parent's name");
+      const existing = await duplicateOf(upload(app, TENANT_A, name));
+      assert.deepEqual([existing.documentId, existing.statusCategory, existing.retryable], [pdf.documentId, "split", false]);
+      const found = await app.findFilenameDuplicates(TENANT_A, [name, ` ${name.toUpperCase()}`]);
+      assert.deepEqual(found.map((result) => result.document?.documentId), [pdf.documentId, pdf.documentId], "the parent, never a page");
+    });
+
+    test("5. every status of a top-level document blocks; retryable only for FAILED; the category follows statusCategoryOf", async () => {
+      const cases: Array<[string, boolean, string, boolean]> = [["SCANNING", false, "queued", false], ["CLEAN", false, "queued", false], ["PROCESSING", false, "processing", false],
+        ["NEEDS_REVIEW", false, "review", false], ["SUCCEEDED", false, "succeeded", false], ["SUCCEEDED", true, "confirmed", false], ["FAILED", false, "failed", true],
+        ["QUARANTINED", false, "failed", false], ["SPLIT", false, "split", false], ["VALIDATING", false, "queued", false]];
+      for (const [status, reviewed, category, retryable] of cases) {
+        const name = `${uniqueName(`status-${status.toLowerCase()}`)}.png`;
+        const doc = await upload(app, TENANT_A, name);
+        await setStatus(doc.documentId, status, reviewed);
+        const existing = await duplicateOf(upload(app, TENANT_A, name));
+        assert.deepEqual([existing.documentId, existing.statusCategory, existing.retryable], [doc.documentId, category, retryable], `${status}${reviewed ? " reviewed" : ""}`);
+      }
+    });
+
+    test("6. a soft-deleted row and a DELETED row never block", async () => {
+      const deleted = `${uniqueName("soft-deleted")}.png`, gone = `${uniqueName("status-deleted")}.png`;
+      await legacyRow(TENANT_A, deleted, { deleted: true });
+      await legacyRow(TENANT_A, gone, { status: "DELETED" });
+      assert.deepEqual((await app.findFilenameDuplicates(TENANT_A, [deleted, gone])).map((result) => result.exists), [false, false]);
+      assert.ok((await upload(app, TENANT_A, deleted)).documentId);
+      assert.ok((await upload(app, TENANT_A, gone)).documentId);
+    });
+
+    test("7. another organization's name never blocks and is never reported (RLS)", async () => {
+      const shared = `${uniqueName("tenant-shared")}.png`, onlyA = `${uniqueName("tenant-only-a")}.png`;
+      const a = await upload(app, TENANT_A, shared);
+      await upload(app, TENANT_A, onlyA);
+      const b = await upload(app, TENANT_B, shared);
+      assert.notEqual(a.documentId, b.documentId);
+      assert.equal((await duplicateOf(upload(app, TENANT_B, shared))).documentId, b.documentId, "tenant B is told about its own document only");
+      const seen = await app.findFilenameDuplicates(TENANT_B, [shared, onlyA]);
+      assert.deepEqual(seen.map((result) => [result.exists, result.document?.documentId ?? null]), [[true, b.documentId], [false, null]]);
+    });
+
+    test("8. an idempotent retry still answers the original upload; another key is a duplicate; another fingerprint a conflict", async () => {
+      const name = `${uniqueName("idem")}.png`, key = randomUUID();
+      const first = await upload(app, TENANT_A, name, { idempotencyKey: key, requestFingerprint: "fp-idem" });
+      const again = await upload(app, TENANT_A, name, { idempotencyKey: key, requestFingerprint: "fp-idem" });
+      assert.deepEqual([again.documentId, again.reused], [first.documentId, true]);
+      assert.equal((await duplicateOf(upload(app, TENANT_A, name, { idempotencyKey: randomUUID(), requestFingerprint: "fp-idem" }))).documentId, first.documentId);
+      await assert.rejects(upload(app, TENANT_A, name, { idempotencyKey: key, requestFingerprint: "other" }), { message: "IDEMPOTENCY_CONFLICT" });
+      // Two requests with one key racing: the second waits on the filename lock, then finds the key and reuses (D6).
+      const raced = `${uniqueName("idem-race")}.png`, raceKey = randomUUID();
+      const pair = await Promise.all([1, 2].map(() => upload(app, TENANT_A, raced, { idempotencyKey: raceKey, requestFingerprint: "fp-race" })));
+      assert.equal(pair[0]!.documentId, pair[1]!.documentId);
+      assert.deepEqual(pair.map((result) => result.reused === true).sort(), [false, true]);
+    });
+
+    test("9. a refused duplicate takes no batch slot; a batch left short ends by the idle rule (D9)", async () => {
+      const batch = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3 });
+      const [a, b, c] = ["acct-a", "acct-b", "acct-c"].map((base) => `${uniqueName(base)}.png`) as [string, string, string];
+      await upload(app, TENANT_A, a, { batchId: batch.batchId });
+      await duplicateOf(upload(app, TENANT_A, a, { batchId: batch.batchId }));
+      await upload(app, TENANT_A, b, { batchId: batch.batchId });
+      await upload(app, TENANT_A, c, { batchId: batch.batchId });
+      assert.equal((await app.getBatch(TENANT_A, batch.batchId))?.uploaded, 3, "b and c both fitted: no BATCH_FULL");
+      const short = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 2 });
+      await upload(app, TENANT_A, `${uniqueName("acct-d")}.png`, { batchId: short.batchId });
+      await duplicateOf(upload(app, TENANT_A, a, { batchId: short.batchId }));
+      const summary = (await app.getBatch(TENANT_A, short.batchId))!;
+      assert.deepEqual([summary.uploaded, summary.expectedTotal, summary.finished], [1, 2, false]);
+      // The batch total cannot shrink (ocr_app has no UPDATE on ocr_batches): the clock stops by the existing idle rule.
+      const created = Date.parse("2026-10-10T01:00:00.000Z"), completed = created + 90_000;
+      const row = (now: number) => ({ id: short.batchId, label: null, created_at: new Date(created), expected_total: 2, uploaded: 1, rows: 1, pages: 0, pages_expected: 0, splitting: 0,
+        splitting_counted: 0, queued: 0, processing: 0, succeeded: 1, needs_review: 0, failed: 0, confirmed: 0, last_completed_at: new Date(completed),
+        last_created_at: new Date(created + 1_000), db_now: new Date(now), round_opened_at: null, round_started_at: null, round_completed: 0 });
+      const running = toBatchSummary(row(completed + 5 * 60_000 - 1));
+      const idle = toBatchSummary(row(completed + 5 * 60_000 + 1));
+      assert.deepEqual([running.finished, running.durationMs], [false, 5 * 60_000 - 1 + 90_000], "before the idle bound the clock still runs");
+      assert.deepEqual([idle.finished, idle.durationMs, idle.finishedAt], [false, 90_000, null], "after it the clock stops at the last completion");
+    });
+
+    test("10. findFilenameDuplicates: aligned results for hits, misses, variants and repeats; 100 names; bounds", async () => {
+      const hit = `${uniqueName("check-hit")}.png`;
+      const doc = await upload(app, TENANT_A, hit);
+      const results = await app.findFilenameDuplicates(TENANT_A, [hit, `${uniqueName("check-miss")}.png`, ` ${hit.toUpperCase()}`, hit]);
+      assert.deepEqual(results.map((result) => [result.index, result.exists, result.document?.documentId ?? null]),
+        [[0, true, doc.documentId], [1, false, null], [2, true, doc.documentId], [3, true, doc.documentId]]);
+      assert.deepEqual(Object.keys(results[0]!.document!).sort(), FIVE);
+      const hundred = Array.from({ length: 100 }, (_, index) => index === 57 ? hit : `${uniqueName("check-many")}-${index}.png`);
+      const many = await app.findFilenameDuplicates(TENANT_A, hundred);
+      assert.deepEqual(many.map((result) => result.index), Array.from({ length: 100 }, (_, index) => index));
+      assert.deepEqual(many.flatMap((result) => result.exists ? [result.index] : []), [57]);
+      await assert.rejects(app.findFilenameDuplicates(TENANT_A, []), { message: "INVALID_NAME_CHECK" });
+      await assert.rejects(app.findFilenameDuplicates(TENANT_A, [...hundred, "one-more.png"]), { message: "INVALID_NAME_CHECK" });
+    });
+
+    test("11. JS/SQL parity: the SQL key of every stored vector name equals canonicalFilenameKey", async (t) => {
+      const locale = (await superDb.query<{ datcollate: string; datctype: string }>("SELECT datcollate, datctype FROM pg_database WHERE datname = current_database()")).rows[0]!;
+      t.diagnostic(`test database datcollate=${locale.datcollate} datctype=${locale.datctype}`);
+      assert.equal(locale.datcollate, "en_US.utf8");
+      assert.equal(locale.datctype, "en_US.utf8");
+      // Stored names are what normalizeFilename produced, so SQL sees cleanFilename(input); the column type is the real one.
+      const sqlKey = async (input: string) => (await asApp<{ key: string }>(TENANT_A, `SELECT ${filenameKeySql("t.filename", "$2")} AS key FROM (VALUES ($1::varchar(120))) t(filename)`,
+        [cleanFilename(input), FILENAME_KEY_SQL_WS_PATTERN]))[0]!.key;
+      for (const vector of FILENAME_KEY_VECTORS) {
+        assert.equal(await sqlKey(vector.input), vector.key, JSON.stringify(vector.input));
+        assert.equal(canonicalFilenameKey(vector.input), vector.key);
+      }
+      // The documented JS-only group really differs in PostgreSQL (so it is right to keep it out of the parity run).
+      for (const vector of FILENAME_KEY_JS_ONLY_VECTORS) assert.notEqual(await sqlKey(vector.input), vector.key, JSON.stringify(vector.input));
+      t.diagnostic(`parity vectors=${FILENAME_KEY_VECTORS.length} js-only=${FILENAME_KEY_JS_ONLY_VECTORS.length}`);
+    });
+
+    test("12. timing at 20,000 top-level documents: a miss, a hit and a 100-name pre-check", { timeout: 120_000 }, async (t) => {
+      const tenant = randomUUID();
+      await superDb.query("INSERT INTO organizations(id, name) VALUES ($1, 'Tenant timing')", [tenant]);
+      // 5% of the rows share 7 names (legacy duplicates, older rows first by created_at); the rest are unique.
+      await superDb.query(`INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, created_at)
+        SELECT gen_random_uuid(), $1::uuid, md5('timing-' || g || $2), 'SUCCEEDED',
+               CASE WHEN g % 20 = 0 THEN 'Shared Form ' || (g % 7) || '.PDF' ELSE 'bulk form ' || g || '.png' END,
+               'image/png', 1, 'h', now() - g * interval '1 second'
+        FROM generate_series(1, 20000) g`, [tenant, randomUUID()]);
+      try {
+        const time = async <T>(work: () => Promise<T>): Promise<[number, T]> => { const start = performance.now(); const value = await work(); return [performance.now() - start, value]; };
+        const [miss] = await time(() => upload(app, tenant, `${uniqueName("timing-miss")}.png`));
+        const [hit, refused] = await time(() => duplicateOf(upload(app, tenant, "shared form 3.pdf")));
+        const oldest = (await superDb.query<{ id: string }>("SELECT id FROM documents WHERE organization_id = $1 AND filename = 'Shared Form 3.PDF' ORDER BY created_at, id LIMIT 1", [tenant])).rows[0]!.id;
+        assert.equal(refused.documentId, oldest, "D7: the oldest of the legacy duplicates is reported");
+        const names = Array.from({ length: 100 }, (_, index) => index % 10 === 0 ? `Shared Form ${index % 7}.pdf` : `bulk form ${index * 20 + 1}.PNG`);
+        const [check, results] = await time(() => app.findFilenameDuplicates(tenant, names));
+        assert.equal(results.filter((result) => result.exists).length, 100, "every name exists (shared or bulk, case-insensitively)");
+        t.diagnostic(`timing rows=20000 miss_ms=${miss.toFixed(1)} hit_ms=${hit.toFixed(1)} check100_ms=${check.toFixed(1)}`);
+        assert.ok(miss < 500, `a miss took ${miss} ms`);
+        assert.ok(check < 1000, `100 names took ${check} ms`);
+      } finally {
+        await superDb.query("DELETE FROM document_runs WHERE organization_id = $1", [tenant]);
+        await superDb.query("DELETE FROM documents WHERE organization_id = $1", [tenant]);
+      }
+    });
   });
 });
