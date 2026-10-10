@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { Script } from "node:vm";
-import { CATEGORY_LABELS_TH, DELIVERY_LABELS_TH, DOCUMENT_SORT_KEYS, FIELD_LABELS_TH, LEGACY_REVIEWER_LABEL } from "@innovera/ocr-persistence";
+import { CATEGORY_LABELS_TH, DELIVERY_LABELS_TH, DOCUMENT_SORT_KEYS, FIELD_LABELS_TH, FILENAME_KEY_JS_ONLY_VECTORS, FILENAME_KEY_VECTORS, LEGACY_REVIEWER_LABEL } from "@innovera/ocr-persistence";
 import { workbenchPage } from "./workbench.js";
 
 const html = workbenchPage({ nonce: "test-nonce-123" });
@@ -251,4 +251,40 @@ test("the drawer's OCR summary line sits under the alert, neutral gray, labelled
     "'ลายมือ: ไม่พบลายมือในแบบฟอร์ม'", "' · ช่องติ๊ก '"]) {
     assert.ok(inlineScript.includes(needle), needle);
   }
+});
+
+// ---- duplicate file names (plan upload-duplicate-filename) -----------------------------------------------------------
+
+test("the inline script source has no backtick and no ${ (it is one String.raw template), and parses with new Function", () => {
+  const source = readFileSync(new URL("./workbench.ts", import.meta.url), "utf8");
+  const start = source.indexOf("const SCRIPT = String.raw`") + "const SCRIPT = String.raw`".length;
+  const body = source.slice(start, source.indexOf("`", start));
+  assert.ok(body.length > 100_000 && body.trimEnd().endsWith("})();"), "the whole script, up to its closing backtick");
+  assert.equal(body.includes("${"), false);
+  assert.equal(inlineScript.includes("`"), false);
+  assert.doesNotThrow(() => new Function(inlineScript));
+});
+
+test("the client's nameKey runs the shared vectors of the server's canonicalFilenameKey", () => {
+  const line = inlineScript.split("\n").find((text) => text.startsWith("const KEYWS="));
+  assert.ok(line && line.includes("function cleanName(") && line.includes("function nameKey("), "KEYWS, cleanName and nameKey share one line");
+  const nameKey = new Function(`${line}\nreturn nameKey;`)() as (name: string) => string;
+  const vectors = [...FILENAME_KEY_VECTORS, ...FILENAME_KEY_JS_ONLY_VECTORS];
+  assert.ok(vectors.length >= 40);
+  for (const vector of vectors) assert.equal(nameKey(vector.input), vector.key, JSON.stringify(vector.input));
+  // nameProblem reuses the same cleaning, so a name the key accepts is measured exactly as the server measures it.
+  assert.match(inlineScript, /function nameProblem\(name\)\{const v=cleanName\(name\);/);
+});
+
+test("a duplicate is a final upload error with the plan's Thai texts, and the pre-check is a CSRF POST through postJson", () => {
+  const finals = /const FINAL_UPLOAD_ERRORS=\[([^\]]*)\]/.exec(inlineScript)?.[1] ?? "";
+  assert.match(finals, /'DUPLICATE_FILENAME'/);
+  for (const text of ["DUPLICATE_FILENAME:'ไฟล์ชื่อนี้มีในระบบแล้ว กรุณาเปลี่ยนชื่อไฟล์ถ้าต้องการอัปโหลดจริง'",
+    "'ชื่อไฟล์ซ้ำกันในรายการที่เลือก (ใช้ไฟล์แรกเท่านั้น) กรุณาเปลี่ยนชื่อไฟล์'", "'มีไฟล์ชื่อนี้อยู่ในคิวอัปโหลดแล้ว กรุณาเปลี่ยนชื่อไฟล์'",
+    "'ไฟล์ชื่อนี้มีในระบบแล้ว'", "' (อัปโหลดเมื่อ '", "' ถ้าต้องการอัปโหลดจริง กรุณาเปลี่ยนชื่อไฟล์'",
+    "' และอ่านไม่สำเร็จ กรุณากด \"ส่งอ่านใหม่\" ที่เอกสารเดิม หรือเปลี่ยนชื่อไฟล์ถ้าต้องการอัปโหลดใหม่'", "'ดูเอกสารเดิม'"]) {
+    assert.ok(inlineScript.includes(text), text);
+  }
+  assert.match(inlineScript, /postJson\('\/api\/documents\/name-check',\{names:names\},\{signal:ctl\.signal\}\)/);
+  assert.match(inlineScript, /const NAME_CHECK_MS=8000;/);
 });

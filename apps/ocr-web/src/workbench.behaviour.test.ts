@@ -697,7 +697,10 @@ test("the original of a quarantined document is never fetched, and a server refu
 });
 
 test("files the server always rejects are refused before the batch is created and are not counted in its total", async () => {
-  const { wb, fetches } = load(() => new Promise(() => undefined));
+  // The name pre-check answers "none exists"; everything else hangs, so the batch request is the last thing sent.
+  const { wb, fetches, calls } = load((url, init) => url === "/api/documents/name-check"
+    ? Promise.resolve(json(200, { results: (JSON.parse(String(init?.body)).names as string[]).map((_, index) => ({ index, exists: false })) }))
+    : new Promise(() => undefined));
   const thaiName = `${"ใบลงทะเบียนลูกค้า".repeat(8)}.pdf`; // > 120 code points
   wb.addFiles([
     { name: "ok.pdf", size: 10, type: "application/pdf" }, { name: "empty.pdf", size: 0, type: "application/pdf" },
@@ -709,12 +712,13 @@ test("files the server always rejects are refused before the batch is created an
   assert.deepEqual(Array.from(wb.state.uploads, (upload) => upload.status), ["uploading", "rejected", "rejected", "rejected", "rejected", "uploading"]);
   assert.deepEqual(Array.from(wb.state.uploads, (upload) => upload.group?.total ?? null), [2, null, null, null, null, 2]);
   assert.match(wb.state.uploads[3]!.error, /120/);
-  assert.deepEqual(fetches, ["POST /api/batches"], "one batch for the whole selection; nothing else is sent");
+  assert.deepEqual(fetches, ["POST /api/documents/name-check", "POST /api/batches"], "one name pre-check, then one batch for the whole selection");
+  assert.deepEqual(JSON.parse(calls[0]!.body), { names: ["ok.pdf", "ok2.png"] }, "only the files that can be uploaded are pre-checked");
 });
 
 test("deterministic upload rejections get no retry button; network failures do", async () => {
   const api = async (url: string) => json(url === "/api/batches" ? 201 : 200, url === "/api/batches" ? { batchId: ID, expectedTotal: 1 } : { batches: [] });
-  for (const [status, code, retryable] of [[400, "FILENAME_TOO_LONG", false], [400, "INVALID_UPLOAD_HEADERS", false], [404, "BATCH_NOT_FOUND", false], [400, "FILENAME_TOO_LARGE", false], [409, "UPLOAD_IN_PROGRESS", true], [0, "", true]] as const) {
+  for (const [status, code, retryable] of [[400, "FILENAME_TOO_LONG", false], [400, "INVALID_UPLOAD_HEADERS", false], [404, "BATCH_NOT_FOUND", false], [400, "FILENAME_TOO_LARGE", false], [409, "UPLOAD_IN_PROGRESS", true], [409, "DUPLICATE_FILENAME", false], [0, "", true]] as const) {
     const { wb } = load(api, { status, body: code ? { error: code } : {} });
     wb.addFiles([{ name: "a.pdf", size: 10, type: "application/pdf" }]);
     await settle();
@@ -2086,4 +2090,152 @@ test("parity: the drawer's ocrSummary and the export's ocrReadSummary agree numb
     const view: DocumentView = typeof fixture === "object" && fixture !== null ? normalizeStructuredResult(fixture) : fixture as unknown as DocumentView;
     assert.deepEqual(JSON.parse(JSON.stringify(ctx.wb.ocrSummary(view))), ocrReadSummary(view), JSON.stringify(fixture).slice(0, 80));
   }
+});
+
+// ---- duplicate file names (plan upload-duplicate-filename, D11 to D14) ----------------------------------------------
+
+const PDF = (name: string) => ({ name, size: 10, type: "application/pdf" });
+const EXISTING_DOC = { documentId: ID, filename: "b.pdf", uploadedAt: "2026-10-09T03:00:00.000Z", statusCategory: "review", retryable: false };
+/** The date the row shows for EXISTING_DOC: the script's own `when()` format (th-TH, day month hour minute). */
+const SHOWN_AT = new Intl.DateTimeFormat("th-TH", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(EXISTING_DOC.uploadedAt));
+/** A name-check route: `existing(name)` returns the document a name collides with, or null. */
+const nameCheck = (existing: (name: string) => Record<string, unknown> | null): Routes => (url, init) => {
+  if (url !== "/api/documents/name-check") return null;
+  const names = JSON.parse(String(init.body)).names as string[];
+  return json(200, { results: names.map((name, index) => { const document = existing(name); return document ? { index, exists: true, document } : { index, exists: false }; }) });
+};
+type Row = Upload & { existing?: unknown; view?: { act: FakeElement } };
+const rows = (wb: Workbench) => Array.from(wb.state.uploads as Row[]);
+const batchTotals = (calls: Call[]) => calls.filter((call) => call.url === "/api/batches" && call.method === "POST").map((call) => JSON.parse(call.body).total as number);
+const nameChecks = (calls: Call[]) => calls.filter((call) => call.url === "/api/documents/name-check").map((call) => JSON.parse(call.body).names as string[]);
+
+test("a name the system already has is refused before upload with the Thai text and its date, and is left out of the batch total", async () => {
+  const state: Server = { user: STAFF, csrf: "csrf-1", sessionStatus: 200 };
+  const ctx = await bootedIn(state, nameCheck((name) => name === "b.pdf" ? EXISTING_DOC : null));
+  ctx.wb.addFiles([PDF("a.pdf"), PDF("b.pdf"), PDF("c.pdf")]);
+  await settle();
+  assert.deepEqual(rows(ctx.wb).map((upload) => upload.status), ["done", "rejected", "done"]);
+  assert.equal(rows(ctx.wb)[1]!.error, `ไฟล์ชื่อนี้มีในระบบแล้ว (อัปโหลดเมื่อ ${SHOWN_AT}) ถ้าต้องการอัปโหลดจริง กรุณาเปลี่ยนชื่อไฟล์`);
+  assert.deepEqual(batchTotals(ctx.calls), [2], "the batch promises only the files that are sent");
+  assert.deepEqual(nameChecks(ctx.calls), [["a.pdf", "b.pdf", "c.pdf"]], "one pre-check for the whole selection");
+  assert.deepEqual(ctx.sent.map((sent) => decodeURIComponent(sent.headers["X-Upload-Filename"] ?? "")), ["a.pdf", "c.pdf"]);
+  assert.match(ctx.$("notice").textContent, /เพิ่ม 2 ไฟล์เข้าคิวอัปโหลดแล้ว · ข้ามไฟล์ชื่อซ้ำ 1 ไฟล์/);
+});
+
+test("the same name twice in one selection: the first is kept, the others are refused and never pre-checked", async () => {
+  const state: Server = { user: STAFF, csrf: "csrf-1", sessionStatus: 200 };
+  const ctx = await bootedIn(state, nameCheck(() => null));
+  ctx.wb.addFiles([PDF("A.pdf"), PDF("a.PDF"), PDF("a.pdf ")]);
+  await settle();
+  assert.deepEqual(rows(ctx.wb).map((upload) => upload.status), ["done", "rejected", "rejected"]);
+  for (const upload of rows(ctx.wb).slice(1)) assert.equal(upload.error, "ชื่อไฟล์ซ้ำกันในรายการที่เลือก (ใช้ไฟล์แรกเท่านั้น) กรุณาเปลี่ยนชื่อไฟล์");
+  assert.deepEqual(nameChecks(ctx.calls), [["A.pdf"]]);
+  assert.deepEqual(batchTotals(ctx.calls), [1]);
+});
+
+test("a name already in the upload queue is refused without a pre-check, also while the first pre-check is still running", async () => {
+  const state: Server = { user: STAFF, csrf: "csrf-1", sessionStatus: 200 };
+  let release: () => void = () => undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const ctx = await bootedIn(state, undefined, { status: 0, hang: true });
+  // A queued (still uploading) file: dropping it again is refused at once.
+  ctx.wb.addFiles([PDF("queued.pdf")]);
+  await settle();
+  assert.equal(rows(ctx.wb)[0]!.status, "uploading");
+  ctx.calls.length = 0;
+  ctx.wb.addFiles([PDF("Queued.PDF")]);
+  await settle();
+  assert.deepEqual([rows(ctx.wb)[1]!.status, rows(ctx.wb)[1]!.error], ["rejected", "มีไฟล์ชื่อนี้อยู่ในคิวอัปโหลดแล้ว กรุณาเปลี่ยนชื่อไฟล์"]);
+  assert.deepEqual(nameChecks(ctx.calls), [], "nothing to ask the server");
+  // Two quick drops of one new name: the second comes while the first one's pre-check is still in flight.
+  const slow = load(async (url, init) => {
+    if (url === "/api/documents/name-check") { await held; return nameCheck(() => null)(url, init ?? {})!; }
+    return url === "/api/batches" ? json(201, { batchId: ID, expectedTotal: 1 }) : json(200, { batches: [] });
+  });
+  slow.wb.addFiles([PDF("twice.pdf")]);
+  slow.wb.addFiles([PDF("twice.pdf")]);
+  await settle();
+  assert.deepEqual(rows(slow.wb).map((upload) => [upload.status, upload.file.name]), [["rejected", "twice.pdf"]], "the second drop is refused at once");
+  release();
+  await settle();
+  assert.deepEqual(rows(slow.wb).map((upload) => upload.status), ["rejected", "done"]);
+  assert.equal(slow.fetches.filter((call) => call === "POST /api/documents/name-check").length, 1);
+});
+
+test("when every selected file is a duplicate no batch is created and the notice asks for a rename", async () => {
+  const state: Server = { user: STAFF, csrf: "csrf-1", sessionStatus: 200 };
+  const ctx = await bootedIn(state, nameCheck(() => EXISTING_DOC));
+  ctx.wb.addFiles([PDF("b.pdf"), PDF("B.PDF")]);
+  await settle();
+  assert.deepEqual(rows(ctx.wb).map((upload) => upload.status), ["rejected", "rejected"]);
+  assert.deepEqual(batchTotals(ctx.calls), []);
+  assert.equal(ctx.sent.length, 0);
+  assert.match(ctx.$("notice").className, /is-error/);
+  assert.match(ctx.$("notice").textContent, /ชื่อไฟล์ซ้ำ 2 ไฟล์ ถ้าต้องการอัปโหลดจริง กรุณาเปลี่ยนชื่อไฟล์/);
+});
+
+test("a pre-check that fails (network, 429, 500, or no answer within 8 s) uploads everything, with today's batch total", async () => {
+  const modes = ["network", "429", "500", "timeout"] as const;
+  for (const mode of modes) {
+    const ctx = load((url) => {
+      if (url === "/api/documents/name-check") {
+        if (mode === "network") return Promise.reject(new TypeError("fetch failed"));
+        if (mode === "timeout") return new Promise(() => undefined);
+        return Promise.resolve(json(Number(mode), { error: mode === "429" ? "NAME_CHECK_THROTTLED" : "INTERNAL_ERROR" }));
+      }
+      return Promise.resolve(url === "/api/batches" ? json(201, { batchId: ID, expectedTotal: 2 }) : json(200, { batches: [] }));
+    });
+    ctx.wb.addFiles([PDF("a.pdf"), PDF("b.pdf")]);
+    await settle();
+    if (mode === "timeout") {
+      assert.equal(rows(ctx.wb).length, 0, "nothing is queued while the pre-check may still answer");
+      assert.equal(ctx.clock.timers.size, 1, "the 8 s pre-check timer is armed");
+      ctx.clock.run([...ctx.clock.timers.keys()][0]!);
+      await settle();
+    }
+    assert.deepEqual(rows(ctx.wb).map((upload) => upload.status), ["done", "done"], mode);
+    assert.deepEqual(batchTotals(ctx.calls), [2], mode);
+  }
+});
+
+test("a 409 DUPLICATE_FILENAME from the server fails only that file, for good, with the date; the others continue", async () => {
+  const state: Server = { user: STAFF, csrf: "csrf-1", sessionStatus: 200 };
+  const ctx = await bootedIn(state, undefined, (index) => index === 1 ? { status: 409, body: { error: "DUPLICATE_FILENAME", existing: EXISTING_DOC } } : { status: 202, body: { documentId: ID } });
+  ctx.wb.addFiles([PDF("b.pdf"), PDF("other.pdf")]);
+  await settle();
+  const [duplicate, other] = rows(ctx.wb);
+  assert.deepEqual([duplicate!.status, duplicate!.retryable, other!.status], ["failed", false, "done"]);
+  assert.equal(duplicate!.error, `ไฟล์ชื่อนี้มีในระบบแล้ว (อัปโหลดเมื่อ ${SHOWN_AT}) ถ้าต้องการอัปโหลดจริง กรุณาเปลี่ยนชื่อไฟล์`);
+  assert.equal(ctx.sent.length, 2, "the duplicate is not resent");
+  assert.doesNotMatch(duplicate!.view!.act.textContent, /ลองใหม่/, "no retry button");
+  // Without details (an older server, or a plain code) the generic text of ERRORS stands.
+  const bare = await bootedIn(state, undefined, { status: 409, body: { error: "DUPLICATE_FILENAME" } });
+  bare.wb.addFiles([PDF("b.pdf")]);
+  await settle();
+  assert.deepEqual([rows(bare.wb)[0]!.status, rows(bare.wb)[0]!.error], ["failed", bare.wb.ERRORS.DUPLICATE_FILENAME]);
+});
+
+test("a duplicate of a document that failed to read says to press ส่งอ่านใหม่ on it or rename", async () => {
+  const state: Server = { user: STAFF, csrf: "csrf-1", sessionStatus: 200 };
+  const ctx = await bootedIn(state, nameCheck(() => ({ ...EXISTING_DOC, statusCategory: "failed", retryable: true })));
+  ctx.wb.addFiles([PDF("b.pdf")]);
+  await settle();
+  assert.equal(rows(ctx.wb)[0]!.error, `ไฟล์ชื่อนี้มีในระบบแล้ว (อัปโหลดเมื่อ ${SHOWN_AT}) และอ่านไม่สำเร็จ กรุณากด "ส่งอ่านใหม่" ที่เอกสารเดิม หรือเปลี่ยนชื่อไฟล์ถ้าต้องการอัปโหลดใหม่`);
+});
+
+test("ดูเอกสารเดิม searches the list for the existing document's name, with every other filter cleared", async () => {
+  const state: Server = { user: STAFF, csrf: "csrf-1", sessionStatus: 200 };
+  const ctx = await bootedIn(state, nameCheck(() => EXISTING_DOC));
+  ctx.wb.state.status = "review";
+  ctx.wb.state.batchFilter = ID;
+  ctx.wb.addFiles([PDF("B.PDF")]);
+  await settle();
+  const button = rows(ctx.wb)[0]!.view!.act.children[0]!;
+  assert.equal(button.textContent, "ดูเอกสารเดิม");
+  ctx.fetches.length = 0;
+  button.dispatch("click");
+  await settle();
+  assert.deepEqual([ctx.wb.state.q, ctx.wb.state.status, ctx.wb.state.batchFilter, ctx.$("q").value], ["b.pdf", "", "", "b.pdf"]);
+  const list = ctx.fetches.find((call) => call.startsWith("GET /api/documents?")) ?? "";
+  assert.equal(new URLSearchParams(list.split("?")[1]).get("q"), "b.pdf");
 });
