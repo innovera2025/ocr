@@ -2215,12 +2215,12 @@ test("a 409 DUPLICATE_FILENAME from the server fails only that file, for good, w
   assert.deepEqual([rows(bare.wb)[0]!.status, rows(bare.wb)[0]!.error], ["failed", bare.wb.ERRORS.DUPLICATE_FILENAME]);
 });
 
-test("a duplicate of a document that failed to read says to press ส่งอ่านใหม่ on it or rename", async () => {
+test("a duplicate of a document that failed to read says to press ลองอ่านอีกครั้ง on it or rename", async () => {
   const state: Server = { user: STAFF, csrf: "csrf-1", sessionStatus: 200 };
   const ctx = await bootedIn(state, nameCheck(() => ({ ...EXISTING_DOC, statusCategory: "failed", retryable: true })));
   ctx.wb.addFiles([PDF("b.pdf")]);
   await settle();
-  assert.equal(rows(ctx.wb)[0]!.error, `ไฟล์ชื่อนี้มีในระบบแล้ว (อัปโหลดเมื่อ ${SHOWN_AT}) และอ่านไม่สำเร็จ กรุณากด "ส่งอ่านใหม่" ที่เอกสารเดิม หรือเปลี่ยนชื่อไฟล์ถ้าต้องการอัปโหลดใหม่`);
+  assert.equal(rows(ctx.wb)[0]!.error, `ไฟล์ชื่อนี้มีในระบบแล้ว (อัปโหลดเมื่อ ${SHOWN_AT}) และอ่านไม่สำเร็จ กรุณากด "ลองอ่านอีกครั้ง" ที่เอกสารเดิม หรือเปลี่ยนชื่อไฟล์ถ้าต้องการอัปโหลดใหม่`);
 });
 
 test("ดูเอกสารเดิม searches the list for the existing document's name, with every other filter cleared", async () => {

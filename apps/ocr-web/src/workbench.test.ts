@@ -282,9 +282,11 @@ test("a duplicate is a final upload error with the plan's Thai texts, and the pr
   for (const text of ["DUPLICATE_FILENAME:'ไฟล์ชื่อนี้มีในระบบแล้ว กรุณาเปลี่ยนชื่อไฟล์ถ้าต้องการอัปโหลดจริง'",
     "'ชื่อไฟล์ซ้ำกันในรายการที่เลือก (ใช้ไฟล์แรกเท่านั้น) กรุณาเปลี่ยนชื่อไฟล์'", "'มีไฟล์ชื่อนี้อยู่ในคิวอัปโหลดแล้ว กรุณาเปลี่ยนชื่อไฟล์'",
     "'ไฟล์ชื่อนี้มีในระบบแล้ว'", "' (อัปโหลดเมื่อ '", "' ถ้าต้องการอัปโหลดจริง กรุณาเปลี่ยนชื่อไฟล์'",
-    "' และอ่านไม่สำเร็จ กรุณากด \"ส่งอ่านใหม่\" ที่เอกสารเดิม หรือเปลี่ยนชื่อไฟล์ถ้าต้องการอัปโหลดใหม่'", "'ดูเอกสารเดิม'"]) {
+    "' และอ่านไม่สำเร็จ กรุณากด \"ลองอ่านอีกครั้ง\" ที่เอกสารเดิม หรือเปลี่ยนชื่อไฟล์ถ้าต้องการอัปโหลดใหม่'", "'ดูเอกสารเดิม'"]) {
     assert.ok(inlineScript.includes(text), text);
   }
   assert.match(inlineScript, /postJson\('\/api\/documents\/name-check',\{names:names\},\{signal:ctl\.signal\}\)/);
   assert.match(inlineScript, /const NAME_CHECK_MS=8000;/);
+  // The retryable duplicate's text names the failed document's real retry button, so the two cannot drift apart.
+  assert.ok(inlineScript.includes("btn('ลองอ่านอีกครั้ง',"), "the button the duplicate text tells staff to press exists");
 });
