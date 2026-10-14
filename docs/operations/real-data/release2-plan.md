@@ -979,7 +979,8 @@ equal the inline-script copies at `workbench.ts:254-260`).
 
 **Cell rules:**
 - A compact cell shows `value`. When the value is null and `raw` exists, it shows `raw + " (?)"`. Items still flagged
-  get `" (?)"`.
+  get `" (?)"`. **Superseded 2026-10-14:** a value cell is the clean `value` only, empty when there is none; see
+  design §3.2 and `export-columns-guide.md`.
 - Text over 32,000 characters is cut with `…[ตัดทอน]`.
 - Numbers (`page`, `page_count`, `*_minutes`, `total_minutes`, `min_confidence`) are emitted bare. `room` stays text.
   Excel may still strip leading zeros when it opens a CSV; this is documented, and `="…"` is not used.
@@ -2082,6 +2083,8 @@ write the deviation down instead of diverging silently.
   no sum is invented for older rows, which would be a number no one wrote. The `" (?)"` marker is applied to any
   still-flagged reading, not only to one with no value — H3's "items still flagged get `" (?)"`" read the other way
   would export an unreviewed guess as if it were confirmed. A confirmed row carries no flags (`markReviewed`).
+  **Superseded 2026-10-14:** the marker was removed; review state is read from `needs_review`, `review_fields` and
+  the full set's `<field>_needs_review` instead.
 - **Read-only proof of the download's own transaction.** §12 asks for "an INSERT inside the export transaction fails
   with 25006". `previewExport` runs through `withTenant(readOnly)`, which the DB suite already proves; the
   download's own `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` plus both `set_config` timeouts are asserted

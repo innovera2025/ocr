@@ -59,6 +59,18 @@ move them.
   field whose ink the OCR could not read no longer counts as writing; an edited field that the OCR had text for but
   could not turn into a value counts as read.
 
+## Value cells (no "(?)" marker)
+
+A value cell (`form_number`, `customer_name`, the joined lists, `treatment_N_name`, `treatments`, ...) holds the
+**clean value only**. It never carries a `(?)` marker, and when a field has no value the cell is **empty** even if
+the OCR read some text there. Where to look instead:
+
+- **Still needs review?** `needs_review` (the whole row) and `review_fields` (which fields) in both files; the
+  per-field `*_needs_review` columns in the ทั้งหมด (full) file.
+- **What the OCR read when there is no value?** The `*_raw` column of the full file (`treatment_N_raw` for treatments
+  1-4). The สรุป (compact) file has no `_raw` columns, so that text is not in it: use the full file or JSONL.
+- A treatment with no service value but a duration shows only the duration in `treatments` (for example `60 นาที`).
+
 ## Empty cells
 
 Every column is present in every row. A missing field, an empty list or an absent treatment slot is an **empty CSV
@@ -91,6 +103,9 @@ The `_source` cell holds the raw machine code so it can be filtered; the drawer 
   57 moved. Lists and treatments gained their own columns.
 - The default changed: a download without a choice is now the full set (the dialog and the API alike).
 - Files exported before 2026-10-08 keep the old meaning.
+- **From 2026-10-14 the `(?)` marker is gone.** Earlier files appended ` (?)` to a still-flagged value (`Male (?)`)
+  and showed the OCR text with ` (?)` when there was no value (`03230 (?)`). Now the value cell is clean or empty;
+  see "Value cells" above. Column counts and positions did not change (57 / 180).
 
 ## เปิดไฟล์ใน Excel
 
@@ -120,7 +135,7 @@ Columns 1-57 are also the สรุป (compact) file.
 | 7 | `reviewed` | ยืนยันแล้ว | bool | TRUE once a staff member confirmed the document. |
 | 8 | `reviewed_at` | ยืนยันเมื่อ | datetime | Confirmation time, Bangkok. |
 | 9 | `reviewed_by` | ยืนยันโดย | text | Who confirmed it. |
-| 10 | `form_number` | เลขที่ฟอร์ม | text | Form number (value; `(?)` = not verified). |
+| 10 | `form_number` | เลขที่ฟอร์ม | text | Form number (the value only; review state is in `needs_review` / `review_fields`). |
 | 11 | `form_date` | วันที่ | text | Date written on the form. |
 | 12 | `form_time` | เวลา | text | Time written on the form. |
 | 13 | `branch` | สาขา | text | Branch. |

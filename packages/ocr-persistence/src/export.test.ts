@@ -103,22 +103,35 @@ test("more than four treatments: items 5 and up are joined into treatments_more"
   assert.equal(row.treatments!.split("; ").length, 6, "the joined column still holds every item");
 });
 
-test("an unverified reading keeps its raw text and the (?) marker, so an export never looks confirmed", () => {
+test("an unverified reading exports its clean value only; review state lives in its own columns, raw text in _raw", () => {
   const unsure = {
     schemaVersion: 3,
-    customerInformation: { name: field("Chun Li", null, 0.41, true), gender: field(null, null, 0, false, "none") },
+    customerInformation: { name: field("Chun Li", null, 0.41, true), gender: field("Male", "Male", 0.6, true, "checkbox"),
+      nationality: field(null, null, 0, false, "none"),
+      referralSources: [{ ...field("Walk-in", "Walk-in", 0.9, false, "checkbox"), checked: true }, { ...field("Google", "Google", 0.5, true, "checkbox"), checked: true }] },
     staffOnly: { treatments: [treatment("ฟุต", null, "60 นาที", true), treatment("ไทย", "นวดไทย", "90 นาที", true)], roomNo: field("12", "12", 0.95) }
   };
   const document: ExportDocument = { ...pageDocument, statusCategory: "review", status: "NEEDS_REVIEW", needsReview: true, reviewedAt: null, reviewedBy: null,
     reviewedByName: null, deliveryStatus: "NONE", structuredResult: normalizeStructuredResult(unsure) };
   const row = cells(document);
-  assert.equal(row.customer_name, "Chun Li (?)", "no confirmed value: the raw reading is kept, marked as unsure");
-  assert.equal(row.gender, "", "nothing was read at all");
-  assert.equal(row.treatments, "ฟุต (?) 60 นาที; นวดไทย (?) 90 นาที", "a flagged item keeps the marker even with a value");
-  assert.equal(row.review_fields, "customerInformation.name; staffOnly.treatments[0]; staffOnly.treatments[1]");
+  assert.equal(row.customer_name, "", "no value: the cell is empty, the raw reading is not shown in its place");
+  assert.equal(row.gender, "Male", "a still-flagged value is exported clean");
+  assert.equal(row.nationality, "", "nothing was read at all");
+  assert.equal(row.referral_sources, "Walk-in; Google", "a flagged list item is exported clean");
+  assert.equal(row.treatments, "60 นาที; นวดไทย 90 นาที", "a treatment with no service value keeps only its duration");
+  assert.deepEqual([row.treatment_1_name, row.treatment_1_duration, row.treatment_2_name], ["", "60 นาที", "นวดไทย"]);
+  assert.equal(row.review_fields, "customerInformation.name; customerInformation.gender; customerInformation.referralSources[1]; staffOnly.treatments[0]; staffOnly.treatments[1]");
   assert.deepEqual([row.needs_review, row.reviewed, row.reviewed_by, row.reviewed_at], ["TRUE", "FALSE", "", ""], "an unconfirmed row names no reviewer");
   assert.deepEqual([row.delivery_status, row.status], ["", "รอตรวจสอบ"]);
-  assert.deepEqual(flaggedPaths(document.structuredResult), ["customerInformation.name", "staffOnly.treatments[0]", "staffOnly.treatments[1]"]);
+  assert.deepEqual(flaggedPaths(document.structuredResult),
+    ["customerInformation.name", "customerInformation.gender", "customerInformation.referralSources[1]", "staffOnly.treatments[0]", "staffOnly.treatments[1]"]);
+  const full = cells(document, "detailed");
+  assert.deepEqual([full.customer_name, full.customer_name_raw, full.customer_name_needs_review], ["", "Chun Li", "TRUE"], "the full set keeps the OCR text and the flag");
+  assert.deepEqual([full.gender, full.gender_needs_review, full.referral_sources_needs_review], ["Male", "TRUE", "TRUE"]);
+  assert.deepEqual([full.treatment_1_raw, full.treatment_2_raw], ["ฟุต", "ไทย"]);
+  for (const set of ["compact", "detailed"] as const) {
+    assert.ok(!exportCells(document, set).some((cell) => cell.includes("(?)")), `${set}: no cell carries the old (?) marker`);
+  }
 });
 
 test("legacy v2.2 rows flatten through the canonical view, and a legacy reviewer reads as the shared account", () => {
@@ -127,7 +140,7 @@ test("legacy v2.2 rows flatten through the canonical view, and a legacy reviewer
     therapistName: field("Legacyname", "Legacyname", 1, false, "verified-memory"), roomNo: field("7", null, 0, true) };
   const row = cells({ ...pageDocument, reviewedBy: "front-desk", reviewedByName: null, structuredResult: normalizeStructuredResult(legacy) });
   assert.equal(row.treatments, "นวดไทย 60 นาที");
-  assert.deepEqual([row.therapist, row.room], ["Legacyname", "7 (?)"]);
+  assert.deepEqual([row.therapist, row.room], ["Legacyname", ""], "a room read as 7 with no value is an empty cell");
   assert.equal(row.reviewed_by, LEGACY_REVIEWER_LABEL, "a pre-login actor matches no user row");
   assert.deepEqual([row.form_number, row.customer_name, row.total_minutes], ["", "", ""], "a v2.2 row simply has no header or customer section");
 });
@@ -208,9 +221,11 @@ test("Others free text: two columns right after their lists, filled from the Fie
     ["Chat GPT", "human", 100, null, true, null], "typed by staff: 100 %, no OCR %, edited");
   const rawOnly = flattenDocument(withOthers({ healthOther: { raw: "Asthma", value: null, confidence: 0.4, source: "ocr", needsReview: true },
     referralOther: { raw: "Chat GPT", value: "Chat GPT", confidence: 0.6, source: "ocr", needsReview: true } }), "detailed");
-  assert.equal(rawOnly.referral_other, "Chat GPT (?)", "a still-flagged value keeps the unverified marker");
+  assert.equal(rawOnly.referral_other, "Chat GPT", "a still-flagged value is exported clean");
+  assert.equal(rawOnly.referral_other_needs_review, true);
   assert.match(String(rawOnly.review_fields), /customerInformation\.referralOther/);
-  assert.deepEqual([rawOnly.health_other, rawOnly.health_other_raw, rawOnly.health_other_needs_review], ["Asthma (?)", "Asthma", true]);
+  assert.deepEqual([rawOnly.health_other, rawOnly.health_other_raw, rawOnly.health_other_needs_review], [null, "Asthma", true],
+    "no value: the value cell is empty, the OCR text stays in _raw");
   assert.match(String(rawOnly.review_fields), /customerInformation\.healthOther/);
   const old = flattenDocument(pageDocument, "detailed");
   assert.deepEqual([old.referral_other, old.health_other, old.referral_other_raw, old.health_other_source], [null, null, null, null]);

@@ -50,8 +50,6 @@ export type FlattenOptions = Readonly<{ publicBaseUrl?: string | undefined }>;
 /** Excel's cell limit is 32,767; longer text is cut here so the CSV writer never produces a cell Excel refuses. */
 export const MAX_CELL_LENGTH = 32_000;
 export const TRUNCATION_SUFFIX = "…[ตัดทอน]";
-/** A reading the system is not sure of: a value that is still flagged, or a `raw` with no confirmed value behind it. */
-export const UNVERIFIED_SUFFIX = "(?)";
 /** Treatments 1–4 get their own columns; item 5 onward are joined into `treatments_more`. */
 export const TREATMENT_COLUMNS = 4;
 /** Lists (checkbox groups, treatments, flagged paths) are joined with this, as the design specifies. */
@@ -348,16 +346,12 @@ export function ocrReadSummary(view: DocumentView): OcrReadSummary {
 }
 
 /**
- * Design §3.2: a cell shows `value`; when there is no value but a `raw` reading exists it shows `raw + " (?)"`, so
- * nothing the model read is dropped; and a reading that is still flagged keeps the same marker, so a row exported
- * before anyone reviewed it never looks confirmed. A confirmed document has no flags left (`markReviewed`).
+ * Design §3.2 (2026-10-14): a value cell holds the clean `value` and nothing else — no marker, and no `raw` fallback
+ * when there is no value (the cell is empty). Review state lives in its own columns: `needs_review` and
+ * `review_fields` in both sets, `<field>_needs_review` in the full set, where `<field>_raw` keeps the OCR text.
  */
 export function fieldCell(field: unknown): string | null {
-  if (!isRecord(field)) return text(field);
-  const value = text(field.value);
-  if (value !== null) return field.needsReview === true ? `${value} ${UNVERIFIED_SUFFIX}` : value;
-  const raw = text(field.raw);
-  return raw === null ? null : `${raw} ${UNVERIFIED_SUFFIX}`;
+  return isRecord(field) ? text(field.value) : text(field);
 }
 
 /** One treatment as staff read it: the service and its duration, e.g. "นวดไทย 90 นาที". */
