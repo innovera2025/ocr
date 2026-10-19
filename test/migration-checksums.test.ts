@@ -45,8 +45,8 @@ const CHECKSUMS: Readonly<Record<string, string>> = {
   // Applied in production by the export-selection deploy (2026-10-05) and frozen there: a fix takes 0022, never an
   // edit to this file.
   "0021_document_export_marks": "6a4026d137820a627d6f5070a2ebf1a5e91d62f078a196d0147f722326819919",
-  // Applied by NO deploy yet — the queue-control Release A deploy (AP-2) applies it and freezes it. Until then an edit
-  // is allowed: regenerate this line in the same commit (`shasum -a 256 prisma/migrations/0022_queue_control/migration.sql`).
+  // Applied in production by the queue-control Release A deploy (AP-2, 2026-10-19) and frozen there: a fix takes a new
+  // migration, never an edit to this file.
   "0022_queue_control": "72712df4e605657d4be17d33013b21edbac7de145ebfe32e4c749218554cfc3f"
 };
 
@@ -60,7 +60,7 @@ function sha256(version: string): string {
  * still be edited; the pin is simply regenerated in the same commit, because the pin is what freezes it the moment
  * the deploy that applies it runs. Move this line in the same commit as the deploy that applies the next one.
  */
-export const APPLIED_IN_PRODUCTION = "0021_document_export_marks";
+export const APPLIED_IN_PRODUCTION = "0022_queue_control";
 
 test("every applied migration still hashes to the value production recorded", () => {
   for (const [version, expected] of Object.entries(CHECKSUMS)) {
