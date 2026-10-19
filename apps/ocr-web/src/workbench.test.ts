@@ -317,3 +317,8 @@ test("every queue code the routes can answer has Thai text, and the panel never 
   assert.equal(/\bconfirm\(/.test(inlineScript.replace(/confirmAsk\(|answerConfirm\(/g, "")), false);
   assert.match(inlineScript, /\/api\/queue\/next-round',\{roundNo\}/, "next-round sends the round on screen");
 });
+
+test("the open-batch list scrolls inside the card (the API sends at most 50; production had 222 open) and says how many are not shown", () => {
+  assert.match(html, /\.q-list\{[^}]*max-height:480px;overflow:auto/);
+  assert.ok(inlineScript.includes("'แสดง '+list.length+' จาก '+total+' ชุดที่ยังอ่านไม่เสร็จ'"));
+});

@@ -99,7 +99,8 @@ main{padding:40px 24px 96px}
 .q-controls{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;margin:12px 0}
 .q-controls .fld{min-width:160px;max-width:200px}
 .q-help{margin-top:8px;padding:8px 12px;border-radius:6px;background:var(--amber-row);box-shadow:0 0 0 1px var(--amber-line);font-size:13px}
-.q-list{margin-top:12px}
+/* Up to 50 open batches (the API's page; production has 222 open): the list scrolls inside the card. */
+.q-list{margin-top:12px;max-height:480px;overflow:auto;overscroll-behavior:contain}
 .q-row{display:grid;grid-template-columns:minmax(0,2fr) minmax(120px,1fr) auto;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--line);font-size:13px}
 .q-row .stack{margin:6px 0 0}
 .q-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
