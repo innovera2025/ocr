@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createAppServer, errorStatus, NAME_CHECK_LIMIT, routeLabel, workbenchCsp, type AppDependencies, type DocumentListQuery, type WorkbenchStore } from "./server.js";
+import { createAppServer, errorStatus, NAME_CHECK_LIMIT, QUEUE_OVERVIEW_CACHE_MS, routeLabel, workbenchCsp, type AppDependencies, type DocumentListQuery, type WorkbenchStore } from "./server.js";
 import { csrfTokenFor, type AuthContext } from "@innovera/ocr-auth";
 import type { IngestDependencies } from "@innovera/ocr-ingest";
 import { DuplicateFilenameError, parseRoundCap, parseRoundNo, queueOverview, RoundAlreadyStartedError, type FilenameDuplicate, type QueueActor, type ReviewDocument } from "@innovera/ocr-persistence";
@@ -705,7 +705,7 @@ test("name-check is throttled per user: 429 NAME_CHECK_THROTTLED with Retry-Afte
 
 const ADMIN_NAME = "ผู้ดูแลคิว";
 /** An in-memory queue control row with the store's semantics: guarded next-round, idempotent repeats report `changed: false`. */
-function queueHarness(options: { role?: "admin" | "staff"; withStore?: boolean } = {}) {
+function queueHarness(options: { role?: "admin" | "staff"; withStore?: boolean; clock?: () => number } = {}) {
   let role = options.role ?? "admin";
   const calls: Array<{ method: string; args: unknown[] }> = [];
   const control = { stopped: false, stoppedAt: null as string | null, stoppedBy: null as string | null, roundCap: null as number | null, roundNo: 1,
@@ -752,6 +752,7 @@ function queueHarness(options: { role?: "admin" | "staff"; withStore?: boolean }
     ...(options.withStore === false ? {} : queueMethods)
   } satisfies WorkbenchStore;
   const app = createAppServer({ ingest: { stage: async () => "key", scan: async () => "CLEAN", enqueue: async () => "job" }, workbenchStore: store }, {
+    ...(options.clock ? { clock: options.clock } : {}),
     authenticate: (request): AuthContext => {
       if (request.headers.cookie !== cookie(sessionToken)) throw new Error("UNAUTHENTICATED");
       return { ...principal(tenant), role, displayName: ADMIN_NAME };
@@ -849,4 +850,27 @@ test("GET /api/queue: any signed-in user reads the overview of the session's ten
   });
   const bare = queueHarness({ withStore: false });
   await withQueueServer(bare, async (base) => { await expectError(await fetch(`${base}/api/queue`, { headers: auth }), 503, "QUEUE_NOT_CONFIGURED"); });
+});
+
+test("GET /api/queue is served from a 2 s per-tenant cache; a control action (also a 409) clears it", async () => {
+  let now = 1_000_000;
+  const h = queueHarness({ role: "admin", clock: () => now });
+  await withQueueServer(h, async (base) => {
+    const reads = () => h.calls.filter((call) => call.method === "getQueueOverview").length;
+    const get = () => fetch(`${base}/api/queue`, { headers: auth });
+    assert.equal((await get()).status, 200);
+    assert.equal((await get()).status, 200);
+    assert.equal(reads(), 1, "the second read within 2 s comes from the cache");
+    now += QUEUE_OVERVIEW_CACHE_MS;
+    await get();
+    assert.equal(reads(), 2, "expired after 2 s");
+    const stopped = await body(await fetch(`${base}/api/queue/stop`, { method: "POST", headers: jsonAuth, body: "{}" }));
+    assert.equal((stopped.control as { stopped: boolean }).stopped, true);
+    const fresh = await body(await get());
+    assert.equal(reads(), 3, "an action clears the cache");
+    assert.equal((fresh.control as { stopped: boolean }).stopped, true);
+    assert.equal((await fetch(`${base}/api/queue/next-round`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ roundNo: 99 }) })).status, 409);
+    await get();
+    assert.equal(reads(), 4, "a refused action clears it too");
+  });
 });

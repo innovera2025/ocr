@@ -74,6 +74,12 @@ const FORBIDDEN_ERRORS = new Set(["CSRF_REJECTED", "FORBIDDEN", "PASSWORD_CHANGE
 /** D10: name pre-checks per user per window (the workbench sends one per file selection). */
 export const NAME_CHECK_LIMIT = 60;
 export const NAME_CHECK_WINDOW_MS = 60_000;
+/**
+ * queue-control review S3: GET /api/queue is answered from a per-tenant cache this long. Every open tab polls it (5 s
+ * while reading) and the aggregate reads every open batch; a control action clears the tenant's entry, so its own
+ * answer and the reload right after it are always fresh.
+ */
+export const QUEUE_OVERVIEW_CACHE_MS = 2_000;
 /** Every 429 carries `Retry-After`; the login route computes its own from the window that is spent. */
 const THROTTLED_ERRORS: ReadonlyMap<string, number> = new Map([["LOGIN_THROTTLED", 900], ["LOGIN_BUSY", LOGIN_BUSY_RETRY_SECONDS],
   ["EXPORT_BUSY", 30], ["EXPORT_BUSY_ORG", 30], ["EXPORT_THROTTLED", Math.round(PREVIEW_WINDOW_MS / 1000)],
@@ -270,6 +276,7 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
   const markLimit = new SlidingWindow(EXPORT_MARK_LIMIT, PREVIEW_WINDOW_MS);
   const nameCheckLimit = new SlidingWindow(NAME_CHECK_LIMIT, NAME_CHECK_WINDOW_MS);
   const exportStore = (): ExportStore => { if (!app?.exportStore) throw new Error("EXPORT_NOT_CONFIGURED"); return app.exportStore; };
+  const queueOverviewCache = new Map<string, { at: number; body: object }>();
 
   /**
    * §5 C2.7 and §4 B4: a denied request is audited once, at most 5 times a minute. The budget is keyed on the **user**,
@@ -374,7 +381,11 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
     if (pathname === "/api/queue" && method === "GET") {
       const store = workbench();
       if (!store.getQueueOverview) throw new Error("QUEUE_NOT_CONFIGURED");
-      respond(response, 200, await store.getQueueOverview(ctx.tenantId));
+      const cached = queueOverviewCache.get(ctx.tenantId);
+      if (cached && clock() - cached.at < QUEUE_OVERVIEW_CACHE_MS && clock() >= cached.at) { respond(response, 200, cached.body); return true; }
+      const body = await store.getQueueOverview(ctx.tenantId);
+      queueOverviewCache.set(ctx.tenantId, { at: clock(), body });
+      respond(response, 200, body);
       return true;
     }
     const queueAction = method === "POST" ? QUEUE_ACTIONS[pathname as keyof typeof QUEUE_ACTIONS] : undefined;
@@ -391,7 +402,9 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
       };
       const call = calls[queueAction];
       if (!call) throw new Error("QUEUE_NOT_CONFIGURED");
-      const result = await call();
+      // Whatever the outcome (a 409 also means the state moved), the next overview is read fresh.
+      queueOverviewCache.delete(ctx.tenantId);
+      const result = await call().finally(() => { queueOverviewCache.delete(ctx.tenantId); });
       if (result.changed) logEvent("queue_control_changed", { request_id: reqId, trace_id: traceId, user_id: ctx.userId, tenant_id: ctx.tenantId, action: queueAction });
       respond(response, 200, { control: result.control });
       return true;

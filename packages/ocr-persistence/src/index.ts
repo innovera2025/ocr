@@ -438,8 +438,15 @@ const OPEN_STATUS_SQL = "('VALIDATING','SCANNING','CLEAN','PROCESSING')";
  * (top-level documents), the status counters count visible rows (SPLIT parents match none of them). `files_done`
  * (D11): top-level documents that are no longer open and none of whose page rows is open. Shared by BATCH_SELECT and
  * OPEN_BATCH_SELECT, so the batch strip and the queue panel can never count differently.
+ *
+ * The aggregate is a LATERAL per batch (an index scan on `documents_org_batch_idx`, one row even for an empty batch) over
+ * `chosen`, a MATERIALIZED CTE of the batches to show: the planner cannot aggregate first and filter after, so the
+ * strip's LIMIT 20 newest and the queue panel's open batches never aggregate the rest of the organization's history
+ * (queue-control review S3). Each caller defines `chosen` (ocr_batches rows, RLS applies).
  */
-const BATCH_AGGREGATE = `SELECT b.id, b.label, b.created_at, b.expected_total, b.queue_seq, now() AS db_now, b.round_opened_at,
+const BATCH_AGGREGATE = `SELECT b.id, b.label, b.created_at, b.expected_total, b.queue_seq, now() AS db_now, b.round_opened_at, a.*
+FROM chosen b
+CROSS JOIN LATERAL (SELECT
   min(d.processing_started_at) FILTER (WHERE b.round_opened_at IS NOT NULL AND d.processing_started_at >= b.round_opened_at) AS round_started_at,
   count(d.id) FILTER (WHERE b.round_opened_at IS NOT NULL AND d.status IN ('SUCCEEDED','NEEDS_REVIEW','FAILED','QUARANTINED')
     AND COALESCE(d.processed_at, d.updated_at) >= b.round_opened_at)::int AS round_completed,
@@ -460,22 +467,30 @@ const BATCH_AGGREGATE = `SELECT b.id, b.label, b.created_at, b.expected_total, b
   count(d.id) FILTER (WHERE d.parent_document_id IS NULL AND d.status NOT IN ${OPEN_STATUS_SQL}
     AND NOT EXISTS (SELECT 1 FROM documents c WHERE c.organization_id = d.organization_id AND c.parent_document_id = d.id
                     AND c.deleted_at IS NULL AND c.status IN ${OPEN_STATUS_SQL}))::int AS files_done
-FROM ocr_batches b
-LEFT JOIN documents d ON d.batch_id = b.id AND d.organization_id = b.organization_id AND d.deleted_at IS NULL AND d.status <> 'DELETED'`;
-const BATCH_SELECT = `${BATCH_AGGREGATE}
-WHERE b.organization_id = $1::uuid AND ($2::uuid IS NULL OR b.id = $2::uuid)
-GROUP BY b.id ORDER BY b.created_at DESC, b.id DESC LIMIT $3`;
-/** D11: the open batches (something still queued or reading), in queue order. All of them: the caller pages and totals. */
-const OPEN_BATCH_SELECT = `${BATCH_AGGREGATE}
-WHERE b.organization_id = $1::uuid
-GROUP BY b.id HAVING count(d.id) FILTER (WHERE d.status IN ${OPEN_STATUS_SQL}) > 0
+  FROM documents d
+  WHERE d.batch_id = b.id AND d.organization_id = b.organization_id AND d.deleted_at IS NULL AND d.status <> 'DELETED') a`;
+/** The batch strip's read (newest first). Exported for the plan-shape test. */
+export const BATCH_SELECT = `WITH chosen AS MATERIALIZED (SELECT * FROM ocr_batches
+  WHERE organization_id = $1::uuid AND ($2::uuid IS NULL OR id = $2::uuid) ORDER BY created_at DESC, id DESC LIMIT $3)
+${BATCH_AGGREGATE}
+ORDER BY b.created_at DESC, b.id DESC`;
+/** The ids of the tenant's open batches (a document still queued or reading), from the (organization_id, status) index. */
+const OPEN_BATCH_IDS = `SELECT o.batch_id FROM documents o WHERE o.organization_id = $1::uuid AND o.status IN ${OPEN_STATUS_SQL}
+  AND o.batch_id IS NOT NULL AND o.deleted_at IS NULL`;
+/**
+ * D11: the open batches (something still queued or reading), in queue order. All of them: the caller pages and totals.
+ * The open set is chosen before anything is aggregated, so finished batches cost nothing. Exported for the plan-shape test.
+ */
+export const OPEN_BATCH_SELECT = `WITH chosen AS MATERIALIZED (SELECT * FROM ocr_batches WHERE organization_id = $1::uuid AND id IN (${OPEN_BATCH_IDS}))
+${BATCH_AGGREGATE}
 ORDER BY b.queue_seq ASC NULLS LAST, b.created_at, b.id`;
-/** The open batches' ids in queue order: the `queuePosition` of the batch strip's own reads. */
-const OPEN_BATCH_ORDER = `SELECT b.id FROM ocr_batches b WHERE b.organization_id = $1::uuid
-  AND EXISTS (SELECT 1 FROM documents d WHERE d.organization_id = b.organization_id AND d.batch_id = b.id AND d.deleted_at IS NULL AND d.status IN ${OPEN_STATUS_SQL})
+/** The open batches' ids in queue order: the `queuePosition` of the batch strip's own reads (only run when one is open). */
+const OPEN_BATCH_ORDER = `SELECT b.id FROM ocr_batches b WHERE b.organization_id = $1::uuid AND b.id IN (${OPEN_BATCH_IDS})
   ORDER BY b.queue_seq ASC NULLS LAST, b.created_at, b.id`;
 
 type Row = Record<string, unknown>;
+/** A BATCH_AGGREGATE row with a document still queued or reading. */
+function isOpenRow(row: Row): boolean { return Number(row.queued ?? 0) + Number(row.processing ?? 0) > 0; }
 /** A replayed upload that is still SCANNING/CLEAN without a job after this long belongs to a request that died. */
 const RESUME_AFTER = "2 minutes";
 /** A short batch with nothing queued/processing stops its clock only after this long without a new document or completion
@@ -1223,7 +1238,8 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     return this.tenantTransaction(tenantId, async (client) => {
       const result = await client.query<Row>(BATCH_SELECT, [tenantId, batchId, 1]);
       if (!result.rows[0]) return null;
-      const positions = await this.openBatchPositions(client, tenantId);
+      // A closed batch has no queue position: the ordered open-batch query only runs for an open one.
+      const positions = isOpenRow(result.rows[0]) ? await this.openBatchPositions(client, tenantId) : new Map<string, number>();
       return toBatchSummary(result.rows[0], positions.get(String(result.rows[0].id)) ?? null);
     });
   }
@@ -1232,7 +1248,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
   async listBatches(tenantId: string, limit = 20): Promise<BatchSummary[]> {
     return this.tenantTransaction(tenantId, async (client) => {
       const result = await client.query<Row>(BATCH_SELECT, [tenantId, null, clampInt(limit, 20, 1, 100)]);
-      const positions = await this.openBatchPositions(client, tenantId);
+      const positions = result.rows.some(isOpenRow) ? await this.openBatchPositions(client, tenantId) : new Map<string, number>();
       return result.rows.map((row) => toBatchSummary(row, positions.get(String(row.id)) ?? null));
     });
   }
@@ -1624,7 +1640,7 @@ export class PostgresOcrDocumentStore implements ReviewStore {
    * `GET /api/queue` (Public Contracts): the control row, totals over every open batch, the first QUEUE_BATCHES_SHOWN
    * of them, the measured rate and the ETAs. Everything is derived on read; nothing is stored.
    */
-  async getQueueOverview(tenantId: string): Promise<QueueOverview> {
+  async getQueueOverview(tenantId: string): Promise<QueueOverview<BatchSummary>> {
     const control = await this.getQueueControl();
     const batches = await this.listOpenBatches(tenantId);
     const rate = await this.measureRate(tenantId);
