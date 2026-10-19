@@ -308,7 +308,7 @@ describe("queue control against PostgreSQL as the runtime roles", { skip: skipWi
 
   // The bound is on the MEDIAN of 7 warm runs (recorded deviation DEV-2): on a shared, heavily loaded laptop the slowest
   // single run measures the scheduler, not the query. Every run is printed for the report.
-  test("timing: getQueueOverview over 30,000 documents in 250 open batches stays under 300 ms (median of 7 warm runs)", { timeout: 300_000 }, async (t) => {
+  test("timing: getQueueOverview over 30,000 documents in 250 open batches stays under 300 ms (median of 7 warm runs)", { timeout: 900_000 }, async (t) => {
     await orgs();
     await db.superDb.query(`
       WITH batches AS (
