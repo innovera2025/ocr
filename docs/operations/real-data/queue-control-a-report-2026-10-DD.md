@@ -19,7 +19,9 @@ value, no file name, no credential. Sections marked PENDING are filled at Phase 
 - **Export default.** The export dialog opens with รอตรวจสอบ, อ่านสำเร็จ, ยืนยันแล้ว ticked; button
   `เฉพาะที่อ่านเสร็จแล้ว`.
 - **Operator script.** `deploy/sql/queue-reorder-once.sql` (dry run / apply / revert) reorders the jobs queued before the
-  deploy, with a backup table.
+  deploy, with a backup table. It refuses unless run as the superuser (or a BYPASSRLS role), refuses an apply while any
+  `queue_reorder_backup_*` table exists, and a revert needs `-v backup_date=YYYYMMDD` (the date in the apply's backup
+  table name, printed by the apply). In production nearly every PENDING job changes (all carry old priorities 107-208).
 
 ## Code and verification (local, 2026-10-19)
 
@@ -31,7 +33,7 @@ counts and the recorded deviations (DEV-1 backfill under FORCE RLS, DEV-2 timing
 | Step | Gate | Result |
 |---|---|---|
 | Merge to GitHub `main`, tag `queue-control-a-1` | AP-1 | PENDING |
-| Pre-flight (read-only): head, images, `/health/ready`, migrations end `0021`, `ocr_batches` owner = `ocr_migrator` (DEV-1) | - | PENDING |
+| Pre-flight (read-only): head, images, `/health/ready`, `schema_migrations` ends `0021`, `ocr_batches` owner = `ocr_migrator` (DEV-1; already confirmed 2026-10-19) | - | PENDING |
 | Backup (dump sha256, image tags `pre-queue-control-a`) + web deploy, migration `0022` | AP-2 | PENDING |
 | Reorder dry run counts, then apply (backup table name, rows) | AP-3 | PENDING |
 | Worker swap | AP-4 | PENDING |
@@ -40,6 +42,16 @@ counts and the recorded deviations (DEV-1 backfill under FORCE RLS, DEV-2 timing
 | User check UC-A | user | PENDING |
 
 ## Known limitations and notes
+
+- Do AP-2, AP-3 and AP-4 on the same day: between them new uploads (queue_seq 253+) sit behind the old PENDING jobs, and
+  the old worker still creates page jobs with old priorities.
+- N1: exactly one worker process is supported (the round slot count is in-process).
+- N2: a stopped or round-full queue also pauses PDF splitting; new uploads show no pages until reading resumes.
+- N3: Stop, Resume, N and the round counter are deployment-wide.
+- N4: upload order inside a batch is approximate (enqueue time); a PDF's pages always stay together and in order.
+- N5: jobs without a batch have priority 0 and run before every batch.
+- Overview read cost (production-shaped seed, loaded laptop): median 149 ms, p95 294 ms; served from a 2 s per-tenant
+  cache. The batch strip: median 34 ms.
 
 - The control row is deployment-wide: a second organization would share Stop/Resume and N (backlog note in the plan's
   feature folder).
