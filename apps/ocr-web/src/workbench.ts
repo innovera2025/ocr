@@ -1045,7 +1045,9 @@ function queueCap(c){return isObj(c)&&typeof c.roundCap==='number'&&isFinite(c.r
 function queueFull(c){const cap=queueCap(c);return cap!==null&&qNum(c,'roundDone')>=cap;}
 /* Reading, not stopped, and something still waiting or being read: the 5 s cadence; otherwise 15 s. */
 function queueActive(){const q=state.queue;if(!q||!isObj(q.control)||!isObj(q.overview))return false;return q.control.stopped!==true&&!queueFull(q.control)&&qNum(q.overview,'pagesWaiting')+qNum(q.overview,'pagesReading')>0;}
-function scheduleQueue(){clearTimeout(state.qTimer);state.qTimer=0;if(state.leaving||document.hidden)return;state.qTimer=setTimeout(()=>{loadQueue(false);},queueActive()?QUEUE_ACTIVE_MS:QUEUE_IDLE_MS);}
+/* The timer is armed after a load has finished, so its own loads are always 5 s or more apart (forced: a timer that
+   fires a few ms early must not be pushed back by the 5 s guard and double the interval). */
+function scheduleQueue(){clearTimeout(state.qTimer);state.qTimer=0;if(state.leaving||document.hidden)return;state.qTimer=setTimeout(()=>{loadQueue(true);},queueActive()?QUEUE_ACTIVE_MS:QUEUE_IDLE_MS);}
 /* GET /api/queue at most every 5 s (force: right after a control action or a login). A login stops it like tick. */
 async function loadQueue(force){clearTimeout(state.qTimer);state.qTimer=0;if(state.leaving||!state.started)return;
 if(state.authWait){const wait=state.authWait;if(state.qRearm!==wait){state.qRearm=wait;wait.then(()=>loadQueue(true),()=>undefined);}return;}

@@ -148,7 +148,9 @@ const EXPOSE = "globalThis.__wb={wire,init,checkSession,requireLogin,api,loadDoc
 class FakeClock {
   seq = 0;
   readonly timers = new Map<number, () => void>();
-  readonly set = (fn: () => void): number => { this.seq += 1; this.timers.set(this.seq, fn); return this.seq; };
+  /** The delay each timer was armed with (the queue panel's 5 s / 15 s cadence is asserted from it). */
+  readonly delays = new Map<number, number>();
+  readonly set = (fn: () => void, ms?: number): number => { this.seq += 1; this.timers.set(this.seq, fn); this.delays.set(this.seq, ms ?? 0); return this.seq; };
   readonly clear = (id: number): void => { this.timers.delete(id); };
   run(id: number): void { const fn = this.timers.get(id); this.timers.delete(id); fn?.(); }
 }
@@ -2412,6 +2414,7 @@ test("poll cadence: the 3 s tick never calls /api/queue; the panel's own timer i
   const ctx = await queuePage(STAFF, () => body);
   const armed = ctx.wb.state.qTimer;
   assert.ok(armed !== 0 && ctx.clock.timers.has(armed), "init armed the panel's own timer");
+  assert.equal(ctx.clock.delays.get(armed), 5000, "reading with pages waiting: 5 s");
   ctx.calls.length = 0;
   await ctx.wb.tick();
   await settle();
@@ -2420,7 +2423,6 @@ test("poll cadence: the 3 s tick never calls /api/queue; the panel's own timer i
   await ctx.wb.loadQueue(false);
   await settle();
   assert.equal(ctx.calls.filter((call) => call.url === "/api/queue").length, 0, "at most one call per 5 s");
-  ctx.wb.state.qLast = 0;
   ctx.clock.run(ctx.wb.state.qTimer);
   await settle();
   assert.equal(ctx.calls.filter((call) => call.url === "/api/queue").length, 1, "the timer fires one load");
@@ -2429,6 +2431,7 @@ test("poll cadence: the 3 s tick never calls /api/queue; the panel's own timer i
   await ctx.wb.loadQueue(false);
   await settle();
   assert.ok(ctx.wb.state.qTimer !== 0, "re-armed");
+  assert.equal(ctx.clock.delays.get(ctx.wb.state.qTimer), 15000, "stopped: 15 s");
   for (const call of ctx.calls.filter((entry) => entry.url === "/api/queue")) assert.equal(call.headers["X-OCR-Background"], "1", "background polling");
 });
 
