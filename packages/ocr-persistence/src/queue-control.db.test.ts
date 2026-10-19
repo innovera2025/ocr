@@ -6,6 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { loadavg } from "node:os";
 import { after, before, describe, test } from "node:test";
 import { Pool } from "pg";
 import type { QueueActor } from "./index.js";
@@ -215,5 +216,137 @@ describe("queue control against PostgreSQL as the runtime roles", { skip: skipWi
     gates.push(blind);
     await assert.rejects(blind.reserve(), { code: "42501" });
     await reset();
+  });
+
+  // ---- D11 progress read model (Phase 3.5) -----------------------------------------------------------------------
+
+  const TENANT_O = randomUUID(), TENANT_P = randomUUID(), TENANT_T = randomUUID();
+  let orgsReady = false;
+  async function orgs() {
+    if (orgsReady) return;
+    await db.superDb.query("INSERT INTO organizations(id, name) VALUES ($1, 'Overview'), ($2, 'Other'), ($3, 'Timing')", [TENANT_O, TENANT_P, TENANT_T]);
+    orgsReady = true;
+  }
+  /** A batch and its documents written directly (superuser): `files` are [status, pages?, pageStatuses?]. */
+  async function seedBatch(tenantId: string, files: Array<{ status: string; pages?: string[] }>, createdAt = "2026-10-18T00:00:00Z"): Promise<string> {
+    const batchId = (await db.superDb.query<{ id: string }>("INSERT INTO ocr_batches(organization_id, created_by, expected_total, created_at) VALUES ($1, 'seed', $2, $3) RETURNING id",
+      [tenantId, files.length, createdAt])).rows[0]!.id;
+    for (const file of files) {
+      const isPdf = file.pages !== undefined;
+      const parent = (await db.superDb.query<{ id: string }>(
+        `INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, batch_id, page_count, processed_at)
+         VALUES (gen_random_uuid(), $1, md5(random()::text), $2::document_status, 'seed', $3, 1, 'h', $4, $5,
+                 CASE WHEN $2::text IN ('SUCCEEDED','NEEDS_REVIEW','FAILED','SPLIT') THEN now() END) RETURNING id`,
+        [tenantId, file.status, isPdf ? "application/pdf" : "image/png", batchId, isPdf ? file.pages!.length : null])).rows[0]!.id;
+      for (const [index, status] of (file.pages ?? []).entries()) {
+        await db.superDb.query(
+          `INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, batch_id, parent_document_id, page_number, page_count, processed_at)
+           VALUES (gen_random_uuid(), $1, md5(random()::text), $2::document_status, 'seed', 'image/png', 1, 'h', $3, $4, $5, $6,
+                   CASE WHEN $2::text IN ('SUCCEEDED','NEEDS_REVIEW','FAILED') THEN now() END)`,
+          [tenantId, status, batchId, parent, index + 1, file.pages!.length]);
+      }
+    }
+    return batchId;
+  }
+
+  test("open batches: finished and fully failed batches are out, one CLEAN row is enough; queue order; filesDone for split PDFs; totals = sum", async () => {
+    await orgs();
+    const finished = await seedBatch(TENANT_O, [{ status: "SUCCEEDED" }, { status: "SPLIT", pages: ["SUCCEEDED", "NEEDS_REVIEW"] }], "2026-10-18T01:00:00Z");
+    const failed = await seedBatch(TENANT_O, [{ status: "FAILED" }, { status: "QUARANTINED" }], "2026-10-18T02:00:00Z");
+    const oneClean = await seedBatch(TENANT_O, [{ status: "SUCCEEDED" }, { status: "CLEAN" }], "2026-10-18T03:00:00Z");
+    // Two split PDFs: one fully read (a done file), one with a page still waiting; an image read; a PDF not split yet.
+    const mixed = await seedBatch(TENANT_O, [{ status: "SPLIT", pages: ["SUCCEEDED", "FAILED", "NEEDS_REVIEW"] }, { status: "SPLIT", pages: ["SUCCEEDED", "CLEAN"] },
+      { status: "SUCCEEDED" }, { status: "PROCESSING" }], "2026-10-18T00:30:00Z");
+    // queue_seq decides, not created_at: the newest batch (oneClean) is renumbered to the front.
+    await db.superDb.query("UPDATE ocr_batches SET queue_seq = 1000000 + (SELECT count(*) FROM ocr_batches) WHERE id = $1", [mixed]);
+    await db.superDb.query("UPDATE ocr_batches SET queue_seq = 1 WHERE id = $1", [oneClean]).catch(async () => {
+      await db.superDb.query("UPDATE ocr_batches SET queue_seq = (SELECT min(queue_seq) - 1 FROM ocr_batches) WHERE id = $1", [oneClean]);
+    });
+    const open = await db.app.listOpenBatches(TENANT_O);
+    assert.deepEqual(open.map((batch) => batch.batchId), [oneClean, mixed], "finished and fully failed batches are not open; queue_seq order");
+    assert.deepEqual(open.map((batch) => batch.queuePosition), [1, 2]);
+    const m = open[1]!;
+    assert.deepEqual([m.uploaded, m.filesDone, m.rows, m.completed, m.failed, m.queued, m.processing, m.rowsExpected], [4, 2, 7, 5, 1, 1, 1, 7],
+      "files done: the fully read PDF and the image; the PDF with a waiting page and the unsplit PDF are not");
+    const overview = await db.app.getQueueOverview(TENANT_O);
+    assert.equal(overview.batchesTotal, 2);
+    assert.deepEqual([overview.overview.pagesTotal, overview.overview.pagesRead, overview.overview.pagesWaiting, overview.overview.pagesReading, overview.overview.filesDone,
+      overview.overview.filesUploaded, overview.overview.heldPages], [open.reduce((t, b) => t + b.rowsExpected, 0), open.reduce((t, b) => t + b.completed, 0),
+      open.reduce((t, b) => t + b.queued, 0), open.reduce((t, b) => t + b.processing, 0), open.reduce((t, b) => t + b.filesDone, 0), open.reduce((t, b) => t + b.uploaded, 0), 0]);
+    assert.equal(overview.holdsAvailable, false, "Release A: no holds");
+    // The strip's own reads carry the same position; a closed batch has none.
+    assert.equal((await db.app.getBatch(TENANT_O, mixed))!.queuePosition, 2);
+    assert.equal((await db.app.getBatch(TENANT_O, finished))!.queuePosition, null);
+    assert.deepEqual((await db.app.listBatches(TENANT_O)).filter((batch) => batch.batchId === failed).map((batch) => batch.queuePosition), [null]);
+    // Tenant isolation: another organization sees none of these batches, and its totals are its own.
+    await seedBatch(TENANT_P, [{ status: "CLEAN" }]);
+    assert.deepEqual((await db.app.listOpenBatches(TENANT_P)).map((batch) => batch.uploaded), [1]);
+    assert.equal((await db.app.getQueueOverview(TENANT_P)).overview.pagesTotal, 1);
+    assert.ok((await db.app.listOpenBatches(TENANT_O)).every((batch) => batch.batchId !== undefined && batch.batchId !== null));
+  });
+
+  test("measured rate from processed_at: the last 21 reads of the last 24 h, a 20-minute stop ignored, null with fewer than 5 gaps", async () => {
+    await orgs();
+    const tenant = randomUUID();
+    await db.superDb.query("INSERT INTO organizations(id, name) VALUES ($1, 'Rate')", [tenant]);
+    const batchId = await seedBatch(tenant, [{ status: "CLEAN" }]);
+    const read = async (secondsAgo: number, status = "SUCCEEDED") => db.superDb.query(
+      `INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, batch_id, processed_at)
+       VALUES (gen_random_uuid(), $1, md5(random()::text), $2::document_status, 'seed', 'image/png', 1, 'h', $3, now() - $4 * interval '1 second')`, [tenant, status, batchId, secondsAgo]);
+    assert.deepEqual(await db.app.measureRate(tenant), { secondsPerPage: null, sample: 0 });
+    for (const ago of [4000, 3800, 3600]) await read(ago);
+    assert.equal((await db.app.measureRate(tenant)).secondsPerPage, null, "2 gaps");
+    // A 20-minute stop, then reads every 190 s; a FAILED read and a read older than 24 h never count.
+    for (const ago of [2400, 2210, 2020, 1830, 1640]) await read(ago);
+    await read(1500, "FAILED");
+    await read(90_000);
+    await read(1450, "NEEDS_REVIEW");
+    const rate = await db.app.measureRate(tenant);
+    assert.deepEqual(rate, { secondsPerPage: 190, sample: 7 }, "9 reads → 8 gaps: 200, 200, (1200 s stop dropped), 190 × 5");
+    assert.equal((await db.app.getQueueOverview(tenant)).overview.secondsPerPage, 190);
+  });
+
+  // The bound is on the MEDIAN of 7 warm runs (recorded deviation DEV-2): on a shared, heavily loaded laptop the slowest
+  // single run measures the scheduler, not the query. Every run is printed for the report.
+  test("timing: getQueueOverview over 30,000 documents in 250 open batches stays under 300 ms (median of 7 warm runs)", { timeout: 300_000 }, async (t) => {
+    await orgs();
+    await db.superDb.query(`
+      WITH batches AS (
+        INSERT INTO ocr_batches(organization_id, created_by, expected_total, created_at)
+        SELECT $1, 'seed', 20, now() - interval '2 days' + g * interval '1 minute' FROM generate_series(1, 250) g RETURNING id),
+      parents AS (
+        INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, batch_id, page_count, processed_at)
+        SELECT gen_random_uuid(), $1, md5(random()::text || g), 'SPLIT', 'seed.pdf', 'application/pdf', 1, 'h', b.id, 25, now() - interval '1 day'
+        FROM batches b CROSS JOIN generate_series(1, 4) g RETURNING id, batch_id),
+      pages AS (
+        INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, batch_id, parent_document_id, page_number, page_count, processed_at)
+        SELECT gen_random_uuid(), $1, md5(random()::text || p.id::text || g), CASE WHEN g <= 6 THEN 'SUCCEEDED'::document_status ELSE 'CLEAN'::document_status END,
+               'seed.pdf', 'image/png', 1, 'h', p.batch_id, p.id, g, 25, CASE WHEN g <= 6 THEN now() - (g * interval '190 seconds') END
+        FROM parents p CROSS JOIN generate_series(1, 25) g RETURNING 1)
+      INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, batch_id)
+      SELECT gen_random_uuid(), $1, md5(random()::text || b.id::text || g), 'CLEAN', 'seed.png', 'image/png', 1, 'h', b.id
+      FROM batches b CROSS JOIN generate_series(1, 16) g`, [TENANT_T]);
+    await db.superDb.query("ANALYZE documents; ANALYZE ocr_batches");
+    const count = (await db.superDb.query<{ n: number }>("SELECT count(*)::int AS n FROM documents WHERE organization_id = $1", [TENANT_T])).rows[0]!.n;
+    assert.equal(count, 30_000);
+    await db.app.getQueueOverview(TENANT_T); // warm-up
+    const runs: number[] = [];
+    let overview = await db.app.getQueueOverview(TENANT_T);
+    for (let run = 0; run < 7; run += 1) {
+      const started = performance.now();
+      overview = await db.app.getQueueOverview(TENANT_T);
+      runs.push(Math.round(performance.now() - started));
+    }
+    const strip: number[] = [];
+    for (let run = 0; run < 7; run += 1) {
+      const started = performance.now();
+      await db.app.listBatches(TENANT_T, 20);
+      strip.push(Math.round(performance.now() - started));
+    }
+    const middle = (values: number[]) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]!;
+    t.diagnostic(`getQueueOverview ms over 7 warm runs: ${runs.join(", ")} (median ${middle(runs)}); listBatches(20) ms: ${strip.join(", ")} (median ${middle(strip)}); host load ${loadavg().map((value) => value.toFixed(1)).join(" / ")}`);
+    assert.deepEqual([overview.batchesTotal, overview.batches.length, overview.overview.pagesTotal, overview.overview.pagesRead, overview.overview.filesUploaded],
+      [250, 50, 29_000, 6000, 5000], "29,000 page/image rows (the 1,000 SPLIT parents are no rows), 6,000 read, 5,000 files");
+    assert.ok(middle(runs) < 300, `median ${middle(runs)} ms (runs ${runs.join(", ")})`);
   });
 });

@@ -40,7 +40,8 @@ export type WorkbenchStore = Readonly<{
   saveReview(tenantId: string, documentId: string, input: { structuredResult: unknown; reviewedBy: string; expectedUpdatedAt?: string; audit?: AuditContext }): Promise<{ corrections: number; delivery: "PENDING" | "NOT_REQUIRED"; document: unknown }>;
   /** D10's name pre-check, one entry per name in input order (`{index, exists, document?}`); absent → NAME_CHECK_NOT_CONFIGURED. */
   findFilenameDuplicates?(tenantId: string, names: readonly string[]): Promise<ReadonlyArray<{ index: number; exists: boolean }>>;
-  /** Queue control (plan queue-control D7, D10, D14); absent → QUEUE_NOT_CONFIGURED. */
+  /** Queue control (plan queue-control D7, D10, D11, D14); absent → QUEUE_NOT_CONFIGURED. `getQueueOverview` is the panel's read. */
+  getQueueOverview?(tenantId: string): Promise<object>;
   stopQueue?(tenantId: string, actor: QueueActor): Promise<QueueControlChange>;
   resumeQueue?(tenantId: string, actor: QueueActor): Promise<QueueControlChange>;
   setRoundCap?(tenantId: string, cap: unknown, actor: QueueActor): Promise<QueueControlChange>;
@@ -368,6 +369,12 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
       const batch = await store.getBatch(ctx.tenantId, uuidOr404(batchMatch[1]!, "BATCH_NOT_FOUND"));
       if (!batch) throw new Error("BATCH_NOT_FOUND");
       respond(response, 200, batch);
+      return true;
+    }
+    if (pathname === "/api/queue" && method === "GET") {
+      const store = workbench();
+      if (!store.getQueueOverview) throw new Error("QUEUE_NOT_CONFIGURED");
+      respond(response, 200, await store.getQueueOverview(ctx.tenantId));
       return true;
     }
     const queueAction = method === "POST" ? QUEUE_ACTIONS[pathname as keyof typeof QUEUE_ACTIONS] : undefined;

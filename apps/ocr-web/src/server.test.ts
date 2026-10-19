@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { createAppServer, errorStatus, NAME_CHECK_LIMIT, routeLabel, workbenchCsp, type AppDependencies, type DocumentListQuery, type WorkbenchStore } from "./server.js";
 import { csrfTokenFor, type AuthContext } from "@innovera/ocr-auth";
 import type { IngestDependencies } from "@innovera/ocr-ingest";
-import { DuplicateFilenameError, parseRoundCap, parseRoundNo, RoundAlreadyStartedError, type FilenameDuplicate, type QueueActor, type ReviewDocument } from "@innovera/ocr-persistence";
+import { DuplicateFilenameError, parseRoundCap, parseRoundNo, queueOverview, RoundAlreadyStartedError, type FilenameDuplicate, type QueueActor, type ReviewDocument } from "@innovera/ocr-persistence";
 
 const tenant = "00000000-0000-0000-0000-000000000001";
 const documentId = "00000000-0000-0000-0000-000000000002";
@@ -734,6 +734,10 @@ function queueHarness(options: { role?: "admin" | "staff"; withStore?: boolean }
       control.roundCap = parsed;
       return { changed, control: snapshot() };
     },
+    getQueueOverview: async (tenantId: string) => {
+      calls.push({ method: "getQueueOverview", args: [tenantId] });
+      return queueOverview(snapshot(), [], { secondsPerPage: null, sample: 0 }, false);
+    },
     startNextRound: async (tenantId: string, roundNo: unknown, actor: QueueActor) => {
       calls.push({ method: "startNextRound", args: [tenantId, roundNo, actor.displayName] });
       const expected = parseRoundNo(roundNo);
@@ -824,4 +828,25 @@ test("a store without the queue methods answers 503 QUEUE_NOT_CONFIGURED; the ro
   for (const path of ["/api/queue", "/api/queue/stop", "/api/queue/resume", "/api/queue/round-cap", "/api/queue/next-round"]) assert.equal(routeLabel(path), path);
   assert.equal(routeLabel("/api/queue/other"), "unmatched");
   assert.deepEqual(["ROUND_CAP_INVALID", "ROUND_INVALID", "ROUND_ALREADY_STARTED", "QUEUE_NOT_CONFIGURED"].map(errorStatus), [400, 400, 409, 503]);
+});
+
+test("GET /api/queue: any signed-in user reads the overview of the session's tenant; 401 without a session; 503 without the store", async () => {
+  const h = queueHarness({ role: "staff" });
+  await withQueueServer(h, async (base) => {
+    await expectError(await fetch(`${base}/api/queue`), 401, "UNAUTHENTICATED");
+    h.setRole("admin");
+    await fetch(`${base}/api/queue/stop`, { method: "POST", headers: jsonAuth, body: "{}" });
+    h.setRole("staff");
+    const response = await fetch(`${base}/api/queue`, { headers: { ...auth, "x-ocr-background": "1" } });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.equal(text.includes(userId), false, "no id of the stopping user");
+    const payload = JSON.parse(text) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(payload).sort(), ["batches", "batchesTotal", "control", "holdsAvailable", "overview"]);
+    assert.deepEqual([(payload.control as { stoppedBy: string }).stoppedBy, payload.holdsAvailable], [ADMIN_NAME, false]);
+    assert.deepEqual(h.calls.at(-1), { method: "getQueueOverview", args: [tenant] });
+    assert.equal((await fetch(`${base}/api/queue`, { method: "POST", headers: jsonAuth, body: "{}" })).status, 404, "GET only");
+  });
+  const bare = queueHarness({ withStore: false });
+  await withQueueServer(bare, async (base) => { await expectError(await fetch(`${base}/api/queue`, { headers: auth }), 503, "QUEUE_NOT_CONFIGURED"); });
 });

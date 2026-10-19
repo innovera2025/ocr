@@ -6,8 +6,8 @@ import { CONFIDENCE_SORT_MAX_ROWS, DEFAULT_ORDER_SQL, documentOrderSql, parseDoc
 import { isUuid, withTenant } from "./tenant.js";
 import { DOCUMENT_STATUS_CATEGORIES, type DeliveryStatus, type DocumentStatusCategory } from "./labels.js";
 import { canonicalFilenameKey, FILENAME_KEY_SQL_WS_PATTERN, filenameKeySql } from "./filename-key.js";
-import { parseRoundCap, parseRoundNo, RoundAlreadyStartedError, stoppedByName, toQueueControlState, type QueueActor, type QueueControlChange,
-  type QueueControlState } from "./queue-control.js";
+import { parseRoundCap, parseRoundNo, queueOverview, RATE_COMPLETIONS, rateFromCompletions, RoundAlreadyStartedError, stoppedByName, toQueueControlState,
+  type QueueActor, type QueueControlChange, type QueueControlState, type QueueOverview, type QueueRate } from "./queue-control.js";
 import { EXPORT_SELECTION_MAX, type DocumentFilter, type ExportCandidate, type ExportCandidatesResult, type ExportDocument, type ExportMarkInput,
   type ExportMarkResult, type ExportState, type ExportStateChangeInput } from "./export.js";
 
@@ -154,7 +154,15 @@ export type BatchSummary = { batchId: string; label: string | null; createdAt: s
    * all three null. `roundStartedAt` is the first claim of that round, so it stays null until the worker picks a row up. */
   roundOpenedAt: string | null;
   roundStartedAt: string | null;
-  roundCompleted: number /* rows completed since the round opened; 0 while no round is open */ };
+  roundCompleted: number /* rows completed since the round opened; 0 while no round is open */;
+  /** 0022 (queue-control D3/D11): the batch's queue number, its 1-based position among the OPEN batches in queue order
+   * (null once nothing of it is queued or reading), and the files all of whose rows are read. */
+  queueSeq: number | null;
+  queuePosition: number | null;
+  filesDone: number;
+  /** Per-batch Stop/Resume is Release B (0023); in Release A a batch is never paused. */
+  paused: boolean;
+  pausedAt: string | null };
 /** `createdBy` is `users.id` (§6 D9); `audit` writes `batch.created` in the same transaction. */
 export type CreateBatchInput = { createdBy: string; expectedTotal: number; label?: string | null | undefined; audit?: AuditContext | undefined };
 export type DocumentListItem = { documentId: string; batchId: string | null; filename: string; mimeType: string;
@@ -423,11 +431,15 @@ ${CORRECTION_ACTOR_JOIN}`;
  */
 const EXPORT_ORDER = "ORDER BY d.created_at, COALESCE(d.parent_document_id, d.id), d.page_number ASC NULLS FIRST, d.id";
 
+/** A document still waiting or being read (queued + processing): what makes a batch "open" in the queue (D11). */
+const OPEN_STATUS_SQL = "('VALIDATING','SCANNING','CLEAN','PROCESSING')";
 /**
  * Counters are derived from document rows on every read (nothing stored, nothing to drift). `uploaded` counts files
- * (top-level documents), the status counters count visible rows (SPLIT parents match none of them).
+ * (top-level documents), the status counters count visible rows (SPLIT parents match none of them). `files_done`
+ * (D11): top-level documents that are no longer open and none of whose page rows is open. Shared by BATCH_SELECT and
+ * OPEN_BATCH_SELECT, so the batch strip and the queue panel can never count differently.
  */
-const BATCH_SELECT = `SELECT b.id, b.label, b.created_at, b.expected_total, now() AS db_now, b.round_opened_at,
+const BATCH_AGGREGATE = `SELECT b.id, b.label, b.created_at, b.expected_total, b.queue_seq, now() AS db_now, b.round_opened_at,
   min(d.processing_started_at) FILTER (WHERE b.round_opened_at IS NOT NULL AND d.processing_started_at >= b.round_opened_at) AS round_started_at,
   count(d.id) FILTER (WHERE b.round_opened_at IS NOT NULL AND d.status IN ('SUCCEEDED','NEEDS_REVIEW','FAILED','QUARANTINED')
     AND COALESCE(d.processed_at, d.updated_at) >= b.round_opened_at)::int AS round_completed,
@@ -444,11 +456,24 @@ const BATCH_SELECT = `SELECT b.id, b.label, b.created_at, b.expected_total, now(
   count(d.id) FILTER (WHERE d.status IN ('FAILED','QUARANTINED'))::int AS failed,
   count(d.id) FILTER (WHERE d.status = 'SUCCEEDED' AND ${REVIEWED_AT_SQL} IS NOT NULL)::int AS confirmed,
   max(COALESCE(d.processed_at, d.updated_at)) FILTER (WHERE d.status IN ('SUCCEEDED','NEEDS_REVIEW','FAILED','QUARANTINED')) AS last_completed_at,
-  max(d.created_at) AS last_created_at
+  max(d.created_at) AS last_created_at,
+  count(d.id) FILTER (WHERE d.parent_document_id IS NULL AND d.status NOT IN ${OPEN_STATUS_SQL}
+    AND NOT EXISTS (SELECT 1 FROM documents c WHERE c.organization_id = d.organization_id AND c.parent_document_id = d.id
+                    AND c.deleted_at IS NULL AND c.status IN ${OPEN_STATUS_SQL}))::int AS files_done
 FROM ocr_batches b
-LEFT JOIN documents d ON d.batch_id = b.id AND d.organization_id = b.organization_id AND d.deleted_at IS NULL AND d.status <> 'DELETED'
+LEFT JOIN documents d ON d.batch_id = b.id AND d.organization_id = b.organization_id AND d.deleted_at IS NULL AND d.status <> 'DELETED'`;
+const BATCH_SELECT = `${BATCH_AGGREGATE}
 WHERE b.organization_id = $1::uuid AND ($2::uuid IS NULL OR b.id = $2::uuid)
 GROUP BY b.id ORDER BY b.created_at DESC, b.id DESC LIMIT $3`;
+/** D11: the open batches (something still queued or reading), in queue order. All of them: the caller pages and totals. */
+const OPEN_BATCH_SELECT = `${BATCH_AGGREGATE}
+WHERE b.organization_id = $1::uuid
+GROUP BY b.id HAVING count(d.id) FILTER (WHERE d.status IN ${OPEN_STATUS_SQL}) > 0
+ORDER BY b.queue_seq ASC NULLS LAST, b.created_at, b.id`;
+/** The open batches' ids in queue order: the `queuePosition` of the batch strip's own reads. */
+const OPEN_BATCH_ORDER = `SELECT b.id FROM ocr_batches b WHERE b.organization_id = $1::uuid
+  AND EXISTS (SELECT 1 FROM documents d WHERE d.organization_id = b.organization_id AND d.batch_id = b.id AND d.deleted_at IS NULL AND d.status IN ${OPEN_STATUS_SQL})
+  ORDER BY b.queue_seq ASC NULLS LAST, b.created_at, b.id`;
 
 type Row = Record<string, unknown>;
 /** A replayed upload that is still SCANNING/CLEAN without a job after this long belongs to a request that died. */
@@ -502,7 +527,7 @@ function clampInt(value: unknown, fallback: number, min: number, max: number): n
  * processing row while it is split and its pages are queued rows after, so a 1-file batch is not finished after its first
  * page (the old rule `completed >= expectedTotal` counted rows against files).
  */
-export function toBatchSummary(row: Row): BatchSummary {
+export function toBatchSummary(row: Row, queuePosition: number | null = null): BatchSummary {
   const createdAt = ms(row.created_at) ?? 0;
   const expectedTotal = num(row.expected_total);
   const uploaded = num(row.uploaded), succeeded = num(row.succeeded), needsReview = num(row.needs_review), failed = num(row.failed);
@@ -533,7 +558,9 @@ export function toBatchSummary(row: Row): BatchSummary {
     rows, pages, pagesExpected, splitting: num(row.splitting), rowsExpected,
     queued, processing, succeeded, needsReview, failed, confirmed: num(row.confirmed), completed,
     finished, finishedAt: finished ? iso(row.last_completed_at) : null, durationMs, throughputPerMinute,
-    roundOpenedAt, roundStartedAt, roundCompleted };
+    roundOpenedAt, roundStartedAt, roundCompleted,
+    queueSeq: row.queue_seq === null || row.queue_seq === undefined ? null : Number(row.queue_seq), queuePosition, filesDone: num(row.files_done),
+    paused: false, pausedAt: null };
 }
 
 /** Canonical view of a row; a confirmed row (see REVIEWED_AT_SQL) has nothing left to review. */
@@ -1185,11 +1212,19 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     });
   }
 
+  /** 1-based queue positions of the tenant's open batches (D11), for the strip's own batch reads. */
+  private async openBatchPositions(client: PoolClient, tenantId: string): Promise<Map<string, number>> {
+    const order = await client.query<{ id: string }>(OPEN_BATCH_ORDER, [tenantId]);
+    return new Map(order.rows.map((entry, index) => [String(entry.id), index + 1]));
+  }
+
   async getBatch(tenantId: string, batchId: string): Promise<BatchSummary | null> {
     if (!isUuid(batchId)) return null;
     return this.tenantTransaction(tenantId, async (client) => {
       const result = await client.query<Row>(BATCH_SELECT, [tenantId, batchId, 1]);
-      return result.rows[0] ? toBatchSummary(result.rows[0]) : null;
+      if (!result.rows[0]) return null;
+      const positions = await this.openBatchPositions(client, tenantId);
+      return toBatchSummary(result.rows[0], positions.get(String(result.rows[0].id)) ?? null);
     });
   }
 
@@ -1197,7 +1232,8 @@ export class PostgresOcrDocumentStore implements ReviewStore {
   async listBatches(tenantId: string, limit = 20): Promise<BatchSummary[]> {
     return this.tenantTransaction(tenantId, async (client) => {
       const result = await client.query<Row>(BATCH_SELECT, [tenantId, null, clampInt(limit, 20, 1, 100)]);
-      return result.rows.map(toBatchSummary);
+      const positions = await this.openBatchPositions(client, tenantId);
+      return result.rows.map((row) => toBatchSummary(row, positions.get(String(row.id)) ?? null));
     });
   }
 
@@ -1564,6 +1600,36 @@ export class PostgresOcrDocumentStore implements ReviewStore {
   // ---- Queue control (plan queue-control D2, D7, D10, D14). One deployment-wide row, no RLS: the tenant transaction
   // exists for the audit row, which is tenant-scoped. Every change and its audit row commit together; an idempotent
   // repeat changes nothing and writes no audit row.
+
+  /** D11: every open batch of the tenant in queue order, positions 1..n. */
+  async listOpenBatches(tenantId: string): Promise<BatchSummary[]> {
+    return withTenant(this.pool, tenantId, async (client) => (await client.query<Row>(OPEN_BATCH_SELECT, [tenantId])).rows
+      .map((row, index) => toBatchSummary(row, index + 1)), { readOnly: true });
+  }
+
+  /**
+   * D11 measured rate: the tenant's last 21 read pages (SUCCEEDED or NEEDS_REVIEW, processed in the last 24 h; a SPLIT
+   * parent has neither status) → `rateFromCompletions`.
+   */
+  async measureRate(tenantId: string): Promise<QueueRate> {
+    const rows = await withTenant(this.pool, tenantId, async (client) => (await client.query<{ processed_at: Date }>(
+      `SELECT d.processed_at FROM documents d
+       WHERE d.organization_id = $1::uuid AND d.status IN ('SUCCEEDED','NEEDS_REVIEW') AND d.deleted_at IS NULL
+         AND d.processed_at >= now() - interval '24 hours'
+       ORDER BY d.processed_at DESC LIMIT ${RATE_COMPLETIONS}`, [tenantId])).rows, { readOnly: true });
+    return rateFromCompletions(rows.map((row) => ms(row.processed_at) ?? 0));
+  }
+
+  /**
+   * `GET /api/queue` (Public Contracts): the control row, totals over every open batch, the first QUEUE_BATCHES_SHOWN
+   * of them, the measured rate and the ETAs. Everything is derived on read; nothing is stored.
+   */
+  async getQueueOverview(tenantId: string): Promise<QueueOverview> {
+    const control = await this.getQueueControl();
+    const batches = await this.listOpenBatches(tenantId);
+    const rate = await this.measureRate(tenantId);
+    return queueOverview(control, batches, rate, false);
+  }
 
   /** The control row. QUEUE_NOT_CONFIGURED when 0022 is not applied or the single row is missing. */
   async getQueueControl(): Promise<QueueControlState> {

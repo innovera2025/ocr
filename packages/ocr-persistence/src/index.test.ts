@@ -556,3 +556,13 @@ test("M1: the two export-history writes bound their lock waits and statements tr
   assert.deepEqual([stuck.texts.at(-1), stuck.released], ["ROLLBACK", [false]], "rolled back, connection returned intact");
   await Promise.all([recorded.pool.end(), flipped.pool.end(), stuckStore.pool.end()]);
 });
+
+test("batch summary (0022): queueSeq, queuePosition and filesDone are additive; a Release A batch is never paused", () => {
+  const plain = toBatchSummary(batchRow({ rows: 2, queued: 1, succeeded: 1 }));
+  assert.deepEqual([plain.queueSeq, plain.queuePosition, plain.filesDone, plain.paused, plain.pausedAt], [null, null, 0, false, null], "a row without the new columns");
+  const queued = toBatchSummary(batchRow({ rows: 2, queued: 1, succeeded: 1, queue_seq: 222, files_done: 1 }), 3);
+  assert.deepEqual([queued.queueSeq, queued.queuePosition, queued.filesDone], [222, 3, 1]);
+  const { queueSeq: _seq, queuePosition: _position, filesDone: _done, paused: _paused, pausedAt: _at, ...rest } = queued;
+  assert.deepEqual(rest, (({ queueSeq: _a, queuePosition: _b, filesDone: _c, paused: _d, pausedAt: _e, ...old }) => old)(toBatchSummary(batchRow({ rows: 2, queued: 1, succeeded: 1 }))),
+    "every pre-0022 field is computed exactly as before");
+});

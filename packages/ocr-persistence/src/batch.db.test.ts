@@ -173,11 +173,14 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
   test("batches: create/get/list with derived counters, scoped to the tenant", async () => {
     const created = await app.createBatch(TENANT_A, { createdBy: "user-a", expectedTotal: 3, label: " Morning intake " });
     batchA = created.batchId;
-    const { batchId: _id, createdAt: _created, ...counters } = created;
+    const { batchId: _id, createdAt: _created, queueSeq, ...counters } = created;
     assert.deepEqual(counters, { label: "Morning intake", expectedTotal: 3, uploaded: 0, rows: 0, pages: 0, pagesExpected: 0, splitting: 0, rowsExpected: 3, queued: 0, processing: 0,
       succeeded: 0, needsReview: 0, failed: 0, confirmed: 0, completed: 0, finished: false, finishedAt: null, durationMs: null, throughputPerMinute: null,
       // 0020: a batch that was never retried has no round, so the clock still starts at createdAt.
-      roundOpenedAt: null, roundStartedAt: null, roundCompleted: 0 });
+      roundOpenedAt: null, roundStartedAt: null, roundCompleted: 0,
+      // 0022 (queue-control D11): an empty batch is not open (no queue position), has no file done and is never paused in Release A.
+      queuePosition: null, filesDone: 0, paused: false, pausedAt: null });
+    assert.ok(Number.isInteger(queueSeq) && queueSeq! > 0, "0022: every new batch is numbered by the column default");
     assert.ok(Date.parse(created.createdAt) > 0);
     batchB = (await app.createBatch(TENANT_B, { createdBy: "user-b", expectedTotal: 1 })).batchId;
     assert.deepEqual(await app.getBatch(TENANT_A, batchA), created);
