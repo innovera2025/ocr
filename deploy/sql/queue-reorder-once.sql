@@ -1,11 +1,16 @@
 -- One-off reorder of the jobs that were queued before batch-first order (plan queue-control D4, approval gate AP-3).
--- Run AFTER migration 0022_queue_control, as the bootstrap superuser (it must see every organization's rows):
+-- Run AFTER migration 0022_queue_control, as the bootstrap superuser (it must see every organization's rows; every
+-- table it reads has FORCE row-level security, so any other role would see 0 rows). It refuses to run, in every mode,
+-- unless the current role is a superuser or has BYPASSRLS.
 --
 --   psql -X -v ON_ERROR_STOP=1 -v apply=0 -d innovera_ocr -f queue-reorder-once.sql   # dry run: counts only, changes nothing
 --   psql -X -v ON_ERROR_STOP=1 -v apply=1 -d innovera_ocr -f queue-reorder-once.sql   # apply, in one transaction
---   psql -X -v ON_ERROR_STOP=1 -v apply=2 -d innovera_ocr -f queue-reorder-once.sql   # revert from the backup table
+--   psql -X -v ON_ERROR_STOP=1 -v apply=2 -v backup_date=YYYYMMDD -d innovera_ocr -f queue-reorder-once.sql   # revert
 --
--- Optional: -v backup_date=YYYYMMDD names the backup table (default: today, UTC), e.g. to revert on a later day.
+-- The backup table is queue_reorder_backup_<YYYYMMDD>; apply names it after today (UTC) unless -v backup_date is given.
+-- REVERT REQUIRES -v backup_date: the YYYYMMDD of the apply (the apply prints it as backup_table|...). Apply refuses
+-- while ANY queue_reorder_backup_* table exists: one apply per database; a later apply needs the operator to drop or
+-- rename the old backup on purpose first (after deciding it is no longer needed for a revert).
 --
 -- Apply: (1) numbers any batch that still has no queue_seq, oldest first by (created_at, id); (2) records every PENDING
 -- job it is about to change in queue_reorder_backup_<YYYYMMDD> (old and new priority / available_at); (3) sets those
@@ -13,6 +18,8 @@
 -- parent's created_at + page number in microseconds. RUNNING, SUCCEEDED, FAILED and DEAD jobs are never touched, and
 -- nothing is deleted. It refuses to run when the backup table already exists (one apply per backup). Revert restores the
 -- recorded old values of the jobs that are still PENDING and keeps the backup table.
+-- Note: in production every PENDING job carries an old priority (100 + position / page) and almost all of them belong to
+-- a batch, so an apply changes nearly every PENDING job (the dry run's pending_would_change says how many).
 -- Output is counts only (key|value lines): no file name, no customer value, no id.
 \set ON_ERROR_STOP on
 \pset format unaligned
@@ -21,7 +28,7 @@
 
 \if :{?apply}
 \else
-  \echo 'usage: psql -v apply=0|1|2 [-v backup_date=YYYYMMDD] -f queue-reorder-once.sql'
+  \echo 'usage: psql -v apply=0|1|2 [-v backup_date=YYYYMMDD, required for 2] -f queue-reorder-once.sql'
   DO $$ BEGIN RAISE EXCEPTION 'apply is required (0 dry run, 1 apply, 2 revert)'; END $$;
 \endif
 \if :{?backup_date}
@@ -40,7 +47,21 @@ SELECT :'apply' IN ('0','1','2') AS apply_ok,
 \else
   DO $$ BEGIN RAISE EXCEPTION 'backup_date must be YYYYMMDD'; END $$;
 \endif
-SELECT to_regclass(:'backup_table') IS NOT NULL AS backup_exists \gset
+-- Every table here has FORCE RLS: without superuser or BYPASSRLS the script would see no row at all, report zeros and
+-- (apply) create an empty backup. Refuse before anything is read or written.
+SELECT (rolsuper OR rolbypassrls) AS sees_all_rows FROM pg_roles WHERE rolname = current_user \gset
+\if :sees_all_rows
+\else
+  DO $$ BEGIN RAISE EXCEPTION 'run this as the bootstrap superuser (or a BYPASSRLS role): under FORCE row-level security this role sees no rows'; END $$;
+\endif
+SELECT :'apply' = '2' AND :'backup_date' = '' AS revert_without_date \gset
+\if :revert_without_date
+  DO $$ BEGIN RAISE EXCEPTION 'revert needs -v backup_date=YYYYMMDD (the date of the apply''s backup table)'; END $$;
+\endif
+SELECT to_regclass(:'backup_table') IS NOT NULL AS backup_exists,
+       count(*) FILTER (WHERE tablename LIKE 'queue\_reorder\_backup\_%') AS backups_existing,
+       count(*) FILTER (WHERE tablename LIKE 'queue\_reorder\_backup\_%') > 0 AS any_backup
+FROM pg_tables WHERE schemaname = 'public' \gset
 SELECT 'mode|' || CASE :'apply' WHEN '0' THEN 'dry_run' WHEN '1' THEN 'apply' ELSE 'revert' END;
 SELECT 'backup_table|' || :'backup_table';
 
@@ -68,13 +89,14 @@ WHERE j.status = 'PENDING'
   AND (j.priority, j.available_at) IS DISTINCT FROM
       (COALESCE(b.queue_seq, 0), CASE WHEN d.parent_document_id IS NOT NULL THEN p.created_at + d.page_number * interval '1 microsecond' ELSE j.available_at END);
 SELECT 'backup_exists|' || :'backup_exists';
+SELECT 'backup_tables_existing|' || :'backups_existing';
 COMMIT;
 \endif
 
 -- ---- apply: number missing batches, back up and reorder the PENDING jobs, in one transaction ---------------------
 \if :is_apply
-\if :backup_exists
-  DO $$ BEGIN RAISE EXCEPTION 'the backup table already exists: this backup was applied already (revert with apply=2, or pass another backup_date)'; END $$;
+\if :any_backup
+  DO $$ BEGIN RAISE EXCEPTION 'a queue_reorder_backup_* table already exists: the reorder was applied before (revert with apply=2 and its backup_date; drop or rename the old backup on purpose before another apply)'; END $$;
 \endif
 BEGIN;
 SET LOCAL lock_timeout = '5s';

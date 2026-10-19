@@ -26,10 +26,15 @@ describe("queue-reorder-once.sql against PostgreSQL", { skip }, () => {
   let db: QueueDb;
   const ids: Record<string, string> = {};
   let before0: Map<string, string>;
+  /** The YYYYMMDD of the apply's backup table (printed by the apply as backup_table|queue_reorder_backup_<date>). */
+  let applied = "";
+  const backups = async () => (await db.superDb.query<{ t: string }>("SELECT tablename AS t FROM pg_tables WHERE tablename LIKE 'queue\\_reorder\\_backup\\_%' ORDER BY 1")).rows.map((row) => row.t);
 
   /** Runs the script with `-v apply=<n>` (and optional variables) as the superuser; returns the key|value lines. */
-  function psql(database: string, vars: Record<string, string>): Run {
-    const flags = ["-X", "-q", "-v", "ON_ERROR_STOP=1", ...Object.entries(vars).flatMap(([key, value]) => ["-v", `${key}=${value}`])];
+  /** `asRole`: the superuser connection first runs `SET ROLE <asRole>` (a role without BYPASSRLS, for the refusal test). */
+  function psql(database: string, vars: Record<string, string>, asRole?: string): Run {
+    const flags = ["-X", "-q", "-v", "ON_ERROR_STOP=1", ...Object.entries(vars).flatMap(([key, value]) => ["-v", `${key}=${value}`]),
+      ...(asRole ? ["-c", `SET ROLE ${asRole}`] : [])];
     let command: string, args: string[];
     if (psqlPrefix) { command = psqlPrefix[0]!; args = [...psqlPrefix.slice(1), ...flags, "-d", database, "-f", "-"]; }
     else { const url = new URL(bootstrapUrl!); url.pathname = `/${database}`; command = "psql"; args = [...flags, "-d", url.toString(), "-f", "-"]; }
@@ -110,11 +115,38 @@ describe("queue-reorder-once.sql against PostgreSQL", { skip }, () => {
     assert.deepEqual(await snapshot(), before0);
     assert.equal((await db.superDb.query("SELECT to_regclass($1) AS t", [run.out.backup_table])).rows[0].t, null);
     assert.equal((await db.superDb.query<{ n: number }>("SELECT count(*)::int AS n FROM ocr_batches WHERE queue_seq IS NULL")).rows[0]!.n, 1);
+    assert.equal(run.out.backup_tables_existing, "0");
+  });
+
+  test("a role without superuser or BYPASSRLS is refused in every mode (under FORCE RLS it would see no rows) and creates nothing", async () => {
+    for (const vars of [{ apply: "0" }, { apply: "1" }, { apply: "2", backup_date: "20261019" }]) {
+      const run = psql(db.database, vars, "ocr_migrator");
+      assert.notEqual(run.status, 0, JSON.stringify(vars));
+      assert.match(run.stderr, /run this as the bootstrap superuser/, JSON.stringify(vars));
+      assert.equal(run.out.pending_total, undefined, "nothing was counted");
+    }
+    assert.deepEqual(await backups(), [], "no backup table was created");
+    assert.deepEqual(await snapshot(), before0);
+  });
+
+  test("an older backup table from an earlier apply refuses a new apply and changes nothing", async () => {
+    await db.superDb.query("CREATE TABLE queue_reorder_backup_20200101 (job_id uuid PRIMARY KEY)");
+    try {
+      const run = psql(db.database, { apply: "1" });
+      assert.notEqual(run.status, 0);
+      assert.match(run.stderr, /a queue_reorder_backup_\* table already exists/);
+      assert.deepEqual(await backups(), ["queue_reorder_backup_20200101"]);
+      assert.deepEqual(await snapshot(), before0);
+      const dry = psql(db.database, { apply: "0" });
+      assert.equal(dry.out.backup_tables_existing, "1", "the dry run says so");
+    } finally { await db.superDb.query("DROP TABLE queue_reorder_backup_20200101"); }
   });
 
   test("apply: PENDING jobs only; the backup holds exactly the changed rows; the claim order is batch-first; RUNNING and SUCCEEDED untouched", async () => {
     const run = psql(db.database, { apply: "1" });
     assert.equal(run.status, 0, run.stderr);
+    applied = /^queue_reorder_backup_(\d{8})$/.exec(run.out.backup_table ?? "")?.[1] ?? "";
+    assert.match(applied, /^\d{8}$/);
     const afterApply = await snapshot();
     const changed = [...afterApply].filter(([id, value]) => before0.get(id) !== value).map(([id]) => id);
     assert.deepEqual([run.out.batches_numbered, run.out.jobs_reordered, run.out.backup_rows, run.out.pending_total], ["1", String(changed.length), String(changed.length), "9"]);
@@ -128,16 +160,22 @@ describe("queue-reorder-once.sql against PostgreSQL", { skip }, () => {
     assert.deepEqual(await claimOrder(), ["single", "b1p1", "b1p2", "b1p3", "b1img", "b2a", "b2b", "b2pdf", "b3a"]);
   });
 
-  test("a second apply refuses (the backup exists) and changes nothing", async () => {
+  test("a second apply refuses (a backup exists, also under another backup_date) and changes nothing", async () => {
     const snap = await snapshot();
-    const run = psql(db.database, { apply: "1" });
-    assert.notEqual(run.status, 0);
-    assert.match(run.stderr, /backup table already exists/);
+    for (const vars of [{ apply: "1" }, { apply: "1", backup_date: "20990101" }]) {
+      const run = psql(db.database, vars);
+      assert.notEqual(run.status, 0);
+      assert.match(run.stderr, /a queue_reorder_backup_\* table already exists/);
+    }
     assert.deepEqual(await snapshot(), snap);
+    assert.equal((await backups()).length, 1);
   });
 
   test("revert restores the exact old priority and available_at of the jobs still PENDING", async () => {
-    const run = psql(db.database, { apply: "2" });
+    const missing = psql(db.database, { apply: "2" });
+    assert.notEqual(missing.status, 0, "revert requires -v backup_date");
+    assert.match(missing.stderr, /revert needs -v backup_date/);
+    const run = psql(db.database, { apply: "2", backup_date: applied });
     assert.equal(run.status, 0, run.stderr);
     assert.deepEqual(await snapshot(), before0, "microsecond-exact");
     assert.equal(Number(run.out.jobs_restored), Number(run.out.backup_rows));
@@ -165,6 +203,8 @@ describe("queue-reorder-once.sql against PostgreSQL", { skip }, () => {
       SELECT gen_random_uuid(), organization_id, id, 'OCR', 'PENDING', 100 + (random() * 30)::int, now() - random() * interval '2 days'
       FROM document_runs WHERE organization_id = $1`, [seed]);
     await db.superDb.query("ANALYZE");
+    // The operator drops the earlier (reverted) backup on purpose before another apply.
+    for (const table of await backups()) await db.superDb.query(`DROP TABLE ${table}`);
     const started = performance.now();
     const run = psql(db.database, { apply: "1", backup_date: "20990101" });
     const elapsed = Math.round(performance.now() - started);
