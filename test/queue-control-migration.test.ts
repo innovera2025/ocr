@@ -51,3 +51,8 @@ test("0022 lifts FORCE on ocr_batches only around the backfill and restores it i
   assert.match(flat, /WHERE x\.queue_seq IS NULL/, "a re-run touches nothing already numbered");
   assert.match(flat, /ORDER BY x\.created_at, x\.id/, "oldest first by (created_at, id)");
 });
+
+test("0022 bounds its lock wait: SET LOCAL lock_timeout before the first ALTER", () => {
+  const timeout = flat.indexOf("SET LOCAL lock_timeout = '5s';");
+  assert.ok(timeout >= 0 && timeout < flat.indexOf("ALTER TABLE"), "the lock timeout comes first");
+});

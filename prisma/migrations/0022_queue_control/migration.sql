@@ -2,6 +2,11 @@
 -- Additive. Creates no routine and removes nothing: the queue and confirm-outbox SECURITY DEFINER routines are owned by
 -- ocr_queue_definer in production and stay exactly as they are; the claim keeps ordering by (priority, available_at).
 
+-- The web applies this at startup; the ALTERs below take an ACCESS EXCLUSIVE lock on ocr_batches. Waiting at most 5 s for
+-- it (instead of queueing behind a long transaction while every upload and batch read queues behind this one) makes a
+-- busy moment fail the startup cleanly; the web restarts and the migration runs again from the start.
+SET LOCAL lock_timeout = '5s';
+
 -- 1. Batch-first order. Every batch gets a queue sequence number; the web and the worker give each new job
 --    priority = its batch's queue_seq (a job without a batch keeps priority 0, ahead of every batch).
 CREATE SEQUENCE IF NOT EXISTS ocr_batch_queue_seq;

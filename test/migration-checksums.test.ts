@@ -47,7 +47,7 @@ const CHECKSUMS: Readonly<Record<string, string>> = {
   "0021_document_export_marks": "6a4026d137820a627d6f5070a2ebf1a5e91d62f078a196d0147f722326819919",
   // Applied by NO deploy yet — the queue-control Release A deploy (AP-2) applies it and freezes it. Until then an edit
   // is allowed: regenerate this line in the same commit (`shasum -a 256 prisma/migrations/0022_queue_control/migration.sql`).
-  "0022_queue_control": "6c9f8eca0f302715f7712707d63f3814e136075bb52ce871735b09d7cd8de369"
+  "0022_queue_control": "72712df4e605657d4be17d33013b21edbac7de145ebfe32e4c749218554cfc3f"
 };
 
 function sha256(version: string): string {
