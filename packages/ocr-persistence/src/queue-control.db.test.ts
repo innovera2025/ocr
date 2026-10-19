@@ -9,14 +9,45 @@ import { randomUUID } from "node:crypto";
 import { loadavg } from "node:os";
 import { after, before, describe, test } from "node:test";
 import { Pool } from "pg";
-import type { QueueActor } from "./index.js";
-import { openQueueDb, repo, skipWithoutDatabase, type QueueDb } from "./queue-db-harness.js";
+import { BATCH_SELECT, OPEN_BATCH_SELECT, type QueueActor } from "./index.js";
+import { openQueueDb, repo, seedProductionShape, skipWithoutDatabase, type QueueDb } from "./queue-db-harness.js";
 
 type Slot = { complete(counted: boolean): Promise<void>; release(): void };
 type Gate = { reserve(): Promise<Slot | null>; read(): Promise<{ stopped: boolean; roundCap: number | null; roundDone: number }>; readonly inflight: number; close(): Promise<void> };
 type GateModule = { PostgresQueueControl: new (config: Pool | string, options?: { log?: (event: string, fields: Readonly<Record<string, unknown>>) => void }) => Gate };
 
 const TENANT = randomUUID();
+/**
+ * The overview timing bound (plan 3.5): 300 ms unless OCR_TEST_QUEUE_OVERVIEW_MAX_MS says otherwise (a slower or shared
+ * machine). The wall-clock bound is backed by plan-shape assertions (rows visited) that do not depend on the clock.
+ */
+const OVERVIEW_MAX_MS = (() => {
+  const raw = process.env.OCR_TEST_QUEUE_OVERVIEW_MAX_MS;
+  const value = raw === undefined || raw.trim() === "" ? 300 : Number(raw);
+  if (!Number.isFinite(value) || value <= 0) throw new Error("OCR_TEST_QUEUE_OVERVIEW_MAX_MS must be a positive number of milliseconds");
+  return value;
+})();
+const sorted = (values: number[]) => [...values].sort((a, b) => a - b);
+const median = (values: number[]) => sorted(values)[Math.floor(values.length / 2)]!;
+const p95 = (values: number[]) => sorted(values)[Math.ceil(values.length * 0.95) - 1]!;
+async function timed(runs: number, work: () => Promise<unknown>): Promise<number[]> {
+  await work(); // warm-up
+  const out: number[] = [];
+  for (let run = 0; run < runs; run += 1) { const started = performance.now(); await work(); out.push(Math.round(performance.now() - started)); }
+  return out;
+}
+const load = () => loadavg().map((value) => value.toFixed(1)).join(" / ");
+/** Plan nodes of an EXPLAIN (ANALYZE, FORMAT JSON), flattened (sub-plans and init-plans included). */
+type PlanNode = { "Node Type": string; "Relation Name"?: string; Alias?: string; "Actual Rows"?: number; "Actual Loops"?: number; Plans?: PlanNode[] };
+function nodes(plan: PlanNode): PlanNode[] { return [plan, ...(plan.Plans ?? []).flatMap(nodes)]; }
+/**
+ * How many batches the per-batch aggregate ran for (the loops of the alias-d document scan under the LATERAL: exact,
+ * unlike Actual Rows, which EXPLAIN reports as a per-loop average), and whether any document scan of it is sequential.
+ */
+function aggregateShape(plan: PlanNode): { batchesAggregated: number; seqScan: boolean } {
+  const scans = nodes(plan).filter((node) => node["Relation Name"] === "documents" && node.Alias === "d");
+  return { batchesAggregated: scans.reduce((total, node) => total + (node["Actual Loops"] ?? 1), 0), seqScan: scans.some((node) => node["Node Type"] === "Seq Scan") };
+}
 /** Obviously fake, in the stored format, matching no password. */
 const FAKE_HASH = "scrypt$v1$N=32768,r=8,p=3$bm90LWEtcmVhbC1zYWx0$bm90LWEtcmVhbC1rZXk";
 
@@ -308,7 +339,7 @@ describe("queue control against PostgreSQL as the runtime roles", { skip: skipWi
 
   // The bound is on the MEDIAN of 7 warm runs (recorded deviation DEV-2): on a shared, heavily loaded laptop the slowest
   // single run measures the scheduler, not the query. Every run is printed for the report.
-  test("timing: getQueueOverview over 30,000 documents in 250 open batches stays under 300 ms (median of 7 warm runs)", { timeout: 900_000 }, async (t) => {
+  test("timing: getQueueOverview over 30,000 documents in 250 open batches stays under the bound (median of 7 warm runs)", { timeout: 900_000 }, async (t) => {
     await orgs();
     await db.superDb.query(`
       WITH batches AS (
@@ -343,10 +374,42 @@ describe("queue control against PostgreSQL as the runtime roles", { skip: skipWi
       await db.app.listBatches(TENANT_T, 20);
       strip.push(Math.round(performance.now() - started));
     }
-    const middle = (values: number[]) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)]!;
-    t.diagnostic(`getQueueOverview ms over 7 warm runs: ${runs.join(", ")} (median ${middle(runs)}); listBatches(20) ms: ${strip.join(", ")} (median ${middle(strip)}); host load ${loadavg().map((value) => value.toFixed(1)).join(" / ")}`);
+    t.diagnostic(`getQueueOverview ms over 7 warm runs: ${runs.join(", ")} (median ${median(runs)}, p95 ${p95(runs)}); listBatches(20) ms: ${strip.join(", ")} (median ${median(strip)}); bound ${OVERVIEW_MAX_MS} ms; host load ${load()}`);
     assert.deepEqual([overview.batchesTotal, overview.batches.length, overview.overview.pagesTotal, overview.overview.pagesRead, overview.overview.filesUploaded],
       [250, 50, 29_000, 6000, 5000], "29,000 page/image rows (the 1,000 SPLIT parents are no rows), 6,000 read, 5,000 files");
-    assert.ok(middle(runs) < 300, `median ${middle(runs)} ms (runs ${runs.join(", ")})`);
+    assert.ok(median(runs) < OVERVIEW_MAX_MS, `median ${median(runs)} ms (runs ${runs.join(", ")})`);
+  });
+
+  test("production shape (pre-flight 2026-10-19): 222 open of 252 batches, 24,802 documents; the reads visit only the batches they show", { timeout: 900_000 }, async (t) => {
+    const tenant = randomUUID();
+    await seedProductionShape(db, tenant);
+    const counts = (await db.superDb.query<{ docs: number; open_batches: number; open_docs: number; newest20_docs: number; pending: number; succeeded: number }>(
+      `SELECT (SELECT count(*)::int FROM documents WHERE organization_id = $1) AS docs,
+              (SELECT count(DISTINCT batch_id)::int FROM documents WHERE organization_id = $1 AND status IN ('VALIDATING','SCANNING','CLEAN','PROCESSING')) AS open_batches,
+              (SELECT count(*)::int FROM documents d WHERE d.organization_id = $1 AND d.batch_id IN
+                 (SELECT batch_id FROM documents WHERE organization_id = $1 AND status IN ('VALIDATING','SCANNING','CLEAN','PROCESSING'))) AS open_docs,
+              (SELECT count(*)::int FROM documents d WHERE d.organization_id = $1 AND d.batch_id IN
+                 (SELECT id FROM ocr_batches WHERE organization_id = $1 ORDER BY created_at DESC, id DESC LIMIT 20)) AS newest20_docs,
+              (SELECT count(*)::int FROM extraction_jobs WHERE organization_id = $1 AND status = 'PENDING') AS pending,
+              (SELECT count(*)::int FROM extraction_jobs WHERE organization_id = $1 AND status = 'SUCCEEDED') AS succeeded`, [tenant])).rows[0]!;
+    assert.deepEqual([counts.docs, counts.open_batches, counts.pending, counts.succeeded], [24_802, 222, 17_608, 7_194]);
+    // Plan shape, independent of the clock: the aggregate runs once per batch it returns (222 open, 20 for the strip),
+    // never for the 30 finished ones or the rest of the history, and only through the batch index.
+    const explain = async (sql: string, values: unknown[]) => (await db.asApp<{ "QUERY PLAN": Array<{ Plan: PlanNode }> }>(tenant, `EXPLAIN (ANALYZE, FORMAT JSON) ${sql}`, values))[0]!["QUERY PLAN"][0]!.Plan;
+    const open = aggregateShape(await explain(OPEN_BATCH_SELECT, [tenant]));
+    assert.deepEqual([open.batchesAggregated, open.seqScan], [counts.open_batches, false], "the open-batch read aggregates the 222 open batches only");
+    const strip = aggregateShape(await explain(BATCH_SELECT, [tenant, null, 20]));
+    assert.deepEqual([strip.batchesAggregated, strip.seqScan], [20, false], "the strip's LIMIT 20 aggregates 20 batches, not 252");
+    void counts.newest20_docs;
+    // Wall clock: 20 warm runs each, median and p95 printed with the host load.
+    const overviewRuns = await timed(20, () => db.app.getQueueOverview(tenant));
+    const stripRuns = await timed(20, () => db.app.listBatches(tenant, 20));
+    const someOpen = (await db.app.listOpenBatches(tenant))[40]!.batchId;
+    const batchRuns = await timed(20, () => db.app.getBatch(tenant, someOpen));
+    t.diagnostic(`production shape: docs ${counts.docs}, open batches ${counts.open_batches}, docs in open batches ${counts.open_docs}, pending ${counts.pending}, succeeded ${counts.succeeded}`);
+    t.diagnostic(`getQueueOverview ms: median ${median(overviewRuns)}, p95 ${p95(overviewRuns)} (${overviewRuns.join(", ")})`);
+    t.diagnostic(`strip listBatches(20) ms: median ${median(stripRuns)}, p95 ${p95(stripRuns)} (${stripRuns.join(", ")})`);
+    t.diagnostic(`strip getBatch(open) ms: median ${median(batchRuns)}, p95 ${p95(batchRuns)} (${batchRuns.join(", ")}); bound ${OVERVIEW_MAX_MS} ms; host load ${load()}`);
+    assert.ok(median(overviewRuns) < OVERVIEW_MAX_MS, `overview median ${median(overviewRuns)} ms`);
   });
 });

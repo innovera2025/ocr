@@ -150,3 +150,39 @@ export async function openQueueDb(options: { stopBefore?: string } = {}): Promis
 
 /** A storage key in the tenant's original grammar (`org/{tenant}/original/{shard}/{publicId}`); content never exists. */
 export function fakeKey(tenantId: string): string { return `org/${tenantId}/original/ab/${randomBytes(16).toString("hex")}`; }
+
+/**
+ * A production-shaped tenant (pre-flight 2026-10-19 counts, rounded): 252 batches, of which the oldest 30 are finished and
+ * 222 open; 418 split PDFs x 30 pages (12,540 page rows) and 47 images per batch (11,844), so 24,802 documents; every
+ * row has a run and a job: 17,608 PENDING, 7,194 SUCCEEDED (incl. the 418 split jobs). Finished history carries
+ * processed_at in the last day, reviews and confirmations. Fake values only. Separate statements (fast RI checks).
+ */
+export async function seedProductionShape(db: QueueDb, tenantId: string): Promise<void> {
+  const q = (sql: string) => db.superDb.query(sql, [tenantId]);
+  await q("INSERT INTO organizations(id, name) VALUES ($1, 'Production shape')");
+  await q(`INSERT INTO ocr_batches(organization_id, created_by, expected_total, created_at)
+    SELECT $1, 'seed', 49, now() - interval '20 days' + g * interval '1 hour' FROM generate_series(1, 252) g`);
+  // Rank the batches by age: 1..30 finished, 31..252 open; ranks 1..166 carry two PDFs, the rest one.
+  await q(`INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, batch_id, page_count, processed_at, created_at)
+    SELECT gen_random_uuid(), $1, md5(random()::text || s.id::text || g), 'SPLIT', 'seed.pdf', 'application/pdf', 1, 'h', s.id, 30, now() - interval '1 day', now() - interval '3 days'
+    FROM (SELECT id, row_number() OVER (ORDER BY created_at, id) AS r FROM ocr_batches WHERE organization_id = $1) s CROSS JOIN generate_series(1, 2) g WHERE g = 1 OR s.r <= 166`);
+  await q(`INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, batch_id, parent_document_id, page_number, page_count,
+                                 processed_at, needs_review, created_at)
+    SELECT gen_random_uuid(), $1, md5(random()::text || p.id::text || g),
+           CASE WHEN s.r <= 30 OR g <= 5 THEN (CASE WHEN g % 4 = 0 THEN 'NEEDS_REVIEW' ELSE 'SUCCEEDED' END)::document_status ELSE 'CLEAN'::document_status END,
+           'seed.pdf', 'image/png', 1, 'h', p.batch_id, p.id, g, 30,
+           CASE WHEN s.r <= 30 OR g <= 5 THEN now() - (random() * interval '20 hours') END, g % 4 = 0 AND (s.r <= 30 OR g <= 5), p.created_at
+    FROM documents p JOIN (SELECT id, row_number() OVER (ORDER BY created_at, id) AS r FROM ocr_batches WHERE organization_id = $1) s ON s.id = p.batch_id CROSS JOIN generate_series(1, 30) g WHERE p.organization_id = $1 AND p.parent_document_id IS NULL`);
+  await q(`INSERT INTO documents(id, organization_id, public_id, status, filename, mime_type, size_bytes, content_hash, batch_id, processed_at, reviewed_at, created_at)
+    SELECT gen_random_uuid(), $1, md5(random()::text || s.id::text || 'i' || g),
+           CASE WHEN s.r <= 30 OR g <= 8 THEN 'SUCCEEDED'::document_status ELSE 'CLEAN'::document_status END, 'seed.png', 'image/png', 1, 'h', s.id,
+           CASE WHEN s.r <= 30 OR g <= 8 THEN now() - (random() * interval '20 hours') END,
+           CASE WHEN s.r <= 30 AND g % 3 = 0 THEN now() - interval '1 hour' END, now() - interval '3 days'
+    FROM (SELECT id, row_number() OVER (ORDER BY created_at, id) AS r FROM ocr_batches WHERE organization_id = $1) s CROSS JOIN generate_series(1, 47) g`);
+  await q(`INSERT INTO document_runs(id, organization_id, document_id, outcome) SELECT gen_random_uuid(), organization_id, id, 'RUNNING' FROM documents WHERE organization_id = $1`);
+  await q(`INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, priority, available_at, attempts)
+    SELECT gen_random_uuid(), r.organization_id, r.id, 'OCR', CASE WHEN d.status = 'CLEAN' THEN 'PENDING'::job_status ELSE 'SUCCEEDED'::job_status END,
+           100 + (random() * 100)::int, now() - random() * interval '3 days', CASE WHEN d.status = 'CLEAN' THEN 0 ELSE 1 END
+    FROM document_runs r JOIN documents d ON d.id = r.document_id WHERE r.organization_id = $1`);
+  await db.superDb.query("ANALYZE");
+}
