@@ -281,6 +281,23 @@ test("uncounted: nothing claimed, a failure, a retry, a lost lease (failure or s
   assert.deepEqual([events, out()], [["reserve", "release"], 0], "a thrown claim gives the slot back");
 });
 
+test("a failed count after a SUCCEEDED finish is logged (queue_gate_count_failed) and the job still reports success", async () => {
+  const h = harness({ process: async () => fullDocument(false) });
+  let released = 0;
+  const gate = { reserve: async () => ({ release: () => { released += 1; }, complete: async () => { throw new Error("connection terminated"); } }) };
+  const lines: string[] = [];
+  const write = process.stdout.write.bind(process.stdout);
+  process.stdout.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => { lines.push(String(chunk)); return (write as (...args: unknown[]) => boolean)(chunk, ...rest); }) as typeof process.stdout.write;
+  try {
+    assert.equal(await runWorkerOnce({ ...h.dependencies, gate }), true, "not a loop error");
+  } finally { process.stdout.write = write; }
+  assert.deepEqual(h.calls, ["markProcessing", "saveOcrResult", "finish:SUCCEEDED"]);
+  const failed = lines.map((line) => { try { return JSON.parse(line) as Record<string, unknown>; } catch { return {}; } }).filter((event) => event.event === "queue_gate_count_failed");
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0]!.error, "connection terminated");
+  assert.equal(released, 1, "the slot is still given back");
+});
+
 test("a PDF split gives its slot back uncounted (splitting does not consume the cap)", async () => {
   const h = harness();
   const pdf = { documentId, organizationId, sourceKey, filename: "a.pdf", mimeType: "application/pdf", status: "CLEAN", batchId: null,

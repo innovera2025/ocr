@@ -261,7 +261,14 @@ async function claimAndRun(dependencies: WorkerDependencies, slot: QueueSlot | n
   metrics.increment("jobs_completed");
   logEvent("job_completed", fields);
   // D6: only a successfully finished page counts toward the round; a split only created pages.
-  if (slot && result.status !== "SPLIT") await slot.complete(true);
+  if (slot && result.status !== "SPLIT") {
+    try { await slot.complete(true); }
+    catch (error) {
+      // The job is already SUCCEEDED and its result saved: a failed count is at most one page undercounted in this round
+      // (the slot is freed either way), never a loop error that would back the worker off.
+      logEvent("queue_gate_count_failed", { job_id: claimed.jobId, tenant_id: document.organizationId, error: errorText(error, "COUNT_FAILED").slice(0, 200) });
+    }
+  }
   return true;
 }
 
