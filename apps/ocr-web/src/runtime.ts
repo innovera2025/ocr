@@ -3,16 +3,16 @@ import { createClamAvStorageScanner } from "@innovera/ocr-ingest/clamav";
 import type { IngestDependencies } from "@innovera/ocr-ingest";
 import { mintOriginalKey } from "@innovera/ocr-storage";
 import { createLocalStorage } from "@innovera/ocr-storage/local";
-import { DEFAULT_JOB_PRIORITY, jobPriority, PostgresQueue } from "@innovera/ocr-queue/postgres";
+import { jobPriority, PostgresQueue } from "@innovera/ocr-queue/postgres";
 import { PostgresOcrDocumentStore, type AuditContext } from "@innovera/ocr-persistence";
 import type { Pool } from "pg";
 
 /**
- * Fair queue priority (design §4.1): the k-th file of a batch gets 100 + k, a single upload (no batch) and a retry keep the
- * default 100, the pages of a PDF 100 + (page - 1). `ocr_claim_v1` claims by priority, so batches interleave and a single
- * urgent upload goes ahead of a large batch without touching the queue functions.
+ * Batch-first queue priority (plan queue-control D3): every job of a batch gets the batch's `queue_seq`, so
+ * `ocr_claim_v1` (priority ASC, available_at ASC) reads one batch completely, in upload order, before the next; an upload
+ * without a batch gets 0 and goes ahead of every batch (FIFO among themselves), without touching the queue functions.
  */
-export function batchJobPriority(position: number): number { return jobPriority(DEFAULT_JOB_PRIORITY + position); }
+export function queueJobPriority(queueSeq?: number): number { return queueSeq === undefined ? 0 : jobPriority(queueSeq); }
 
 /** `actor` is who is uploading (§6 D9): `createUploadedDocument` writes its `document.uploaded` row in the same transaction. */
 export function createRuntimeIngest(pool: Pool, tenantId: string, idempotencyKey?: string, batchId?: string, actor?: AuditContext): IngestDependencies {
@@ -39,15 +39,18 @@ export function createRuntimeIngest(pool: Pool, tenantId: string, idempotencyKey
     scan: scanner,
     enqueue: async () => { throw new Error("PERSISTENT_QUEUE_REQUIRED"); },
     persistUpload: async ({ filename, mimeType, bytes, stagedKey }) => {
-      const { batchPosition, ...uploaded } = await store.createUploadedDocument({
+      const { batchPosition: _position, queueSeq, ...uploaded } = await store.createUploadedDocument({
         tenantId, filename, mimeType, sizeBytes: bytes.byteLength,
         contentHash: createHash("sha256").update(bytes).digest("hex"), storageKey: stagedKey,
         ...idempotency, ...(batchId ? { batchId } : {}), ...(actor ? { audit: actor } : {}), requestFingerprint: fingerprint(filename, mimeType, bytes)
       });
-      return { ...uploaded, ...(batchPosition !== undefined ? { priority: batchJobPriority(batchPosition) } : {}) };
+      return { ...uploaded, priority: queueJobPriority(queueSeq) };
     },
     updateStatus: async ({ documentId, status, errorMessage }) => store.updateScanStatus(tenantId, documentId, status, errorMessage),
-    enqueuePersistent: async ({ runId, priority }) => queue.enqueue({ organizationId: tenantId, runId, ...(priority !== undefined ? { priority } : {}) }),
+    // A resumed upload (claimResume) reaches here without the priority persistUpload returned: look it up (one SELECT),
+    // so it keeps its batch's place instead of the column default 100.
+    enqueuePersistent: async ({ documentId, runId, priority }) => queue.enqueue({ organizationId: tenantId, runId,
+      priority: priority ?? await store.queuePriorityOf(tenantId, documentId) }),
     discard: async (stagedKey) => storage.remove(stagedKey)
   };
 }

@@ -7,9 +7,13 @@ export type FinalJobStatus = "PENDING" | "SUCCEEDED" | "FAILED" | "DEAD";
 export type FinishResult = Readonly<{ accepted: boolean; finalStatus: FinalJobStatus | null }>;
 const FINAL_STATUSES: readonly FinalJobStatus[] = ["PENDING", "SUCCEEDED", "FAILED", "DEAD"];
 
-/** `ocr_claim_v1` claims by `priority ASC, available_at ASC`; 100 is the column default (a single upload or a retry). */
+/**
+ * `ocr_claim_v1` claims by `priority ASC, available_at ASC`. Since 0022 a job's priority is its batch's `queue_seq`
+ * (batch-first order; 0 without a batch), so the ceiling is the int4-safe 2,000,000,000 and a growing sequence is never
+ * clamped. 100 stays the column default for a caller that passes nothing (no code path does any more).
+ */
 export const DEFAULT_JOB_PRIORITY = 100;
-export const MAX_JOB_PRIORITY = 10_000;
+export const MAX_JOB_PRIORITY = 2_000_000_000;
 /** Integer priority clamped to 0..MAX_JOB_PRIORITY; anything else → the default. */
 export function jobPriority(value: number | undefined): number {
   return typeof value === "number" && Number.isFinite(value) ? Math.min(MAX_JOB_PRIORITY, Math.max(0, Math.trunc(value))) : DEFAULT_JOB_PRIORITY;
@@ -23,7 +27,7 @@ export class PostgresQueue {
     this.workerPool = workerConfig instanceof Pool ? workerConfig : workerConfig ? new Pool(typeof workerConfig === "string" ? { connectionString: workerConfig } : workerConfig) : this.pool;
   }
 
-  /** `priority` (lower = earlier) is set at insert time only: fair share between batches without touching the queue functions. */
+  /** `priority` (lower = earlier) is set at insert time only: batch-first order without touching the queue functions. */
   async enqueue(input: { organizationId: string; runId: string; kind?: string; availableAt?: Date; priority?: number }): Promise<string> {
     const client = await this.pool.connect();
     try {

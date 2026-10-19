@@ -42,7 +42,7 @@ test("finish keeps its boolean contract on top of finishDetailed", async () => {
   await lost.pool.end();
 });
 
-test("enqueue sets the job priority at insert time (default 100, clamped to 0..10000)", async () => {
+test("enqueue sets the job priority at insert time (default 100, clamped to 0..2,000,000,000)", async () => {
   const calls: Array<{ sql: string; values: unknown[] }> = [];
   const pool = new Pool();
   const client = { query: async (sql: string, values: unknown[] = []) => { calls.push({ sql, values }); return { rows: [{ id: "job-1" }] }; }, release: () => undefined };
@@ -53,6 +53,7 @@ test("enqueue sets the job priority at insert time (default 100, clamped to 0..1
   const inserts = calls.filter((call) => call.sql.includes("INSERT INTO extraction_jobs"));
   assert.match(inserts[0]!.sql, /priority\)\s+VALUES \(gen_random_uuid\(\), \$1::uuid, \$2::uuid, \$3, 'PENDING', COALESCE\(\$4, now\(\)\), \$5\)/);
   assert.deepEqual(inserts.map((call) => call.values[4]), [103, 100]);
-  assert.deepEqual([jobPriority(undefined), jobPriority(Number.NaN), jobPriority(-5), jobPriority(99.7), jobPriority(1e9)], [100, 100, 0, 99, 10_000]);
+  assert.deepEqual([jobPriority(undefined), jobPriority(Number.NaN), jobPriority(-5), jobPriority(99.7), jobPriority(20_000), jobPriority(1e9), jobPriority(3e9)],
+    [100, 100, 0, 99, 20_000, 1_000_000_000, 2_000_000_000], "a batch queue_seq above the old 10,000 ceiling is kept; int4-safe clamp");
   await pool.end();
 });

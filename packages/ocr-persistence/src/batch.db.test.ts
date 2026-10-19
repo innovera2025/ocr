@@ -712,8 +712,10 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     assert.deepEqual(await worker.createPageDocuments(TENANT_A, parent.documentId, 5, pageInputs(TENANT_A, parent.documentId, [1, 2, 3])), { created: [1, 2, 3], existing: [] });
     const parentRow = (await superDb.query("SELECT created_at, batch_id FROM documents WHERE id = $1", [parent.documentId])).rows[0];
     const pages = await pagesOf(parent.documentId);
+    // 0022 (queue-control D3): every page job takes its batch's queue_seq; page order comes from available_at.
+    const seq = (await superDb.query<{ q: number }>("SELECT queue_seq AS q FROM ocr_batches WHERE id = $1", [batch.batchId])).rows[0]!.q;
     assert.deepEqual(pages.map((page) => [page.page_number, page.status, page.filename, page.batch_id, page.page_count, page.runs, page.jobs, page.priorities]),
-      [[1, "CLEAN", "intake-12.pdf", batch.batchId, 5, 1, 1, [100]], [2, "CLEAN", "intake-12.pdf", batch.batchId, 5, 1, 1, [101]], [3, "CLEAN", "intake-12.pdf", batch.batchId, 5, 1, 1, [102]]]);
+      [[1, "CLEAN", "intake-12.pdf", batch.batchId, 5, 1, 1, [seq]], [2, "CLEAN", "intake-12.pdf", batch.batchId, 5, 1, 1, [seq]], [3, "CLEAN", "intake-12.pdf", batch.batchId, 5, 1, 1, [seq]]]);
     assert.ok(pages.every((page) => page.created_at.getTime() === parentRow.created_at.getTime()), "pages carry the parent's created_at (they list where the upload was)");
     assert.equal(pages[1]!.storage_key, pageKey(TENANT_A, publicIdOf(parent.documentId, 2)));
     await assert.rejects(worker.createPageDocuments(TENANT_B, parent.documentId, 5, pageInputs(TENANT_B, parent.documentId, [4])), { message: "DOCUMENT_NOT_FOUND" });
@@ -792,11 +794,13 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     void image;
   });
 
-  test("retry: a page whose render failed gets a job (re-rendered by it); a FAILED PDF parent re-splits; the new jobs have priority 100", async () => {
+  test("retry: a page whose render failed gets a job (re-rendered by it); a FAILED PDF parent re-splits; the new job has its batch's priority", async () => {
     const parentId = split.parent!.documentId;
     const failedPage = (await superDb.query<{ id: string }>("SELECT id FROM documents WHERE parent_document_id = $1 AND page_number = 4", [parentId])).rows[0]!.id;
     const { jobId } = await app.retryDocument(TENANT_A, failedPage);
-    assert.deepEqual((await pagesOf(parentId))[3]!.priorities, [100]);
+    // 0022 (queue-control D3): the retry job takes its batch's queue_seq (it goes to the back of its batch), not 100.
+    const seq = (await superDb.query<{ q: number }>("SELECT b.queue_seq AS q FROM documents d JOIN ocr_batches b ON b.id = d.batch_id WHERE d.id = $1", [failedPage])).rows[0]!.q;
+    assert.deepEqual((await pagesOf(parentId))[3]!.priorities, [seq]);
     assert.deepEqual(await app.getReviewDocument(TENANT_A, failedPage).then((doc) => [doc?.status, doc?.errorMessage]), ["CLEAN", null]);
     assert.ok(jobId);
     await assert.rejects(app.retryDocument(TENANT_A, failedPage), { message: "DOCUMENT_NOT_RETRYABLE" });
@@ -814,12 +818,15 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     await assert.rejects(app.retryDocument(TENANT_A, scanFailed.documentId), { message: "DOCUMENT_NOT_RETRYABLE" }, "an unscanned upload is still never retried");
   });
 
-  test("fair priority: ocr_claim_v1 claims pages in page order and a single upload ahead of the remaining pages", async () => {
+  // 0022 (queue-control D3) replaced the fair interleave: jobs without a batch take priority 0 and pages keep page order
+  // through available_at (parent created_at + page µs), so a PDF without a batch is read whole, in page order, before a
+  // later single upload (also priority 0, FIFO) and before any batch. The full batch-first proof is queue-order.db.test.ts.
+  test("batch-first priority: ocr_claim_v1 claims a PDF's pages in page order, then a later single upload, then a batch", async () => {
     const pdf = await uploadFile(TENANT_B, "priority.pdf", "application/pdf");
     await worker.createPageDocuments(TENANT_B, pdf.documentId, 3, pageInputs(TENANT_B, pdf.documentId, [1, 2, 3]));
     await new Promise((resolve) => setTimeout(resolve, 20));
     const single = await uploadFile(TENANT_B, "urgent.png", "image/png");
-    const singleJob = await appQueue.enqueue({ organizationId: TENANT_B, runId: single.runId });
+    const singleJob = await appQueue.enqueue({ organizationId: TENANT_B, runId: single.runId, priority: 0 });
     const batched = await uploadFile(TENANT_B, "batch-file-1.png", "image/png");
     const batchedJob = await appQueue.enqueue({ organizationId: TENANT_B, runId: batched.runId, priority: 101 });
     const names = new Map<string, string>([[singleJob, "single"], [batchedJob, "batch#1"]]);
@@ -830,7 +837,7 @@ describe("batch processing against PostgreSQL as the runtime roles", { skip: boo
     for (let claimed = await queue.claim(new Date(Date.now() + 60_000)); claimed; claimed = await queue.claim(new Date(Date.now() + 60_000))) {
       if (names.has(claimed.jobId)) order.push(names.get(claimed.jobId)!);
     }
-    assert.deepEqual(order, ["page1", "single", "page2", "batch#1", "page3"]);
+    assert.deepEqual(order, ["page1", "page2", "page3", "single", "batch#1"]);
   });
 
   // ---- 0019_user_auth: staff accounts, server-side sessions and the append-only audit log. ----

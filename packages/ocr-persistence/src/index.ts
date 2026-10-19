@@ -29,8 +29,12 @@ export type ConfirmStatus = "PENDING" | "SUCCEEDED" | "RETRY";
  */
 export type CorrectionAudit = Readonly<{ raw: string; verifiedBy: string; audit?: AuditContext | undefined }>;
 
-/** `batchPosition`: 1-based position of a new upload among the batch's files (counted under the batch lock; fair priority). */
-export type UploadedDocument = Readonly<{ documentId: string; runId: string; tenantId: string; reused?: boolean; batchId?: string; batchPosition?: number }>;
+/**
+ * `batchPosition`: 1-based position of a new upload among the batch's files (counted under the batch lock; display only
+ * since 0022). `queueSeq`: the batch's queue number (0022), which is the upload job's priority (batch-first order);
+ * present whenever `batchId` is, absent for an upload without a batch (priority 0).
+ */
+export type UploadedDocument = Readonly<{ documentId: string; runId: string; tenantId: string; reused?: boolean; batchId?: string; batchPosition?: number; queueSeq?: number }>;
 /**
  * What the worker needs to process a job. `sourceKey` is null only for a page whose render failed (it has no object yet;
  * the OCR job re-renders it from `parentSourceKey`). `status` lets the worker dispatch: a top-level PDF that is CLEAN or
@@ -80,7 +84,10 @@ export type DocumentStore = Readonly<{
   saveCorrection(tenantId: string, documentId: string, field: string, value: string, confirmStatus: ConfirmStatus, confirmError?: string, remainingNeedsReview?: boolean, audit?: CorrectionAudit): Promise<void>;
 }>;
 
-/** Page documents of a split PDF are created with this queue priority: page order, and fair against other uploads. */
+/**
+ * @deprecated since 0022 (plan queue-control D3): page jobs take their batch's `queue_seq` as priority and keep page order
+ * through `available_at` (`createPageDocuments`). Kept exported for compatibility; no code path uses it any more.
+ */
 export function pageJobPriority(pageNumber: number): number { return Math.min(10_000, 100 + Math.max(0, Math.trunc(pageNumber) - 1)); }
 export const MAX_PDF_PAGES = 1000;
 
@@ -677,15 +684,17 @@ export class PostgresOcrDocumentStore implements ReviewStore {
 
   /** Unexpired upload with the same idempotency key → reused; other fingerprint → IDEMPOTENCY_CONFLICT; none → null. */
   private async reuseIdempotentUpload(client: PoolClient, tenantId: string, idempotencyKey: string, requestFingerprint: string): Promise<UploadedDocument | null> {
-    const existing = await client.query<{ document_id: string; request_fingerprint: string; batch_id: string | null }>(
-      `SELECT i.document_id, i.request_fingerprint, d.batch_id FROM upload_idempotency_keys i
+    const existing = await client.query<{ document_id: string; request_fingerprint: string; batch_id: string | null; queue_seq: number | null }>(
+      `SELECT i.document_id, i.request_fingerprint, d.batch_id, b.queue_seq FROM upload_idempotency_keys i
        LEFT JOIN documents d ON d.id=i.document_id AND d.organization_id=i.organization_id
+       LEFT JOIN ocr_batches b ON b.id=d.batch_id AND b.organization_id=d.organization_id
        WHERE i.organization_id=$1::uuid AND i.idempotency_key=$2 AND i.expires_at > now()`, [tenantId, idempotencyKey]);
     const row = existing.rows[0];
     if (!row) return null;
     if (row.request_fingerprint !== requestFingerprint) throw new Error("IDEMPOTENCY_CONFLICT");
     const existingRun = await client.query<{ id: string }>("SELECT id FROM document_runs WHERE organization_id=$1::uuid AND document_id=$2::uuid ORDER BY created_at DESC LIMIT 1", [tenantId, row.document_id]);
-    return { documentId: row.document_id, runId: existingRun.rows[0]!.id, tenantId, reused: true, ...(row.batch_id ? { batchId: row.batch_id } : {}) };
+    return { documentId: row.document_id, runId: existingRun.rows[0]!.id, tenantId, reused: true, ...(row.batch_id ? { batchId: row.batch_id } : {}),
+      ...(row.batch_id && row.queue_seq !== null ? { queueSeq: Number(row.queue_seq) } : {}) };
   }
 
   /**
@@ -693,11 +702,13 @@ export class PostgresOcrDocumentStore implements ReviewStore {
    * UUID), BATCH_FULL once the batch holds expected_total files. Only top-level documents count: the page rows a PDF is
    * split into never fill a batch. Uploads into one batch are serialised with a transaction-scoped advisory lock (ocr_app
    * has no UPDATE on ocr_batches, so the batch row cannot be locked FOR UPDATE), so there is no overshoot, and the new
-   * file's 1-based position in its batch (`batchPosition`, for the fair queue priority) is exact.
+   * file's 1-based position in its batch (`batchPosition`) is exact. `queueSeq` is the batch's queue number (0022): the
+   * upload job's priority, so a batch is read completely, in upload order, before the next one.
    */
   async createUploadedDocument(input: { tenantId: string; filename: string; mimeType: string; sizeBytes: number; contentHash: string; storageKey: string; idempotencyKey?: string; requestFingerprint?: string; batchId?: string | undefined; audit?: AuditContext | undefined }): Promise<UploadedDocument> {
     if (input.batchId !== undefined && !isUuid(input.batchId)) throw new Error("BATCH_NOT_FOUND");
     let batchPosition: number | undefined;
+    let queueSeq: number | undefined;
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -707,8 +718,8 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       }
       if (input.batchId) {
         await client.query("SELECT pg_advisory_xact_lock(hashtext('innovera_ocr:batch'), hashtext($1))", [input.batchId]);
-        const batch = await client.query<{ expected_total: number; uploaded: number }>(
-          `SELECT b.expected_total, (SELECT count(*)::int FROM documents d WHERE d.organization_id=b.organization_id AND d.batch_id=b.id AND d.parent_document_id IS NULL
+        const batch = await client.query<{ expected_total: number; uploaded: number; queue_seq: number | null }>(
+          `SELECT b.expected_total, b.queue_seq, (SELECT count(*)::int FROM documents d WHERE d.organization_id=b.organization_id AND d.batch_id=b.id AND d.parent_document_id IS NULL
              AND d.deleted_at IS NULL AND d.status <> 'DELETED') AS uploaded
            FROM ocr_batches b WHERE b.id=$1::uuid AND b.organization_id=$2::uuid`, [input.batchId, input.tenantId]);
         const capacity = batch.rows[0];
@@ -720,6 +731,10 @@ export class PostgresOcrDocumentStore implements ReviewStore {
           return reused;
         }
         batchPosition = capacity.uploaded + 1;
+        // 0022 numbers every batch (new ones by the column default, existing ones by the backfill); a NULL would be a
+        // batch the backfill missed, which must not silently jump the queue as priority 0.
+        if (capacity.queue_seq === null) throw new Error("BATCH_QUEUE_SEQ_MISSING");
+        queueSeq = Number(capacity.queue_seq);
       }
       await this.assertFilenameFree(client, input);
       const document = await client.query<{ id: string; public_id: string }>(
@@ -753,9 +768,27 @@ export class PostgresOcrDocumentStore implements ReviewStore {
       // request created. Every early return above reused a document whose upload was recorded when it was created.
       if (input.audit) await insertAudit(client, { ...input.audit, tenantId: input.tenantId, action: "document.uploaded", targetType: "document", targetId: row.id });
       await client.query("COMMIT");
-      return { documentId: row.id, runId: run.rows[0]!.id, tenantId: input.tenantId, ...(input.batchId ? { batchId: input.batchId } : {}), ...(batchPosition ? { batchPosition } : {}) };
+      return { documentId: row.id, runId: run.rows[0]!.id, tenantId: input.tenantId, ...(input.batchId ? { batchId: input.batchId } : {}), ...(batchPosition ? { batchPosition } : {}),
+        ...(queueSeq !== undefined ? { queueSeq } : {}) };
     } catch (error) { await client.query("ROLLBACK").catch(() => undefined); throw error; }
     finally { client.release(); }
+  }
+
+  /**
+   * The queue priority of a document's next job (0022, batch-first order): its batch's `queue_seq`, or 0 without a
+   * batch. One SELECT; used when a resumed upload is enqueued without the priority `createUploadedDocument` returned.
+   * DOCUMENT_NOT_FOUND when the document is not this tenant's.
+   */
+  async queuePriorityOf(tenantId: string, documentId: string): Promise<number> {
+    if (!isUuid(documentId)) throw new Error("DOCUMENT_NOT_FOUND");
+    return this.tenantTransaction(tenantId, async (client) => {
+      const result = await client.query<{ priority: number }>(
+        `SELECT COALESCE(b.queue_seq, 0)::int AS priority FROM documents d
+         LEFT JOIN ocr_batches b ON b.id = d.batch_id AND b.organization_id = d.organization_id
+         WHERE d.id = $1::uuid AND d.organization_id = $2::uuid`, [documentId, tenantId]);
+      if (!result.rows[0]) throw new Error("DOCUMENT_NOT_FOUND");
+      return Number(result.rows[0].priority);
+    });
   }
 
   /** D6: an unexpired upload already recorded under this request's idempotency key (expired ones were deleted above). */
@@ -937,8 +970,10 @@ export class PostgresOcrDocumentStore implements ReviewStore {
   /**
    * Creates the page documents of one rendered chunk of `parentId` in ONE transaction: per new page its document (status
    * CLEAN, or FAILED `PAGE_RENDER_FAILED` without an object when its render failed), its run and — for rendered pages —
-   * its OCR job with priority `pageJobPriority(page)`. Pages copy the parent's filename, batch and created_at (so they
-   * list together, in page order, where the upload was). Serialised per parent with an advisory lock; a page that already
+   * its OCR job. Pages copy the parent's filename, batch and created_at (so they list together, in page order, where the
+   * upload was). The job's priority is the batch's `queue_seq` (0 without a batch) and its `available_at` is the parent's
+   * `created_at` plus the page number in microseconds (0022, batch-first order): every page of this file sorts before any
+   * file uploaded later and in page order (at most MAX_PDF_PAGES µs = 1 ms after the upload). Serialised per parent with an advisory lock; a page that already
    * exists is left alone (partial unique index + ON CONFLICT DO NOTHING), so a resumed or repeated split never
    * duplicates a page, run or job. Runs as the worker under the tenant's RLS: another tenant's parent is not found, and
    * the composite FK keeps parent and page in one tenant. A failed page carries its source's size and hash
@@ -953,8 +988,12 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     }
     return this.tenantTransaction(tenantId, async (client) => {
       await client.query("SELECT pg_advisory_xact_lock(hashtext('innovera_ocr:split'), hashtext($1))", [parentId]);
-      const parent = await client.query("SELECT 1 FROM documents WHERE id=$1::uuid AND organization_id=$2::uuid AND parent_document_id IS NULL AND deleted_at IS NULL", [parentId, tenantId]);
+      const parent = await client.query<{ priority: number }>(
+        `SELECT COALESCE(b.queue_seq, 0)::int AS priority FROM documents p
+         LEFT JOIN ocr_batches b ON b.id = p.batch_id AND b.organization_id = p.organization_id
+         WHERE p.id=$1::uuid AND p.organization_id=$2::uuid AND p.parent_document_id IS NULL AND p.deleted_at IS NULL`, [parentId, tenantId]);
       if (parent.rowCount !== 1) throw new Error("DOCUMENT_NOT_FOUND");
+      const priority = Number(parent.rows[0]!.priority);
       const result: PageDocumentsResult = { created: [], existing: [] };
       for (const page of pages) {
         const rendered = page.storageKey !== null;
@@ -972,8 +1011,12 @@ export class PostgresOcrDocumentStore implements ReviewStore {
         if (!documentId) { result.existing.push(page.pageNumber); continue; }
         const run = await client.query<{ id: string }>("INSERT INTO document_runs(id, organization_id, document_id, outcome) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'RUNNING') RETURNING id", [tenantId, documentId]);
         if (rendered) {
-          await client.query("INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, priority, available_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'OCR', 'PENDING', $3, now())",
-            [tenantId, run.rows[0]!.id, pageJobPriority(page.pageNumber)]);
+          // created_at + page µs is computed in SQL: the parent's timestamp keeps its microseconds (a JS Date would not).
+          await client.query(
+            `INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, priority, available_at)
+             SELECT gen_random_uuid(), $1::uuid, $2::uuid, 'OCR', 'PENDING', $3::int, p.created_at + ($4::int * interval '1 microsecond')
+             FROM documents p WHERE p.id=$5::uuid AND p.organization_id=$1::uuid`,
+            [tenantId, run.rows[0]!.id, priority, page.pageNumber, parentId]);
         }
         result.created.push(page.pageNumber);
       }
@@ -1425,8 +1468,9 @@ export class PostgresOcrDocumentStore implements ReviewStore {
    * RUNNING; never a second run). A document that never reached the queue (scan failure → no job) is not retryable,
    * because a retry would skip the malware scan — except a page of a split PDF: it is our own render of an original that
    * passed the scan, and a page whose render failed never got a job (its new job re-renders it). A FAILED PDF parent is
-   * split again by its new job (the worker decides from the document; existing pages are kept). The job has the default
-   * priority 100. DOCUMENT_NOT_FOUND / DOCUMENT_NOT_RETRYABLE.
+   * split again by its new job (the worker decides from the document; existing pages are kept). The job's priority is its
+   * batch's `queue_seq` (0 without a batch) and `available_at` is now (0022): it goes to the back of its batch.
+   * DOCUMENT_NOT_FOUND / DOCUMENT_NOT_RETRYABLE.
    */
   async retryDocument(tenantId: string, documentId: string, audit?: AuditContext): Promise<{ jobId: string }> {
     if (!isUuid(documentId)) throw new Error("DOCUMENT_NOT_FOUND");
@@ -1451,8 +1495,11 @@ export class PostgresOcrDocumentStore implements ReviewStore {
         [tenantId, documentId]);
       await client.query("UPDATE documents SET status='CLEAN', error_message=NULL, processing_started_at=NULL, updated_at=now() WHERE id=$1::uuid AND organization_id=$2::uuid", [documentId, tenantId]);
       const job = await client.query<{ id: string }>(
-        "INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, available_at) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'OCR', 'PENDING', now()) RETURNING id",
-        [tenantId, latest.id]);
+        `INSERT INTO extraction_jobs(id, organization_id, run_id, kind, status, priority, available_at)
+         VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 'OCR', 'PENDING',
+           COALESCE((SELECT b.queue_seq FROM documents d JOIN ocr_batches b ON b.id = d.batch_id AND b.organization_id = d.organization_id
+                     WHERE d.id = $3::uuid AND d.organization_id = $1::uuid), 0), now()) RETURNING id`,
+        [tenantId, latest.id, documentId]);
       if (audit) await insertAudit(client, { ...audit, tenantId, action: "document.retried", targetType: "document", targetId: documentId });
       return { jobId: job.rows[0]!.id };
     });

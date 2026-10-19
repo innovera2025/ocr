@@ -54,11 +54,26 @@ test("no migration after 0016 touches a queue or confirm-outbox SECURITY DEFINER
   }
 });
 
-test("every table any migration creates has forced row-level security", () => {
+/**
+ * Tables that deliberately have no row-level security because they hold no tenant data at all. `queue_control`
+ * (0022, plan queue-control D2): one deployment-wide row the worker reads before every claim without a tenant.
+ * Such a table must not carry an organization_id column, or it would be tenant data without a policy.
+ */
+const TENANTLESS_TABLES = ["queue_control"];
+
+test("every table any migration creates has forced row-level security (except the tenant-less control row)", () => {
   const all = versions.map((version) => read(new URL(`${version}/migration.sql`, migrations))).join("\n");
   const tables = [...all.matchAll(/CREATE TABLE (?:IF NOT EXISTS )?([a-z_]+)/g)].map((match) => match[1]!);
   assert.ok(tables.includes("ocr_batches"));
-  for (const table of tables) assert.match(all, new RegExp(`ALTER TABLE ${table} FORCE ROW LEVEL SECURITY`), table);
+  for (const table of tables) {
+    if (TENANTLESS_TABLES.includes(table)) {
+      const body = new RegExp(`CREATE TABLE (?:IF NOT EXISTS )?${table} \\(([\\s\\S]*?)\\n\\);`).exec(all)?.[1] ?? "";
+      assert.ok(body.length > 0, table);
+      assert.doesNotMatch(body, /organization_id/, `${table} must hold no tenant data`);
+      continue;
+    }
+    assert.match(all, new RegExp(`ALTER TABLE ${table} FORCE ROW LEVEL SECURITY`), table);
+  }
 });
 
 test("provisioning moves queue and confirm-outbox functions to ocr_queue_definer", () => {
