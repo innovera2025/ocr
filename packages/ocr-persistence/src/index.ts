@@ -6,6 +6,8 @@ import { CONFIDENCE_SORT_MAX_ROWS, DEFAULT_ORDER_SQL, documentOrderSql, parseDoc
 import { isUuid, withTenant } from "./tenant.js";
 import { DOCUMENT_STATUS_CATEGORIES, type DeliveryStatus, type DocumentStatusCategory } from "./labels.js";
 import { canonicalFilenameKey, FILENAME_KEY_SQL_WS_PATTERN, filenameKeySql } from "./filename-key.js";
+import { parseRoundCap, parseRoundNo, RoundAlreadyStartedError, stoppedByName, toQueueControlState, type QueueActor, type QueueControlChange,
+  type QueueControlState } from "./queue-control.js";
 import { EXPORT_SELECTION_MAX, type DocumentFilter, type ExportCandidate, type ExportCandidatesResult, type ExportDocument, type ExportMarkInput,
   type ExportMarkResult, type ExportState, type ExportStateChangeInput } from "./export.js";
 
@@ -18,6 +20,7 @@ export * from "./export.js";
 export * from "./document-sort.js";
 export * from "./filename-key.js";
 export * from "./filename-key.vectors.js";
+export * from "./queue-control.js";
 
 export type OcrDocumentStatus = "PROCESSING" | "SUCCEEDED" | "NEEDS_REVIEW" | "FAILED";
 export type ConfirmStatus = "PENDING" | "SUCCEEDED" | "RETRY";
@@ -1558,5 +1561,86 @@ export class PostgresOcrDocumentStore implements ReviewStore {
     });
   }
 
+  // ---- Queue control (plan queue-control D2, D7, D10, D14). One deployment-wide row, no RLS: the tenant transaction
+  // exists for the audit row, which is tenant-scoped. Every change and its audit row commit together; an idempotent
+  // repeat changes nothing and writes no audit row.
+
+  /** The control row. QUEUE_NOT_CONFIGURED when 0022 is not applied or the single row is missing. */
+  async getQueueControl(): Promise<QueueControlState> {
+    const result = await this.pool.query<Row>(QUEUE_CONTROL_SELECT);
+    if (!result.rows[0]) throw new Error("QUEUE_NOT_CONFIGURED");
+    return toQueueControlState(result.rows[0]);
+  }
+
+  /** Stop the whole queue: the worker claims nothing more; the page in flight finishes. Admin only (route). */
+  async stopQueue(tenantId: string, actor: QueueActor): Promise<QueueControlChange> {
+    return this.queueControlChange(tenantId, "queue.stopped",
+      `UPDATE queue_control SET stopped_at = now(), stopped_by = $1, updated_at = now(), updated_by = $2 WHERE id AND stopped_at IS NULL`,
+      [stoppedByName(actor), actor.audit.actorUserId], actor);
+  }
+
+  /** Resume. Never resets the round counter: a full round stays closed until "Start next round" or a higher cap. */
+  async resumeQueue(tenantId: string, actor: QueueActor): Promise<QueueControlChange> {
+    return this.queueControlChange(tenantId, "queue.resumed",
+      `UPDATE queue_control SET stopped_at = NULL, stopped_by = NULL, updated_at = now(), updated_by = $1 WHERE id AND stopped_at IS NOT NULL`,
+      [actor.audit.actorUserId], actor);
+  }
+
+  /** N pages per round (1..100,000) or null for unlimited; ROUND_CAP_INVALID otherwise. Takes effect at the worker's next claim. */
+  async setRoundCap(tenantId: string, cap: unknown, actor: QueueActor): Promise<QueueControlChange> {
+    const roundCap = parseRoundCap(cap);
+    return this.tenantTransaction(tenantId, async (client) => {
+      const current = await client.query<{ round_cap: number | null }>("SELECT round_cap FROM queue_control WHERE id FOR UPDATE");
+      if (!current.rows[0]) throw new Error("QUEUE_NOT_CONFIGURED");
+      const previous = current.rows[0].round_cap === null ? null : Number(current.rows[0].round_cap);
+      if (previous === roundCap) return { changed: false, control: await readQueueControl(client) };
+      await client.query("UPDATE queue_control SET round_cap = $1, updated_at = now(), updated_by = $2 WHERE id", [roundCap, actor.audit.actorUserId]);
+      await insertAudit(client, { ...actor.audit, tenantId, action: "queue.cap_changed", detail: { cap_old: previous, cap_new: roundCap } });
+      return { changed: true, control: await readQueueControl(client) };
+    });
+  }
+
+  /**
+   * D7 "Start next round", allowed at any time (full or not, stopped or not). `roundNo` is the round the caller is
+   * looking at: the guarded UPDATE matches only while it is still current, so a double press (two tabs, two people)
+   * opens exactly one round and the late one gets ROUND_ALREADY_STARTED (with the current state) and writes nothing.
+   * Resets the counter, keeps the cap and never clears a Stop. The row lock serialises it with the worker's
+   * `round_done + 1`, so a page finishing around the reset is counted in exactly one round.
+   */
+  async startNextRound(tenantId: string, roundNo: unknown, actor: QueueActor): Promise<QueueControlChange> {
+    const expected = parseRoundNo(roundNo);
+    return this.tenantTransaction(tenantId, async (client) => {
+      const current = await client.query<{ round_no: number; round_done: number; round_cap: number | null }>(
+        "SELECT round_no, round_done, round_cap FROM queue_control WHERE id FOR UPDATE");
+      const row = current.rows[0];
+      if (!row) throw new Error("QUEUE_NOT_CONFIGURED");
+      if (Number(row.round_no) !== expected) throw new RoundAlreadyStartedError(await readQueueControl(client));
+      const updated = await client.query(
+        "UPDATE queue_control SET round_no = round_no + 1, round_started_at = now(), round_done = 0, updated_at = now(), updated_by = $2 WHERE id AND round_no = $1",
+        [expected, actor.audit.actorUserId]);
+      if (updated.rowCount !== 1) throw new RoundAlreadyStartedError(await readQueueControl(client));
+      const previousDone = Number(row.round_done), previousCap = row.round_cap === null ? null : Number(row.round_cap);
+      await insertAudit(client, { ...actor.audit, tenantId, action: "queue.round_started", detail: { round_no: expected + 1, previous_round_no: expected,
+        previous_done: previousDone, previous_cap: previousCap, was_full: previousCap !== null && previousDone >= previousCap } });
+      return { changed: true, control: await readQueueControl(client) };
+    });
+  }
+
+  /** One guarded UPDATE + its audit row in one tenant transaction; a 0-row UPDATE is an idempotent repeat. */
+  private async queueControlChange(tenantId: string, action: "queue.stopped" | "queue.resumed", sql: string, values: unknown[], actor: QueueActor): Promise<QueueControlChange> {
+    return this.tenantTransaction(tenantId, async (client) => {
+      const updated = await client.query(sql, values);
+      if (updated.rowCount === 1) await insertAudit(client, { ...actor.audit, tenantId, action });
+      return { changed: updated.rowCount === 1, control: await readQueueControl(client) };
+    });
+  }
+
   async close(): Promise<void> { await this.pool.end(); }
+}
+
+const QUEUE_CONTROL_SELECT = "SELECT stopped_at, stopped_by, round_cap, round_no, round_started_at, round_done FROM queue_control";
+async function readQueueControl(client: PoolClient): Promise<QueueControlState> {
+  const result = await client.query<Row>(QUEUE_CONTROL_SELECT);
+  if (!result.rows[0]) throw new Error("QUEUE_NOT_CONFIGURED");
+  return toQueueControlState(result.rows[0]);
 }

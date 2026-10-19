@@ -6,6 +6,7 @@ import { hasReviewFields, toStructuredResult, type DocumentStore, type WorkerDoc
 import type { LocalStorage } from "@innovera/ocr-storage/local";
 import { PostgresQueue, type ClaimedJob, type FinishOutcome, type FinishResult } from "@innovera/ocr-queue/postgres";
 import { PostgresConfirmOutbox, type ConfirmSender, type OutboxDispatchResult } from "@innovera/ocr-queue/outbox";
+import { PostgresQueueControl, type QueueGate, type QueueSlot } from "@innovera/ocr-queue/control";
 import { assertDatabaseReady, createDatabasePool } from "@innovera/ocr-db-runtime";
 import { PostgresOcrDocumentStore } from "@innovera/ocr-persistence";
 import { createLocalStorage } from "@innovera/ocr-storage/local";
@@ -29,7 +30,7 @@ export type OcrJobResult = Readonly<{ status: "SUCCEEDED" | "NEEDS_REVIEW"; ocrD
 /** What a job did: read by the OCR API, or split into page documents (a PDF). */
 type JobOutcome = Readonly<{ status: "SUCCEEDED" | "NEEDS_REVIEW" | "SPLIT"; pages?: number }>;
 
-export type { FinishOutcome, FinishResult };
+export type { FinishOutcome, FinishResult, QueueGate, QueueSlot };
 /** Structural view of PostgresQueue used by the job loops (fakes in tests). */
 export type WorkerQueue = Readonly<{
   claim(): Promise<ClaimedJob | null>;
@@ -51,10 +52,11 @@ export type WorkerOutbox = Readonly<{ recoverExpired(): Promise<number>; dispatc
 export type WorkerOcrClient = Pick<OcrClient, "processDocument"> & Partial<Pick<OcrClient, "healthCheck">>;
 /**
  * `renderer` splits PDFs (poppler in production); `tmpRoot` is the scratch directory for renders (default: the OS temp
- * directory); `maxPdfPages` the page limit of one PDF (default `limits.maxOcrPagesPerDocument`).
+ * directory); `maxPdfPages` the page limit of one PDF (default `limits.maxOcrPagesPerDocument`). `gate` is the queue
+ * control (plan queue-control D5/D6: Stop/Resume and the per-round page cap); absent, every claim proceeds as before.
  */
 export type WorkerDependencies = Readonly<{ queue: WorkerQueue; store: WorkerStore; storage: LocalStorage; ocrClient: WorkerOcrClient; heartbeatMs?: number;
-  renderer?: PdfRenderer; tmpRoot?: string; maxPdfPages?: number }>;
+  renderer?: PdfRenderer; tmpRoot?: string; maxPdfPages?: number; gate?: QueueGate }>;
 export type MaintenanceDependencies = Readonly<{ queue: Readonly<{ recoverExpired(): Promise<number> }>; outbox: WorkerOutbox; sendConfirmation: ConfirmSender }>;
 export type WorkerLoopOptions = Readonly<{ concurrency?: number; idleMs?: number; maintenanceMs?: number; maxBackoffMs?: number; outboxBatch?: number }>;
 export type WorkerLoops = Readonly<{ concurrency: number; done: Promise<void>; stop(): Promise<void> }>;
@@ -173,7 +175,20 @@ async function failJob(dependencies: WorkerDependencies, claimed: ClaimedJob, do
   logEvent(retrying ? "job_retrying" : "job_failed", { ...fields, status: finished.finalStatus ?? outcome, duration_ms: durationMs });
 }
 
+/**
+ * One job. With a `gate` a slot is reserved BEFORE the claim (a closed gate → idle, nothing claimed or changed); the slot
+ * is counted only by an accepted SUCCEEDED finish of an OCR job and given back uncounted in every other case (nothing
+ * claimed, a PDF split, a failure, a lost lease, a thrown error).
+ */
 export async function runWorkerOnce(dependencies: WorkerDependencies): Promise<boolean> {
+  const slot = dependencies.gate ? await dependencies.gate.reserve() : null;
+  if (dependencies.gate && !slot) return false;
+  try {
+    return await claimAndRun(dependencies, slot);
+  } finally { slot?.release(); }
+}
+
+async function claimAndRun(dependencies: WorkerDependencies, slot: QueueSlot | null): Promise<boolean> {
   const { queue, store } = dependencies;
   const claimed = await queue.claim();
   if (!claimed) return false;
@@ -245,6 +260,8 @@ export async function runWorkerOnce(dependencies: WorkerDependencies): Promise<b
   }
   metrics.increment("jobs_completed");
   logEvent("job_completed", fields);
+  // D6: only a successfully finished page counts toward the round; a split only created pages.
+  if (slot && result.status !== "SPLIT") await slot.complete(true);
   return true;
 }
 
@@ -386,8 +403,11 @@ export function startWorkerLoops(dependencies: WorkerDependencies & MaintenanceD
   return { concurrency, done, stop: async () => { control.stop(); await done; } };
 }
 
-/** The newest migration this worker's SQL needs (`markProcessing` writes the 0020 `processing_started_at`). */
-export const REQUIRED_SCHEMA_VERSION = "0020_batch_round_clock";
+/**
+ * The newest migration this worker's SQL needs: the queue gate reads `queue_control` and `createPageDocuments` reads
+ * `ocr_batches.queue_seq` (0022). A worker on an older schema would keep its gate closed forever (fail closed).
+ */
+export const REQUIRED_SCHEMA_VERSION = "0022_queue_control";
 
 /**
  * Refuses to start before the web has applied REQUIRED_SCHEMA_VERSION (it migrates at startup): a worker that claimed
@@ -402,13 +422,16 @@ export async function assertSchemaReady(pool: Readonly<{ query(sql: string, valu
 export async function startWorkerRuntime(): Promise<() => Promise<void>> {
   const pool = createDatabasePool(process.env.DATABASE_URL_WORKER || process.env.DATABASE_URL);
   const queuePool = createDatabasePool(process.env.DATABASE_URL_QUEUE || process.env.DATABASE_URL_WORKER || process.env.DATABASE_URL);
+  // The queue gate's own small pool, as the worker role (it reads queue_control and writes round_done only).
+  const controlPool = createDatabasePool({ connectionString: process.env.DATABASE_URL_WORKER || process.env.DATABASE_URL, max: 2 });
   try {
     await assertDatabaseReady(pool);
     await assertSchemaReady(pool);
   } catch (error) {
-    await Promise.allSettled([pool.end(), queuePool.end()]);
+    await Promise.allSettled([pool.end(), queuePool.end(), controlPool.end()]);
     throw error;
   }
+  const gate = new PostgresQueueControl(controlPool, { log: logEvent });
   const queue = new PostgresQueue(queuePool, pool);
   const outbox = new PostgresConfirmOutbox(pool, process.env.OCR_WORKER_ID ?? undefined);
   const store = new PostgresOcrDocumentStore(pool);
@@ -417,14 +440,14 @@ export async function startWorkerRuntime(): Promise<() => Promise<void>> {
   const storage = createLocalStorage(storageRoot);
   const renderer = createPopplerRenderer({ format: pageFormat() });
   const maxPdfPages = pdfPageLimit();
-  const loops = startWorkerLoops({ queue, store, storage, ocrClient, outbox, sendConfirmation: confirmSender(ocrClient), renderer, tmpRoot: join(storageRoot, "tmp"), maxPdfPages },
+  const loops = startWorkerLoops({ queue, store, storage, ocrClient, outbox, sendConfirmation: confirmSender(ocrClient), renderer, tmpRoot: join(storageRoot, "tmp"), maxPdfPages, gate },
     { concurrency: workerConcurrency() });
   logEvent("worker_started", { concurrency: loops.concurrency, max_pdf_pages: maxPdfPages, page_format: renderer.format });
   let stopping: Promise<void> | undefined;
   return () => stopping ??= (async () => {
     // Let in-flight jobs finish briefly; an unfinished lease expires and is recovered by another worker.
     await Promise.race([loops.stop(), new Promise<void>((resolveTimeout) => setTimeout(resolveTimeout, STOP_TIMEOUT_MS).unref())]);
-    await Promise.allSettled([pool.end(), queuePool.end()]);
+    await Promise.allSettled([pool.end(), queuePool.end(), controlPool.end()]);
     logEvent("worker_stopped", {});
   })();
 }

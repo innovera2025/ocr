@@ -2,7 +2,7 @@
   "name": "@innovera/ocr-queue",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts", "./postgres": "./src/postgres.ts", "./outbox": "./src/outbox.ts" },
+  "exports": { ".": "./src/index.ts", "./postgres": "./src/postgres.ts", "./outbox": "./src/outbox.ts", "./control": "./src/control.ts" },
   "types": "./src/index.ts",
   "scripts": { "typecheck": "tsc -p tsconfig.json" },
   "dependencies": { "pg": "8.16.3" },

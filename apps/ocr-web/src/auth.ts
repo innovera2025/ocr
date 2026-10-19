@@ -227,9 +227,13 @@ export function sessionAuthenticator(store: UserStore, config: Readonly<{ env: A
   };
 }
 
+/** Queue control (plan queue-control D10): Stop/Resume of the whole queue and the page cap N are admin only. */
+export const ADMIN_QUEUE_ROUTES: ReadonlySet<string> = new Set(["/api/queue/stop", "/api/queue/resume", "/api/queue/round-cap"]);
+
 /** §5 C6, server-enforced. `can_export` gates the export file, not the data (D8). */
 export function requiredRight(pathname: string): "admin" | "export" | null {
   if (pathname === "/api/users" || pathname.startsWith("/api/users/")) return "admin";
+  if (ADMIN_QUEUE_ROUTES.has(pathname)) return "admin";
   if (pathname.startsWith("/api/exports/")) return "export";
   return null;
 }

@@ -202,18 +202,117 @@ test("heartbeat runs during OCR and its timer is cleared on success and on failu
   }
 });
 
-test("the worker refuses to start until the web applied 0020 (on an older schema every claimed job would fail with 42703)", async () => {
+test("the worker refuses to start until the web applied 0022 (its gate reads queue_control; on an older schema it would stay closed)", async () => {
   const seen: Array<{ sql: string; values: unknown[] | undefined }> = [];
   const pool = (applied: string[]) => ({ query: async (sql: string, values?: unknown[]) => {
     seen.push({ sql, values });
     return { rowCount: applied.includes(String(values?.[0])) ? 1 : 0 };
   } });
-  // Deploy B raises the gate: markProcessing writes 0020's processing_started_at, so a worker on 0019 fails every claim.
-  assert.equal(REQUIRED_SCHEMA_VERSION, "0020_batch_round_clock");
-  await assert.rejects(assertSchemaReady(pool(["0018_multipage_documents", "0019_user_auth"])), /^Error: SCHEMA_NOT_READY: migration 0020_batch_round_clock is not applied yet/);
-  await assertSchemaReady(pool(["0019_user_auth", "0020_batch_round_clock"]));
-  assert.deepEqual(seen.at(-1), { sql: "SELECT 1 FROM schema_migrations WHERE version = $1", values: ["0020_batch_round_clock"] });
+  // Queue control (Release A) raises the gate: the queue gate reads 0022's queue_control and page jobs read queue_seq.
+  assert.equal(REQUIRED_SCHEMA_VERSION, "0022_queue_control");
+  await assert.rejects(assertSchemaReady(pool(["0020_batch_round_clock", "0021_document_export_marks"])), /^Error: SCHEMA_NOT_READY: migration 0022_queue_control is not applied yet/);
+  await assertSchemaReady(pool(["0021_document_export_marks", "0022_queue_control"]));
+  assert.deepEqual(seen.at(-1), { sql: "SELECT 1 FROM schema_migrations WHERE version = $1", values: ["0022_queue_control"] });
   assert.match(readFileSync(new URL("./index.ts", import.meta.url), "utf8"), /await assertDatabaseReady\(pool\);\s*await assertSchemaReady\(pool\);/, "startWorkerRuntime checks the schema before any loop claims a job");
+});
+
+// ---- Queue gate (plan queue-control D5 to D7): a slot before the claim, counted only by a successful OCR finish. ----
+
+/** A fake gate: `open` decides, `cap` (with the counted pages and the slots out) closes like the real one. */
+function fakeGate(options: { open?: () => boolean; cap?: number } = {}) {
+  const events: string[] = [];
+  let counted = 0;
+  let out = 0;
+  const gate = {
+    reserve: async () => {
+      events.push("reserve");
+      if (options.open && !options.open()) return null;
+      if (options.cap !== undefined && counted + out >= options.cap) return null;
+      out += 1;
+      let settled = false;
+      const settle = (how: string) => { if (settled) return; settled = true; out -= 1; events.push(how); };
+      return { release: () => settle("release"), complete: async (isCounted: boolean) => { if (isCounted && !settled) counted += 1; settle(isCounted ? "complete:counted" : "release"); } };
+    }
+  };
+  return { gate, events, counted: () => counted, out: () => out };
+}
+
+test("gate closed: nothing is claimed, the loop reports idle", async () => {
+  const h = harness();
+  let claims = 0;
+  const claim = h.dependencies.queue.claim;
+  const { gate, events } = fakeGate({ open: () => false });
+  assert.equal(await runWorkerOnce({ ...h.dependencies, gate, queue: { ...h.dependencies.queue, claim: async () => { claims += 1; return claim(); } } }), false);
+  assert.equal(claims, 0);
+  assert.deepEqual(events, ["reserve"]);
+  assert.deepEqual(h.calls, []);
+});
+
+test("gate open and OCR success: the page is counted exactly once, after the accepted finish", async () => {
+  const h = harness({ process: async () => fullDocument(false) });
+  const { gate, events, counted, out } = fakeGate();
+  assert.equal(await runWorkerOnce({ ...h.dependencies, gate }), true);
+  assert.deepEqual(events, ["reserve", "complete:counted"]);
+  assert.deepEqual([counted(), out()], [1, 0]);
+  assert.deepEqual(h.calls, ["markProcessing", "saveOcrResult", "finish:SUCCEEDED"]);
+  const review = harness({ process: async () => fullDocument(true) });
+  const second = fakeGate();
+  await runWorkerOnce({ ...review.dependencies, gate: second.gate });
+  assert.equal(second.counted(), 1, "a NEEDS_REVIEW result is a successful read too");
+});
+
+test("uncounted: nothing claimed, a failure, a retry, a lost lease (failure or success), a missing document, a thrown claim", async () => {
+  const cases: Array<[string, Harness]> = [
+    ["empty queue", harness({ jobs: 0 })],
+    ["DEAD failure", harness({ process: async () => { throw new OcrClientError("http", "OCR API returned HTTP 422", { status: 422, retryable: false }); } })],
+    ["retry", harness({ finalStatus: "PENDING", process: async () => { throw new Error("socket hang up"); } })],
+    ["lease lost on failure", harness({ accepted: false, process: async () => { throw new Error("socket hang up"); } })],
+    ["lease lost on success", harness({ accepted: false, process: async () => fullDocument(false) })],
+    ["missing document", harness({ documentMissing: true })]
+  ];
+  for (const [name, h] of cases) {
+    const { gate, events, counted, out } = fakeGate();
+    await runWorkerOnce({ ...h.dependencies, gate });
+    assert.deepEqual([events, counted(), out()], [["reserve", "release"], 0, 0], name);
+  }
+  const thrown = harness();
+  const { gate, events, out } = fakeGate();
+  await assert.rejects(runWorkerOnce({ ...thrown.dependencies, gate, queue: { ...thrown.dependencies.queue, claim: async () => { throw new Error("db down"); } } }), /db down/);
+  assert.deepEqual([events, out()], [["reserve", "release"], 0], "a thrown claim gives the slot back");
+});
+
+test("a PDF split gives its slot back uncounted (splitting does not consume the cap)", async () => {
+  const h = harness();
+  const pdf = { documentId, organizationId, sourceKey, filename: "a.pdf", mimeType: "application/pdf", status: "CLEAN", batchId: null,
+    parentDocumentId: null, pageNumber: null, pageCount: null, createdAt: "2026-09-22T01:00:00.000Z", parentSourceKey: null };
+  const splitDone = { ...pdf, status: "SPLIT" };
+  for (const document of [pdf, splitDone]) {
+    const { gate, events, counted } = fakeGate();
+    // No renderer: the split path fails (retryable) — still a split job; the already-split path finishes SUCCEEDED.
+    await runWorkerOnce({ ...h.dependencies, gate, store: { ...h.dependencies.store, getWorkerDocument: async () => document } });
+    assert.deepEqual([events, counted()], [["reserve", "release"], 0], document.status);
+  }
+});
+
+test("three concurrent loops with cap 2: exactly 2 claims start, the third waits; nothing more after they are counted", async () => {
+  let claims = 0;
+  const h = harness({ jobs: 10, process: async () => { await delay(30); return fullDocument(false); } });
+  const claim = h.dependencies.queue.claim;
+  const { gate, counted } = fakeGate({ cap: 2 });
+  const loops = startWorkerLoops({
+    ...h.dependencies, gate,
+    queue: { ...h.dependencies.queue, claim: async () => { claims += 1; return claim(); }, recoverExpired: async () => 0 },
+    outbox: { recoverExpired: async () => 0, dispatchOnce: async () => ({ claimed: false, delivered: false }) },
+    sendConfirmation: async () => undefined
+  }, { concurrency: 3, idleMs: 5, maintenanceMs: 5, maxBackoffMs: 10 });
+  await delay(15);
+  assert.equal(claims, 2, "two slots, two claims; the third loop is idle");
+  const deadline = Date.now() + 2000;
+  while (counted() < 2 && Date.now() < deadline) await delay(5);
+  await delay(50);
+  await loops.stop();
+  assert.equal(counted(), 2);
+  assert.equal(claims, 2, "the round is full: no third claim");
 });
 
 test("OCR_WORKER_CONCURRENCY is clamped to 1..8 with default 2", () => {

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { createAppServer, errorStatus, NAME_CHECK_LIMIT, routeLabel, workbenchCsp, type AppDependencies, type DocumentListQuery, type WorkbenchStore } from "./server.js";
 import { csrfTokenFor, type AuthContext } from "@innovera/ocr-auth";
 import type { IngestDependencies } from "@innovera/ocr-ingest";
-import { DuplicateFilenameError, type FilenameDuplicate, type ReviewDocument } from "@innovera/ocr-persistence";
+import { DuplicateFilenameError, parseRoundCap, parseRoundNo, RoundAlreadyStartedError, type FilenameDuplicate, type QueueActor, type ReviewDocument } from "@innovera/ocr-persistence";
 
 const tenant = "00000000-0000-0000-0000-000000000001";
 const documentId = "00000000-0000-0000-0000-000000000002";
@@ -699,4 +699,129 @@ test("name-check is throttled per user: 429 NAME_CHECK_THROTTLED with Retry-Afte
     assert.deepEqual(await body(throttled), { error: "NAME_CHECK_THROTTLED" });
     assert.equal(h.calls.length, NAME_CHECK_LIMIT, "the refused request never reached the store");
   });
+});
+
+// ---- queue control (plan queue-control D7, D10, D14) -----------------------------------------------------------------
+
+const ADMIN_NAME = "ผู้ดูแลคิว";
+/** An in-memory queue control row with the store's semantics: guarded next-round, idempotent repeats report `changed: false`. */
+function queueHarness(options: { role?: "admin" | "staff"; withStore?: boolean } = {}) {
+  let role = options.role ?? "admin";
+  const calls: Array<{ method: string; args: unknown[] }> = [];
+  const control = { stopped: false, stoppedAt: null as string | null, stoppedBy: null as string | null, roundCap: null as number | null, roundNo: 1,
+    roundStartedAt: "2026-10-19T00:00:00.000Z", roundDone: 0, roundState: "reading" as "reading" | "stopped" | "round_full" };
+  const snapshot = () => {
+    control.roundState = control.stopped ? "stopped" : control.roundCap !== null && control.roundDone >= control.roundCap ? "round_full" : "reading";
+    return { ...control };
+  };
+  const queueMethods = {
+    stopQueue: async (tenantId: string, actor: QueueActor) => {
+      calls.push({ method: "stopQueue", args: [tenantId, actor.displayName, actor.audit.actorUserId] });
+      const changed = !control.stopped;
+      if (changed) { control.stopped = true; control.stoppedAt = "2026-10-19T01:00:00.000Z"; control.stoppedBy = actor.displayName; }
+      return { changed, control: snapshot() };
+    },
+    resumeQueue: async (tenantId: string, actor: QueueActor) => {
+      calls.push({ method: "resumeQueue", args: [tenantId, actor.displayName] });
+      const changed = control.stopped;
+      control.stopped = false; control.stoppedAt = null; control.stoppedBy = null;
+      return { changed, control: snapshot() };
+    },
+    setRoundCap: async (tenantId: string, cap: unknown, actor: QueueActor) => {
+      calls.push({ method: "setRoundCap", args: [tenantId, cap, actor.displayName] });
+      const parsed = parseRoundCap(cap);
+      const changed = parsed !== control.roundCap;
+      control.roundCap = parsed;
+      return { changed, control: snapshot() };
+    },
+    startNextRound: async (tenantId: string, roundNo: unknown, actor: QueueActor) => {
+      calls.push({ method: "startNextRound", args: [tenantId, roundNo, actor.displayName] });
+      const expected = parseRoundNo(roundNo);
+      if (expected !== control.roundNo) throw new RoundAlreadyStartedError(snapshot());
+      control.roundNo += 1; control.roundDone = 0;
+      return { changed: true, control: snapshot() };
+    }
+  };
+  const store = {
+    createBatch: async () => ({}), getBatch: async () => null, listBatches: async () => [], listDocuments: async () => ({ total: 0, documents: [] }),
+    retryDocument: async () => ({ jobId: "j" }), saveReview: async () => ({ corrections: 0, delivery: "NOT_REQUIRED" as const, document: {} }),
+    ...(options.withStore === false ? {} : queueMethods)
+  } satisfies WorkbenchStore;
+  const app = createAppServer({ ingest: { stage: async () => "key", scan: async () => "CLEAN", enqueue: async () => "job" }, workbenchStore: store }, {
+    authenticate: (request): AuthContext => {
+      if (request.headers.cookie !== cookie(sessionToken)) throw new Error("UNAUTHENTICATED");
+      return { ...principal(tenant), role, displayName: ADMIN_NAME };
+    }
+  });
+  return { app, calls, control, setRole: (next: "admin" | "staff") => { role = next; } };
+}
+
+async function withQueueServer(harness: ReturnType<typeof queueHarness>, run: (base: string) => Promise<void>): Promise<void> {
+  await new Promise<void>((resolve) => harness.app.listen(0, "127.0.0.1", resolve));
+  try { await run(`http://127.0.0.1:${(harness.app.address() as { port: number }).port}`); }
+  finally { await new Promise<void>((resolve, reject) => harness.app.close((error) => error ? reject(error) : resolve())); }
+}
+
+test("queue control routes: 401 without a session, 403 without CSRF or a JSON body, admin stop/resume/cap with the control state back", async () => {
+  const h = queueHarness();
+  await withQueueServer(h, async (base) => {
+    const post = (path: string, payload: unknown = {}, headers: Record<string, string> = jsonAuth) => fetch(`${base}${path}`, { method: "POST", headers, body: JSON.stringify(payload) });
+    for (const path of ["/api/queue/stop", "/api/queue/resume", "/api/queue/round-cap", "/api/queue/next-round"]) {
+      await expectError(await fetch(`${base}${path}`, { method: "POST", headers: { "content-type": "application/json", "sec-fetch-site": "same-origin" }, body: "{}" }), 401, "UNAUTHENTICATED");
+      const { "x-csrf-token": _token, ...withoutToken } = jsonAuth;
+      await expectError(await post(path, {}, withoutToken), 403, "CSRF_REJECTED");
+      await expectError(await fetch(`${base}${path}`, { method: "POST", headers: auth, body: "{}" }), 415, "UNSUPPORTED_MEDIA_TYPE");
+    }
+    assert.equal(h.calls.length, 0, "nothing reached the store");
+    const stopped = await post("/api/queue/stop");
+    assert.equal(stopped.status, 200);
+    const text = await stopped.text();
+    assert.equal(text.includes(userId), false, "the response carries no id of the stopping user");
+    assert.equal(text.includes(sessionId), false);
+    const state = (JSON.parse(text) as { control: Record<string, unknown> }).control;
+    assert.deepEqual([state.stopped, state.stoppedBy, state.roundState], [true, ADMIN_NAME, "stopped"]);
+    assert.equal((await post("/api/queue/stop")).status, 200, "stop while stopped: 200 with the current state");
+    assert.deepEqual(((await body(await post("/api/queue/round-cap", { roundCap: 3 }))).control as { roundCap: number }).roundCap, 3);
+    assert.deepEqual(((await body(await post("/api/queue/round-cap", { roundCap: null }))).control as { roundCap: null }).roundCap, null, "null = unlimited");
+    for (const bad of [{}, { roundCap: 0 }, { roundCap: 100_001 }, { roundCap: 2.5 }, { roundCap: "3" }]) await expectError(await post("/api/queue/round-cap", bad), 400, "ROUND_CAP_INVALID");
+    assert.equal(((await body(await post("/api/queue/resume"))).control as { stopped: boolean }).stopped, false);
+    assert.deepEqual(h.calls.map((call) => call.method), ["stopQueue", "stopQueue", "setRoundCap", "setRoundCap", "setRoundCap", "setRoundCap", "setRoundCap", "setRoundCap", "setRoundCap", "resumeQueue"]);
+    assert.deepEqual(h.calls[0]!.args, [tenant, ADMIN_NAME, userId], "the session's tenant and user; the display name for stopped_by");
+  });
+});
+
+test("staff: 403 FORBIDDEN on stop, resume and round-cap; Start next round at any time with roundNo, 409 when stale, 400 when invalid", async () => {
+  const h = queueHarness({ role: "staff" });
+  await withQueueServer(h, async (base) => {
+    const post = (path: string, payload: unknown = {}) => fetch(`${base}${path}`, { method: "POST", headers: jsonAuth, body: JSON.stringify(payload) });
+    for (const path of ["/api/queue/stop", "/api/queue/resume", "/api/queue/round-cap"]) await expectError(await post(path, { roundCap: 3 }), 403, "FORBIDDEN");
+    assert.equal(h.calls.length, 0);
+    // Not full, no cap: allowed. Then stopped by an admin: still allowed, and the stop stays.
+    const first = await post("/api/queue/next-round", { roundNo: 1 });
+    assert.equal(first.status, 200);
+    assert.equal(((await body(first)).control as { roundNo: number }).roundNo, 2);
+    h.setRole("admin");
+    await post("/api/queue/stop");
+    h.setRole("staff");
+    const whileStopped = await body(await post("/api/queue/next-round", { roundNo: 2 }));
+    assert.deepEqual([(whileStopped.control as { roundNo: number }).roundNo, (whileStopped.control as { stopped: boolean }).stopped], [3, true]);
+    const stale = await post("/api/queue/next-round", { roundNo: 2 });
+    assert.equal(stale.status, 409);
+    const payload = await body(stale);
+    assert.equal(payload.error, "ROUND_ALREADY_STARTED");
+    assert.equal((payload.control as { roundNo: number }).roundNo, 3, "the 409 carries the current state");
+    for (const bad of [{}, { roundNo: 0 }, { roundNo: "3" }, { roundNo: 1.5 }]) await expectError(await post("/api/queue/next-round", bad), 400, "ROUND_INVALID");
+  });
+});
+
+test("a store without the queue methods answers 503 QUEUE_NOT_CONFIGURED; the routes are labelled and the codes mapped", async () => {
+  const h = queueHarness({ withStore: false });
+  await withQueueServer(h, async (base) => {
+    for (const path of ["/api/queue/stop", "/api/queue/resume", "/api/queue/round-cap", "/api/queue/next-round"]) {
+      await expectError(await fetch(`${base}${path}`, { method: "POST", headers: jsonAuth, body: JSON.stringify({ roundNo: 1, roundCap: 1 }) }), 503, "QUEUE_NOT_CONFIGURED");
+    }
+  });
+  for (const path of ["/api/queue", "/api/queue/stop", "/api/queue/resume", "/api/queue/round-cap", "/api/queue/next-round"]) assert.equal(routeLabel(path), path);
+  assert.equal(routeLabel("/api/queue/other"), "unmatched");
+  assert.deepEqual(["ROUND_CAP_INVALID", "ROUND_INVALID", "ROUND_ALREADY_STARTED", "QUEUE_NOT_CONFIGURED"].map(errorStatus), [400, 400, 409, 503]);
 });

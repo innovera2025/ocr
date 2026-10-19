@@ -4,7 +4,7 @@ import { loadConfig, loadWebConfig, redactLog, type WebConfig } from "@innovera/
 import { handleRawUpload, type IngestDependencies } from "@innovera/ocr-ingest/http";
 import { normalizeFilename } from "@innovera/ocr-ingest";
 import { OcrClient } from "@innovera/ocr-client";
-import { DOCUMENT_SORT_DIRS, DOCUMENT_SORT_KEYS, DOCUMENT_STATUS_CATEGORIES, DuplicateFilenameError, legacyTreatmentIndex, NAME_CHECK_MAX_NAMES, normalizeStructuredResult, type AuditContext, type DocumentSortDir, type DocumentSortKey, type DocumentStatusCategory, type DocumentView, type ReviewStore } from "@innovera/ocr-persistence";
+import { DOCUMENT_SORT_DIRS, DOCUMENT_SORT_KEYS, DOCUMENT_STATUS_CATEGORIES, DuplicateFilenameError, legacyTreatmentIndex, NAME_CHECK_MAX_NAMES, normalizeStructuredResult, RoundAlreadyStartedError, type AuditContext, type DocumentSortDir, type DocumentSortKey, type DocumentStatusCategory, type DocumentView, type QueueActor, type QueueControlChange, type ReviewStore } from "@innovera/ocr-persistence";
 import { assertDatabaseReady, createDatabasePool, runMigrationsWithPool } from "@innovera/ocr-db-runtime";
 import { resolve } from "node:path";
 import { PostgresOcrDocumentStore } from "@innovera/ocr-persistence";
@@ -40,6 +40,11 @@ export type WorkbenchStore = Readonly<{
   saveReview(tenantId: string, documentId: string, input: { structuredResult: unknown; reviewedBy: string; expectedUpdatedAt?: string; audit?: AuditContext }): Promise<{ corrections: number; delivery: "PENDING" | "NOT_REQUIRED"; document: unknown }>;
   /** D10's name pre-check, one entry per name in input order (`{index, exists, document?}`); absent → NAME_CHECK_NOT_CONFIGURED. */
   findFilenameDuplicates?(tenantId: string, names: readonly string[]): Promise<ReadonlyArray<{ index: number; exists: boolean }>>;
+  /** Queue control (plan queue-control D7, D10, D14); absent → QUEUE_NOT_CONFIGURED. */
+  stopQueue?(tenantId: string, actor: QueueActor): Promise<QueueControlChange>;
+  resumeQueue?(tenantId: string, actor: QueueActor): Promise<QueueControlChange>;
+  setRoundCap?(tenantId: string, cap: unknown, actor: QueueActor): Promise<QueueControlChange>;
+  startNextRound?(tenantId: string, roundNo: unknown, actor: QueueActor): Promise<QueueControlChange>;
 }>;
 
 export type AppDependencies = Readonly<{
@@ -76,7 +81,7 @@ const THROTTLED_ERRORS: ReadonlyMap<string, number> = new Map([["LOGIN_THROTTLED
 const UNAVAILABLE_ERRORS = new Set(["EXPORT_MARK_FAILED"]);
 const CONFLICT_ERRORS = new Set(["BATCH_FULL", "IDEMPOTENCY_CONFLICT", "DUPLICATE_FILENAME", "DOCUMENT_NOT_RETRYABLE", "DOCUMENT_NOT_REVIEWABLE", "REVIEW_CONFLICT",
   "DOCUMENT_QUARANTINED", "DOCUMENT_NOT_SCANNED", "CONFIRMATION_TARGET_AMBIGUOUS", "UPLOAD_IN_PROGRESS",
-  "USERNAME_TAKEN", "LAST_ADMIN", "CANNOT_CHANGE_SELF", "EXPORT_SELECTION_CHANGED"]);
+  "USERNAME_TAKEN", "LAST_ADMIN", "CANNOT_CHANGE_SELF", "EXPORT_SELECTION_CHANGED", "ROUND_ALREADY_STARTED"]);
 /** Originals are only served once ClamAV let them through: quarantined bytes never reach a reviewer's browser. */
 const UNSERVED_CONTENT: ReadonlyMap<string, string> = new Map([["QUARANTINED", "DOCUMENT_QUARANTINED"], ["VALIDATING", "DOCUMENT_NOT_SCANNED"], ["SCANNING", "DOCUMENT_NOT_SCANNED"]]);
 const TIMESTAMP = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}(:?\d{2})?)?$/;
@@ -84,7 +89,10 @@ const TIMESTAMP = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{
 const PROXY_HEADERS = ["x-forwarded-for", "x-forwarded-host", "x-real-ip"] as const;
 const EXACT_ROUTES = ["/", "/metrics", "/health/live", "/health/ready", "/api/batches", "/api/documents", "/api/documents/name-check", "/api/auth/login",
   "/api/auth/logout", "/api/auth/session", "/api/auth/password", "/api/users", "/api/exports/preview",
-  "/api/exports/documents.csv", "/api/exports/documents.jsonl", "/api/exports/candidates", "/api/exports/marks"];
+  "/api/exports/documents.csv", "/api/exports/documents.jsonl", "/api/exports/candidates", "/api/exports/marks",
+  "/api/queue", "/api/queue/stop", "/api/queue/resume", "/api/queue/round-cap", "/api/queue/next-round"];
+/** The queue control routes (plan queue-control D10): stop/resume/round-cap are admin only (`requiredRight`), next-round any signed-in user. */
+const QUEUE_ACTIONS = { "/api/queue/stop": "stop", "/api/queue/resume": "resume", "/api/queue/round-cap": "round_cap", "/api/queue/next-round": "next_round" } as const;
 
 export function healthResponse(pathname: string): { status: number; body: { status: string } } {
   if (pathname === "/health/live") return { status: 200, body: { status: "ok" } };
@@ -362,6 +370,25 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
       respond(response, 200, batch);
       return true;
     }
+    const queueAction = method === "POST" ? QUEUE_ACTIONS[pathname as keyof typeof QUEUE_ACTIONS] : undefined;
+    if (queueAction) {
+      const store = workbench();
+      // The JSON content type is required even where the body is empty (stop/resume): a cross-site form cannot send it.
+      const body = await readJson(request);
+      const actor: QueueActor = { displayName: ctx.displayName, audit };
+      const calls: Record<typeof queueAction, (() => Promise<QueueControlChange>) | undefined> = {
+        stop: store.stopQueue ? () => store.stopQueue!(ctx.tenantId, actor) : undefined,
+        resume: store.resumeQueue ? () => store.resumeQueue!(ctx.tenantId, actor) : undefined,
+        round_cap: store.setRoundCap ? () => store.setRoundCap!(ctx.tenantId, body.roundCap, actor) : undefined,
+        next_round: store.startNextRound ? () => store.startNextRound!(ctx.tenantId, body.roundNo, actor) : undefined
+      };
+      const call = calls[queueAction];
+      if (!call) throw new Error("QUEUE_NOT_CONFIGURED");
+      const result = await call();
+      if (result.changed) logEvent("queue_control_changed", { request_id: reqId, trace_id: traceId, user_id: ctx.userId, tenant_id: ctx.tenantId, action: queueAction });
+      respond(response, 200, { control: result.control });
+      return true;
+    }
     const documentMatch = /^\/api\/documents\/([^/]+)\/(content|ocr|ocr\/review|ocr\/confirm|retry)$/.exec(pathname);
     if (!documentMatch) return false;
     const action = `${method} ${documentMatch[2]!}`;
@@ -492,7 +519,9 @@ export function createAppServer(dependencies?: IngestDependencies | AppDependenc
       if (response.headersSent) { response.destroy(); return; }
       const retryAfter = THROTTLED_ERRORS.get(code);
       // D8: only a refused duplicate upload says which document it collides with (the five D7 fields, nothing else).
-      const payload = error instanceof DuplicateFilenameError && code === "DUPLICATE_FILENAME" ? { error: code, existing: error.existing } : { error: code };
+      const payload = error instanceof DuplicateFilenameError && code === "DUPLICATE_FILENAME" ? { error: code, existing: error.existing }
+        // D7: a stale "Start next round" says what the round is now, so the page refreshes without another request.
+        : error instanceof RoundAlreadyStartedError && code === "ROUND_ALREADY_STARTED" ? { error: code, control: error.control } : { error: code };
       respond(response, errorStatus(code), payload, retryAfter === undefined ? {} : { "retry-after": String(retryAfter) });
     }
   }).on("error", () => undefined);
