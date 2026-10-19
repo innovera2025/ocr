@@ -396,6 +396,20 @@ test("a PDF job splits the PDF (no OCR call) and finishes SUCCEEDED; the parent 
   } finally { await h.cleanup(); }
 });
 
+test("queue gate: a PDF split that SUCCEEDS gives its slot back uncounted (splitting never consumes the round cap)", async () => {
+  const events: string[] = [];
+  const gate = { reserve: async () => { events.push("reserve"); return {
+    release: () => { events.push("release"); },
+    complete: async (counted: boolean) => { events.push(counted ? "count" : "release"); } }; } };
+  const h = jobHarness(parent(), { renderer: fakeRenderer({ pages: 3 }).renderer });
+  try {
+    assert.equal(await runWorkerOnce({ ...h.dependencies, gate }), true);
+    assert.deepEqual(h.calls, ["markProcessing", "finish:SUCCEEDED"], "the split itself succeeded");
+    assert.equal(h.store.pages.size, 3);
+    assert.deepEqual(events, ["reserve", "release"], "reserved before the claim, released after, never counted");
+  } finally { await h.cleanup(); }
+});
+
 test("a PDF that cannot be split ends DEAD with its code; a missing renderer is retried", async () => {
   const encrypted = jobHarness(parent(), { renderer: fakeRenderer(new PdfSplitError("PDF_ENCRYPTED", "a password is required to open it")).renderer });
   try {
