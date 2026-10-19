@@ -290,3 +290,30 @@ test("a duplicate is a final upload error with the plan's Thai texts, and the pr
   // The retryable duplicate's text names the failed document's real retry button, so the two cannot drift apart.
   assert.ok(inlineScript.includes("btn('ลองอ่านอีกครั้ง',"), "the button the duplicate text tells staff to press exists");
 });
+
+// ---- queue control (plan queue-control D11 to D13) --------------------------------------------------------------------
+
+test("the queue panel sits above the batch card with the plan's Thai strings; the stale rate note is gone", () => {
+  assert.ok(markup.indexOf('<section id="queue"') >= 0 && markup.indexOf('<section id="queue"') < markup.indexOf('<section id="batch"'), "#queue comes before #batch");
+  for (const text of ["คิวการอ่าน", "หยุดคิวทั้งหมด", "เริ่มคิวต่อ", "เริ่มรอบถัดไป", "ตั้งจำนวนหน้าต่อรอบ", "ไม่จำกัด", "จำนวนหน้าสูงสุดต่อรอบ", "เฉพาะที่อ่านเสร็จแล้ว"]) {
+    assert.ok(markup.includes(text), `markup: ${text}`);
+  }
+  for (const text of ["กำลังอ่าน", "หยุดอยู่", "ครบรอบแล้ว รอเริ่มรอบถัดไป", "อ่านแล้ว ", "ความเร็วจริง ประมาณ ", " หน้า/ชั่วโมง", "ยังประเมินความเร็วไม่ได้",
+    " ชม. ", " นาที (ไม่รวมช่วงที่หยุดรอ)", "เหลือประมาณ ", "รอบที่ ", " หน้า (ไม่จำกัด)", "หยุดคิวอ่าน?",
+    "หน้าที่กำลังอ่านอยู่จะอ่านจนเสร็จ หน้าที่ยังไม่ได้อ่านจะถูกเก็บไว้ ไม่ถูกลบ เริ่มต่อได้ทุกเมื่อ", "เริ่มรอบใหม่?",
+    " ต้องการเริ่มรอบใหม่ไหม? ตัวนับของรอบนี้จะถูกรีเซ็ตเป็น 0 หน้าที่กำลังอ่านอยู่จะนับในรอบใหม่ คิวที่หยุดอยู่จะยังหยุดอยู่", "'เริ่มรอบใหม่'",
+    "มีผู้เริ่มรอบใหม่แล้ว", "ถึงจำนวนหน้าของรอบนี้แล้ว ระบบหยุดรอให้ Export ข้อมูลที่อ่านเสร็จ แล้วกด \"เริ่มรอบถัดไป\"",
+    "เริ่มคิวต่อแล้ว แต่รอบนี้เต็ม ต้องกด \"เริ่มรอบถัดไป\" ก่อนระบบจึงอ่านต่อ", "กรอกเลขจำนวนเต็ม 1 ถึง 100000", "ดูเอกสารในชุดนี้"]) {
+    assert.ok(inlineScript.includes(text), `script: ${text}`);
+  }
+  const note = /const PDF_NOTE='([^']*)'/.exec(inlineScript)?.[1] ?? "";
+  assert.equal(note, 'ไฟล์ PDF จะถูกแยกเป็นหนึ่งแถวต่อหน้า ระบบอ่านทีละชุดอัปโหลดตามลำดับที่อัปโหลด ดูความเร็วจริงและเวลาโดยประมาณได้ที่ "คิวการอ่าน" ปิดหน้านี้ได้ ระบบทำงานต่อเอง');
+  for (const stale of ["2–3 หน้าต่อนาที", "2-3 หน้าต่อนาที", "40 นาที"]) assert.equal(html.includes(stale), false, stale);
+});
+
+test("every queue code the routes can answer has Thai text, and the panel never uses window.confirm", () => {
+  const errors = Object.fromEntries([...inlineScript.matchAll(/([A-Z_]+):'([^']*)'/g)].map((match) => [match[1]!, match[2]!]));
+  for (const code of ["ROUND_ALREADY_STARTED", "ROUND_INVALID", "ROUND_CAP_INVALID", "QUEUE_NOT_CONFIGURED", "FORBIDDEN"]) assert.match(errors[code] ?? "", /[฀-๿]/, code);
+  assert.equal(/\bconfirm\(/.test(inlineScript.replace(/confirmAsk\(|answerConfirm\(/g, "")), false);
+  assert.match(inlineScript, /\/api\/queue\/next-round',\{roundNo\}/, "next-round sends the round on screen");
+});

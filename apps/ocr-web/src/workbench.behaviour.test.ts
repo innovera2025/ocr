@@ -118,6 +118,15 @@ type Workbench = {
   clearFilters(): void;
   showPages(parentId: string, name: string): Promise<void>;
   ocrSummary(view: unknown): unknown;
+  loadQueue(force?: boolean): Promise<void>;
+  renderQueue(): void;
+  nextRound(): Promise<void>;
+  stopQueue(): Promise<void>;
+  resumeQueue(): Promise<void>;
+  setCap(value: string | null): void;
+  tick(): Promise<void>;
+  pickFinished(): void;
+  exportFilter(): Record<string, unknown>;
   ERRORS: Record<string, string>;
   state: {
     uploads: Upload[]; batch: unknown; batchId: string | null; current: unknown; draft: unknown; editable: boolean;
@@ -126,12 +135,14 @@ type Workbench = {
     sort: string; dir: string; offset: number; docs: Array<{ documentId: string }>;
     exQ: string; exParent: string; exTotal: number | null; exMax: number; batchFilter: string;
     exTab: string; exOffset: number; exSize: number; exSel: Set<string>; exWarnIds: Set<string>; exAll: boolean; exAllTotal: number | null; exRows: unknown[];
+    queue: unknown; qTimer: number; qOpen: boolean; qLast: number;
   };
 };
 
 const inline = /<script\b[^>]*>([\s\S]*?)<\/script>/.exec(workbenchPage({ nonce: "n" }))?.[1] ?? "";
 const EXPOSE = "globalThis.__wb={wire,init,checkSession,requireLogin,api,loadDocuments,logout,openUsers,openExportDialog,downloadExport,applyUser,renderHead,reviewerLabel,"
-  + "row,renderBatch,addFiles,loadPreview,save,ERRORS,state,applyDocument,failText,toggleOriginal,toDraft,renderEditor,countNeeds,cycleSort,renderSort,listUrl,clearFilters,showPages,ocrSummary};";
+  + "row,renderBatch,addFiles,loadPreview,save,ERRORS,state,applyDocument,failText,toggleOriginal,toDraft,renderEditor,countNeeds,cycleSort,renderSort,listUrl,clearFilters,showPages,ocrSummary,"
+  + "loadQueue,renderQueue,nextRound,stopQueue,resumeQueue,setCap,tick,pickFinished,exportFilter};";
 
 /** setTimeout/clearTimeout with no wall clock: a test decides when an armed timer fires (and can see that one is armed). */
 class FakeClock {
@@ -1077,7 +1088,7 @@ test("paging keeps the ticked ids; a tab or filter change resets to the first pa
   ctx.$("ex-next").dispatch("click");
   await settle();
   assert.equal(candidateCalls(ctx).at(-1)?.get("offset"), "100");
-  assert.equal(ctx.$("ex-count").textContent, "พบ 120 แถว · แสดงแถวที่ 101–120");
+  assert.equal(ctx.$("ex-count").textContent, "พบ 120 แถว (เฉพาะที่อ่านเสร็จแล้ว) · แสดงแถวที่ 101–120");
   assert.equal(ctx.$("ex-rows").children[0]!.children[1]!.textContent, "ใบลูกค้า-101.pdf");
   tick(ctx, 0);
   assert.equal(ctx.$("ex-picked").textContent, "เลือกแล้ว 2 แถว", "a tick is an id, so the first page's tick survives the page change");
@@ -1093,7 +1104,7 @@ test("paging keeps the ticked ids; a tab or filter change resets to the first pa
   runLastTimer(ctx);
   await settle();
   assert.equal(candidateCalls(ctx).at(-1)?.get("exportState"), null, "ทั้งหมด sends no exportState");
-  assert.equal(ctx.$("ex-count").textContent, "พบ 121 แถว · แสดงแถวที่ 1–100");
+  assert.equal(ctx.$("ex-count").textContent, "พบ 121 แถว (เฉพาะที่อ่านเสร็จแล้ว) · แสดงแถวที่ 1–100");
   tick(ctx, 0);
   ctx.$("ex-confirmed").checked = true;
   ctx.$("ex-confirmed").dispatch("change");
@@ -1116,12 +1127,12 @@ test("แสดงต่อหน้า: 50 to 500 rows a page; a change keeps t
   await settle();
   const asked = candidateCalls(ctx);
   assert.deepEqual(asked.map((call) => [call.get("limit"), call.get("offset"), call.get("exportState")]), [["500", "0", "never"]], "one request, from the first page");
-  assert.equal(ctx.$("ex-count").textContent, "พบ 650 แถว · แสดงแถวที่ 1–500");
+  assert.equal(ctx.$("ex-count").textContent, "พบ 650 แถว (เฉพาะที่อ่านเสร็จแล้ว) · แสดงแถวที่ 1–500");
   assert.equal(ctx.$("ex-rows").children.length, 500);
   assert.deepEqual([ctx.wb.state.exSel.size, rowBox(ctx, 0).checked, rowBox(ctx, 100).checked], [2, true, true], "a tick is an id: both survive the new page size");
   ctx.$("ex-next").dispatch("click");
   await settle();
-  assert.deepEqual([candidateCalls(ctx).at(-1)?.get("offset"), ctx.$("ex-count").textContent, ctx.$("ex-next").disabled], ["500", "พบ 650 แถว · แสดงแถวที่ 501–650", true]);
+  assert.deepEqual([candidateCalls(ctx).at(-1)?.get("offset"), ctx.$("ex-count").textContent, ctx.$("ex-next").disabled], ["500", "พบ 650 แถว (เฉพาะที่อ่านเสร็จแล้ว) · แสดงแถวที่ 501–650", true]);
   // A value the control does not offer is put back and asks nothing (the server would refuse more than 500).
   ctx.calls.length = 0;
   size("1000");
@@ -1216,8 +1227,9 @@ test("เลือกทั้งหมด N switches to filter mode: rows locke
   ctx.$("ex-download").dispatch("click");
   await settle();
   const post = ctx.calls.find((call) => call.url === "/api/exports/documents.csv");
-  assert.deepEqual(bodyOf(post), { columns: "detailed", selection: { mode: "filter", filter: { dateField: "created_at", exportState: "never" }, expectedTotal: 175 } },
-    "the dialog's default is the full set");
+  // D13 (queue-control): the dialog opens with the three read statuses ticked, so "select all" carries them.
+  assert.deepEqual(bodyOf(post), { columns: "detailed", selection: { mode: "filter", filter: { status: ["review", "succeeded", "confirmed"], dateField: "created_at", exportState: "never" }, expectedTotal: 175 } },
+    "the dialog's default is the finished rows (D13)");
   // ล้างการเลือก goes back to explicit ticking with nothing ticked.
   const again = await openList(many(60));
   tickPage(again);
@@ -1362,7 +1374,7 @@ test("EXPORT_SELECTION_CHANGED or _EMPTY: the Thai reason stays, the selection c
     assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS[code], `${route} ${code}`);
     assert.deepEqual([ctx.wb.state.exAll, ctx.wb.state.exSel.size], [false, 0], `${route} ${code}: the selection described rows that changed`);
     assert.equal(candidateCalls(ctx).length, 1, "the list is asked again");
-    assert.equal(ctx.$("ex-count").textContent, "พบ 60 แถว · แสดงแถวที่ 1–60");
+    assert.equal(ctx.$("ex-count").textContent, "พบ 60 แถว (เฉพาะที่อ่านเสร็จแล้ว) · แสดงแถวที่ 1–60");
     assert.ok(!ctx.$("notice").textContent.includes("แถวแล้ว"), "no success notice");
   }
 });
@@ -1474,7 +1486,7 @@ test("a late answer for the old filter never lands on the new one", async () => 
   assert.equal(ctx.$("ex-count").textContent, "กำลังนับจำนวนแถว…");
   runLastTimer(ctx);
   await settle();
-  assert.equal(ctx.$("ex-count").textContent, "พบ 1 แถว · แสดงแถวที่ 1–1");
+  assert.equal(ctx.$("ex-count").textContent, "พบ 1 แถว (เฉพาะที่อ่านเสร็จแล้ว) · แสดงแถวที่ 1–1");
 });
 
 test("ถึงวันที่ before ตั้งแต่วันที่ is named in Thai and never reaches the server", async () => {
@@ -1586,7 +1598,7 @@ test("M2: เลือกทั้งหมด pins the N the user agreed to; a 
   assert.deepEqual([ctx.wb.state.exAll, ctx.wb.state.exAllTotal, ctx.wb.state.exSel.size], [false, null, 0]);
   assert.equal(ctx.$("ex-error").textContent, ctx.wb.ERRORS.EXPORT_SELECTION_CHANGED);
   assert.deepEqual([ctx.$("ex-picked").textContent, ctx.$("ex-download").disabled, rowBox(ctx, 0).disabled], ["เลือกแล้ว 0 แถว", true, false]);
-  assert.equal(ctx.$("ex-count").textContent, "พบ 171 แถว · แสดงแถวที่ 1–100", "the new count is shown, nothing is downloaded");
+  assert.equal(ctx.$("ex-count").textContent, "พบ 171 แถว (เฉพาะที่อ่านเสร็จแล้ว) · แสดงแถวที่ 1–100", "the new count is shown, nothing is downloaded");
   ctx.$("ex-download").dispatch("click");
   await settle();
   assert.deepEqual(ctx.calls.filter((call) => call.url.startsWith("/api/exports/documents.")), []);
@@ -2238,4 +2250,205 @@ test("ดูเอกสารเดิม searches the list for the existing do
   assert.deepEqual([ctx.wb.state.q, ctx.wb.state.status, ctx.wb.state.batchFilter, ctx.$("q").value], ["b.pdf", "", "", "b.pdf"]);
   const list = ctx.fetches.find((call) => call.startsWith("GET /api/documents?")) ?? "";
   assert.equal(new URLSearchParams(list.split("?")[1]).get("q"), "b.pdf");
+});
+
+
+// ---- queue panel (plan queue-control D7, D10 to D13) ---------------------------------------------------------------
+
+type QueueControl = { stopped: boolean; stoppedAt: string | null; stoppedBy: string | null; roundCap: number | null; roundNo: number; roundStartedAt: string; roundDone: number; roundState: string };
+const queueBody = (control: Partial<QueueControl> = {}, overview: Record<string, unknown> = {}) => ({
+  control: { stopped: false, stoppedAt: null, stoppedBy: null, roundCap: null, roundNo: 4, roundStartedAt: "2026-10-19T00:00:00.000Z", roundDone: 0, roundState: "reading", ...control },
+  overview: { openBatches: 1, pagesTotal: 120, pagesRead: 30, pagesFailed: 1, pagesWaiting: 89, pagesReading: 1, heldPages: 0, filesUploaded: 4, filesExpected: 4, filesDone: 1,
+    secondsPerPage: 120, etaSeconds: 90 * 120, roundEtaSeconds: null, rateSample: 20, ...overview },
+  batches: [{ batchId: ID, label: "เช้า", createdAt: "2026-10-19T01:00:00.000Z", expectedTotal: 4, uploaded: 4, rowsExpected: 120, completed: 30, failed: 1, queuePosition: 1 }],
+  batchesTotal: 1, holdsAvailable: false
+});
+/** A booted page whose /api/queue answers `body()` and whose queue POSTs answer `post(url, body)`. */
+async function queuePage(user: SessionUser, body: () => unknown, post: (url: string, payload: Record<string, unknown>) => FakeResponse = () => json(200, { control: (body() as { control: unknown }).control })) {
+  const state: Server = { user, csrf: "csrf-q", sessionStatus: 200 };
+  const ctx = await bootedIn(state, (url, init) => {
+    if (url === "/api/queue") return json(200, body());
+    if (url.startsWith("/api/queue/")) return post(url, JSON.parse(String(init.body ?? "{}")) as Record<string, unknown>);
+    return null;
+  });
+  return ctx;
+}
+const queuePosts = (ctx: { calls: Call[] }) => ctx.calls.filter((call) => call.url.startsWith("/api/queue/"));
+
+test("queue panel states: reading with rate and ETA, stopped, round full, stopped and full, unlimited cap, no rate yet", async () => {
+  let body: unknown = queueBody();
+  const ctx = await queuePage(STAFF, () => body);
+  assert.equal(ctx.$("queue").hidden, false, "init loads the panel");
+  assert.equal(ctx.$("queue-chips").textContent, "กำลังอ่าน");
+  assert.equal(ctx.$("queue-summary").textContent, "อ่านแล้ว 30 จาก 120 หน้า · ความเร็วจริง ประมาณ 30 หน้า/ชั่วโมง · เหลือประมาณ 3 ชม. 0 นาที (ไม่รวมช่วงที่หยุดรอ)");
+  assert.equal(ctx.$("queue-body").hidden, true, "collapsed to the summary line until opened");
+  ctx.$("queue-toggle").dispatch("click");
+  assert.equal(ctx.$("queue-body").hidden, false);
+  assert.equal(ctx.$("queue-round").textContent, "รอบที่ 4: อ่านแล้ว 0 หน้า (ไม่จำกัด)");
+  assert.equal(ctx.$("queue-help").hidden, true);
+  assert.match(ctx.$("queue-list").textContent, /#1 · เช้า/);
+  assert.match(ctx.$("queue-list").textContent, /อ่านแล้ว 30 จาก 120 หน้า · ไฟล์ 4\/4 · ไม่สำเร็จ 1/);
+  const set = async (next: unknown) => { body = next; await ctx.wb.loadQueue(true); await settle(); };
+  await set(queueBody({ stopped: true, stoppedAt: "2026-10-19T02:00:00.000Z", stoppedBy: "บอส", roundState: "stopped" }));
+  assert.equal(ctx.$("queue-chips").textContent, "หยุดอยู่");
+  await set(queueBody({ roundCap: 3, roundDone: 3, roundState: "round_full" }));
+  assert.equal(ctx.$("queue-chips").textContent, "ครบรอบแล้ว รอเริ่มรอบถัดไป");
+  assert.equal(ctx.$("queue-round").textContent, "รอบที่ 4: อ่านแล้ว 3/3 หน้า");
+  assert.deepEqual([ctx.$("queue-help").hidden, ctx.$("queue-help").textContent], [false, 'ถึงจำนวนหน้าของรอบนี้แล้ว ระบบหยุดรอให้ Export ข้อมูลที่อ่านเสร็จ แล้วกด "เริ่มรอบถัดไป"']);
+  await set(queueBody({ stopped: true, roundCap: 3, roundDone: 3, roundState: "stopped" }));
+  assert.equal(ctx.$("queue-chips").textContent, "หยุดอยู่ครบรอบแล้ว รอเริ่มรอบถัดไป", "both are listed, stopped first");
+  await set(queueBody({}, { secondsPerPage: null, etaSeconds: null, rateSample: 3 }));
+  assert.equal(ctx.$("queue-summary").textContent, "อ่านแล้ว 30 จาก 120 หน้า · ยังประเมินความเร็วไม่ได้");
+});
+
+test("staff: no Stop/Resume/N controls; Start next round at any time sends the round on screen, with the in-page confirm only when not full and something was read", async () => {
+  let body = queueBody();
+  const ctx = await queuePage(STAFF, () => body, (url, payload) => {
+    body = queueBody({ roundNo: Number(payload.roundNo) + 1, roundDone: 0 });
+    return json(200, { control: body.control });
+  });
+  assert.equal(ctx.$("queue-admin").hidden, true, "admin controls hidden for staff");
+  assert.equal(ctx.$("queue-next").hidden, false);
+  // Round 4 has read nothing: no dialog, one POST with roundNo 4.
+  await ctx.wb.nextRound();
+  await settle();
+  assert.equal(ctx.$("confirm-dlg").open, false);
+  assert.deepEqual(queuePosts(ctx).map((call) => [call.url, JSON.parse(call.body), call.headers["X-CSRF-Token"]]), [["/api/queue/next-round", { roundNo: 4 }, "csrf-q"]]);
+  // Round 5 has read 2 of 10 (not full): the in-page dialog; cancel sends nothing.
+  body = queueBody({ roundNo: 5, roundCap: 10, roundDone: 2 });
+  await ctx.wb.loadQueue(true);
+  await settle();
+  ctx.calls.length = 0;
+  const cancelled = ctx.wb.nextRound();
+  await settle();
+  assert.equal(ctx.$("confirm-dlg").open, true);
+  assert.equal(ctx.$("cf-title").textContent, "เริ่มรอบใหม่?");
+  assert.equal(ctx.$("cf-text").textContent, "รอบนี้อ่านไปแล้ว 2 จาก 10 หน้า ต้องการเริ่มรอบใหม่ไหม? ตัวนับของรอบนี้จะถูกรีเซ็ตเป็น 0 หน้าที่กำลังอ่านอยู่จะนับในรอบใหม่ คิวที่หยุดอยู่จะยังหยุดอยู่");
+  assert.equal(ctx.$("cf-yes").textContent, "เริ่มรอบใหม่", "the cancel button is the dialog's own ยกเลิก (markup)");
+  ctx.$("cf-no").dispatch("click");
+  await cancelled;
+  await settle();
+  assert.equal(queuePosts(ctx).length, 0, "cancel sends nothing");
+  // Confirmed: exactly one POST. Unlimited cap and stopped: the dialog text says so, and the stop is not touched.
+  body = queueBody({ roundNo: 6, roundCap: null, roundDone: 7, stopped: true, roundState: "stopped" });
+  await ctx.wb.loadQueue(true);
+  await settle();
+  ctx.calls.length = 0;
+  const confirmed = ctx.wb.nextRound();
+  await settle();
+  assert.match(ctx.$("cf-text").textContent, /^รอบนี้อ่านไปแล้ว 7 หน้า ต้องการเริ่มรอบใหม่ไหม\?/);
+  ctx.$("cf-yes").dispatch("click");
+  await confirmed;
+  await settle();
+  assert.deepEqual(queuePosts(ctx).map((call) => JSON.parse(call.body)), [{ roundNo: 6 }]);
+  // A full round needs no confirmation.
+  body = queueBody({ roundNo: 7, roundCap: 3, roundDone: 3, roundState: "round_full" });
+  await ctx.wb.loadQueue(true);
+  await settle();
+  ctx.calls.length = 0;
+  await ctx.wb.nextRound();
+  await settle();
+  assert.equal(ctx.$("confirm-dlg").open, false);
+  assert.deepEqual(queuePosts(ctx).map((call) => JSON.parse(call.body)), [{ roundNo: 7 }]);
+});
+
+test("ROUND_ALREADY_STARTED is shown as success and the panel reloads; the other queue codes and 403 are Thai", async () => {
+  let answer: FakeResponse = json(409, { error: "ROUND_ALREADY_STARTED", control: queueBody({ roundNo: 9 }).control });
+  const ctx = await queuePage(ADMIN, () => queueBody(), () => answer);
+  ctx.calls.length = 0;
+  await ctx.wb.nextRound();
+  await settle();
+  assert.equal(ctx.$("notice").className, "notice", "not an error notice");
+  assert.match(ctx.$("notice").textContent, /มีผู้เริ่มรอบใหม่แล้ว/);
+  assert.equal(ctx.$("queue-error").textContent, "");
+  assert.ok(ctx.calls.some((call) => call.url === "/api/queue" && call.method === "GET"), "reloaded at once");
+  for (const [status, code] of [[400, "ROUND_INVALID"], [400, "ROUND_CAP_INVALID"], [403, "FORBIDDEN"], [503, "QUEUE_NOT_CONFIGURED"]] as const) {
+    answer = json(status, { error: code });
+    await ctx.wb.nextRound();
+    await settle();
+    assert.equal(ctx.$("queue-error").textContent, ctx.wb.ERRORS[code], code);
+    assert.match(ctx.$("queue-error").textContent, /[\u0E00-\u0E7F]/, code);
+  }
+});
+
+test("admin: Stop asks in the page, then one POST with the CSRF header and a reload; Resume into a full round says so; N is validated", async () => {
+  let body = queueBody({ roundCap: 3, roundDone: 3, roundState: "round_full" });
+  const ctx = await queuePage(ADMIN, () => body, (url, payload) => {
+    if (url.endsWith("/stop")) body = queueBody({ ...body.control, stopped: true, roundState: "stopped" });
+    if (url.endsWith("/resume")) body = queueBody({ ...body.control, stopped: false, roundState: "round_full" });
+    if (url.endsWith("/round-cap")) body = queueBody({ ...body.control, roundCap: payload.roundCap as number | null });
+    return json(200, { control: body.control });
+  });
+  assert.equal(ctx.$("queue-admin").hidden, false);
+  assert.deepEqual([ctx.$("queue-stop").hidden, ctx.$("queue-resume").hidden], [false, true]);
+  ctx.calls.length = 0;
+  const stopping = ctx.wb.stopQueue();
+  await settle();
+  assert.deepEqual([ctx.$("cf-title").textContent, ctx.$("cf-text").textContent, ctx.$("cf-yes").textContent],
+    ["หยุดคิวอ่าน?", "หน้าที่กำลังอ่านอยู่จะอ่านจนเสร็จ หน้าที่ยังไม่ได้อ่านจะถูกเก็บไว้ ไม่ถูกลบ เริ่มต่อได้ทุกเมื่อ", "หยุดคิวทั้งหมด"]);
+  assert.equal(queuePosts(ctx).length, 0, "nothing before the answer");
+  ctx.$("cf-yes").dispatch("click");
+  await stopping;
+  await settle();
+  const posts = queuePosts(ctx);
+  assert.deepEqual(posts.map((call) => [call.method, call.url, call.headers["X-CSRF-Token"], call.headers["Content-Type"]]), [["POST", "/api/queue/stop", "csrf-q", "application/json"]]);
+  assert.ok(ctx.calls.findIndex((call) => call.url === "/api/queue") > ctx.calls.indexOf(posts[0]!), "the panel reloads after the action");
+  assert.deepEqual([ctx.$("queue-stop").hidden, ctx.$("queue-resume").hidden], [true, false]);
+  await ctx.wb.resumeQueue();
+  await settle();
+  assert.equal(ctx.$("queue-help").textContent, 'เริ่มคิวต่อแล้ว แต่รอบนี้เต็ม ต้องกด "เริ่มรอบถัดไป" ก่อนระบบจึงอ่านต่อ');
+  ctx.calls.length = 0;
+  for (const bad of ["0", "100001", "2.5", "abc", ""]) { ctx.wb.setCap(bad); assert.equal(ctx.$("queue-error").textContent, "กรอกเลขจำนวนเต็ม 1 ถึง 100000", bad); }
+  assert.equal(queuePosts(ctx).length, 0, "an invalid N is never sent");
+  ctx.wb.setCap(" 25 ");
+  await settle();
+  ctx.wb.setCap(null);
+  await settle();
+  assert.deepEqual(queuePosts(ctx).map((call) => JSON.parse(call.body)), [{ roundCap: 25 }, { roundCap: null }]);
+});
+
+test("poll cadence: the 3 s tick never calls /api/queue; the panel's own timer is 5 s while reading, 15 s otherwise, and never twice within 5 s", async () => {
+  let body = queueBody();
+  const ctx = await queuePage(STAFF, () => body);
+  const armed = ctx.wb.state.qTimer;
+  assert.ok(armed !== 0 && ctx.clock.timers.has(armed), "init armed the panel's own timer");
+  ctx.calls.length = 0;
+  await ctx.wb.tick();
+  await settle();
+  assert.equal(ctx.calls.filter((call) => call.url === "/api/queue").length, 0, "not part of tick");
+  // A non-forced load within 5 s of the last one only re-arms the timer.
+  await ctx.wb.loadQueue(false);
+  await settle();
+  assert.equal(ctx.calls.filter((call) => call.url === "/api/queue").length, 0, "at most one call per 5 s");
+  ctx.wb.state.qLast = 0;
+  ctx.clock.run(ctx.wb.state.qTimer);
+  await settle();
+  assert.equal(ctx.calls.filter((call) => call.url === "/api/queue").length, 1, "the timer fires one load");
+  body = queueBody({ stopped: true, roundState: "stopped" });
+  ctx.wb.state.qLast = 0;
+  await ctx.wb.loadQueue(false);
+  await settle();
+  assert.ok(ctx.wb.state.qTimer !== 0, "re-armed");
+  for (const call of ctx.calls.filter((entry) => entry.url === "/api/queue")) assert.equal(call.headers["X-OCR-Background"], "1", "background polling");
+});
+
+test("export default (D13): the dialog opens with รอตรวจสอบ, อ่านสำเร็จ, ยืนยันแล้ว; เฉพาะที่อ่านเสร็จแล้ว selects exactly those; a list status is kept", async () => {
+  const state: Server = { user: ADMIN, csrf: "csrf-x", sessionStatus: 200 };
+  const ctx = await bootedIn(state, (url) => url.startsWith("/api/exports/candidates") ? json(200, { total: 0, limit: 100, offset: 0, counts: { never: 0, exported: 0, all: 0, unconfirmed: 0 }, rows: [] }) : null);
+  ctx.wb.openExportDialog();
+  await settle();
+  const ticked = () => ["queued", "processing", "review", "succeeded", "confirmed", "failed"].filter((key) => ctx.$("ex-st-" + key).checked);
+  assert.deepEqual(ticked(), ["review", "succeeded", "confirmed"]);
+  const statusOf = () => { const status = ctx.wb.exportFilter().status; return Array.isArray(status) ? [...status] : status; };
+  assert.deepEqual(statusOf(), ["review", "succeeded", "confirmed"]);
+  for (const key of ["queued", "processing", "failed"]) ctx.$("ex-st-" + key).checked = true;
+  assert.equal(statusOf(), undefined, "all six is still no filter (ทุกสถานะ)");
+  ctx.$("ex-st-finished").dispatch("click");
+  await settle();
+  assert.deepEqual(ticked(), ["review", "succeeded", "confirmed"]);
+  assert.deepEqual(statusOf(), ["review", "succeeded", "confirmed"], "เฉพาะที่อ่านเสร็จแล้ว → f.status = [review, succeeded, confirmed]");
+  ctx.wb.state.status = "failed";
+  ctx.wb.openExportDialog();
+  await settle();
+  assert.deepEqual(ticked(), ["failed"], "a status chosen on the list still decides");
 });

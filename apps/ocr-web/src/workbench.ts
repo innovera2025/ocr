@@ -81,6 +81,7 @@ main{padding:40px 24px 96px}
 .fill{display:block;height:100%;width:0;background:var(--fg);transition:width .15s var(--ease)}
 .up-act{display:flex;justify-content:flex-end;min-width:0}
 .batch{padding:20px 24px;margin-bottom:40px}
+#queue{margin-bottom:24px}
 .batch-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:16px}
 .stack{display:flex;height:8px;border-radius:9999px;background:var(--fill);overflow:hidden;margin-bottom:16px}
 .stack span{display:block;height:100%;transition:width .15s var(--ease)}
@@ -89,6 +90,19 @@ main{padding:40px 24px 96px}
 .stat{min-width:0}
 .stat dt{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg3);white-space:nowrap}
 .stat dd{margin:2px 0 0;font:600 24px/1.3 var(--mono);letter-spacing:-.04em;font-variant-numeric:tabular-nums}
+/* The queue panel (queue-control D12): the batch card's look, a one-line summary until it is opened. */
+.q-chips{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.badge.q-reading{background:var(--teal-bg)}.badge.q-reading .dot{background:var(--teal)}
+.badge.q-stopped{background:var(--red-bg)}.badge.q-stopped .dot{background:var(--red)}
+.badge.q-full{background:var(--amber-bg)}.badge.q-full .dot{background:var(--amber)}
+.q-body{margin-top:16px}
+.q-controls{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;margin:12px 0}
+.q-controls .fld{min-width:160px;max-width:200px}
+.q-help{margin-top:8px;padding:8px 12px;border-radius:6px;background:var(--amber-row);box-shadow:0 0 0 1px var(--amber-line);font-size:13px}
+.q-list{margin-top:12px}
+.q-row{display:grid;grid-template-columns:minmax(0,2fr) minmax(120px,1fr) auto;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--line);font-size:13px}
+.q-row .stack{margin:6px 0 0}
+.q-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .stat .dot.k-confirmed{background:var(--teal)}.stat .dot.k-succeeded{background:var(--blue)}.stat .dot.k-review{background:var(--amber)}.stat .dot.k-failed{background:var(--red)}.stat .dot.k-processing{background:var(--fg4)}.stat .dot.k-queued{background:var(--line2)}
 .docs-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:12px}
 .docs-head h2:focus{outline:none}
@@ -296,7 +310,7 @@ body[data-auth="checking"] main,body[data-auth="checking"] .top-right{visibility
 body[data-auth="out"] #me,body[data-auth="out"] #me-open{display:none!important}
 @media (max-width:1180px){.stats{grid-template-columns:repeat(5,minmax(0,1fr))}}
 @media (max-width:860px){.d-body{display:block;overflow:auto}.d-preview{height:42vh;height:42dvh;box-shadow:inset 0 -1px 0 var(--line)}.d-editor{overflow:visible;padding:16px}.d-head{padding:12px 16px}.d-alert{padding:10px 16px}.ocr-sum{padding:8px 16px}.d-foot{flex-direction:column;align-items:stretch;gap:8px;padding:10px 16px}.d-foot .draft{font-size:12px}.d-foot .draft:empty{display:none}.d-foot .acts{flex-wrap:wrap}.d-foot #d-cancel{order:1}.d-foot #d-save{order:2;flex:1}.d-foot #d-next{order:3;flex:1 1 100%}.p-content iframe{min-height:0}}
-@media (max-width:720px){main{padding:24px 16px 80px}.top{padding:0 16px}.brand .crumb,.brand .here{display:none}.hero{flex-direction:column;align-items:stretch;gap:16px}.hero h1{font-size:32px}.drop-inner{flex-direction:column;align-items:stretch;padding:16px}.up-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"name act" "state act" "bar bar";row-gap:4px;padding:8px 12px}.up-name{grid-area:name}.up-size{display:none}.up-state{grid-area:state}.bar{grid-area:bar}.up-act{grid-area:act}.batch{padding:16px}.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.stat dd{font-size:20px}.fld,.fld.grow{flex:1 1 100%;max-width:none;min-width:0}.toolbar .btn{flex:1}.t-grid{grid-template-columns:1fr}.notice{left:16px;right:16px;bottom:16px}th:first-child,td:first-child{width:168px;min-width:168px;max-width:168px}.c-file .m-only{display:inline-flex!important;margin-top:6px}
+@media (max-width:720px){main{padding:24px 16px 80px}.top{padding:0 16px}.brand .crumb,.brand .here{display:none}.hero{flex-direction:column;align-items:stretch;gap:16px}.hero h1{font-size:32px}.drop-inner{flex-direction:column;align-items:stretch;padding:16px}.up-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"name act" "state act" "bar bar";row-gap:4px;padding:8px 12px}.up-name{grid-area:name}.up-size{display:none}.up-state{grid-area:state}.bar{grid-area:bar}.up-act{grid-area:act}.batch{padding:16px}.stats{grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.stat dd{font-size:20px}.q-row{grid-template-columns:minmax(0,1fr) auto}.q-row .q-counts{grid-column:1/-1;grid-row:2}.fld,.fld.grow{flex:1 1 100%;max-width:none;min-width:0}.toolbar .btn{flex:1}.t-grid{grid-template-columns:1fr}.notice{left:16px;right:16px;bottom:16px}th:first-child,td:first-child{width:168px;min-width:168px;max-width:168px}.c-file .m-only{display:inline-flex!important;margin-top:6px}
 /* The 56px header must fit 375px: the brand, the connection chip and the one #me-open pill. The pill carries the whole
    display name, and .btn is nowrap, so without a cap a long Thai name gives the page a horizontal scrollbar. The
    connection text keeps its live region (it is only taken out of the flow), so its state is still announced. */
@@ -314,6 +328,10 @@ const BODY = String.raw`<a class="skip" href="#docs-title">ข้ามไปท
 <section id="drop" class="drop card" aria-labelledby="drop-title"><div class="drop-inner"><div class="drop-copy"><span class="drop-icon" aria-hidden="true">+</span><div><h2 id="drop-title" class="h-sm">ลากไฟล์มาวางที่นี่ หรือเลือกไฟล์จากเครื่อง</h2><p class="sub">PNG, JPG, WebP หรือ PDF · ครั้งละไม่เกิน 100 ไฟล์ · PDF หลายหน้าจะถูกแยกเป็นหนึ่งแถวต่อหน้า · ระบบอ่านแต่ละไฟล์แยกกัน ไฟล์ที่ผิดพลาดไม่กระทบไฟล์อื่น · ไฟล์ที่ชื่อซ้ำกับไฟล์ที่มีในระบบแล้วจะไม่ถูกอัปโหลด (เปลี่ยนชื่อไฟล์ถ้าต้องการอัปโหลดจริง)</p></div></div><button id="pick2" class="btn" type="button">เลือกไฟล์</button><input id="files" class="sr-only" type="file" multiple accept="image/png,image/jpeg,image/webp,application/pdf,.png,.jpg,.jpeg,.webp,.pdf" tabindex="-1" aria-hidden="true"></div>
 <div id="uploads" class="uploads" hidden><div class="up-bar"><span id="up-summary" class="sub" role="status"></span><div class="acts"><button id="up-retry" class="btn sm" type="button" hidden>ลองใหม่ทั้งหมด</button><button id="up-clear" class="btn sm ghost" type="button" hidden>ล้างรายการที่เสร็จแล้ว</button></div></div><div id="up-list" class="up-list" aria-label="สถานะการอัปโหลดแต่ละไฟล์"></div></div>
 </section>
+<section id="queue" class="batch card" aria-labelledby="queue-title" hidden><div class="batch-head"><div><h2 id="queue-title" class="h-sm">คิวการอ่าน</h2><p id="queue-summary" class="sub" role="status"></p></div><div class="acts"><span id="queue-chips" class="q-chips"></span><button id="queue-toggle" class="btn sm" type="button" aria-expanded="false" aria-controls="queue-body">ดูรายละเอียด</button></div></div>
+<div id="queue-body" class="q-body" hidden><p id="queue-round" class="sub num"></p><p id="queue-help" class="q-help" role="status" hidden></p>
+<div class="q-controls"><button id="queue-next" class="btn sm" type="button">เริ่มรอบถัดไป</button><span id="queue-admin" class="q-controls" hidden><button id="queue-stop" class="btn sm danger" type="button">หยุดคิวทั้งหมด</button><button id="queue-resume" class="btn sm" type="button">เริ่มคิวต่อ</button><label class="fld"><span class="fld-l">จำนวนหน้าสูงสุดต่อรอบ</span><input id="queue-cap" type="text" inputmode="numeric" autocomplete="off" maxlength="6"></label><button id="queue-cap-save" class="btn sm" type="button">ตั้งจำนวนหน้าต่อรอบ</button><button id="queue-cap-none" class="btn sm ghost" type="button">ไม่จำกัด</button></span></div>
+<p id="queue-error" class="err" role="alert"></p><div id="queue-list" class="q-list"></div><p id="queue-more" class="sub" hidden></p></div></section>
 <section id="batch" class="batch card" aria-labelledby="batch-title" hidden><div class="batch-head"><div><h2 id="batch-title" class="h-sm">ชุดอัปโหลดล่าสุด</h2><p id="batch-meta" class="sub"></p></div><button id="batch-view" class="btn sm" type="button">ดูเอกสารในชุดนี้</button></div><div id="batch-bar" class="stack" role="img"></div><dl id="batch-stats" class="stats"></dl></section>
 <section aria-labelledby="docs-title">
 <div class="docs-head"><h2 id="docs-title" class="h-sm" tabindex="-1">รายการเอกสาร</h2><span id="updated" class="sub mono" aria-live="off"></span></div>
@@ -389,6 +407,7 @@ const BODY = String.raw`<a class="skip" href="#docs-title">ข้ามไปท
 <label class="chk"><input id="ex-st-succeeded" type="checkbox"><span>อ่านสำเร็จ (ยังไม่ยืนยัน)</span></label>
 <label class="chk"><input id="ex-st-confirmed" type="checkbox"><span>ยืนยันแล้ว</span></label>
 <label class="chk"><input id="ex-st-failed" type="checkbox"><span>ไม่สำเร็จ</span></label>
+<button id="ex-st-finished" class="btn sm" type="button">เฉพาะที่อ่านเสร็จแล้ว</button>
 </div></fieldset>
 <label class="chk"><input id="ex-confirmed" type="checkbox"><span>เฉพาะที่ยืนยันแล้ว</span></label>
 <div class="ex-tabs" role="group" aria-label="สถานะการ Export"><button id="ex-tab-never" class="btn sm" type="button" aria-pressed="true">ยังไม่เคย Export (…)</button><button id="ex-tab-exported" class="btn sm" type="button" aria-pressed="false">Export แล้ว (…)</button><button id="ex-tab-all" class="btn sm" type="button" aria-pressed="false">ทั้งหมด (…)</button></div>
@@ -428,7 +447,15 @@ const ALLOWED=['image/png','image/jpeg','image/webp','application/pdf'];
 const CATEGORY={queued:'รอคิว',processing:'กำลังอ่าน',review:'รอตรวจสอบ',succeeded:'อ่านสำเร็จ',confirmed:'ยืนยันแล้ว',failed:'ไม่สำเร็จ',split:'แยกเป็นรายหน้าแล้ว'};
 /* Coded failures of the PDF split (worker) and of one page's render: shown in Thai, the code stays in the tooltip. */
 const SPLIT_ERRORS={PDF_ENCRYPTED:'PDF ตั้งรหัสผ่านไว้ ระบบเปิดไม่ได้ กรุณาอัปโหลดไฟล์ที่ไม่มีรหัสผ่าน',PDF_TOO_MANY_PAGES:'PDF มีจำนวนหน้าเกินที่ระบบรองรับ กรุณาแบ่งไฟล์แล้วอัปโหลดใหม่',PDF_PAGE_TOO_LARGE:'หน้ากระดาษใน PDF ใหญ่เกินกำหนด',PDF_RENDER_FAILED:'อ่านไฟล์ PDF ไม่ได้ (ไฟล์อาจเสียหาย)',PDF_RENDERER_UNAVAILABLE:'ระบบแยก PDF ยังไม่พร้อม กรุณาลองอีกครั้งภายหลัง',PAGE_RENDER_FAILED:'แปลงหน้านี้เป็นภาพไม่สำเร็จ กด "ลองอีกครั้ง" เพื่อแปลงใหม่'};
-const PDF_NOTE='ไฟล์ PDF จะถูกแยกเป็นหนึ่งแถวต่อหน้า ระบบอ่านได้ประมาณ 2–3 หน้าต่อนาที (95 หน้า ≈ 40 นาที) ปิดหน้านี้ได้ ระบบทำงานต่อเอง';
+const PDF_NOTE='ไฟล์ PDF จะถูกแยกเป็นหนึ่งแถวต่อหน้า ระบบอ่านทีละชุดอัปโหลดตามลำดับที่อัปโหลด ดูความเร็วจริงและเวลาโดยประมาณได้ที่ "คิวการอ่าน" ปิดหน้านี้ได้ ระบบทำงานต่อเอง';
+/* The queue panel (queue-control D12): its own poll, never part of tick's 3 s chain. */
+const QUEUE_ACTIVE_MS=5000,QUEUE_IDLE_MS=15000,QUEUE_CAP_MAX=100000;
+const QUEUE_CHIP={reading:'กำลังอ่าน',stopped:'หยุดอยู่',round_full:'ครบรอบแล้ว รอเริ่มรอบถัดไป'};
+const QUEUE_FULL_HELP='ถึงจำนวนหน้าของรอบนี้แล้ว ระบบหยุดรอให้ Export ข้อมูลที่อ่านเสร็จ แล้วกด "เริ่มรอบถัดไป"';
+const QUEUE_RESUMED_FULL='เริ่มคิวต่อแล้ว แต่รอบนี้เต็ม ต้องกด "เริ่มรอบถัดไป" ก่อนระบบจึงอ่านต่อ';
+const QUEUE_CAP_HINT='กรอกเลขจำนวนเต็ม 1 ถึง 100000';
+/* The export dialog's default (D13): only rows that are read. "ทุกสถานะ" is still one tick of the other three away. */
+const EXPORT_FINISHED=['review','succeeded','confirmed'];
 const DELIVERY={PENDING:'รอส่งการแก้ไขให้ AI',DELIVERED:'AI รับการแก้ไขแล้ว',RETRYING:'กำลังลองส่งการแก้ไขให้ AI อีกครั้ง',FAILED:'ส่งการแก้ไขให้ AI ไม่สำเร็จ'};
 const SOURCE={ocr:'อ่านด้วย OCR',checkbox:'จากช่องทำเครื่องหมาย','ink-mark':'ตรวจจากรอยหมึก',rule:'ตามกฎของระบบ','master-fuzzy':'เทียบกับรายการบริการ','visual-alias':'เดาจากลายมือที่มักอ่านผิด (ต้องตรวจ)','verified-memory':'จากข้อมูลที่เคยยืนยัน',none:'ไม่พบข้อมูล',human:'แก้ไขโดยพนักงาน'};
 const LABEL={formNumber:'เลขที่ฟอร์ม',date:'วันที่',time:'เวลา',branch:'สาขา',name:'ชื่อลูกค้า',gender:'เพศ',nationality:'สัญชาติ',hotelName:'โรงแรมที่พัก',referralSources:'รู้จักร้านจาก',healthConditions:'ภาวะสุขภาพ',pressure:'แรงกด',referralOther:'รู้จักร้านจาก: อื่น ๆ (ระบุ)',healthOther:'ภาวะสุขภาพ: อื่น ๆ (ระบุ)',massageOilScrub:'น้ำมัน / สครับ',preferredAreas:'จุดที่ต้องการเน้น',avoidAreas:'จุดที่ควรหลีกเลี่ยง',treatments:'ทรีตเมนต์',therapistName:'พนักงานนวด',roomNo:'ห้อง',duration:'ระยะเวลา'};
@@ -469,8 +496,11 @@ EXPORT_TOO_LARGE:'ข้อมูลที่เลือกมีจำนว�
    EXPORT_INCOMPLETE; EXPORT_MARK_FAILED itself is what ทำเครื่องหมาย / ย้ายกลับ answer when the write was rolled back. */
 INVALID_EXPORT_SELECTION:'รายการที่เลือกไม่ถูกต้องหรือมากเกินไป (เลือกเองได้ไม่เกิน 5,000 แถว) กรุณาใช้ "เลือกทั้งหมด" หรือเลือกใหม่',EXPORT_SELECTION_EMPTY:'ไม่พบแถวที่เลือกแล้ว (อาจถูกลบหรือเปลี่ยนไป) กรุณาโหลดรายการใหม่',EXPORT_SELECTION_CHANGED:'รายการเปลี่ยนไประหว่างที่คุณเลือก (มีเอกสารเข้ามาใหม่หรือสถานะเปลี่ยน) กรุณาตรวจรายการแล้วเลือกใหม่อีกครั้ง',EXPORT_MARK_FAILED:'บันทึกสถานะ Export ไม่สำเร็จ ยังไม่มีแถวใดเปลี่ยนสถานะ กรุณาลองใหม่อีกครั้ง',
 /* The list's sort (sort/dir of GET /api/documents): either one resets the list to its default order. */
-INVALID_SORT:'เรียงลำดับตามคอลัมน์นี้ไม่ได้',SORT_TOO_LARGE:'มีเอกสารมากเกินไปที่จะเรียงตามความมั่นใจ (เกิน 2,000 รายการ) กรุณากรองให้แคบลงก่อน'};
+INVALID_SORT:'เรียงลำดับตามคอลัมน์นี้ไม่ได้',SORT_TOO_LARGE:'มีเอกสารมากเกินไปที่จะเรียงตามความมั่นใจ (เกิน 2,000 รายการ) กรุณากรองให้แคบลงก่อน',
+/* Queue control (queue-control D7, D10). ROUND_ALREADY_STARTED is shown as success: the round the user wanted exists. */
+ROUND_ALREADY_STARTED:'มีผู้เริ่มรอบใหม่แล้ว',ROUND_INVALID:'ข้อมูลรอบไม่ตรงกับปัจจุบัน กรุณารีเฟรชหน้านี้แล้วลองใหม่',ROUND_CAP_INVALID:'กรอกเลขจำนวนเต็ม 1 ถึง 100000',QUEUE_NOT_CONFIGURED:'ระบบควบคุมคิวยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแลระบบ'};
 const state={exSeq:0,exAbort:null,exTimer:0,exBusy:false,exTotal:null,exMax:0,exQ:'',exParent:'',exParentName:'',exTab:'never',exOffset:0,exSize:100,exRows:[],exCounts:null,exSel:new Set(),exWarnIds:new Set(),exAll:false,exAllTotal:null,exDlg:0,exGen:0,exSig:'',exPending:false,
+queue:null,qOpen:false,qTimer:0,qBusy:false,qAgain:false,qLast:0,qRearm:null,qAct:false,qResumedFull:false,
 user:null,csrf:'',authWait:null,authSettle:null,authBefore:null,csrfWait:null,rearm:null,leaving:false,started:false,bg:0,xhrs:new Set(),users:[],tempPass:'',pwForced:false,pwBusy:false,pwResolve:null,loginBusy:false,confirmResolve:null,confirmReturn:null,conn:'',docs:[],total:0,offset:0,sort:'',dir:'',q:'',status:'',batchFilter:'',parentFilter:'',parentName:'',pdfView:false,batches:[],batchId:null,batch:null,listSeq:0,listAbort:null,listSig:'',loaded:false,uploads:[],pendingNames:new Set(),active:0,timer:0,ticking:false,soon:0,searchTimer:0,noticeTimer:0,current:null,draft:null,originalSig:'',editable:false,dirty:false,saving:false,blobUrl:'',previewSeq:0,previewAbort:null,previewMissing:false,zoom:1,openSeq:0,lastFocus:null,askResolve:null,askReturn:null,uid:0,inputs:new WeakMap(),others:[]};
 const $=id=>document.getElementById(id);
 const dateFmt=new Intl.DateTimeFormat('th-TH',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
@@ -544,7 +574,7 @@ return state.authWait;}
    reload, because navigation is asynchronous: a resolved waiter would otherwise send user A's save and start A's
    queued uploads carrying B's cookie and CSRF token, and the guard would offer B "Stay" inside A's draft. */
 function userChanged(){state.leaving=true;state.dirty=false;
-clearTimeout(state.timer);state.timer=0;clearTimeout(state.soon);clearTimeout(state.searchTimer);clearTimeout(state.noticeTimer);
+clearTimeout(state.timer);state.timer=0;clearTimeout(state.qTimer);state.qTimer=0;clearTimeout(state.soon);clearTimeout(state.searchTimer);clearTimeout(state.noticeTimer);
 abortInFlight();
 state.uploads.forEach(u=>{if(u.status==='waiting'||u.status==='authwait'){u.status='cancelled';u.error='ยกเลิก (เปลี่ยนผู้ใช้)';paintUpload(u);}});
 const err=apiError(0,'USER_CHANGED');
@@ -578,7 +608,7 @@ restoreAfterLogin();}
 function restoreAfterLogin(){if(!state.started||state.leaving)return;
 state.listSig='';
 if(!state.listAbort)loadDocuments();
-loadBatches();if(state.batchId)loadBatch();
+loadBatches();if(state.batchId)loadBatch();loadQueue(true);
 /* clearPhi() blanked the drawer head, and loadReview() keeps its hands off a dirty drawer — which is exactly the case
    this release exists for — so the head is restored from state here instead of waiting for a load that will not come. */
 if($('drawer').open&&state.current&&state.current.documentId){const seq=state.openSeq;state.pdfView=false;
@@ -593,6 +623,7 @@ $('me-name').textContent=name;$('me-role').textContent=role;$('me-open-name').te
 $('users-open').hidden=!admin;$('me-users').hidden=!admin;
 /* D8: the admin role carries the export right by itself, so the pill follows the effective right, not the raw flag. */
 $('export-open').hidden=!(admin||u.canExport===true);
+renderQueue();
 showMenu(true);}
 /* Everything rendered from customer data. Only state.draft and the id of the open document survive, so an interrupted
    review resumes after the same user logs back in. */
@@ -601,6 +632,8 @@ $('rows').replaceChildren();$('range').textContent='';$('updated').textContent='
 const empty=$('empty');empty.replaceChildren(el('p','sub','กรุณาเข้าสู่ระบบเพื่อดูรายการเอกสาร'));empty.hidden=false;
 $('parent-chip').hidden=true;$('parent-chip-text').replaceChildren();
 $('batch').hidden=true;$('batch-title').textContent='ชุดอัปโหลดล่าสุด';$('batch-meta').textContent='';$('batch-bar').replaceChildren();$('batch-stats').replaceChildren();
+/* The queue panel lists batch labels (operator text): it goes with everything else. */
+state.queue=null;$('queue').hidden=true;$('queue-list').replaceChildren();$('queue-summary').textContent='';$('queue-error').textContent='';
 renderBatchOptions();
 $('d-title').textContent='กำลังโหลด…';$('d-status').replaceChildren();$('editor').replaceChildren();$('d-draft').textContent='';hideAlert();
 clearPreview();
@@ -611,7 +644,7 @@ $('notice').hidden=true;showMenu(false);}
 async function logout(){const busy=state.active>0||state.uploads.some(u=>u.status==='waiting'||u.status==='authwait');
 if(busy&&!(await confirmAsk('ออกจากระบบ?','ยังมีไฟล์ที่กำลังอัปโหลดหรือรออัปโหลด ไฟล์เหล่านี้จะถูกยกเลิก','ออกจากระบบ')))return;
 state.leaving=true;state.dirty=false;
-clearTimeout(state.timer);state.timer=0;clearTimeout(state.soon);clearTimeout(state.searchTimer);clearTimeout(state.noticeTimer);
+clearTimeout(state.timer);state.timer=0;clearTimeout(state.qTimer);state.qTimer=0;clearTimeout(state.soon);clearTimeout(state.searchTimer);clearTimeout(state.noticeTimer);
 abortInFlight();
 try{await fetch('/api/auth/logout',{method:'POST',cache:'no-store',credentials:'same-origin',headers:{'X-CSRF-Token':state.csrf}});}catch(e){}
 location.replace('/');}
@@ -726,6 +759,9 @@ if(state.exQ)f.q=state.exQ;
 if(state.exParent)f.parentId=state.exParent;
 if(state.exTab!=='all')f.exportState=state.exTab;
 return f;}
+/* Exactly the three "read" statuses are ticked: what เฉพาะที่อ่านเสร็จแล้ว selects and what the dialog opens with. */
+function finishedOnly(){return EXPORT_STATUSES.every(s=>$('ex-st-'+s).checked===EXPORT_FINISHED.includes(s));}
+function pickFinished(){EXPORT_STATUSES.forEach(s=>{$('ex-st-'+s).checked=EXPORT_FINISHED.includes(s);});exportListSoon();}
 function exportParams(f){const p=new URLSearchParams();
 if(f.status)p.set('status',f.status.join(','));
 if(f.batchId)p.set('batchId',f.batchId);
@@ -827,7 +863,7 @@ if(state.exAll&&total!==state.exAllTotal){clearExportSelection();setExportError(
 if(!rows.length&&total>0&&state.exOffset>0){state.exOffset=0;loadExportList();return;}
 state.exRows=rows;state.exTotal=total;state.exMax=typeof data.maxRows==='number'?data.maxRows:0;state.exCounts=isObj(data.counts)?data.counts:null;
 const c=state.exCounts;
-$('ex-count').textContent=total>0?'พบ '+total+' แถว · แสดงแถวที่ '+(state.exOffset+1)+'–'+(state.exOffset+rows.length)
+$('ex-count').textContent=total>0?'พบ '+total+' แถว'+(finishedOnly()?' (เฉพาะที่อ่านเสร็จแล้ว)':'')+' · แสดงแถวที่ '+(state.exOffset+1)+'–'+(state.exOffset+rows.length)
 :state.exTab==='never'&&isObj(c)&&typeof c.exported==='number'&&c.exported>0?'ไม่มีแถวที่ยังไม่เคย Export · ดูแถวที่ Export แล้วได้ที่แท็บ "Export แล้ว"':'ไม่มีเอกสารที่ตรงกับตัวกรองนี้';
 renderExportTabs();renderExportRows();renderExportBar();}
 async function loadExportList(){const seq=++state.exSeq;if(state.exAbort){state.exAbort.abort();state.exAbort=null;}
@@ -844,7 +880,9 @@ state.exTotal=null;state.exRows=[];$('ex-rows').replaceChildren();$('ex-count').
 finally{if(state.exAbort===ctrl)state.exAbort=null;}}
 function openExportDialog(){closeMe();
 state.exQ=state.q;state.exParent=state.parentFilter;state.exParentName=state.parentName;
-EXPORT_STATUSES.forEach(s=>{$('ex-st-'+s).checked=state.status===s;});
+/* D13: with no status filter on the list the dialog starts with the rows that are read (รอตรวจสอบ, อ่านสำเร็จ, ยืนยันแล้ว);
+   a status picked on the list is kept as before. */
+EXPORT_STATUSES.forEach(s=>{$('ex-st-'+s).checked=state.status?state.status===s:EXPORT_FINISHED.includes(s);});
 /* The same fallback option as the toolbar's filter: /api/batches?limit=20 may not hold the selected batch, and a
    <select> given a value that matches no <option> reads back as '' — the export would silently cover every batch. */
 fillBatchOptions($('ex-batch'),state.batchFilter||'');
@@ -1000,6 +1038,73 @@ const missing=expected-uploaded;$('batch-meta').textContent=[b.label||'','เร
 const segs=[['confirmed',n('confirmed')],['succeeded',Math.max(0,n('succeeded')-n('confirmed'))],['review',n('needsReview')],['failed',n('failed')],['processing',n('processing')],['queued',n('queued')]];const bar=$('batch-bar');bar.replaceChildren(...segs.filter(s=>s[1]>0).map(s=>{const x=el('span','seg-'+s[0]);x.style.width=(s[1]/total*100)+'%';return x;}));bar.setAttribute('aria-label','อ่านเสร็จ '+completed+' จาก '+total+' แถว');
 const stats=[['ทั้งหมด (แถว)',total,''],['รอคิว',n('queued'),'queued'],['กำลังอ่าน',n('processing'),'processing'],['อ่านสำเร็จ',n('succeeded'),'succeeded'],['รอตรวจสอบ',n('needsReview'),'review'],['ไม่สำเร็จ',n('failed'),'failed'],['ยืนยันแล้ว',n('confirmed'),'confirmed'],['เวลาที่ใช้',clock(elapsed),''],['หน้า/นาที',rate===null||!isFinite(rate)?'—':rate.toFixed(1),'']];
 $('batch-stats').replaceChildren(...stats.map(s=>{const g=el('div','stat'),dt=el('dt');if(s[2])dt.append(el('span','dot k-'+s[2]));dt.append(document.createTextNode(s[0]));g.append(dt,el('dd',null,s[1]));return g;}));}
+
+/* ---------- queue panel (queue-control D11, D12) ---------- */
+function qNum(o,k){return isObj(o)&&typeof o[k]==='number'&&isFinite(o[k])?o[k]:0;}
+function queueCap(c){return isObj(c)&&typeof c.roundCap==='number'&&isFinite(c.roundCap)?c.roundCap:null;}
+function queueFull(c){const cap=queueCap(c);return cap!==null&&qNum(c,'roundDone')>=cap;}
+/* Reading, not stopped, and something still waiting or being read: the 5 s cadence; otherwise 15 s. */
+function queueActive(){const q=state.queue;if(!q||!isObj(q.control)||!isObj(q.overview))return false;return q.control.stopped!==true&&!queueFull(q.control)&&qNum(q.overview,'pagesWaiting')+qNum(q.overview,'pagesReading')>0;}
+function scheduleQueue(){clearTimeout(state.qTimer);state.qTimer=0;if(state.leaving||document.hidden)return;state.qTimer=setTimeout(()=>{loadQueue(false);},queueActive()?QUEUE_ACTIVE_MS:QUEUE_IDLE_MS);}
+/* GET /api/queue at most every 5 s (force: right after a control action or a login). A login stops it like tick. */
+async function loadQueue(force){clearTimeout(state.qTimer);state.qTimer=0;if(state.leaving||!state.started)return;
+if(state.authWait){const wait=state.authWait;if(state.qRearm!==wait){state.qRearm=wait;wait.then(()=>loadQueue(true),()=>undefined);}return;}
+if(state.qBusy){if(force)state.qAgain=true;return;}
+if(!force&&Date.now()-state.qLast<QUEUE_ACTIVE_MS){scheduleQueue();return;}
+state.qBusy=true;state.qLast=Date.now();
+try{const data=await background(()=>getJson('/api/queue'));state.queue=isObj(data)&&isObj(data.control)&&isObj(data.overview)?data:null;renderQueue();}
+catch(e){if(e.status===503||e.status===404){state.queue=null;renderQueue();}}
+finally{state.qBusy=false;if(state.qAgain){state.qAgain=false;loadQueue(true);}else scheduleQueue();}}
+function hoursText(seconds){const s=Math.max(0,Math.round(seconds)),h=Math.floor(s/3600),m=Math.round(s%3600/60);return 'เหลือประมาณ '+h+' ชม. '+m+' นาที (ไม่รวมช่วงที่หยุดรอ)';}
+function queueChip(kind){const b=el('span','badge q-'+(kind==='round_full'?'full':kind));b.append(el('span','dot'),document.createTextNode(QUEUE_CHIP[kind]));return b;}
+function queueRow(b,index){const r=el('div','q-row'),n=k=>qNum(b,k);
+const total=Math.max(1,n('rowsExpected')),read=n('completed');
+const head=el('div');head.append(el('div','q-name',(typeof b.queuePosition==='number'?'#'+b.queuePosition+' · ':'#'+(index+1)+' · ')+batchName(b)));
+const bar=el('div','stack');const fill=el('span','seg-succeeded');fill.style.width=Math.min(100,read/total*100)+'%';bar.append(fill);bar.setAttribute('role','img');bar.setAttribute('aria-label','อ่านแล้ว '+read+' จาก '+n('rowsExpected')+' หน้า');head.append(bar);
+const counts=el('div','sub num q-counts',['อ่านแล้ว '+read+' จาก '+n('rowsExpected')+' หน้า','ไฟล์ '+n('uploaded')+'/'+n('expectedTotal'),n('failed')>0?'ไม่สำเร็จ '+n('failed'):''].filter(Boolean).join(' · '));
+const view=btn('ดูเอกสารในชุดนี้','sm',()=>{viewBatch(str(b.batchId));});
+r.append(head,counts,view);return r;}
+/* Defensive like renderBatch: every field is checked, a missing one reads as 0 / not set. */
+function renderQueue(){const box=$('queue'),q=state.queue;if(!q||!isObj(q.control)||!isObj(q.overview)||!state.user){box.hidden=true;return;}box.hidden=false;
+const c=q.control,o=q.overview,cap=queueCap(c),done=qNum(c,'roundDone'),stopped=c.stopped===true,full=queueFull(c);
+const admin=state.user.role==='admin';
+const chips=[];if(stopped)chips.push(queueChip('stopped'));if(full)chips.push(queueChip('round_full'));if(!stopped&&!full)chips.push(queueChip('reading'));$('queue-chips').replaceChildren(...chips);
+const spp=typeof o.secondsPerPage==='number'&&isFinite(o.secondsPerPage)&&o.secondsPerPage>0?o.secondsPerPage:null;
+const eta=typeof o.etaSeconds==='number'&&isFinite(o.etaSeconds)?o.etaSeconds:null;
+$('queue-summary').textContent=['อ่านแล้ว '+qNum(o,'pagesRead')+' จาก '+qNum(o,'pagesTotal')+' หน้า',spp?'ความเร็วจริง ประมาณ '+Math.max(1,Math.round(3600/spp))+' หน้า/ชั่วโมง':'ยังประเมินความเร็วไม่ได้',spp&&eta!==null&&qNum(o,'pagesTotal')>qNum(o,'pagesRead')?hoursText(eta):''].filter(Boolean).join(' · ');
+$('queue-body').hidden=!state.qOpen;$('queue-toggle').setAttribute('aria-expanded',state.qOpen?'true':'false');$('queue-toggle').textContent=state.qOpen?'ซ่อนรายละเอียด':'ดูรายละเอียด';
+const roundNo=qNum(c,'roundNo')||1;
+$('queue-round').textContent=cap!==null?'รอบที่ '+roundNo+': อ่านแล้ว '+done+'/'+cap+' หน้า':'รอบที่ '+roundNo+': อ่านแล้ว '+done+' หน้า (ไม่จำกัด)';
+if(!full)state.qResumedFull=false;
+const help=$('queue-help');help.hidden=!full;help.textContent=full?(state.qResumedFull&&!stopped?QUEUE_RESUMED_FULL:QUEUE_FULL_HELP):'';
+/* D10: Stop/Resume and N are admin only (the server refuses staff anyway); Start next round is everyone's, at any time. */
+$('queue-admin').hidden=!admin;$('queue-stop').hidden=stopped;$('queue-resume').hidden=!stopped;
+const input=$('queue-cap');if(document.activeElement!==input)input.value=cap===null?'':String(cap);
+const list=Array.isArray(q.batches)?q.batches.filter(b=>isObj(b)&&typeof b.batchId==='string'):[];
+$('queue-list').replaceChildren(...list.map(queueRow));
+const total=qNum(q,'batchesTotal'),more=$('queue-more');more.hidden=!(total>list.length);more.textContent=total>list.length?'แสดง '+list.length+' จาก '+total+' ชุดที่ยังอ่านไม่เสร็จ':'';}
+function viewBatch(id){if(!id)return;state.batchFilter=id;renderBatchOptions();state.status='';state.parentFilter='';state.parentName='';renderParentChip();$('status').value='';state.offset=0;loadDocuments();$('docs-title').scrollIntoView({block:'start',behavior:reduced()?'auto':'smooth'});}
+function applyControl(r){if(isObj(r)&&isObj(r.control)&&state.queue)state.queue=Object.assign({},state.queue,{control:r.control});renderQueue();}
+/* One control action at a time; every one reloads the panel at once (force) whatever its outcome. */
+async function queueAction(path,body,done){if(state.qAct)return;state.qAct=true;$('queue-error').textContent='';
+try{const r=await postJson(path,body);applyControl(r);if(done)done(isObj(r)&&isObj(r.control)?r.control:null);}
+catch(e){if(e.code==='ROUND_ALREADY_STARTED')notify(ERRORS.ROUND_ALREADY_STARTED);else{$('queue-error').textContent=e.message;notify(e.message,'error');}}
+finally{state.qAct=false;loadQueue(true);}}
+async function stopQueue(){if(state.qAct)return;
+if(!(await confirmAsk('หยุดคิวอ่าน?','หน้าที่กำลังอ่านอยู่จะอ่านจนเสร็จ หน้าที่ยังไม่ได้อ่านจะถูกเก็บไว้ ไม่ถูกลบ เริ่มต่อได้ทุกเมื่อ','หยุดคิวทั้งหมด')))return;
+await queueAction('/api/queue/stop',{},()=>{notify('หยุดคิวทั้งหมดแล้ว');});}
+function resumeQueue(){return queueAction('/api/queue/resume',{},c=>{const full=queueFull(c);state.qResumedFull=full;renderQueue();notify(full?QUEUE_RESUMED_FULL:'เริ่มคิวต่อแล้ว');});}
+/* D7: any time, by anyone. The confirmation only when the round is not full and something was read in it; the
+   roundNo sent is the round on screen, so a second press (or a second person) opens no second round. */
+async function nextRound(){const q=state.queue;if(state.qAct||!q||!isObj(q.control))return;
+const c=q.control,cap=queueCap(c),done=qNum(c,'roundDone'),roundNo=qNum(c,'roundNo')||1;
+if(!queueFull(c)&&done>0){const read=cap!==null?'รอบนี้อ่านไปแล้ว '+done+' จาก '+cap+' หน้า':'รอบนี้อ่านไปแล้ว '+done+' หน้า';
+if(!(await confirmAsk('เริ่มรอบใหม่?',read+' ต้องการเริ่มรอบใหม่ไหม? ตัวนับของรอบนี้จะถูกรีเซ็ตเป็น 0 หน้าที่กำลังอ่านอยู่จะนับในรอบใหม่ คิวที่หยุดอยู่จะยังหยุดอยู่','เริ่มรอบใหม่')))return;}
+await queueAction('/api/queue/next-round',{roundNo},r=>{notify('เริ่มรอบที่ '+(r?qNum(r,'roundNo'):roundNo+1)+' แล้ว');});}
+function setCap(value){const err=$('queue-error');
+if(value===null){queueAction('/api/queue/round-cap',{roundCap:null},()=>{notify('ตั้งเป็นไม่จำกัดจำนวนหน้าแล้ว');});return;}
+const t=String(value).trim();if(!/^\d{1,6}$/.test(t)||Number(t)<1||Number(t)>QUEUE_CAP_MAX){err.textContent=QUEUE_CAP_HINT;$('queue-cap').focus();return;}
+queueAction('/api/queue/round-cap',{roundCap:Number(t)},()=>{notify('ตั้งจำนวนหน้าต่อรอบเป็น '+Number(t)+' หน้าแล้ว');});}
 
 /* ---------- uploads ---------- */
 function mimeOf(file){if(ALLOWED.includes(file.type))return file.type;const m=/\.([a-z0-9]+)$/i.exec(file.name||'');const ext=m?m[1].toLowerCase():'';return has(EXT,ext)?EXT[ext]:'';}
@@ -1203,7 +1308,11 @@ $('up-retry').addEventListener('click',()=>{state.uploads.forEach(u=>{if(u.statu
 $('q').addEventListener('input',()=>{clearTimeout(state.searchTimer);state.searchTimer=setTimeout(()=>{const v=$('q').value.trim().slice(0,100);if(v===state.q)return;state.q=v;state.offset=0;loadDocuments();},300);});
 $('q').addEventListener('keydown',e=>{if(e.key==='Enter'){clearTimeout(state.searchTimer);state.q=$('q').value.trim().slice(0,100);state.offset=0;loadDocuments();}});
 $('status').addEventListener('change',()=>{state.status=$('status').value;state.offset=0;loadDocuments();});$('batch-filter').addEventListener('change',()=>{state.batchFilter=$('batch-filter').value;state.offset=0;loadDocuments();});
-$('reload').addEventListener('click',()=>{loadBatches();tick();});$('prev').addEventListener('click',()=>{state.offset=Math.max(0,state.offset-PAGE);loadDocuments().then(()=>$('docs-title').focus());});$('next').addEventListener('click',()=>{if(state.offset+PAGE<state.total){state.offset+=PAGE;loadDocuments().then(()=>$('docs-title').focus());}});
+$('reload').addEventListener('click',()=>{loadBatches();tick();loadQueue(false);});
+$('queue-toggle').addEventListener('click',()=>{state.qOpen=!state.qOpen;renderQueue();});
+$('queue-next').addEventListener('click',()=>{nextRound();});$('queue-stop').addEventListener('click',()=>{stopQueue();});$('queue-resume').addEventListener('click',()=>{resumeQueue();});
+$('queue-cap-save').addEventListener('click',()=>{setCap($('queue-cap').value);});$('queue-cap-none').addEventListener('click',()=>{setCap(null);});
+$('queue-cap').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();setCap($('queue-cap').value);}});$('prev').addEventListener('click',()=>{state.offset=Math.max(0,state.offset-PAGE);loadDocuments().then(()=>$('docs-title').focus());});$('next').addEventListener('click',()=>{if(state.offset+PAGE<state.total){state.offset+=PAGE;loadDocuments().then(()=>$('docs-title').focus());}});
 $('batch-view').addEventListener('click',()=>{if(!state.batchId)return;state.batchFilter=state.batchId;renderBatchOptions();state.status='';state.parentFilter='';state.parentName='';renderParentChip();$('status').value='';state.offset=0;loadDocuments();$('docs-title').scrollIntoView({block:'start',behavior:reduced()?'auto':'smooth'});});
 $('rows').addEventListener('click',e=>{const b=e.target instanceof Element?e.target.closest('button[data-action]'):null;if(!b)return;const id=b.getAttribute('data-doc')||'';if(b.getAttribute('data-action')==='retry')retryDocument(id,b);else openReview(id,b);});
 $('p-pdf').addEventListener('click',()=>{toggleOriginal();});$('parent-clear').addEventListener('click',()=>{state.parentFilter='';state.parentName='';state.offset=0;renderParentChip();loadDocuments();});
@@ -1214,7 +1323,7 @@ dlg.addEventListener('keydown',e=>{if(e.key==='Escape'){e.preventDefault();e.sto
 dlg.addEventListener('cancel',e=>{e.preventDefault();if(!state.askResolve)requestClose();});
 dlg.addEventListener('close',()=>{if(!state.current)return;if(state.dirty){dlg.showModal();requestClose();return;}finishClose();});
 document.addEventListener('keydown',e=>{if(e.key==='/'&&!busyUi()&&!(e.target instanceof HTMLInputElement||e.target instanceof HTMLSelectElement||e.target instanceof HTMLTextAreaElement)){e.preventDefault();$('q').focus();}});
-document.addEventListener('visibilitychange',()=>{if(document.hidden){clearTimeout(state.timer);state.timer=0;}else tick();});
+document.addEventListener('visibilitychange',()=>{if(document.hidden){clearTimeout(state.timer);state.timer=0;clearTimeout(state.qTimer);state.qTimer=0;}else{tick();loadQueue(false);}});
 window.addEventListener('beforeunload',e=>{if(state.leaving)return;if(state.dirty||state.active>0||state.uploads.some(u=>u.status==='waiting'||u.status==='authwait')){e.preventDefault();e.returnValue='';}});
 window.addEventListener('resize',()=>{if(state.user)showMenu(true);});
 /* Login. method=post on the form means a script failure can never put a password in a URL or in an nginx log. */
@@ -1246,6 +1355,7 @@ $('ex-size').addEventListener('change',setExportSize);
 /* Format and คอลัมน์ shape the file, not the list: they move neither the rows nor the selection. */
 ['ex-batch','ex-datefield','ex-from','ex-to','ex-confirmed'].forEach(id=>$(id).addEventListener('change',exportListSoon));
 EXPORT_STATUSES.forEach(s=>$('ex-st-'+s).addEventListener('change',exportListSoon));
+$('ex-st-finished').addEventListener('click',pickFinished);
 $('users-open').addEventListener('click',openUsers);$('me-users').addEventListener('click',openUsers);
 $('users-close').addEventListener('click',closeUsers);
 $('users-dlg').addEventListener('cancel',e=>{e.preventDefault();closeUsers();});
@@ -1266,7 +1376,7 @@ if(!user){document.body.dataset.auth='out';try{await requireLogin();}catch(e){re
 else{document.body.dataset.auth='in';applyUser();setConnection('ok');}
 if(state.user&&state.user.mustChangePassword)await forcedPasswordChange();
 state.started=true;
-await Promise.all([loadDocuments(),loadBatches()]);const deep=new URLSearchParams(location.search).get('document');if(deep){if(UUID.test(deep))openReview(deep.toLowerCase(),null);else{notify('ลิงก์เอกสารไม่ถูกต้อง','error');setUrl(null);}}schedule();}
+await Promise.all([loadDocuments(),loadBatches(),loadQueue(true)]);const deep=new URLSearchParams(location.search).get('document');if(deep){if(UUID.test(deep))openReview(deep.toLowerCase(),null);else{notify('ลิงก์เอกสารไม่ถูกต้อง','error');setUrl(null);}}schedule();}
 init();
 })();
 `;
